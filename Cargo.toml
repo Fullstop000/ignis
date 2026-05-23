@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "ignis",
+    "ignis-macros"
+]
+resolver = "2"
