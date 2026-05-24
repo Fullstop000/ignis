@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-25
+
+### Added
+- `/copy` — copy the last assistant reply to the system clipboard.
+
 ## [0.4.1] - 2026-05-24
 
 ### Fixed
