@@ -24,18 +24,18 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),            // header
             Constraint::Min(3),               // messages (borderless)
             Constraint::Length(1),            // loading status (above input)
             Constraint::Length(input_height), // input
+            Constraint::Length(1),            // footer: dir · model · context%
         ])
         .split(size);
 
-    draw_header(f, layout[0], app);
-    draw_messages(f, layout[1], app);
-    draw_slash_suggestions(f, layout[1], app);
-    draw_loading(f, layout[2], app);
-    draw_input(f, layout[3], app);
+    draw_messages(f, layout[0], app);
+    draw_slash_suggestions(f, layout[0], app);
+    draw_loading(f, layout[1], app);
+    draw_input(f, layout[2], app);
+    draw_footer(f, layout[3], app);
 }
 
 /// Loading/status line shown directly above the input box (Claude Code style).
@@ -72,41 +72,35 @@ pub(crate) fn draw_loading(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(line).style(Style::default().bg(BG)), area);
 }
 
-pub(crate) fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let cwd_str = format!(" {} ", app.cwd.display());
-    let header_layout = Layout::default()
+/// Status footer under the input: working dir (left) and model + context % (right).
+pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    let right_str = format!(
+        " {}/{}  ·  {}% ctx ",
+        app.provider,
+        app.model,
+        app.context_pct()
+    );
+    let right_w = right_str.chars().count() as u16;
+    let split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(cwd_str.len() as u16)])
+        .constraints([Constraint::Min(0), Constraint::Length(right_w)])
         .split(area);
 
-    let left = Line::from(vec![
-        Span::styled(" 🔥 ", Style::default()),
-        Span::styled(
-            "ignis",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            format!("{}/{}", app.provider, app.model),
-            Style::default().fg(SUBTEXT),
-        ),
-        Span::styled(
-            format!("  {}", app.session_id),
-            Style::default().fg(TEXT_DIM),
-        ),
-    ]);
-
-    let right = Line::from(Span::styled(cwd_str, Style::default().fg(TEXT_DIM)));
+    let left = Line::from(Span::styled(
+        format!("  {}", app.cwd.display()),
+        Style::default().fg(TEXT_DIM),
+    ));
+    let right = Line::from(Span::styled(right_str, Style::default().fg(SUBTEXT)));
 
     f.render_widget(
         Paragraph::new(left).style(Style::default().bg(SURFACE)),
-        header_layout[0],
+        split[0],
     );
     f.render_widget(
         Paragraph::new(right)
             .style(Style::default().bg(SURFACE))
             .alignment(ratatui::layout::Alignment::Right),
-        header_layout[1],
+        split[1],
     );
 }
 
@@ -712,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn render_header_shows_provider_model_session() {
+    fn render_footer_shows_model_dir_and_context() {
         let mut app = App::new(
             "openai".to_string(),
             "gpt-4".to_string(),
@@ -726,10 +720,10 @@ mod tests {
         let content = buffer_content(&term);
         assert!(
             content.contains("openai/gpt-4"),
-            "should show provider/model"
+            "footer should show provider/model"
         );
-        assert!(content.contains("work"), "should show session id");
-        assert!(content.contains("/tmp"), "should show cwd");
+        assert!(content.contains("/tmp"), "footer should show cwd");
+        assert!(content.contains("% ctx"), "footer should show context %");
     }
 
     #[test]

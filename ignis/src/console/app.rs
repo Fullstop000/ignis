@@ -70,6 +70,10 @@ pub(crate) struct App {
     pub(crate) should_quit: bool,
     pub(crate) error_flash: Option<(String, Instant)>,
     pub(crate) exit_pending: bool,
+
+    /// Token budget the context-usage % is measured against (the auto-compact
+    /// threshold). Estimated, not exact.
+    pub(crate) context_window: usize,
 }
 
 impl App {
@@ -97,7 +101,36 @@ impl App {
             should_quit: false,
             error_flash: None,
             exit_pending: false,
+            context_window: 120_000,
         }
+    }
+
+    pub(crate) fn set_context_window(&mut self, window: usize) {
+        self.context_window = window;
+    }
+
+    /// Estimated share of the context budget used by the transcript (chars/4),
+    /// capped at 100. Doubles as "% until auto-compaction".
+    pub(crate) fn context_pct(&self) -> u8 {
+        if self.context_window == 0 {
+            return 0;
+        }
+        let chars: usize = self
+            .blocks
+            .iter()
+            .map(|b| match b {
+                UIBlock::User(t) | UIBlock::Assistant(t) => t.len(),
+                UIBlock::Tool(e) => {
+                    e.arguments.len()
+                        + match &e.status {
+                            ToolStatus::Success(s) | ToolStatus::Error(s) => s.len(),
+                            ToolStatus::Pending => 0,
+                        }
+                }
+            })
+            .sum();
+        let tokens = chars / 4;
+        ((tokens * 100 / self.context_window).min(100)) as u8
     }
 
     pub(crate) fn spinner(&self) -> &str {

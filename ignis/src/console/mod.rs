@@ -170,6 +170,7 @@ pub async fn run_console(
     terminal.clear()?;
 
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
+    app.set_context_window(config.compaction.threshold_tokens);
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
