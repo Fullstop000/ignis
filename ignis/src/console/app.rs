@@ -588,6 +588,95 @@ impl App {
     pub(crate) fn clear_exit_hint(&mut self) {
         self.exit_pending = false;
     }
+
+    pub(crate) fn copy_last_assistant_message(&mut self) {
+        let text = self.blocks.iter().rev().find_map(|b| match b {
+            UIBlock::Assistant(text) => Some(text.clone()),
+            _ => None,
+        });
+
+        match text {
+            Some(content) => {
+                match super::clipboard::set_clipboard(&content) {
+                    Ok(()) => self.add_assistant_notice("Copied to clipboard.".to_string()),
+                    Err(e) => self.add_assistant_notice(format!("Copy failed: {e}")),
+                }
+            }
+            None => self.add_assistant_notice("Nothing to copy.".to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::{App, UIBlock};
+    use std::path::PathBuf;
+
+    fn test_app() -> App {
+        App::new(
+            "p".to_string(),
+            "m".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    #[test]
+    fn copy_finds_last_assistant_message() {
+        let mut app = test_app();
+        app.blocks.push(UIBlock::User("user msg".to_string()));
+        app.blocks.push(UIBlock::Assistant("first reply".to_string()));
+        app.blocks.push(UIBlock::User("user msg 2".to_string()));
+        app.blocks.push(UIBlock::Assistant("last reply".to_string()));
+
+        app.copy_last_assistant_message();
+
+        let last = app.blocks.last().unwrap();
+        assert!(
+            matches!(last, UIBlock::Assistant(text) if text == "Copied to clipboard."),
+            "Expected success notice, got {:?}",
+            last
+        );
+    }
+
+    #[test]
+    fn copy_skips_tool_blocks() {
+        let mut app = test_app();
+        app.blocks.push(UIBlock::User("user msg".to_string()));
+        app.blocks.push(UIBlock::Assistant("reply".to_string()));
+        app.blocks.push(UIBlock::Tool(super::ToolCallEntry {
+            id: "1".to_string(),
+            name: "bash".to_string(),
+            arguments: "{}".to_string(),
+            status: super::ToolStatus::Success("ok".to_string()),
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 0,
+        }));
+
+        app.copy_last_assistant_message();
+
+        let last = app.blocks.last().unwrap();
+        assert!(
+            matches!(last, UIBlock::Assistant(text) if text == "Copied to clipboard."),
+            "Expected copy of 'reply', got {:?}",
+            last
+        );
+    }
+
+    #[test]
+    fn copy_when_nothing_to_copy() {
+        let mut app = test_app();
+        app.blocks.push(UIBlock::User("user only".to_string()));
+
+        app.copy_last_assistant_message();
+
+        let last = app.blocks.last().unwrap();
+        assert!(
+            matches!(last, UIBlock::Assistant(text) if text == "Nothing to copy."),
+            "Expected 'Nothing to copy.' notice, got {:?}",
+            last
+        );
+    }
 }
 
 #[cfg(test)]
@@ -603,7 +692,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            vec!["/resume", "/clear", "/compact"]
+            vec!["/resume", "/clear", "/compact", "/copy"]
         );
     }
 

@@ -82,12 +82,17 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/compact",
         description: "Summarize earlier history to free up context",
     },
+    SlashCommand {
+        name: "/copy",
+        description: "Copy the last assistant message to clipboard",
+    },
 ];
 
 // ==========================================
 // UI State
 
 pub mod app;
+pub mod clipboard;
 pub mod markdown;
 pub mod render;
 
@@ -518,6 +523,8 @@ async fn handle_key(
                             session_id: app.session_id.clone(),
                         })
                         .await;
+                } else if command == "/copy" && arg_count == 1 {
+                    app.copy_last_assistant_message();
                 } else if text.starts_with('/') {
                     app.add_assistant_notice(format!("Unknown command `{}`.", command));
                 } else {
