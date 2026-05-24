@@ -94,11 +94,28 @@ pub(crate) fn format_duration(ms: u128) -> String {
 }
 
 pub(crate) fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        // Take whole chars, never a byte slice — `&s[..max]` panics mid-codepoint.
+        format!("{}…", s.chars().take(max).collect::<String>())
     }
+}
+
+/// Make arbitrary text (tool output, file contents, pasted input) safe to feed
+/// to ratatui: a literal `\t` desyncs layout (the terminal advances to a tab
+/// stop, ratatui assumes width 1) and other control chars (CR, ANSI escapes)
+/// corrupt the screen. Expand tabs to spaces and drop the rest.
+pub(crate) fn sanitize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 pub(crate) fn slash_suggestions(input: &str) -> Vec<SlashCommand> {

@@ -10,8 +10,8 @@ use unicode_width::UnicodeWidthStr;
 use super::app::{App, Mode, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
 use super::markdown::render_md_block;
 use super::{
-    format_duration, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, GREEN, MAUVE, RED, SPINNERS,
-    SUBTEXT, SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
+    format_duration, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, GREEN, MAUVE, RED,
+    SPINNERS, SUBTEXT, SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
 };
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
@@ -146,36 +146,29 @@ pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
         for (bi, block) in app.blocks.iter().enumerate() {
             match block {
                 UIBlock::User(text) => {
+                    // No "You" label — a 👤 prefix on the first line marks the
+                    // user turn; the prompt is bold to stand out from replies.
                     lines.push(Line::from(""));
-                    lines.push(Line::from(vec![
-                        Span::styled("  ❯ ", Style::default().fg(ACCENT)),
-                        Span::styled(
-                            "You",
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                    for l in text.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {}", l),
-                            Style::default().fg(TEXT),
-                        )));
+                    for (i, l) in text.lines().enumerate() {
+                        let prefix = if i == 0 { "👤 " } else { "   " };
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(ACCENT)),
+                            Span::styled(
+                                sanitize(l),
+                                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
                     }
                 }
                 UIBlock::Assistant(text) => {
-                    // Skip empty assistant placeholders (e.g. tool-only turns,
-                    // or before the first streamed delta) so we don't render a
-                    // bare "> Ignis" header with nothing under it.
+                    // Skip empty assistant placeholders (tool-only turns, or
+                    // before the first streamed delta) so we don't render a
+                    // blank gap. No "Ignis" label — replies render as plain
+                    // (unprefixed) markdown, distinct from the 👤 user turn.
                     if text.is_empty() {
                         continue;
                     }
                     lines.push(Line::from(""));
-                    lines.push(Line::from(vec![
-                        Span::styled("  > ", Style::default().fg(MAUVE)),
-                        Span::styled(
-                            "Ignis",
-                            Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
                     let is_active = app.current_chunk_idx == Some(bi);
                     let md_lines = render_md_block(text, is_active);
                     lines.extend(md_lines);
@@ -312,13 +305,13 @@ pub(crate) fn render_tool_block(lines: &mut Vec<Line<'static>>, entry: &ToolCall
         }
         ToolStatus::Error(err) => {
             let elapsed = format_duration(entry.elapsed_ms);
-            let preview = truncate(err.trim(), 300);
+            let preview = truncate(&sanitize(err.trim()), 300);
             ("x", RED, preview, elapsed)
         }
     };
 
     // Parse tool arguments for a compact display
-    let args_compact = compact_tool_args(&entry.arguments);
+    let args_compact = sanitize(&compact_tool_args(&entry.arguments));
 
     lines.push(Line::from(""));
     // Header line: ┌─ ⚙ tool_name(args) [1.2s]
@@ -358,7 +351,7 @@ pub(crate) fn render_tool_block(lines: &mut Vec<Line<'static>>, entry: &ToolCall
         ToolStatus::Success(out) => {
             // Show first 3 lines of output
             for sl in out.lines().take(3) {
-                let display = truncate(sl, 100);
+                let display = truncate(&sanitize(sl), 100);
                 lines.push(Line::from(vec![
                     Span::styled("  │ ", Style::default().fg(color)),
                     Span::styled(display, Style::default().fg(TEXT_DIM)),
@@ -578,8 +571,11 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let content = buffer_content(&term);
-        assert!(content.contains("You"), "should show user label");
         assert!(content.contains("Hello"), "should show user text");
+        assert!(
+            content.contains('👤'),
+            "user turn should carry the emoji prefix"
+        );
     }
 
     #[test]
@@ -597,8 +593,11 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let content = buffer_content(&term);
-        assert!(content.contains("Ignis"), "should show assistant label");
         assert!(content.contains("Code block"), "should show assistant text");
+        assert!(
+            !content.contains("Ignis"),
+            "assistant label should be removed"
+        );
     }
 
     #[test]
@@ -624,6 +623,37 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("read_file"), "should show tool name");
         assert!(content.contains("file content"), "should show tool output");
+    }
+
+    #[test]
+    fn render_tool_output_has_no_literal_tabs() {
+        // Regression: tab-separated tool output (e.g. list_dir "dir\t4096\tname")
+        // reaching ratatui as a literal \t desyncs the terminal layout and
+        // garbles the screen. The renderer must expand tabs first.
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        app.blocks.push(UIBlock::Tool(ToolCallEntry {
+            id: "c".to_string(),
+            name: "list_dir".to_string(),
+            arguments: r#"{"path":"."}"#.to_string(),
+            status: ToolStatus::Success("dir\t4096\t.claude\nfile\t512\tREADME.md".to_string()),
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 2,
+        }));
+
+        let mut term = test_terminal(100, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(
+            !content.contains('\t'),
+            "no literal tab may reach the buffer"
+        );
+        assert!(content.contains(".claude"), "directory name should render");
     }
 
     #[test]

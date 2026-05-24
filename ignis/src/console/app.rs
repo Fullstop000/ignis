@@ -568,6 +568,23 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_expands_tabs_and_drops_control_chars() {
+        use super::super::sanitize;
+        assert_eq!(sanitize("a\tb"), "a    b");
+        assert_eq!(sanitize("a\r\nb"), "ab"); // CR and LF dropped (lines split upstream)
+        assert_eq!(sanitize("x\x1b[31my"), "x[31my"); // ESC dropped
+        assert_eq!(sanitize("正常 text"), "正常 text"); // multibyte untouched
+    }
+
+    #[test]
+    fn truncate_is_char_safe() {
+        use super::super::truncate;
+        // Must not panic slicing mid-codepoint, and counts chars not bytes.
+        assert_eq!(truncate("中文字测试", 3), "中文字…");
+        assert_eq!(truncate("abc", 5), "abc");
+    }
+
+    #[test]
     fn next_selection_wraps_in_both_directions() {
         assert_eq!(next_selection(0, 2, SelectionDirection::Previous), 1);
         assert_eq!(next_selection(1, 2, SelectionDirection::Next), 0);
