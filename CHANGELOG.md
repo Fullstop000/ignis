@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-24
+
 ### Added
 - Switchable `web_search` backend with Brave and Tavily providers, selected via
   `[web_search]` in `config.toml` (`provider` + `api_key`).
