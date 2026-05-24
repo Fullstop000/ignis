@@ -87,12 +87,13 @@ pub(crate) fn draw_loading(f: &mut Frame, area: Rect, app: &App) {
 
 /// Status footer under the input: working dir (left) and model + token usage (right).
 pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    let (ctx_tokens, ctx_pct) = app.context_usage();
     let right_str = format!(
         " {}/{}  ·  {} tok ({}%) ",
         app.provider,
         app.model,
-        format_tokens(app.context_tokens()),
-        app.context_pct()
+        format_tokens(ctx_tokens as usize),
+        ctx_pct
     );
     let right_w = right_str.chars().count() as u16;
     let split = Layout::default()

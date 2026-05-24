@@ -48,6 +48,7 @@ impl LlmProvider for DeepSeekProvider {
             messages: request_messages,
             tools,
             stream: true,
+            stream_options: None,
         };
 
         let endpoint = if self.api_url.ends_with("/chat/completions") {

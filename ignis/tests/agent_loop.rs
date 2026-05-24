@@ -5,7 +5,7 @@ use ignis::{
     provider::{LlmProvider, LlmResponseDelta},
     storage::{InMemoryStorage, SessionStorage},
     tools::tool::{AgentTool, ToolResult},
-    types::{AgentEvent, Message},
+    types::{AgentEvent, Message, Usage},
     Session,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -396,4 +396,42 @@ async fn session_compact_summarizes_old_history() {
     // Compaction is persisted.
     let persisted = storage.load_session("c").await.unwrap();
     assert_eq!(persisted.len(), h.len());
+}
+
+#[tokio::test]
+async fn session_captures_real_token_usage() {
+    // Provider reports a usage delta → it surfaces as an AgentEvent::Usage and
+    // accumulates on the session.
+    let provider = MockProvider::new(vec![vec![
+        LlmResponseDelta::Usage(Usage {
+            input_tokens: 1000,
+            output_tokens: 50,
+            cache_read_tokens: 200,
+            cache_write_tokens: 0,
+        }),
+        LlmResponseDelta::Text("hi".to_string()),
+    ]]);
+    let storage = InMemoryStorage::new();
+    let mut session = Session::open(
+        "u".to_string(),
+        "system".to_string(),
+        Box::new(provider),
+        Box::new(storage),
+        "/tmp".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    session.prompt("hello", tx).await.unwrap();
+    let events = collect_events(&mut rx).await;
+
+    let reported = events.iter().find_map(|e| match e {
+        AgentEvent::Usage(u) => Some(*u),
+        _ => None,
+    });
+    assert_eq!(reported.map(|u| u.total()), Some(1050));
+    assert_eq!(session.usage().input_tokens, 1000);
+    assert_eq!(session.usage().output_tokens, 50);
+    assert_eq!(session.usage().total(), 1050);
 }

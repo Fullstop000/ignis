@@ -13,6 +13,8 @@ pub enum LlmResponseDelta {
         name: Option<String>,
         arguments: String,
     },
+    /// Real token usage for the completion (emitted once, near the end).
+    Usage(crate::types::Usage),
 }
 
 #[async_trait]
@@ -49,6 +51,14 @@ pub struct ChatCompletionsRequest<'a> {
     #[serde(skip_serializing_if = "is_empty_slice")]
     pub tools: &'a [serde_json::Value],
     pub stream: bool,
+    /// Ask the API to emit a final usage chunk (OpenAI-compatible).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
 }
 
 fn is_empty_slice(slice: &[serde_json::Value]) -> bool {
@@ -58,6 +68,42 @@ fn is_empty_slice(slice: &[serde_json::Value]) -> bool {
 #[derive(Deserialize, Debug)]
 pub struct Chunk {
     pub choices: Option<Vec<ChunkChoice>>,
+    #[serde(default)]
+    pub usage: Option<ChunkUsage>,
+}
+
+/// OpenAI-compatible usage object from the final stream chunk.
+#[derive(Deserialize, Debug)]
+pub struct ChunkUsage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u64,
+}
+
+impl ChunkUsage {
+    pub fn to_usage(&self) -> crate::types::Usage {
+        let cache_read = self
+            .prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
+        crate::types::Usage {
+            // prompt_tokens already includes cached tokens (OpenAI semantics).
+            input_tokens: self.prompt_tokens,
+            output_tokens: self.completion_tokens,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: 0,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -122,4 +168,22 @@ where
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_usage_maps_to_usage() {
+        let chunk: Chunk = serde_json::from_str(
+            r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":42,"prompt_tokens_details":{"cached_tokens":600}}}"#,
+        )
+        .unwrap();
+        let u = chunk.usage.unwrap().to_usage();
+        assert_eq!(u.input_tokens, 1000); // includes cached
+        assert_eq!(u.output_tokens, 42);
+        assert_eq!(u.cache_read_tokens, 600);
+        assert_eq!(u.cache_write_tokens, 0);
+    }
 }

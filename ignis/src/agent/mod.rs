@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::provider::{LlmProvider, LlmResponseDelta};
 use crate::tools::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
-use crate::types::{AgentEvent, Message, ToolCall, ToolCallFunction};
+use crate::types::{AgentEvent, Message, ToolCall, ToolCallFunction, Usage};
 
 /// Execution engine: given a conversation `history`, runs the model + tool
 /// loop and emits events. State and persistence live in [`crate::Session`].
@@ -78,8 +78,9 @@ impl Agent {
         &self,
         history: &mut Vec<Message>,
         tx: tokio::sync::mpsc::Sender<AgentEvent>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<Usage, anyhow::Error> {
         let _ = tx.send(AgentEvent::AgentStart).await;
+        let mut total_usage = Usage::default();
 
         let tool_schemas: Vec<serde_json::Value> = self
             .tools
@@ -145,6 +146,7 @@ impl Agent {
             let mut reasoning_content = String::new();
             let mut pending_tool_calls: HashMap<usize, AccumulatingToolCall> = HashMap::new();
             let mut message_started = false;
+            let mut turn_usage = Usage::default();
 
             use futures_util::stream::StreamExt;
             while let Some(delta_result) = stream.next().await {
@@ -201,8 +203,17 @@ impl Agent {
                             }
                             entry.arguments.push_str(&arguments);
                         }
+                        LlmResponseDelta::Usage(u) => {
+                            turn_usage.add(&u);
+                        }
                     },
                 }
+            }
+
+            // Report this turn's real token usage (if the provider supplied it).
+            if !turn_usage.is_zero() {
+                total_usage.add(&turn_usage);
+                let _ = tx.send(AgentEvent::Usage(turn_usage)).await;
             }
 
             // Sort by index to maintain deterministic order
@@ -517,6 +528,6 @@ impl Agent {
         }
 
         let _ = tx.send(AgentEvent::AgentEnd).await;
-        Ok(())
+        Ok(total_usage)
     }
 }

@@ -78,6 +78,8 @@ pub(crate) struct App {
     pub(crate) current_chunk_idx: Option<usize>,
     /// Output chars streamed in the current turn (for live token estimate).
     pub(crate) stream_chars: usize,
+    /// Real token usage from the most recent completed turn (provider-reported).
+    pub(crate) last_usage: Option<crate::Usage>,
 
     pub(crate) scroll: u16,
     pub(crate) max_scroll: u16,
@@ -112,6 +114,7 @@ impl App {
             stream_start: None,
             current_chunk_idx: None,
             stream_chars: 0,
+            last_usage: None,
             scroll: 0,
             max_scroll: 0,
             user_scrolled: false,
@@ -146,13 +149,18 @@ impl App {
         chars / 4
     }
 
-    /// Estimated share of the context budget used (capped at 100). Doubles as
-    /// "% until auto-compaction".
-    pub(crate) fn context_pct(&self) -> u8 {
-        if self.context_window == 0 {
-            return 0;
-        }
-        ((self.context_tokens() * 100 / self.context_window).min(100)) as u8
+    /// Context tokens and % for the footer. Prefers the provider's real
+    /// last-turn input size; falls back to the chars/4 estimate.
+    pub(crate) fn context_usage(&self) -> (u64, u8) {
+        let tokens = match self.last_usage {
+            Some(u) if u.input_tokens > 0 => u.input_tokens,
+            _ => self.context_tokens() as u64,
+        };
+        let pct = (tokens as usize * 100)
+            .checked_div(self.context_window)
+            .map(|p| p.min(100))
+            .unwrap_or(0) as u8;
+        (tokens, pct)
     }
 
     /// Estimated output tokens streamed so far in the current turn (chars/4).
@@ -257,6 +265,10 @@ impl App {
                 self.auto_scroll();
             }
             AgentEvent::TurnEnd => {}
+            AgentEvent::Usage(usage) => {
+                // Real provider-reported usage for the latest turn.
+                self.last_usage = Some(usage);
+            }
             AgentEvent::AgentEnd => {
                 self.mode = Mode::Idle;
                 self.current_chunk_idx = None;
@@ -361,6 +373,7 @@ impl App {
         self.max_scroll = 0;
         self.user_scrolled = false;
         self.history_idx = None;
+        self.last_usage = None;
         self.session_picker = None;
         self.add_assistant_notice(format!("Started new session `{}`.", self.session_id));
     }
@@ -407,6 +420,7 @@ impl App {
         self.scroll = 0;
         self.max_scroll = 0;
         self.user_scrolled = false;
+        self.last_usage = None;
 
         if messages.is_empty() {
             self.add_assistant_notice(format!("Resumed empty session `{}`.", session_id));
