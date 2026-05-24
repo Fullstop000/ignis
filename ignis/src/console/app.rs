@@ -6,6 +6,19 @@ use super::{
 };
 use crate::types::AgentEvent;
 
+/// Decode a persisted tool message's content `{"result": <str>, "is_error": <bool>}`
+/// back into the (display text, is_error) the live UI shows. Falls back to the
+/// raw string if it isn't the expected JSON shape.
+pub(crate) fn parse_tool_result(content: &str) -> (String, bool) {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(result) = v.get("result").and_then(|r| r.as_str()) {
+            let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+            return (result.to_string(), is_error);
+        }
+    }
+    (content.to_string(), false)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallEntry {
     pub(crate) id: String,
@@ -70,6 +83,10 @@ pub(crate) struct App {
     pub(crate) should_quit: bool,
     pub(crate) error_flash: Option<(String, Instant)>,
     pub(crate) exit_pending: bool,
+
+    /// Token budget the context-usage % is measured against (the auto-compact
+    /// threshold). Estimated, not exact.
+    pub(crate) context_window: usize,
 }
 
 impl App {
@@ -97,7 +114,36 @@ impl App {
             should_quit: false,
             error_flash: None,
             exit_pending: false,
+            context_window: 120_000,
         }
+    }
+
+    pub(crate) fn set_context_window(&mut self, window: usize) {
+        self.context_window = window;
+    }
+
+    /// Estimated share of the context budget used by the transcript (chars/4),
+    /// capped at 100. Doubles as "% until auto-compaction".
+    pub(crate) fn context_pct(&self) -> u8 {
+        if self.context_window == 0 {
+            return 0;
+        }
+        let chars: usize = self
+            .blocks
+            .iter()
+            .map(|b| match b {
+                UIBlock::User(t) | UIBlock::Assistant(t) => t.len(),
+                UIBlock::Tool(e) => {
+                    e.arguments.len()
+                        + match &e.status {
+                            ToolStatus::Success(s) | ToolStatus::Error(s) => s.len(),
+                            ToolStatus::Pending => 0,
+                        }
+                }
+            })
+            .sum();
+        let tokens = chars / 4;
+        ((tokens * 100 / self.context_window).min(100)) as u8
     }
 
     pub(crate) fn spinner(&self) -> &str {
@@ -197,6 +243,52 @@ impl App {
         }
     }
 
+    /// Byte offset of the char boundary one character left of the cursor.
+    /// `cursor` indexes `input` by byte, so movement must step whole UTF-8
+    /// chars — a naive `cursor -= 1` lands mid-character and panics on slice.
+    fn prev_char_boundary(&self) -> usize {
+        self.input[..self.cursor]
+            .chars()
+            .next_back()
+            .map_or(0, |c| self.cursor - c.len_utf8())
+    }
+
+    /// Byte offset of the char boundary one character right of the cursor.
+    fn next_char_boundary(&self) -> usize {
+        self.input[self.cursor..]
+            .chars()
+            .next()
+            .map_or(self.cursor, |c| self.cursor + c.len_utf8())
+    }
+
+    pub(crate) fn insert_char(&mut self, c: char) {
+        self.input.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.prev_char_boundary();
+        self.input.remove(prev);
+        self.cursor = prev;
+    }
+
+    pub(crate) fn delete_forward(&mut self) {
+        if self.cursor < self.input.len() {
+            self.input.remove(self.cursor);
+        }
+    }
+
+    pub(crate) fn move_left(&mut self) {
+        self.cursor = self.prev_char_boundary();
+    }
+
+    pub(crate) fn move_right(&mut self) {
+        self.cursor = self.next_char_boundary();
+    }
+
     pub(crate) fn submit(&mut self) -> Option<String> {
         let text = self.input.trim().to_string();
         if text.is_empty() || self.mode != Mode::Idle {
@@ -284,38 +376,67 @@ impl App {
         for message in messages {
             match message.role.as_str() {
                 "user" => {
-                    if let Some(content) = message.content {
+                    if let Some(content) = message.content.filter(|c| !c.is_empty()) {
                         self.blocks.push(UIBlock::User(content));
                     }
                 }
                 "assistant" => {
-                    let mut content = message.content.unwrap_or_default();
-                    if content.is_empty() {
-                        if let Some(reasoning) = &message.reasoning_content {
-                            if !reasoning.is_empty() {
-                                content = format!("<thinking>\n{}\n</thinking>", reasoning);
-                            }
-                        }
-                    }
-                    if content.is_empty() {
-                        if let Some(tool_calls) = message.tool_calls {
-                            let names = tool_calls
-                                .iter()
-                                .map(|tc| tc.function.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            content = format!("Called tool(s): {}", names);
-                        }
-                    }
-                    if !content.is_empty() {
+                    if let Some(content) = message.content.filter(|c| !c.is_empty()) {
                         self.blocks.push(UIBlock::Assistant(content));
+                    } else if let Some(reasoning) =
+                        message.reasoning_content.filter(|r| !r.is_empty())
+                    {
+                        self.blocks
+                            .push(UIBlock::Assistant(format!("💭 {reasoning}")));
+                    }
+                    // Reconstruct tool blocks from this turn's calls; the
+                    // following `tool` messages fill in each result by id.
+                    if let Some(tool_calls) = message.tool_calls {
+                        for tc in tool_calls {
+                            self.blocks.push(UIBlock::Tool(ToolCallEntry {
+                                id: tc.id,
+                                name: tc.function.name,
+                                arguments: tc.function.arguments,
+                                status: ToolStatus::Success(String::new()),
+                                started_at: Instant::now(),
+                                elapsed_ms: 0,
+                            }));
+                        }
                     }
                 }
                 "tool" => {
-                    let name = message.name.unwrap_or_else(|| "tool".to_string());
-                    let content = message.content.unwrap_or_default();
-                    self.blocks
-                        .push(UIBlock::Assistant(format!("Tool `{}`: {}", name, content)));
+                    // Persisted tool content is {"result": <str>, "is_error": <bool>};
+                    // parse it and attach to the matching pending tool block.
+                    let (result, is_error) =
+                        parse_tool_result(message.content.as_deref().unwrap_or(""));
+                    let status = if is_error {
+                        ToolStatus::Error(result)
+                    } else {
+                        ToolStatus::Success(result)
+                    };
+                    let idx = message.tool_call_id.as_deref().and_then(|id| {
+                        self.blocks
+                            .iter()
+                            .rposition(|b| matches!(b, UIBlock::Tool(t) if t.id == id))
+                    });
+                    match idx {
+                        Some(i) => {
+                            if let UIBlock::Tool(t) = &mut self.blocks[i] {
+                                t.status = status;
+                            }
+                        }
+                        None => {
+                            // Orphaned result (no matching call) — show it standalone.
+                            self.blocks.push(UIBlock::Tool(ToolCallEntry {
+                                id: String::new(),
+                                name: message.name.unwrap_or_else(|| "tool".to_string()),
+                                arguments: String::new(),
+                                status,
+                                started_at: Instant::now(),
+                                elapsed_ms: 0,
+                            }));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -428,7 +549,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            vec!["/resume", "/new", "/clear"]
+            vec!["/resume", "/clear", "/compact"]
         );
     }
 
@@ -436,13 +557,73 @@ mod tests {
     fn slash_suggestions_filter_by_command_name_or_description() {
         assert_eq!(slash_suggestions("/res")[0].name, "/resume");
         assert_eq!(slash_suggestions("/list")[0].name, "/resume");
-        assert_eq!(slash_suggestions("/new")[0].name, "/new");
+        // `/new` is merged into `/clear`: typing it still surfaces /clear via
+        // its description ("Start a new session").
+        assert_eq!(slash_suggestions("/new")[0].name, "/clear");
         assert_eq!(slash_suggestions("/clear")[0].name, "/clear");
     }
 
     #[test]
     fn slash_suggestions_stop_after_first_argument() {
         assert!(slash_suggestions("/resume default").is_empty());
+    }
+
+    fn test_app() -> App {
+        App::new(
+            "p".to_string(),
+            "m".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    #[test]
+    fn editing_multibyte_chars_keeps_cursor_on_boundary() {
+        // Regression: typing a CJK char (3 bytes) used to advance the cursor by
+        // 1 byte, landing mid-character and panicking on the next slice/render.
+        let mut app = test_app();
+        for c in "中a文".chars() {
+            app.insert_char(c);
+            assert!(
+                app.input.is_char_boundary(app.cursor),
+                "cursor must stay on a char boundary after insert"
+            );
+        }
+        assert_eq!(app.input, "中a文");
+        assert_eq!(app.cursor, app.input.len());
+
+        // Slicing at the cursor (what draw_input does) must not panic.
+        let _ = &app.input[..app.cursor];
+
+        // Walk left across every char, then delete them.
+        for _ in 0..3 {
+            app.move_left();
+            assert!(app.input.is_char_boundary(app.cursor));
+        }
+        assert_eq!(app.cursor, 0);
+
+        app.cursor = app.input.len();
+        app.backspace(); // removes "文"
+        assert_eq!(app.input, "中a");
+        assert!(app.input.is_char_boundary(app.cursor));
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn sanitize_expands_tabs_and_drops_control_chars() {
+        use super::super::sanitize;
+        assert_eq!(sanitize("a\tb"), "a    b");
+        assert_eq!(sanitize("a\r\nb"), "ab"); // CR and LF dropped (lines split upstream)
+        assert_eq!(sanitize("x\x1b[31my"), "x[31my"); // ESC dropped
+        assert_eq!(sanitize("正常 text"), "正常 text"); // multibyte untouched
+    }
+
+    #[test]
+    fn truncate_is_char_safe() {
+        use super::super::truncate;
+        // Must not panic slicing mid-codepoint, and counts chars not bytes.
+        assert_eq!(truncate("中文字测试", 3), "中文字…");
+        assert_eq!(truncate("abc", 5), "abc");
     }
 
     #[test]

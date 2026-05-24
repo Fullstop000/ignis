@@ -37,3 +37,10 @@ model   = "kimi-for-coding"
 # [web_search]
 # provider = "brave"   # supported: brave, tavily
 # api_key  = "your-search-api-key"
+
+# Context compaction (optional). Summarizes older history to free up context.
+# Token counts are estimated (~4 chars/token). A partial table is fine.
+# [compaction]
+# auto = true                # auto-compact before a prompt when over threshold
+# threshold_tokens = 120000  # estimated-token trigger for auto-compaction
+# keep_recent_tokens = 16000 # recent history kept verbatim when compacting

@@ -1,5 +1,8 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -10,11 +13,11 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::repl::app::{App, Mode};
-use crate::repl::render::draw;
+use crate::console::app::{App, Mode};
+use crate::console::render::draw;
 use crate::session::SessionManager;
 use crate::storage::{FileStorage, SessionStorage};
-use crate::{Agent, AgentEvent};
+use crate::{AgentEvent, Message, Session};
 
 // ==========================================
 // Color Palette
@@ -51,12 +54,12 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "List and resume sessions",
     },
     SlashCommand {
-        name: "/new",
+        name: "/clear",
         description: "Start a new session",
     },
     SlashCommand {
-        name: "/clear",
-        description: "Alias for /new",
+        name: "/compact",
+        description: "Summarize earlier history to free up context",
     },
 ];
 
@@ -67,9 +70,9 @@ pub mod app;
 pub mod markdown;
 pub mod render;
 
-pub(crate) struct AgentRequest {
-    pub(crate) session_id: String,
-    pub(crate) prompt: String,
+pub(crate) enum AgentRequest {
+    Prompt { session_id: String, prompt: String },
+    Compact { session_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,11 +94,28 @@ pub(crate) fn format_duration(ms: u128) -> String {
 }
 
 pub(crate) fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        // Take whole chars, never a byte slice — `&s[..max]` panics mid-codepoint.
+        format!("{}…", s.chars().take(max).collect::<String>())
     }
+}
+
+/// Make arbitrary text (tool output, file contents, pasted input) safe to feed
+/// to ratatui: a literal `\t` desyncs layout (the terminal advances to a tab
+/// stop, ratatui assumes width 1) and other control chars (CR, ANSI escapes)
+/// corrupt the screen. Expand tabs to spaces and drop the rest.
+pub(crate) fn sanitize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 pub(crate) fn slash_suggestions(input: &str) -> Vec<SlashCommand> {
@@ -146,7 +166,7 @@ pub(crate) fn next_selection(current: usize, len: usize, direction: SelectionDir
     }
 }
 
-pub async fn run_repl(
+pub async fn run_console(
     provider_name: String,
     model_name: String,
     session_id: String,
@@ -157,12 +177,13 @@ pub async fn run_repl(
 ) -> Result<(), anyhow::Error> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
+    app.set_context_window(config.compaction.threshold_tokens);
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
@@ -178,6 +199,10 @@ pub async fn run_repl(
     // Background agent runner
     tokio::spawn(async move {
         while let Some(request) = prompt_rx.recv().await {
+            let (session_id, prompt) = match request {
+                AgentRequest::Prompt { session_id, prompt } => (session_id, Some(prompt)),
+                AgentRequest::Compact { session_id } => (session_id, None),
+            };
             let provider = match crate::config::build_provider(&agent_config) {
                 Ok(p) => p,
                 Err(e) => {
@@ -187,89 +212,146 @@ pub async fn run_repl(
                 }
             };
             let storage = crate::storage::FileStorage::new(agent_storage_dir.clone());
-            let mut agent = Agent::new(
-                request.session_id,
+            let mut session = match Session::open(
+                session_id,
                 agent_system_prompt.clone(),
                 provider,
                 Box::new(storage),
                 agent_cwd.to_string_lossy().to_string(),
-            );
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = agent_tx.send(AgentEvent::AgentEnd).await;
+                    log::error!("Session open error: {}", e);
+                    continue;
+                }
+            };
+            session.set_compaction(agent_config.compaction.clone());
 
             crate::tools::register_native_tools(
-                &mut agent,
+                &mut session,
                 &agent_cwd,
                 agent_config.web_search.clone(),
             );
             let ext_dirs = crate::tools::plugin::default_extension_dirs();
             let plugins = crate::tools::plugin::load_extensions(&ext_dirs);
             for plugin in plugins {
-                agent.register_tool(Arc::new(plugin));
+                session.register_tool(Arc::new(plugin));
             }
 
+            let notice_msg = |content: &str| Message {
+                role: "assistant".to_string(),
+                content: Some(content.to_string()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            };
             let tx = agent_tx.clone();
-            tokio::select! {
-                result = agent.prompt(&request.prompt, tx) => {
-                    if let Err(e) = result {
-                        let _ = agent_tx.send(AgentEvent::AgentEnd).await;
-                        log::error!("Agent error: {}", e);
+            match prompt {
+                Some(prompt) => {
+                    tokio::select! {
+                        result = session.prompt(&prompt, tx) => {
+                            if let Err(e) = result {
+                                let _ = agent_tx.send(AgentEvent::AgentEnd).await;
+                                log::error!("Agent error: {}", e);
+                            }
+                        }
+                        _ = cancel_rx.recv() => {
+                            let _ = agent_tx.send(AgentEvent::AgentEnd).await;
+                        }
                     }
                 }
-                _ = cancel_rx.recv() => {
+                None => {
+                    // /compact: summarize earlier history and report a notice.
+                    let _ = agent_tx.send(AgentEvent::AgentStart).await;
+                    let notice = match session.compact().await {
+                        Ok(0) => "Nothing to compact yet.".to_string(),
+                        Ok(n) => format!("Compacted {n} earlier messages into a summary."),
+                        Err(e) => format!("Compact failed: {e}"),
+                    };
+                    let _ = agent_tx
+                        .send(AgentEvent::MessageStart {
+                            message: notice_msg(""),
+                        })
+                        .await;
+                    let _ = agent_tx
+                        .send(AgentEvent::MessageUpdate {
+                            delta: notice.clone(),
+                        })
+                        .await;
+                    let _ = agent_tx
+                        .send(AgentEvent::MessageEnd {
+                            message: notice_msg(&notice),
+                        })
+                        .await;
                     let _ = agent_tx.send(AgentEvent::AgentEnd).await;
                 }
             }
         }
     });
 
-    // 30fps tick
-    let tick = std::time::Duration::from_millis(33);
+    // Render at a capped frame rate. Agent events and keystrokes are coalesced
+    // between frames and the screen is redrawn at most once per frame, so a fast
+    // token stream never triggers a redraw per delta — which tears/flickers on
+    // slow terminals (e.g. Windows Terminal over WSL2).
+    let frame = std::time::Duration::from_millis(33); // ~30fps cap
+    let mut last_draw = std::time::Instant::now();
+    terminal.draw(|f| draw(f, &mut app))?;
 
     loop {
-        terminal.draw(|f| draw(f, &mut app))?;
-
+        // Wake on either the next frame deadline or an incoming agent event.
         tokio::select! {
-            _ = tokio::time::sleep(tick) => {
-                app.tick_update();
-                while event::poll(std::time::Duration::ZERO)? {
-                    if let Event::Key(key) = event::read()? {
-                        handle_key(
-                            &mut app,
-                            key,
-                            &prompt_tx,
-                            &cancel_tx,
-                            &session_manager,
-                            &ui_storage_dir,
-                        ).await;
-                    }
+            _ = tokio::time::sleep(frame) => {}
+            Some(ev) = agent_rx.recv() => app.handle_event(ev),
+        }
+
+        // Drain any other pending agent events and key input — state only, no draw.
+        while let Ok(ev) = agent_rx.try_recv() {
+            app.handle_event(ev);
+        }
+        while event::poll(std::time::Duration::ZERO)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    handle_key(
+                        &mut app,
+                        key,
+                        &prompt_tx,
+                        &cancel_tx,
+                        &session_manager,
+                        &ui_storage_dir,
+                    )
+                    .await;
                 }
-            }
-            Some(ev) = agent_rx.recv() => {
-                app.handle_event(ev);
-                while let Ok(ev) = agent_rx.try_recv() {
-                    app.handle_event(ev);
-                }
-                while event::poll(std::time::Duration::ZERO)? {
-                    if let Event::Key(key) = event::read()? {
-                        handle_key(
-                            &mut app,
-                            key,
-                            &prompt_tx,
-                            &cancel_tx,
-                            &session_manager,
-                            &ui_storage_dir,
-                        ).await;
-                    }
-                }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => app.scroll_up(3),
+                    MouseEventKind::ScrollDown => app.scroll_down(3),
+                    _ => {}
+                },
+                _ => {}
             }
         }
 
         if app.should_quit {
             break;
         }
+
+        // Coalesced redraw: at most once per frame interval.
+        if last_draw.elapsed() >= frame {
+            app.tick_update();
+            terminal.draw(|f| draw(f, &mut app))?;
+            last_draw = std::time::Instant::now();
+        }
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -378,13 +460,13 @@ async fn handle_key(
                         let user_count = app
                             .blocks
                             .iter()
-                            .filter(|b| matches!(b, crate::repl::app::UIBlock::User(_)))
+                            .filter(|b| matches!(b, crate::console::app::UIBlock::User(_)))
                             .count();
                         let preview = app
                             .blocks
                             .iter()
                             .find_map(|b| match b {
-                                crate::repl::app::UIBlock::User(text) => Some(text.clone()),
+                                crate::console::app::UIBlock::User(text) => Some(text.clone()),
                                 _ => None,
                             })
                             .unwrap_or_default();
@@ -398,17 +480,23 @@ async fn handle_key(
                         sessions.sort_by_key(|s| std::cmp::Reverse(s.last_modified));
                     }
                     app.show_session_picker(sessions);
-                } else if (command == "/new" || command == "/clear") && arg_count == 1 {
+                } else if command == "/clear" && arg_count == 1 {
                     let new_id = crate::session::SessionManager::create_id();
                     // Create an empty session file so /sessions can see it
                     let storage = crate::storage::FileStorage::new(storage_dir.to_path_buf());
                     let _ = storage.save_session(&new_id, &[], None).await;
                     app.start_new_session(new_id);
+                } else if command == "/compact" && arg_count == 1 {
+                    let _ = prompt_tx
+                        .send(AgentRequest::Compact {
+                            session_id: app.session_id.clone(),
+                        })
+                        .await;
                 } else if text.starts_with('/') {
                     app.add_assistant_notice(format!("Unknown command `{}`.", command));
                 } else {
                     let _ = prompt_tx
-                        .send(AgentRequest {
+                        .send(AgentRequest::Prompt {
                             session_id: app.session_id.clone(),
                             prompt: text,
                         })
@@ -454,30 +542,36 @@ async fn handle_key(
         (_, KeyCode::Down) => {
             app.history_next();
         }
+        (m, KeyCode::Char('j'))
+            if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
+        {
+            // Ctrl/Cmd+J inserts a newline (Enter still submits).
+            app.clear_exit_hint();
+            app.insert_char('\n');
+            app.reset_slash_selection();
+        }
         (_, KeyCode::Char(c)) => {
             app.clear_exit_hint();
-            app.input.insert(app.cursor, c);
-            app.cursor += 1;
+            app.insert_char(c);
             app.reset_slash_selection();
         }
         (_, KeyCode::Backspace) if app.cursor > 0 => {
             app.clear_exit_hint();
-            app.cursor -= 1;
-            app.input.remove(app.cursor);
+            app.backspace();
             app.reset_slash_selection();
         }
         (_, KeyCode::Delete) if app.cursor < app.input.len() => {
             app.clear_exit_hint();
-            app.input.remove(app.cursor);
+            app.delete_forward();
             app.reset_slash_selection();
         }
         (_, KeyCode::Left) if app.cursor > 0 => {
             app.clear_exit_hint();
-            app.cursor -= 1;
+            app.move_left();
         }
         (_, KeyCode::Right) if app.cursor < app.input.len() => {
             app.clear_exit_hint();
-            app.cursor += 1;
+            app.move_right();
         }
         (_, KeyCode::Home) => {
             app.clear_exit_hint();

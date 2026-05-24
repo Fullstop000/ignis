@@ -1,7 +1,9 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::{ACCENT, BORDER, CODE_BG, GREEN, LAVENDER, MAUVE, PEACH, SUBTEXT, TEAL, TEXT, YELLOW};
+use super::{
+    sanitize, ACCENT, BORDER, CODE_BG, GREEN, LAVENDER, MAUVE, PEACH, SUBTEXT, TEAL, TEXT, YELLOW,
+};
 
 /// Simple inline markdown spans: **bold**, `code`, *italic*
 pub(crate) fn render_md_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
@@ -107,6 +109,9 @@ pub(crate) fn render_md_block(text: &str, is_streaming: bool) -> Vec<Line<'stati
     let mut code_lang = String::new();
 
     for raw_line in text.lines() {
+        // Expand tabs / strip control chars so they can't desync the layout.
+        let raw_line = sanitize(raw_line);
+        let raw_line = raw_line.as_str();
         if raw_line.starts_with("```") {
             if in_code_block {
                 // End code block

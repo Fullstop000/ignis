@@ -30,6 +30,30 @@ pub struct WebSearchConfig {
     pub api_key: Option<String>,
 }
 
+/// Context-compaction settings. Token counts use a chars/4 estimate.
+/// `#[serde(default)]` fills any omitted field from `Default`, so a partial
+/// `[compaction]` table is fine.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct CompactionConfig {
+    /// Auto-compact before a prompt when estimated history exceeds the threshold.
+    pub auto: bool,
+    /// Estimated-token threshold that triggers auto-compaction.
+    pub threshold_tokens: usize,
+    /// Estimated tokens of recent history to keep verbatim when compacting.
+    pub keep_recent_tokens: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            threshold_tokens: 120_000,
+            keep_recent_tokens: 16_000,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub active_provider: String,
@@ -37,6 +61,8 @@ pub struct Config {
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub web_search: WebSearchConfig,
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 pub fn load_config() -> Result<Config, anyhow::Error> {

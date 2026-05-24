@@ -2,18 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::provider::{LlmProvider, LlmResponseDelta};
-use crate::storage::SessionStorage;
 use crate::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
 use crate::types::{AgentEvent, Message, ToolCall, ToolCallFunction};
 
+/// Execution engine: given a conversation `history`, runs the model + tool
+/// loop and emits events. State and persistence live in [`crate::Session`].
 pub struct Agent {
-    session_id: String,
     system_prompt: String,
     provider: Box<dyn LlmProvider>,
-    storage: Box<dyn SessionStorage>,
     tools: Vec<Arc<dyn AgentTool>>,
     hooks: Option<Box<dyn ToolHooks>>,
-    start_dir: String,
 }
 
 struct AccumulatingToolCall {
@@ -23,21 +21,12 @@ struct AccumulatingToolCall {
 }
 
 impl Agent {
-    pub fn new(
-        session_id: String,
-        system_prompt: String,
-        provider: Box<dyn LlmProvider>,
-        storage: Box<dyn SessionStorage>,
-        start_dir: String,
-    ) -> Self {
+    pub fn new(system_prompt: String, provider: Box<dyn LlmProvider>) -> Self {
         Self {
-            session_id,
             system_prompt,
             provider,
-            storage,
             tools: Vec::new(),
             hooks: None,
-            start_dir,
         }
     }
 
@@ -47,6 +36,28 @@ impl Agent {
 
     pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
         self.hooks = Some(hooks);
+    }
+
+    /// One-shot, tool-less completion: stream a response for `messages` and
+    /// return the concatenated text. Used by [`crate::Session::compact`] to
+    /// summarize history.
+    pub async fn complete(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+    ) -> Result<String, anyhow::Error> {
+        use futures_util::stream::StreamExt;
+        let mut stream = self
+            .provider
+            .chat_stream(system_prompt, messages, &[])
+            .await?;
+        let mut out = String::new();
+        while let Some(delta) = stream.next().await {
+            if let Ok(LlmResponseDelta::Text(text)) = delta {
+                out.push_str(&text);
+            }
+        }
+        Ok(out)
     }
 
     fn sanitize_and_truncate_error(err: &str) -> String {
@@ -60,21 +71,14 @@ impl Agent {
         }
     }
 
-    pub async fn prompt(
+    /// Run the model + tool loop over `history`, appending assistant and tool
+    /// messages in place and emitting events. Does not load or persist; the
+    /// caller ([`crate::Session`]) owns history and storage.
+    pub async fn run(
         &self,
-        text: &str,
+        history: &mut Vec<Message>,
         tx: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> Result<(), anyhow::Error> {
-        let mut history = self.storage.load_session(&self.session_id).await?;
-        history.push(Message {
-            role: "user".to_string(),
-            content: Some(text.to_string()),
-            reasoning_content: None,
-            name: None,
-            tool_call_id: None,
-            tool_calls: None,
-        });
-
         let _ = tx.send(AgentEvent::AgentStart).await;
 
         let tool_schemas: Vec<serde_json::Value> = self
@@ -97,7 +101,7 @@ impl Agent {
 
             let mut stream = match self
                 .provider
-                .chat_stream(&self.system_prompt, &history, &tool_schemas)
+                .chat_stream(&self.system_prompt, &*history, &tool_schemas)
                 .await
             {
                 Ok(s) => s,
@@ -505,15 +509,9 @@ impl Agent {
                 }
 
                 let _ = tx.send(AgentEvent::TurnEnd).await;
-                self.storage
-                    .save_session(&self.session_id, &history, Some(&self.start_dir))
-                    .await?;
                 // Continue Turn loop since we provided tool results back to LLM
             } else {
                 let _ = tx.send(AgentEvent::TurnEnd).await;
-                self.storage
-                    .save_session(&self.session_id, &history, Some(&self.start_dir))
-                    .await?;
                 break; // Break turn loop if no tools were called
             }
         }

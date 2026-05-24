@@ -1,8 +1,245 @@
+use crate::agent::Agent;
+use crate::config::CompactionConfig;
+use crate::provider::LlmProvider;
+use crate::storage::SessionStorage;
+use crate::tool::{AgentTool, ToolHooks};
+use crate::types::AgentEvent;
 use crate::Message;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const DEFAULT_SESSION_ID: &str = "default";
+
+/// The core conversational model. Owns the message `history` and its
+/// persistence, and wraps an [`Agent`] (the execution engine) to advance the
+/// conversation via [`Session::prompt`].
+pub struct Session {
+    id: String,
+    history: Vec<Message>,
+    storage: Box<dyn SessionStorage>,
+    start_dir: String,
+    agent: Agent,
+    compaction: CompactionConfig,
+}
+
+impl Session {
+    /// Open a session, loading any persisted history for `id`.
+    pub async fn open(
+        id: String,
+        system_prompt: String,
+        provider: Box<dyn LlmProvider>,
+        storage: Box<dyn SessionStorage>,
+        start_dir: String,
+    ) -> Result<Self, anyhow::Error> {
+        let history = storage.load_session(&id).await?;
+        Ok(Self {
+            id,
+            history,
+            storage,
+            start_dir,
+            agent: Agent::new(system_prompt, provider),
+            compaction: CompactionConfig::default(),
+        })
+    }
+
+    /// Configure context-compaction behavior (auto-trigger + token budgets).
+    pub fn set_compaction(&mut self, compaction: CompactionConfig) {
+        self.compaction = compaction;
+    }
+
+    pub fn register_tool(&mut self, tool: Arc<dyn AgentTool>) {
+        self.agent.register_tool(tool);
+    }
+
+    pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
+        self.agent.set_hooks(hooks);
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn history(&self) -> &[Message] {
+        &self.history
+    }
+
+    /// Append the user's message, run the agent loop over the history, and
+    /// persist the result.
+    pub async fn prompt(
+        &mut self,
+        text: &str,
+        tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<(), anyhow::Error> {
+        // Auto-compact when the estimated context grows past the threshold.
+        // Best-effort: a compaction failure must not block the user's prompt.
+        if self.compaction.auto && estimate_tokens(&self.history) > self.compaction.threshold_tokens
+        {
+            let _ = self.compact().await;
+        }
+        self.history.push(Message {
+            role: "user".to_string(),
+            content: Some(text.to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        });
+        self.agent.run(&mut self.history, tx).await?;
+        self.persist().await
+    }
+
+    /// Summarize older history into a single message, keeping the most recent
+    /// turns (by token budget) verbatim. Returns the number of messages
+    /// replaced by the summary (0 if nothing was compacted).
+    pub async fn compact(&mut self) -> Result<usize, anyhow::Error> {
+        let n = self.history.len();
+        if n == 0 {
+            return Ok(0);
+        }
+        // Keep the most recent messages up to the token budget (walking from the
+        // end), then snap the cut forward to a user turn boundary so a tool
+        // result is never orphaned from the assistant message that requested it.
+        let budget = self.compaction.keep_recent_tokens;
+        let mut acc = 0usize;
+        let mut raw_start = n;
+        for i in (0..n).rev() {
+            acc += estimate_tokens(std::slice::from_ref(&self.history[i]));
+            if acc > budget {
+                break;
+            }
+            raw_start = i;
+        }
+        let cut = match (raw_start..n).find(|&i| self.history[i].role == "user") {
+            Some(c) if c > 0 => c,
+            _ => return Ok(0),
+        };
+
+        let transcript = render_transcript(&self.history[..cut]);
+        let raw = self
+            .agent
+            .complete(
+                SUMMARY_SYSTEM_PROMPT,
+                &[Message {
+                    role: "user".to_string(),
+                    content: Some(format!("Conversation so far:\n\n{transcript}")),
+                    reasoning_content: None,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                }],
+            )
+            .await?;
+        let summary = extract_summary(&raw);
+
+        let summary_msg = Message {
+            role: "user".to_string(),
+            content: Some(format!("[Summary of earlier conversation]\n{summary}")),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        };
+
+        let mut compacted = Vec::with_capacity(1 + n - cut);
+        compacted.push(summary_msg);
+        compacted.extend_from_slice(&self.history[cut..]);
+        self.history = compacted;
+        self.persist().await?;
+        Ok(cut)
+    }
+
+    async fn persist(&self) -> Result<(), anyhow::Error> {
+        self.storage
+            .save_session(&self.id, &self.history, Some(&self.start_dir))
+            .await
+    }
+}
+
+/// Rough token estimate (~4 chars/token) — avoids a tokenizer dependency.
+fn estimate_tokens(messages: &[Message]) -> usize {
+    let mut chars = 0usize;
+    for m in messages {
+        chars += m.content.as_deref().map_or(0, str::len);
+        chars += m.reasoning_content.as_deref().map_or(0, str::len);
+        if let Some(tool_calls) = &m.tool_calls {
+            for tc in tool_calls {
+                chars += tc.function.name.len() + tc.function.arguments.len();
+            }
+        }
+    }
+    chars / 4 + 1
+}
+
+/// Render messages as a transcript for summarization, including tool calls and
+/// (truncated) tool results so the summary reflects tool activity, not just chat.
+fn render_transcript(messages: &[Message]) -> String {
+    const TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
+    let mut out = String::new();
+    for m in messages {
+        match m.role.as_str() {
+            "tool" => {
+                let name = m.name.as_deref().unwrap_or("tool");
+                let raw = m.content.as_deref().unwrap_or("");
+                let body: String = raw.chars().take(TOOL_OUTPUT_MAX_CHARS).collect();
+                let suffix = if raw.chars().count() > TOOL_OUTPUT_MAX_CHARS {
+                    "… [truncated]"
+                } else {
+                    ""
+                };
+                out.push_str(&format!("tool[{name}] result: {body}{suffix}\n"));
+            }
+            role => {
+                if let Some(c) = m.content.as_deref().filter(|c| !c.is_empty()) {
+                    out.push_str(&format!("{role}: {c}\n"));
+                }
+                if let Some(r) = m.reasoning_content.as_deref().filter(|r| !r.is_empty()) {
+                    out.push_str(&format!("{role} (reasoning): {r}\n"));
+                }
+                if let Some(tool_calls) = &m.tool_calls {
+                    for tc in tool_calls {
+                        out.push_str(&format!(
+                            "{role} called {}({})\n",
+                            tc.function.name, tc.function.arguments
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pull the `<summary>…</summary>` body from the model's response, dropping the
+/// `<analysis>` scratchpad; fall back to the whole text if the tags are absent.
+fn extract_summary(text: &str) -> String {
+    const OPEN: &str = "<summary>";
+    const CLOSE: &str = "</summary>";
+    if let (Some(s), Some(e)) = (text.find(OPEN), text.find(CLOSE)) {
+        if e > s + OPEN.len() {
+            return text[s + OPEN.len()..e].trim().to_string();
+        }
+    }
+    text.trim().to_string()
+}
+
+/// Claude Code's 9-section conversation-summarization prompt (condensed).
+const SUMMARY_SYSTEM_PROMPT: &str = "Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions. Capture technical details, code patterns, file paths, and architectural decisions needed to continue the work without losing context.
+
+First, wrap your analysis in <analysis> tags: review the conversation chronologically, noting the user's intent, your approach, key decisions, exact file names / code snippets / function signatures, and errors and how you fixed them. Preserve any security-relevant instructions or constraints verbatim.
+
+Then provide the summary inside <summary> tags with these numbered sections:
+1. Primary Request and Intent
+2. Key Technical Concepts
+3. Files and Code Sections (include important snippets and why each matters)
+4. Errors and Fixes (include any user feedback)
+5. Problem Solving
+6. All User Messages (every non-tool-result user message; preserve security constraints verbatim)
+7. Pending Tasks
+8. Current Work (what was happening immediately before this summary)
+9. Optional Next Step (only if directly in line with the most recent request; quote it verbatim)
+
+Use terse, accurate bullets. Preserve exact paths, commands, identifiers, and error strings. Do not mention that the conversation was compacted.";
 
 pub fn project_slug(cwd: &Path) -> String {
     let raw = cwd.to_string_lossy();

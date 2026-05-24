@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use ignis::{
+    config::CompactionConfig,
     provider::{LlmProvider, LlmResponseDelta},
     storage::{InMemoryStorage, SessionStorage},
     tool::{AgentTool, ToolResult},
     types::{AgentEvent, Message},
-    Agent,
+    Session,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -127,16 +128,18 @@ async fn agent_single_turn_no_tools() {
         "Hello world".to_string(),
     )]]);
     let storage = InMemoryStorage::new();
-    let agent = Agent::new(
+    let mut session = Session::open(
         "test".to_string(),
         "system".to_string(),
         Box::new(provider),
         Box::new(storage),
         "/tmp".to_string(),
-    );
+    )
+    .await
+    .unwrap();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    agent.prompt("Hi", tx).await.unwrap();
+    session.prompt("Hi", tx).await.unwrap();
 
     let events = collect_events(&mut rx).await;
     assert!(events.iter().any(|e| matches!(e, AgentEvent::AgentStart)));
@@ -158,17 +161,19 @@ async fn agent_executes_tool_and_continues() {
         vec![LlmResponseDelta::Text("Done".to_string())],
     ]);
     let storage = InMemoryStorage::new();
-    let mut agent = Agent::new(
+    let mut session = Session::open(
         "test".to_string(),
         "system".to_string(),
         Box::new(provider),
         Box::new(storage),
         "/tmp".to_string(),
-    );
-    agent.register_tool(Arc::new(EchoTool));
+    )
+    .await
+    .unwrap();
+    session.register_tool(Arc::new(EchoTool));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    agent.prompt("Call echo", tx).await.unwrap();
+    session.prompt("Call echo", tx).await.unwrap();
 
     let events = collect_events(&mut rx).await;
 
@@ -212,17 +217,19 @@ async fn agent_handles_tool_error_gracefully() {
         vec![LlmResponseDelta::Text("Recovered".to_string())],
     ]);
     let storage = InMemoryStorage::new();
-    let mut agent = Agent::new(
+    let mut session = Session::open(
         "test".to_string(),
         "system".to_string(),
         Box::new(provider),
         Box::new(storage),
         "/tmp".to_string(),
-    );
-    agent.register_tool(Arc::new(FailTool));
+    )
+    .await
+    .unwrap();
+    session.register_tool(Arc::new(FailTool));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    agent.prompt("Trigger failure", tx).await.unwrap();
+    session.prompt("Trigger failure", tx).await.unwrap();
 
     let events = collect_events(&mut rx).await;
 
@@ -245,16 +252,18 @@ async fn agent_handles_tool_error_gracefully() {
 async fn agent_persists_messages_to_storage() {
     let provider = MockProvider::new(vec![vec![LlmResponseDelta::Text("Reply".to_string())]]);
     let storage = InMemoryStorage::new();
-    let agent = Agent::new(
+    let mut session = Session::open(
         "persist-test".to_string(),
         "system".to_string(),
         Box::new(provider),
         Box::new(storage.clone()),
         "/tmp".to_string(),
-    );
+    )
+    .await
+    .unwrap();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    agent.prompt("Hello", tx).await.unwrap();
+    session.prompt("Hello", tx).await.unwrap();
     let _ = collect_events(&mut rx).await;
 
     let history = storage.load_session("persist-test").await.unwrap();
@@ -273,16 +282,18 @@ async fn agent_streaming_multiple_deltas() {
         LlmResponseDelta::Text("!".to_string()),
     ]]);
     let storage = InMemoryStorage::new();
-    let agent = Agent::new(
+    let mut session = Session::open(
         "stream-test".to_string(),
         "system".to_string(),
         Box::new(provider),
         Box::new(storage),
         "/tmp".to_string(),
-    );
+    )
+    .await
+    .unwrap();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    agent.prompt("Stream", tx).await.unwrap();
+    session.prompt("Stream", tx).await.unwrap();
 
     let events = collect_events(&mut rx).await;
     let updates: Vec<_> = events
@@ -302,16 +313,18 @@ async fn agent_reasoning_content_is_preserved() {
         LlmResponseDelta::Text("Answer".to_string()),
     ]]);
     let storage = InMemoryStorage::new();
-    let agent = Agent::new(
+    let mut session = Session::open(
         "reasoning-test".to_string(),
         "system".to_string(),
         Box::new(provider),
         Box::new(storage.clone()),
         "/tmp".to_string(),
-    );
+    )
+    .await
+    .unwrap();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    agent.prompt("Think", tx).await.unwrap();
+    session.prompt("Think", tx).await.unwrap();
     let _ = collect_events(&mut rx).await;
 
     let history = storage.load_session("reasoning-test").await.unwrap();
@@ -321,4 +334,66 @@ async fn agent_reasoning_content_is_preserved() {
         Some("thinking...")
     );
     assert_eq!(assistant_msg.content.as_deref(), Some("Answer"));
+}
+
+#[tokio::test]
+async fn session_compact_summarizes_old_history() {
+    // Seed a 10-message conversation with uniform, sizable content so a small
+    // keep-budget reliably forces compaction.
+    let storage = InMemoryStorage::new();
+    let mut seed = Vec::new();
+    for _ in 0..5 {
+        for role in ["user", "assistant"] {
+            seed.push(Message {
+                role: role.to_string(),
+                content: Some("x".repeat(400)), // ~101 estimated tokens each
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+    }
+    storage
+        .save_session("c", &seed, Some("/tmp"))
+        .await
+        .unwrap();
+
+    // The compaction completion returns the <analysis>/<summary> framing the
+    // prompt asks for; only the <summary> body should be kept.
+    let provider = MockProvider::new(vec![vec![LlmResponseDelta::Text(
+        "<analysis>thinking</analysis><summary>SUMMARY</summary>".to_string(),
+    )]]);
+    let mut session = Session::open(
+        "c".to_string(),
+        "system".to_string(),
+        Box::new(provider),
+        Box::new(storage.clone()),
+        "/tmp".to_string(),
+    )
+    .await
+    .unwrap();
+    session.set_compaction(CompactionConfig {
+        auto: false,
+        threshold_tokens: usize::MAX,
+        keep_recent_tokens: 350,
+    });
+    assert_eq!(session.history().len(), 10);
+
+    let removed = session.compact().await.unwrap();
+    assert!(removed > 0, "expected the older head to be compacted");
+
+    let h = session.history();
+    assert!(h.len() < 10, "history should shrink");
+    assert_eq!(h[0].role, "user");
+    let summary = h[0].content.as_deref().unwrap();
+    assert!(summary.contains("SUMMARY"));
+    assert!(!summary.contains("thinking")); // <analysis> scratchpad dropped
+                                            // The kept tail must start at a user turn boundary, so no tool result is
+                                            // ever orphaned from the assistant message that requested it.
+    assert_eq!(h[1].role, "user");
+
+    // Compaction is persisted.
+    let persisted = storage.load_session("c").await.unwrap();
+    assert_eq!(persisted.len(), h.len());
 }

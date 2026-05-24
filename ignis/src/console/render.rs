@@ -5,96 +5,113 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, Mode, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
 use super::markdown::render_md_block;
 use super::{
-    format_duration, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, GREEN, MAUVE, RED, SPINNERS,
-    SUBTEXT, SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
+    format_duration, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, GREEN, MAUVE, RED,
+    SPINNERS, SUBTEXT, SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
 };
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let size = f.size();
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
+    // Input box grows with its line count (Ctrl/Cmd+J inserts newlines).
+    let input_text_lines = app.input.split('\n').count().max(1) as u16;
+    let input_height = (input_text_lines + 2).clamp(3, 10);
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Min(6),    // messages
-            Constraint::Length(3), // input
-            Constraint::Length(1), // status bar
+            Constraint::Min(3),               // messages (borderless)
+            Constraint::Length(1),            // loading status (above input)
+            Constraint::Length(input_height), // input
+            Constraint::Length(1),            // footer: dir · model · context%
         ])
         .split(size);
 
-    draw_header(f, layout[0], app);
-    draw_messages(f, layout[1], app);
-    draw_slash_suggestions(f, layout[1], app);
+    draw_messages(f, layout[0], app);
+    draw_slash_suggestions(f, layout[0], app);
+    draw_loading(f, layout[1], app);
     draw_input(f, layout[2], app);
-    draw_status(f, layout[3], app);
+    draw_footer(f, layout[3], app);
 }
 
-pub(crate) fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let mode_span = match app.mode {
-        Mode::Idle => Span::styled(" > ", Style::default().fg(TEXT_DIM)),
-        Mode::Thinking => Span::styled(format!(" {} ", app.spinner()), Style::default().fg(ACCENT)),
-        Mode::ToolRunning => {
-            Span::styled(format!(" {} ", app.spinner()), Style::default().fg(YELLOW))
+/// Loading/status line shown directly above the input box (Claude Code style).
+pub(crate) fn draw_loading(f: &mut Frame, area: Rect, app: &App) {
+    let line = if app.exit_pending {
+        Line::from(Span::styled(
+            "  Press Ctrl-D again to exit",
+            Style::default().fg(YELLOW),
+        ))
+    } else if let Some((msg, _)) = &app.error_flash {
+        Line::from(Span::styled(
+            format!("  ✗ {}", msg),
+            Style::default().fg(RED),
+        ))
+    } else {
+        let label = match app.mode {
+            Mode::Thinking => "Thinking…",
+            Mode::ToolRunning => "Running tool…",
+            Mode::Idle => "",
+        };
+        if label.is_empty() {
+            Line::from("")
+        } else {
+            Line::from(vec![
+                Span::styled(format!("  {} ", app.spinner()), Style::default().fg(ACCENT)),
+                Span::styled(label, Style::default().fg(SUBTEXT)),
+                Span::styled(
+                    format!("  {}  ·  ctrl+c to interrupt", app.elapsed_str()),
+                    Style::default().fg(TEXT_DIM),
+                ),
+            ])
         }
     };
+    f.render_widget(Paragraph::new(line).style(Style::default().bg(BG)), area);
+}
 
-    let elapsed = if app.mode != Mode::Idle {
-        // Fixed-width elapsed so pad doesn't jitter as ms grows
-        Span::styled(
-            format!(" {:>6}", app.elapsed_str()),
-            Style::default().fg(TEXT_DIM),
-        )
-    } else {
-        Span::styled("        ", Style::default().fg(TEXT_DIM))
-    };
-
-    let cwd_str = format!(" {} ", app.cwd.display());
-    let header_layout = Layout::default()
+/// Status footer under the input: working dir (left) and model + context % (right).
+pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    let right_str = format!(
+        " {}/{}  ·  {}% ctx ",
+        app.provider,
+        app.model,
+        app.context_pct()
+    );
+    let right_w = right_str.chars().count() as u16;
+    let split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(cwd_str.len() as u16)])
+        .constraints([Constraint::Min(0), Constraint::Length(right_w)])
         .split(area);
 
-    let left = Line::from(vec![
-        mode_span,
-        Span::styled(
-            "ignis",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            format!("{}/{}", app.provider, app.model),
-            Style::default().fg(SUBTEXT),
-        ),
-        Span::styled(
-            format!("  {}", app.session_id),
-            Style::default().fg(TEXT_DIM),
-        ),
-        elapsed,
-    ]);
-
-    let right = Line::from(Span::styled(cwd_str, Style::default().fg(TEXT_DIM)));
+    let left = Line::from(Span::styled(
+        format!("  {}", app.cwd.display()),
+        Style::default().fg(TEXT_DIM),
+    ));
+    let right = Line::from(Span::styled(right_str, Style::default().fg(SUBTEXT)));
 
     f.render_widget(
         Paragraph::new(left).style(Style::default().bg(SURFACE)),
-        header_layout[0],
+        split[0],
     );
     f.render_widget(
         Paragraph::new(right)
             .style(Style::default().bg(SURFACE))
             .alignment(ratatui::layout::Alignment::Right),
-        header_layout[1],
+        split[1],
     );
 }
 
 pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
 
-    if app.blocks.is_empty() {
+    if let Some(picker) = &app.session_picker {
+        // Resume view: show only the picker, never the prior conversation.
+        render_session_picker(&mut lines, picker);
+    } else if app.blocks.is_empty() {
         // Welcome screen
         lines.push(Line::from(""));
         lines.push(Line::from(""));
@@ -132,30 +149,29 @@ pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
         for (bi, block) in app.blocks.iter().enumerate() {
             match block {
                 UIBlock::User(text) => {
+                    // No "You" label — a 👤 prefix on the first line marks the
+                    // user turn; the prompt is bold to stand out from replies.
                     lines.push(Line::from(""));
-                    lines.push(Line::from(vec![
-                        Span::styled("  ❯ ", Style::default().fg(ACCENT)),
-                        Span::styled(
-                            "You",
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                    for l in text.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {}", l),
-                            Style::default().fg(TEXT),
-                        )));
+                    for (i, l) in text.lines().enumerate() {
+                        let prefix = if i == 0 { "👤 " } else { "   " };
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(ACCENT)),
+                            Span::styled(
+                                sanitize(l),
+                                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
                     }
                 }
                 UIBlock::Assistant(text) => {
+                    // Skip empty assistant placeholders (tool-only turns, or
+                    // before the first streamed delta) so we don't render a
+                    // blank gap. No "Ignis" label — replies render as plain
+                    // (unprefixed) markdown, distinct from the 👤 user turn.
+                    if text.is_empty() {
+                        continue;
+                    }
                     lines.push(Line::from(""));
-                    lines.push(Line::from(vec![
-                        Span::styled("  > ", Style::default().fg(MAUVE)),
-                        Span::styled(
-                            "Ignis",
-                            Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
                     let is_active = app.current_chunk_idx == Some(bi);
                     let md_lines = render_md_block(text, is_active);
                     lines.extend(md_lines);
@@ -165,32 +181,25 @@ pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
                 }
             }
         }
-        if let Some(picker) = &app.session_picker {
-            render_session_picker(&mut lines, picker);
-        }
     }
 
-    // Calculate scroll bounds
-    let visible = area.height.saturating_sub(2); // borders
-    let total = lines.len() as u16;
+    let text = Text::from(lines);
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().bg(BG))
+        .wrap(Wrap { trim: false });
+
+    // Scroll bounds in *rendered* rows: lines word-wrap, so the visible height
+    // is line_count(width), not the logical line count — otherwise auto-scroll
+    // under-shoots and the last wrapped rows hide behind the input box.
+    let visible = area.height;
+    let total = paragraph.line_count(area.width) as u16;
     app.max_scroll = total.saturating_sub(visible);
     if !app.user_scrolled {
         app.scroll = app.max_scroll;
     }
-    // Clamp scroll
     app.scroll = app.scroll.min(app.max_scroll);
 
-    let text = Text::from(lines);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(BG));
-
-    let paragraph = Paragraph::new(text)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0));
-    f.render_widget(paragraph, area);
+    f.render_widget(paragraph.scroll((app.scroll, 0)), area);
 
     // Scrollbar
     if app.max_scroll > 0 {
@@ -297,13 +306,13 @@ pub(crate) fn render_tool_block(lines: &mut Vec<Line<'static>>, entry: &ToolCall
         }
         ToolStatus::Error(err) => {
             let elapsed = format_duration(entry.elapsed_ms);
-            let preview = truncate(err.trim(), 300);
+            let preview = truncate(&sanitize(err.trim()), 300);
             ("x", RED, preview, elapsed)
         }
     };
 
     // Parse tool arguments for a compact display
-    let args_compact = compact_tool_args(&entry.arguments);
+    let args_compact = sanitize(&compact_tool_args(&entry.arguments));
 
     lines.push(Line::from(""));
     // Header line: ┌─ ⚙ tool_name(args) [1.2s]
@@ -343,7 +352,7 @@ pub(crate) fn render_tool_block(lines: &mut Vec<Line<'static>>, entry: &ToolCall
         ToolStatus::Success(out) => {
             // Show first 3 lines of output
             for sl in out.lines().take(3) {
-                let display = truncate(sl, 100);
+                let display = truncate(&sanitize(sl), 100);
                 lines.push(Line::from(vec![
                     Span::styled("  │ ", Style::default().fg(color)),
                     Span::styled(display, Style::default().fg(TEXT_DIM)),
@@ -405,23 +414,24 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     let active = app.mode == Mode::Idle;
     let border_color = if active { BORDER_ACTIVE } else { BORDER };
 
-    let content = if app.input.is_empty() && active {
-        Text::from(Span::styled(
-            " Type a message…",
-            Style::default().fg(TEXT_DIM),
-        ))
-    } else if app.input.is_empty() {
-        let label = match app.mode {
-            Mode::Thinking => format!(" {} Thinking…", app.spinner()),
-            Mode::ToolRunning => format!(" {} Running tool…", app.spinner()),
-            Mode::Idle => String::new(),
-        };
-        Text::from(Span::styled(label, Style::default().fg(TEXT_DIM)))
+    let content = if app.input.is_empty() {
+        if active {
+            Text::from(Span::styled(
+                "Type a message…",
+                Style::default().fg(TEXT_DIM),
+            ))
+        } else {
+            Text::from("")
+        }
     } else {
-        Text::from(Span::styled(
-            format!(" {}", &app.input),
-            Style::default().fg(TEXT),
-        ))
+        // Build one Line per newline-separated row (a Span with embedded "\n"
+        // does not wrap, so we split explicitly).
+        Text::from(
+            app.input
+                .split('\n')
+                .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(TEXT))))
+                .collect::<Vec<_>>(),
+        )
     };
 
     let block = Block::default()
@@ -437,8 +447,15 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 
     if active {
-        // cursor: +2 for border + leading space
-        f.set_cursor(area.x + app.cursor as u16 + 2, area.y + 1);
+        // Place the cursor at its (row, col) within the multi-line input.
+        // `cursor` is a byte offset; the column is the *display width* of the
+        // current row up to it (wide CJK glyphs span two cells), matching how
+        // ratatui lays the text out.
+        let before = &app.input[..app.cursor];
+        let row = before.matches('\n').count() as u16;
+        let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let col = UnicodeWidthStr::width(&app.input[line_start..app.cursor]) as u16;
+        f.set_cursor(area.x + 1 + col, area.y + 1 + row);
     }
 }
 
@@ -495,70 +512,6 @@ pub(crate) fn draw_slash_suggestions(f: &mut Frame, messages_area: Rect, app: &A
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-pub(crate) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let mut spans: Vec<Span> = vec![Span::styled(" ", Style::default())];
-
-    if app.exit_pending {
-        spans.push(Span::styled(
-            " Press Ctrl-D again to exit ",
-            Style::default().fg(BG).bg(YELLOW),
-        ));
-        spans.push(Span::styled("  ", Style::default()));
-    }
-
-    // Error flash
-    if let Some((msg, _)) = &app.error_flash {
-        spans.push(Span::styled(
-            format!(" x {} ", msg),
-            Style::default().fg(BG).bg(RED),
-        ));
-        spans.push(Span::styled("  ", Style::default()));
-    }
-
-    let keybinds: Vec<(&str, &str)> = match app.mode {
-        Mode::Idle if app.session_picker.is_some() => vec![
-            ("↑↓", "pick"),
-            ("enter", "resume"),
-            ("esc", "cancel"),
-            ("ctrl+d", "exit"),
-        ],
-        Mode::Idle if !app.slash_suggestions().is_empty() => vec![
-            ("↑↓", "pick"),
-            ("enter", "run"),
-            ("shift+↑↓", "scroll"),
-            ("esc", "cancel"),
-            ("ctrl+d", "exit"),
-        ],
-        Mode::Idle => vec![
-            ("enter", "send"),
-            ("↑↓", "history"),
-            ("shift+↑↓", "scroll"),
-            ("ctrl+u", "clear"),
-            ("ctrl+d", "exit"),
-        ],
-        _ => vec![
-            ("ctrl+c", "stop"),
-            ("shift+↑↓", "scroll"),
-            ("ctrl+d", "exit"),
-        ],
-    };
-
-    for (key, desc) in keybinds {
-        spans.push(Span::styled(
-            format!(" {} ", key),
-            Style::default().fg(SURFACE).bg(SUBTEXT),
-        ));
-        spans.push(Span::styled(
-            format!(" {} ", desc),
-            Style::default().fg(TEXT_DIM),
-        ));
-    }
-
-    let line = Line::from(spans);
-    let bar = Paragraph::new(line).style(Style::default().bg(SURFACE));
-    f.render_widget(bar, area);
 }
 
 // ==========================================
@@ -619,8 +572,11 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let content = buffer_content(&term);
-        assert!(content.contains("You"), "should show user label");
         assert!(content.contains("Hello"), "should show user text");
+        assert!(
+            content.contains('👤'),
+            "user turn should carry the emoji prefix"
+        );
     }
 
     #[test]
@@ -638,8 +594,11 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let content = buffer_content(&term);
-        assert!(content.contains("Ignis"), "should show assistant label");
         assert!(content.contains("Code block"), "should show assistant text");
+        assert!(
+            !content.contains("Ignis"),
+            "assistant label should be removed"
+        );
     }
 
     #[test]
@@ -665,6 +624,37 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("read_file"), "should show tool name");
         assert!(content.contains("file content"), "should show tool output");
+    }
+
+    #[test]
+    fn render_tool_output_has_no_literal_tabs() {
+        // Regression: tab-separated tool output (e.g. list_dir "dir\t4096\tname")
+        // reaching ratatui as a literal \t desyncs the terminal layout and
+        // garbles the screen. The renderer must expand tabs first.
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        app.blocks.push(UIBlock::Tool(ToolCallEntry {
+            id: "c".to_string(),
+            name: "list_dir".to_string(),
+            arguments: r#"{"path":"."}"#.to_string(),
+            status: ToolStatus::Success("dir\t4096\t.claude\nfile\t512\tREADME.md".to_string()),
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 2,
+        }));
+
+        let mut term = test_terminal(100, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(
+            !content.contains('\t'),
+            "no literal tab may reach the buffer"
+        );
+        assert!(content.contains(".claude"), "directory name should render");
     }
 
     #[test]
@@ -707,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn render_status_bar_shows_idle_keybinds() {
+    fn render_idle_has_no_keybinding_bar() {
         let mut app = App::new(
             "test".to_string(),
             "model".to_string(),
@@ -719,12 +709,19 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let content = buffer_content(&term);
-        assert!(content.contains("enter"), "should show send keybind");
-        assert!(content.contains("ctrl+d"), "should show exit keybind");
+        // The permanent keybinding hint bar is gone; the input placeholder shows.
+        assert!(
+            !content.contains("ctrl+u"),
+            "keybinding bar should be removed"
+        );
+        assert!(
+            content.contains("Type a message"),
+            "should show input prompt"
+        );
     }
 
     #[test]
-    fn render_status_bar_shows_thinking_keybinds() {
+    fn render_loading_line_shows_thinking() {
         let mut app = App::new(
             "test".to_string(),
             "model".to_string(),
@@ -737,11 +734,15 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let content = buffer_content(&term);
-        assert!(content.contains("ctrl+c"), "should show stop keybind");
+        assert!(content.contains("Thinking"), "should show loading status");
+        assert!(
+            content.contains("ctrl+c to interrupt"),
+            "should show interrupt hint while busy",
+        );
     }
 
     #[test]
-    fn render_header_shows_provider_model_session() {
+    fn render_footer_shows_model_dir_and_context() {
         let mut app = App::new(
             "openai".to_string(),
             "gpt-4".to_string(),
@@ -755,10 +756,157 @@ mod tests {
         let content = buffer_content(&term);
         assert!(
             content.contains("openai/gpt-4"),
-            "should show provider/model"
+            "footer should show provider/model"
         );
-        assert!(content.contains("work"), "should show session id");
-        assert!(content.contains("/tmp"), "should show cwd");
+        assert!(content.contains("/tmp"), "footer should show cwd");
+        assert!(content.contains("% ctx"), "footer should show context %");
+    }
+
+    #[test]
+    fn render_input_with_wide_chars_does_not_panic() {
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        // Mixed CJK + ASCII, cursor mid-string on a char boundary.
+        app.input = "中文a测试".to_string();
+        app.cursor = "中文a".len();
+
+        let mut term = test_terminal(80, 24);
+        // Would panic on a non-char-boundary slice if cursor math were byte-naive.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        // (ratatui pads the trailing cell of a wide glyph with a space, so the
+        // CJK chars don't appear contiguously — assert each is present.)
+        let content = buffer_content(&term);
+        assert!(content.contains("中"), "should render wide chars");
+        assert!(content.contains("试"), "should render the full input");
+    }
+
+    #[test]
+    fn last_line_stays_visible_when_content_wraps() {
+        // Regression (bug 1): scroll bounds must count wrapped rows, not logical
+        // lines. With long wrapping blocks, auto-scroll-to-bottom must still
+        // reveal the most recent turn instead of clipping it behind the input.
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        for i in 0..6 {
+            app.blocks.push(UIBlock::Assistant(format!(
+                "Block {i}: {}",
+                "word ".repeat(40)
+            )));
+        }
+        app.blocks.push(UIBlock::User("FINAL_MARKER".to_string()));
+
+        let mut term = test_terminal(40, 16);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(
+            content.contains("FINAL_MARKER"),
+            "auto-scroll must reveal the latest line despite wrapping"
+        );
+        assert!(app.max_scroll > 0, "wrapped content should be scrollable");
+    }
+
+    #[test]
+    fn resumed_tool_call_renders_as_block_not_raw_json() {
+        // Regression (bug 2a): a resumed tool result must render as a tool block,
+        // not the raw persisted {"result":…,"is_error":…} JSON.
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        let messages = vec![
+            crate::Message {
+                role: "user".to_string(),
+                content: Some("list".to_string()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            crate::Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![crate::types::ToolCall {
+                    id: "call_1".to_string(),
+                    r#type: "function".to_string(),
+                    function: crate::types::ToolCallFunction {
+                        name: "list_dir".to_string(),
+                        arguments: r#"{"path":"."}"#.to_string(),
+                    },
+                }]),
+            },
+            crate::Message {
+                role: "tool".to_string(),
+                // \t here is escaped in the JSON string, as it is on disk.
+                content: Some(r#"{"result":"dir\t4096\t.claude","is_error":false}"#.to_string()),
+                reasoning_content: None,
+                name: Some("list_dir".to_string()),
+                tool_call_id: Some("call_1".to_string()),
+                tool_calls: None,
+            },
+        ];
+        app.render_session_history("s".to_string(), messages);
+
+        let mut term = test_terminal(100, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(
+            content.contains("list_dir"),
+            "tool name should show in a block"
+        );
+        assert!(content.contains(".claude"), "tool result should render");
+        assert!(!content.contains("is_error"), "raw JSON must not leak");
+        assert!(!content.contains('\t'), "tabs must be expanded");
+    }
+
+    #[test]
+    fn resume_picker_hides_prior_conversation() {
+        // Regression (bug 2b): while the resume picker is open, the prior
+        // conversation must not be shown.
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        app.blocks
+            .push(UIBlock::User("PRE_RESUME_MESSAGE".to_string()));
+        app.session_picker = Some(SessionPicker {
+            sessions: vec![crate::session::SessionMeta {
+                id: "alpha".to_string(),
+                message_count: 1,
+                last_modified: 1,
+                preview: "hi".to_string(),
+                start_dir: None,
+            }],
+            selected: 0,
+        });
+
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(content.contains("Sessions"), "picker should render");
+        assert!(content.contains("alpha"), "picker should list sessions");
+        assert!(
+            !content.contains("PRE_RESUME_MESSAGE"),
+            "prior conversation must be hidden during resume"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use ignis::{
     config::{build_provider, load_config},
     session::{project_sessions_dir, SessionManager},
     storage::FileStorage,
-    Agent, AgentEvent,
+    AgentEvent, Session,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -122,7 +122,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {
-        return ignis::repl::run_repl(
+        return ignis::console::run_console(
             config.active_provider.clone(),
             active_model,
             session_request.session_id,
@@ -141,16 +141,18 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let provider = build_provider(&config)?;
     let storage = FileStorage::new(storage_dir);
-    let mut agent = Agent::new(
+    let mut session = Session::open(
         session_request.session_id,
         system_prompt,
         provider,
         Box::new(storage),
         cwd.to_string_lossy().to_string(),
-    );
+    )
+    .await?;
+    session.set_compaction(config.compaction.clone());
 
     // Register tools
-    ignis::tools::register_native_tools(&mut agent, &cwd, config.web_search.clone());
+    ignis::tools::register_native_tools(&mut session, &cwd, config.web_search.clone());
     let ext_dirs = ignis::plugin::default_extension_dirs();
     for d in &ext_dirs {
         if !d.exists() {
@@ -159,14 +161,14 @@ async fn main() -> Result<(), anyhow::Error> {
     }
     let plugins = ignis::plugin::load_extensions(&ext_dirs);
     for plugin in plugins {
-        agent.register_tool(Arc::new(plugin));
+        session.register_tool(Arc::new(plugin));
     }
 
     // Run prompt
     let prompt_text = session_request.prompt_args.join(" ");
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
     let prompt_task = tokio::spawn(async move {
-        if let Err(e) = agent.prompt(&prompt_text, tx).await {
+        if let Err(e) = session.prompt(&prompt_text, tx).await {
             eprintln!("Agent error: {:?}", e);
         }
     });
