@@ -122,7 +122,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {
-        return ignis::repl::run_repl(
+        return ignis::console::run_console(
             config.active_provider.clone(),
             active_model,
             session_request.session_id,

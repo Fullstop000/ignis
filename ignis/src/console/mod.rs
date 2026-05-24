@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::repl::app::{App, Mode};
-use crate::repl::render::draw;
+use crate::console::app::{App, Mode};
+use crate::console::render::draw;
 use crate::session::SessionManager;
 use crate::storage::{FileStorage, SessionStorage};
 use crate::{Agent, AgentEvent};
@@ -146,7 +146,7 @@ pub(crate) fn next_selection(current: usize, len: usize, direction: SelectionDir
     }
 }
 
-pub async fn run_repl(
+pub async fn run_console(
     provider_name: String,
     model_name: String,
     session_id: String,
@@ -378,13 +378,13 @@ async fn handle_key(
                         let user_count = app
                             .blocks
                             .iter()
-                            .filter(|b| matches!(b, crate::repl::app::UIBlock::User(_)))
+                            .filter(|b| matches!(b, crate::console::app::UIBlock::User(_)))
                             .count();
                         let preview = app
                             .blocks
                             .iter()
                             .find_map(|b| match b {
-                                crate::repl::app::UIBlock::User(text) => Some(text.clone()),
+                                crate::console::app::UIBlock::User(text) => Some(text.clone()),
                                 _ => None,
                             })
                             .unwrap_or_default();

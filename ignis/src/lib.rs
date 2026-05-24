@@ -8,7 +8,7 @@ pub mod storage;
 pub mod tool;
 pub mod tools;
 pub use tools::plugin;
-pub mod repl;
+pub mod console;
 pub mod types;
 pub mod util;
 
