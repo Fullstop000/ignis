@@ -1,4 +1,4 @@
-use crate::Message;
+use crate::{Message, Usage};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -15,6 +15,17 @@ pub trait SessionStorage: Send + Sync + 'static {
         messages: &[Message],
         start_dir: Option<&str>,
     ) -> Result<(), anyhow::Error>;
+
+    /// Persist the session's cumulative token usage. Default no-op so backends
+    /// that don't track it (e.g. in-memory tests) need no changes.
+    async fn save_usage(&self, _session_id: &str, _usage: &Usage) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    /// Load a session's cumulative token usage (default: none).
+    async fn load_usage(&self, _session_id: &str) -> Result<Usage, anyhow::Error> {
+        Ok(Usage::default())
+    }
 }
 
 #[derive(Clone)]
@@ -223,5 +234,25 @@ impl SessionStorage for FileStorage {
         }
 
         Ok(())
+    }
+
+    async fn save_usage(&self, session_id: &str, usage: &Usage) -> Result<(), anyhow::Error> {
+        let clean_id = self.sanitize_session_id(session_id)?;
+        let path = self.base_dir.join(format!("{}.usage.json", clean_id));
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let _lock = self.write_lock.write().await;
+        tokio::fs::write(&path, serde_json::to_string(usage)?).await?;
+        Ok(())
+    }
+
+    async fn load_usage(&self, session_id: &str) -> Result<Usage, anyhow::Error> {
+        let clean_id = self.sanitize_session_id(session_id)?;
+        let path = self.base_dir.join(format!("{}.usage.json", clean_id));
+        match tokio::fs::read_to_string(&path).await {
+            Ok(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
+            Err(_) => Ok(Usage::default()),
+        }
     }
 }

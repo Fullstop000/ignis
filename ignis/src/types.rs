@@ -28,6 +28,39 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
+/// Real token usage for a turn or session, mirroring how Claude/Kimi/Codex
+/// record it. `input_tokens` is the full prompt (cache reads/writes included);
+/// `cache_read_tokens` is the cached subset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+}
+
+impl Usage {
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+    }
+
+    /// input + output (what the footer/loader headline).
+    pub fn total(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+
+    pub fn is_zero(&self) -> bool {
+        *self == Usage::default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum AgentEvent {
@@ -54,6 +87,8 @@ pub enum AgentEvent {
     },
     #[serde(rename = "turn_end")]
     TurnEnd,
+    #[serde(rename = "usage")]
+    Usage(Usage),
     #[serde(rename = "agent_end")]
     AgentEnd,
 }

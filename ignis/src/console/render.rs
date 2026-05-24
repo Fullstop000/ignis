@@ -11,8 +11,8 @@ use unicode_width::UnicodeWidthStr;
 use super::app::{App, Mode, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
 use super::markdown::render_md_block;
 use super::{
-    format_duration, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, GREEN, MAUVE, RED,
-    SPINNERS, SUBTEXT, SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
+    format_duration, format_tokens, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, GREEN,
+    MAUVE, RED, SPINNERS, SUBTEXT, SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
 };
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
@@ -52,35 +52,48 @@ pub(crate) fn draw_loading(f: &mut Frame, area: Rect, app: &App) {
             format!("  ✗ {}", msg),
             Style::default().fg(RED),
         ))
+    } else if app.mode == Mode::Idle {
+        Line::from("")
     } else {
         let label = match app.mode {
-            Mode::Thinking => "Thinking…",
-            Mode::ToolRunning => "Running tool…",
+            Mode::Thinking => app.thinking_label(),
+            Mode::ToolRunning => "Running tool",
             Mode::Idle => "",
         };
-        if label.is_empty() {
-            Line::from("")
-        } else {
-            Line::from(vec![
-                Span::styled(format!("  {} ", app.spinner()), Style::default().fg(ACCENT)),
-                Span::styled(label, Style::default().fg(SUBTEXT)),
-                Span::styled(
-                    format!("  {}  ·  ctrl+c to interrupt", app.elapsed_str()),
-                    Style::default().fg(TEXT_DIM),
+        let mut spans = vec![
+            Span::styled(format!("  {} ", app.spinner()), Style::default().fg(ACCENT)),
+            Span::styled(format!("{}… ", label), Style::default().fg(SUBTEXT)),
+            Span::styled(app.elapsed_str(), Style::default().fg(TEXT_DIM)),
+        ];
+        // Live token stats once the reply is flowing (estimated chars/4).
+        if app.stream_tokens() > 0 {
+            spans.push(Span::styled(
+                format!(
+                    "  ·  {} tok · {}/s",
+                    format_tokens(app.stream_tokens()),
+                    format_tokens(app.stream_rate()),
                 ),
-            ])
+                Style::default().fg(TEXT_DIM),
+            ));
         }
+        spans.push(Span::styled(
+            "  ·  ctrl+c to interrupt",
+            Style::default().fg(TEXT_DIM),
+        ));
+        Line::from(spans)
     };
     f.render_widget(Paragraph::new(line).style(Style::default().bg(BG)), area);
 }
 
-/// Status footer under the input: working dir (left) and model + context % (right).
+/// Status footer under the input: working dir (left) and model + token usage (right).
 pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    let (ctx_tokens, ctx_pct) = app.context_usage();
     let right_str = format!(
-        " {}/{}  ·  {}% ctx ",
+        " {}/{}  ·  {} tok ({}%) ",
         app.provider,
         app.model,
-        app.context_pct()
+        format_tokens(ctx_tokens as usize),
+        ctx_pct
     );
     let right_w = right_str.chars().count() as u16;
     let split = Layout::default()
@@ -844,7 +857,30 @@ mod tests {
             "footer should show provider/model"
         );
         assert!(content.contains("/tmp"), "footer should show cwd");
-        assert!(content.contains("% ctx"), "footer should show context %");
+        assert!(content.contains("tok"), "footer should show token count");
+        assert!(content.contains("(0%)"), "footer should show context %");
+    }
+
+    #[test]
+    fn render_loading_shows_live_token_stats_when_streaming() {
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        app.mode = Mode::Thinking;
+        app.stream_start = Some(std::time::Instant::now());
+        app.stream_chars = 400; // ~100 estimated output tokens
+
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(
+            content.contains("100 tok"),
+            "should show live output tokens"
+        );
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub struct Session {
     start_dir: String,
     agent: Agent,
     compaction: CompactionConfig,
+    /// Cumulative real token usage for this session (persisted alongside it).
+    usage: crate::Usage,
 }
 
 impl Session {
@@ -35,6 +37,7 @@ impl Session {
         start_dir: String,
     ) -> Result<Self, anyhow::Error> {
         let history = storage.load_session(&id).await?;
+        let usage = storage.load_usage(&id).await.unwrap_or_default();
         Ok(Self {
             id,
             history,
@@ -42,7 +45,13 @@ impl Session {
             start_dir,
             agent: Agent::new(system_prompt, provider),
             compaction: CompactionConfig::default(),
+            usage,
         })
+    }
+
+    /// Cumulative real token usage recorded for this session.
+    pub fn usage(&self) -> crate::Usage {
+        self.usage
     }
 
     /// Configure context-compaction behavior (auto-trigger + token budgets).
@@ -87,7 +96,11 @@ impl Session {
             tool_call_id: None,
             tool_calls: None,
         });
-        self.agent.run(&mut self.history, tx).await?;
+        let turn_usage = self.agent.run(&mut self.history, tx).await?;
+        if !turn_usage.is_zero() {
+            self.usage.add(&turn_usage);
+            let _ = self.storage.save_usage(&self.id, &self.usage).await;
+        }
         self.persist().await
     }
 
@@ -545,6 +558,27 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].role, "user");
         assert_eq!(loaded[0].content.as_deref(), Some("hello"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_storage_round_trips_usage() {
+        let dir = crate::util::unique_temp_dir("ignis-usage-storage");
+        let storage = FileStorage::new(dir.clone());
+
+        // No file yet → default.
+        assert!(storage.load_usage("s").await.unwrap().is_zero());
+
+        let usage = crate::Usage {
+            input_tokens: 1234,
+            output_tokens: 56,
+            cache_read_tokens: 789,
+            cache_write_tokens: 0,
+        };
+        storage.save_usage("s", &usage).await.unwrap();
+        let loaded = storage.load_usage("s").await.unwrap();
+        assert_eq!(loaded, usage);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
