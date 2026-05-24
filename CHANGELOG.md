@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-25
+
 ### Added
 - `/model` — switch provider/model and reasoning effort at runtime, remembered across restarts.
+
+### Changed
+- **BREAKING:** config — active selection is now top-level `model = "provider/model"`; each provider declares a `models` catalog (replaces `active_provider` + per-provider `model`).
 
 ## [0.5.0] - 2026-05-25
 
