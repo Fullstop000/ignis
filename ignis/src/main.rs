@@ -152,7 +152,7 @@ async fn main() -> Result<(), anyhow::Error> {
     session.set_compaction(config.compaction.clone());
 
     // Register tools
-    ignis::tools::register_native_tools(&mut session, &cwd, config.web_search.clone());
+    ignis::tools::register_native_tools(&mut session, &cwd, &config);
     let ext_dirs = ignis::plugin::default_extension_dirs();
     for d in &ext_dirs {
         if !d.exists() {

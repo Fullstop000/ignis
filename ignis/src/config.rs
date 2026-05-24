@@ -54,7 +54,7 @@ impl Default for CompactionConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct Config {
     pub active_provider: String,
     pub auto_resume_last_session: Option<bool>,
