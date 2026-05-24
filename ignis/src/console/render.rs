@@ -5,6 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
 };
+use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, Mode, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
@@ -177,7 +178,7 @@ pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
                     lines.extend(md_lines);
                 }
                 UIBlock::Tool(entry) => {
-                    render_tool_block(&mut lines, entry, app.tick);
+                    render_tool_block(&mut lines, entry, app.tick, &app.cwd);
                 }
             }
         }
@@ -287,7 +288,12 @@ pub(crate) fn render_session_picker(lines: &mut Vec<Line<'static>>, picker: &Ses
     )));
 }
 
-pub(crate) fn render_tool_block(lines: &mut Vec<Line<'static>>, entry: &ToolCallEntry, tick: u64) {
+pub(crate) fn render_tool_block(
+    lines: &mut Vec<Line<'static>>,
+    entry: &ToolCallEntry,
+    tick: u64,
+    cwd: &Path,
+) {
     let (icon, color, status_line, elapsed) = match &entry.status {
         ToolStatus::Pending => {
             let spinner = SPINNERS[(tick as usize / 10) % SPINNERS.len()];
@@ -312,7 +318,7 @@ pub(crate) fn render_tool_block(lines: &mut Vec<Line<'static>>, entry: &ToolCall
     };
 
     // Parse tool arguments for a compact display
-    let args_compact = sanitize(&compact_tool_args(&entry.arguments));
+    let args_compact = sanitize(&compact_tool_args(&entry.arguments, cwd));
 
     lines.push(Line::from(""));
     // Header line: ┌─ ⚙ tool_name(args) [1.2s]
@@ -382,8 +388,10 @@ pub(crate) fn render_tool_block(lines: &mut Vec<Line<'static>>, entry: &ToolCall
     lines.push(Line::from(Span::styled("  └", Style::default().fg(color))));
 }
 
-/// Produce a compact arg summary like `path="src/main.rs"` from JSON
-pub(crate) fn compact_tool_args(json_str: &str) -> String {
+/// Produce a compact arg summary from JSON, e.g. `read_file(src/main.rs)`.
+/// Path-valued args render bare (no `key=`, no quotes) and relative to `cwd`;
+/// other args keep `key=value`.
+pub(crate) fn compact_tool_args(json_str: &str, cwd: &Path) -> String {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
         return truncate(json_str, 60);
     };
@@ -393,6 +401,9 @@ pub(crate) fn compact_tool_args(json_str: &str) -> String {
     let mut parts = Vec::new();
     for (k, v) in obj {
         let s = match v {
+            serde_json::Value::String(s) if is_path_key(k) => {
+                truncate(&relativize_path(s, cwd), 60)
+            }
             serde_json::Value::String(s) => {
                 let t = truncate(s, 40);
                 format!("{}=\"{}\"", k, t)
@@ -408,6 +419,27 @@ pub(crate) fn compact_tool_args(json_str: &str) -> String {
     }
     let joined = parts.join(", ");
     truncate(&joined, 80)
+}
+
+fn is_path_key(key: &str) -> bool {
+    matches!(key, "path" | "file_path")
+}
+
+/// Shorten a path for display by dropping the current-directory prefix: an
+/// absolute path under `cwd`, a leading `./`, or a leading `<cwd-name>/`
+/// (e.g. running in `…/ignis`, `ignis/src/x` → `src/x`).
+fn relativize_path(p: &str, cwd: &Path) -> String {
+    let p = p.trim();
+    if let Ok(stripped) = Path::new(p).strip_prefix(cwd) {
+        return stripped.to_string_lossy().into_owned();
+    }
+    let rel = p.strip_prefix("./").unwrap_or(p);
+    if let Some(name) = cwd.file_name().and_then(|n| n.to_str()) {
+        if let Some(rest) = rel.strip_prefix(&format!("{name}/")) {
+            return rest.to_string();
+        }
+    }
+    rel.to_string()
 }
 
 pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
@@ -535,6 +567,26 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    #[test]
+    fn compact_tool_args_shows_bare_cwd_relative_path() {
+        let cwd = PathBuf::from("/home/u/ignis");
+        // Absolute path under cwd -> relative, bare (no key=, no quotes).
+        assert_eq!(
+            compact_tool_args(r#"{"path":"/home/u/ignis/src/console/render.rs"}"#, &cwd),
+            "src/console/render.rs"
+        );
+        // Leading "<cwd-name>/" prefix dropped: ignis/src/main.rs -> src/main.rs.
+        assert_eq!(
+            compact_tool_args(r#"{"path":"ignis/src/main.rs"}"#, &cwd),
+            "src/main.rs"
+        );
+        // Non-path args keep key="value".
+        assert_eq!(
+            compact_tool_args(r#"{"command":"echo hi"}"#, &cwd),
+            "command=\"echo hi\""
+        );
     }
 
     #[test]
