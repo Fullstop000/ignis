@@ -1,10 +1,8 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
-
+use crate::{AgentTool, ExecutionMode, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
-
-use crate::{AgentTool, ExecutionMode, ToolResult};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 #[derive(Deserialize)]
 struct PluginManifest {
@@ -66,19 +64,14 @@ impl AgentTool for PluginTool {
         let stdin_bytes = serde_json::to_vec(&args).unwrap_or_default();
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(&stdin_bytes).await;
-            // stdin is dropped here, closing it
         }
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            child.wait_with_output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+                .await;
 
         match result {
-            Err(_) => {
-                ToolResult::error("Command timed out after 60 seconds".to_string())
-            }
+            Err(_) => ToolResult::error("Command timed out after 60 seconds".to_string()),
             Ok(Err(e)) => ToolResult::error(format!("Command failed: {e}")),
             Ok(Ok(output)) => {
                 if output.status.success() {
@@ -109,7 +102,7 @@ pub fn load_extensions(dirs: &[PathBuf]) -> Vec<PluginTool> {
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Warning: failed to read {}: {e}", path.display());
+                    log::warn!("Failed to read plugin manifest {}: {e}", path.display());
                     continue;
                 }
             };
@@ -117,7 +110,7 @@ pub fn load_extensions(dirs: &[PathBuf]) -> Vec<PluginTool> {
             let manifest: PluginManifest = match serde_yaml::from_str(&content) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("Warning: invalid manifest {}: {e}", path.display());
+                    log::warn!("Invalid plugin manifest {}: {e}", path.display());
                     continue;
                 }
             };
@@ -129,7 +122,9 @@ pub fn load_extensions(dirs: &[PathBuf]) -> Vec<PluginTool> {
 
             let working_dir = dir.to_path_buf();
 
-            eprintln!("Loaded plugin: {} from {}", manifest.name, path.display());
+
+
+            log::info!("Loaded plugin: {} from {}", manifest.name, path.display());
 
             plugins_by_name.insert(
                 manifest.name.clone(),
@@ -158,4 +153,47 @@ pub fn default_extension_dirs() -> Vec<PathBuf> {
     dirs.push(PathBuf::from(".ignis/extensions"));
 
     dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_plugin_manifest_deserialization() {
+        let manifest_yaml = r#"
+name: "test_tool"
+description: "A tool for testing"
+parameters:
+  type: object
+  properties:
+    input:
+      type: string
+command: "echo test"
+execution_mode: "sequential"
+"#;
+        let manifest: PluginManifest = serde_yaml::from_str(manifest_yaml).unwrap();
+        assert_eq!(manifest.name, "test_tool");
+        assert_eq!(manifest.description, "A tool for testing");
+        assert_eq!(manifest.command, "echo test");
+        assert_eq!(manifest.execution_mode, "sequential");
+    }
+
+    #[tokio::test]
+    async fn test_plugin_tool_call() {
+        let temp_dir = std::env::temp_dir();
+        let plugin = PluginTool {
+            name: "echo_tool".to_string(),
+            description: "echoes input".to_string(),
+            parameters: json!({}),
+            command: "echo 'hello plugin'".to_string(),
+            working_dir: temp_dir,
+            execution_mode: ExecutionMode::Parallel,
+        };
+
+        let res = plugin.call(json!({})).await;
+        assert!(!res.is_error);
+        assert_eq!(res.content.trim(), "hello plugin");
+    }
 }

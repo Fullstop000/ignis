@@ -1,137 +1,155 @@
 use ignis::{
+    cli::{parse_cli_args, resolve_session_request},
+    config::{build_provider, load_config},
+    session::{project_sessions_dir, SessionManager},
     storage::FileStorage,
     Agent, AgentEvent,
 };
-use std::sync::Arc;
-use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-#[derive(Debug, Deserialize)]
-struct ProviderConfig {
-    api_key: Option<String>,
-    api_url: Option<String>,
-    model: Option<String>,
+fn get_git_status() -> String {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "Not a git repository or git not installed".to_string())
 }
 
-#[derive(Debug, Deserialize)]
-struct Config {
-    active_provider: String,
-    session_id: Option<String>,
-    providers: HashMap<String, ProviderConfig>,
-}
-
-fn load_config() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    let paths = vec![
-        PathBuf::from("config.yaml"),
-        PathBuf::from("/home/zht/ignis/config.yaml"),
-    ];
-
-    let mut last_err = None;
-    for path in paths {
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    match serde_yaml::from_str::<Config>(&content) {
-                        Ok(config) => return Ok(config),
-                        Err(e) => last_err = Some(format!("Failed to parse {}: {}", path.display(), e).into()),
-                    }
-                }
-                Err(e) => last_err = Some(format!("Failed to read {}: {}", path.display(), e).into()),
-            }
+fn get_git_diff() -> String {
+    let output = std::process::Command::new("git")
+        .args(["diff"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_else(|_| String::new());
+    if output.trim().is_empty() {
+        "No changes".to_string()
+    } else {
+        if output.len() > 2000 {
+            format!("{}... (truncated)", &output[..2000])
+        } else {
+            output
         }
     }
-
-    Err(last_err.unwrap_or_else(|| "config.yaml not found in current directory or /home/zht/ignis/config.yaml".into()))
 }
 
-fn build_provider(config: &Config) -> Result<Box<dyn ignis::provider::LlmProvider>, Box<dyn std::error::Error + Send + Sync>> {
-    let provider_name = &config.active_provider;
-    let prov_cfg = config.providers.get(provider_name)
-        .ok_or_else(|| format!("Configuration for active provider '{}' not found", provider_name))?;
+fn get_current_date() -> String {
+    std::process::Command::new("date")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "Unknown Date".to_string())
+}
 
-    match provider_name.as_str() {
-        "openai" => {
-            let api_key = prov_cfg.api_key.clone()
-                .ok_or("openai provider requires api_key")?;
-            let api_url = prov_cfg.api_url.clone()
-                .ok_or("openai provider requires api_url")?;
-            let model = prov_cfg.model.clone()
-                .ok_or("openai provider requires model")?;
-            Ok(Box::new(ignis::provider::OpenAiProvider::new(api_key, api_url, model)))
-        }
-        "deepseek" => {
-            let api_key = prov_cfg.api_key.clone()
-                .ok_or("deepseek provider requires api_key")?;
-            let api_url = prov_cfg.api_url.clone()
-                .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
-            let model = prov_cfg.model.clone()
-                .ok_or("deepseek provider requires model")?;
-            Ok(Box::new(ignis::provider::DeepSeekProvider::with_url(api_key, api_url, model)))
-        }
-        "kimi" => {
-            let api_key = prov_cfg.api_key.clone()
-                .ok_or("kimi provider requires api_key")?;
-            let api_url = prov_cfg.api_url.clone()
-                .unwrap_or_else(|| "https://api.kimi.com/coding/v1".to_string());
-            let model = prov_cfg.model.clone()
-                .ok_or("kimi provider requires model")?;
-            // Kimi behaves like OpenAiProvider but uses Kimi api_url
-            Ok(Box::new(ignis::provider::OpenAiProvider::new(api_key, api_url, model)))
-        }
-        "anthropic" => {
-            let api_key = prov_cfg.api_key.clone()
-                .ok_or("anthropic provider requires api_key")?;
-            let model = prov_cfg.model.clone()
-                .ok_or("anthropic provider requires model")?;
-            Ok(Box::new(ignis::provider::AnthropicProvider::new(api_key, model)))
-        }
-        "gemini" => {
-            let api_key = prov_cfg.api_key.clone()
-                .ok_or("gemini provider requires api_key")?;
-            let model = prov_cfg.model.clone()
-                .ok_or("gemini provider requires model")?;
-            Ok(Box::new(ignis::provider::GeminiProvider::new(api_key, model)))
-        }
-        "ollama" => {
-            let api_url = prov_cfg.api_url.clone()
-                .unwrap_or_else(|| "http://localhost:11434".to_string());
-            let model = prov_cfg.model.clone()
-                .ok_or("ollama provider requires model")?;
-            Ok(Box::new(ignis::provider::OllamaProvider::new(api_url, model)))
-        }
-        other => Err(format!("Unknown provider type: {}", other).into()),
-    }
+fn build_system_prompt(cwd: &std::path::Path) -> String {
+    let git_status = get_git_status();
+    let git_diff = get_git_diff();
+    let current_date = get_current_date();
+    let os_name = std::env::consts::OS;
+
+    format!(
+        "You are Ignis, an interactive agent that helps users with software engineering tasks. \
+        Use the instructions below and the tools available to you to assist the user.
+
+# Guidelines
+ - All text you output outside of tool use is displayed to the user.
+ - Tools are executed in a user-selected permission mode.
+ - Read relevant code before changing it and keep changes tightly scoped to the request.
+ - Do not add speculative abstractions, compatibility shims, or unrelated cleanup.
+ - Do not create files unless they are required to complete the task.
+ - If an approach fails, diagnose the failure before switching tactics.
+ - Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.
+ - Report outcomes faithfully: if verification fails or was not run, say so explicitly.
+ - Carefully consider reversibility and blast radius. Local, reversible actions like editing files or running tests are usually fine. Actions that affect shared systems, publish state, delete data, or otherwise have high blast radius should be explicitly authorized by the user.
+
+# Tone & Style
+ - Be concise. Start work immediately. No conversational fillers or preambles.
+ - Answer directly without flattery or flippancy.
+ - Don't summarize what you did unless asked. Don't explain your code unless asked.
+
+# Environment Context
+ - Operating System: {}
+ - Working Directory: {}
+ - Current Date/Time: {}
+
+# Git Context
+Git Status:
+```
+{}
+```
+
+Git Diff:
+```
+{}
+```",
+        os_name,
+        cwd.display(),
+        current_date,
+        git_status,
+        git_diff
+    )
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("=== Starting Ignis ===");
+async fn main() -> Result<(), anyhow::Error> {
+    // Parse arguments
+    let cli = parse_cli_args(std::env::args().skip(1).collect());
+    let is_oneshot = !cli.is_tui && !cli.prompt_args.is_empty();
 
     // 1. Load config
     let config = load_config()?;
-    println!("Active Provider: {}", config.active_provider);
 
-    // 2. Build provider
+    // 2. Resolve paths
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not locate home directory"))?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let ignis_home = home.join(".ignis");
+    let storage_root = ignis_home.clone();
+
+    // Initialize logger
+    if let Err(e) = ignis::logger::init(&ignis_home.join("logs")) {
+        eprintln!("Failed to initialize logger: {}", e);
+    }
+    let storage_dir = project_sessions_dir(&storage_root, &cwd);
+    let session_manager = SessionManager::new(storage_dir.clone());
+    let auto_resume = config.auto_resume_last_session.unwrap_or(false);
+    let session_request = resolve_session_request(cli, &session_manager, auto_resume, &cwd);
+    let system_prompt = build_system_prompt(&cwd);
+    let active_model = config
+        .providers
+        .get(&config.active_provider)
+        .and_then(|p| p.model.clone())
+        .unwrap_or_else(|| "default".to_string());
+
+    // Route: TUI mode (default when no args, or explicit --tui)
+    if session_request.is_tui || !is_oneshot {
+        return ignis::repl::run_repl(
+            config.active_provider.clone(),
+            active_model,
+            session_request.session_id,
+            system_prompt,
+            storage_dir,
+            cwd,
+            config,
+        )
+        .await;
+    }
+
+    // Route: One-shot CLI mode (ignis "do something")
+    println!("=== Ignis (one-shot) ===");
+    println!("Provider: {}/{}" , config.active_provider, active_model);
+    println!("Session: {}", session_request.session_id);
+
     let provider = build_provider(&config)?;
-
-    // 3. Initialize storage
-    let home = dirs::home_dir().ok_or_else(|| "Could not locate home directory")?;
-    let storage_dir = home.join(".config/ignis/sessions");
-    println!("Storage Directory: {}", storage_dir.display());
     let storage = FileStorage::new(storage_dir);
+    let mut agent = Agent::new(
+        session_request.session_id,
+        system_prompt,
+        provider,
+        Box::new(storage),
+        cwd.to_string_lossy().to_string(),
+    );
 
-    // 4. Create Agent
-    let session_id = config.session_id.clone().unwrap_or_else(|| "default".to_string());
-    let system_prompt = "You are a helpful assistant with powerful native tools and plugins. Use them as needed to accomplish your task.".to_string();
-    let mut agent = Agent::new(session_id, system_prompt, provider, Box::new(storage));
-
-    // 5. Register Native Tools
-    let cwd = std::env::current_dir()?;
-    println!("Current Working Directory: {}", cwd.display());
+    // Register tools
     ignis::tools::register_native_tools(&mut agent, &cwd);
-
-    // 6. Register Plugins
     let ext_dirs = ignis::plugin::default_extension_dirs();
     for d in &ext_dirs {
         if !d.exists() {
@@ -139,75 +157,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
     let plugins = ignis::plugin::load_extensions(&ext_dirs);
-    println!("Loaded {} extensions.", plugins.len());
     for plugin in plugins {
         agent.register_tool(Arc::new(plugin));
     }
 
-    // 7. Parse Prompt
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let prompt_text = if args.is_empty() {
-        "List the contents of the current directory and read the Cargo.toml file if it exists."
-    } else {
-        &args.join(" ")
-    };
-    println!("Prompt: {}", prompt_text);
-
-    // 8. Channel for streaming events
+    // Run prompt
+    let prompt_text = session_request.prompt_args.join(" ");
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-
-    // 9. Run prompt in a separate thread
-    let prompt_text_owned = prompt_text.to_string();
     let prompt_task = tokio::spawn(async move {
-        if let Err(e) = agent.prompt(&prompt_text_owned, tx).await {
-            eprintln!("Agent execution error: {:?}", e);
+        if let Err(e) = agent.prompt(&prompt_text, tx).await {
+            eprintln!("Agent error: {:?}", e);
         }
     });
 
-    // 10. Consume events
+    // Stream events to stdout
     use std::io::Write;
     while let Some(event) = rx.recv().await {
         match event {
-            AgentEvent::AgentStart => {
-                println!("[Agent started]");
-            }
-            AgentEvent::TurnStart => {
-                println!("[Turn started]");
-            }
-            AgentEvent::MessageStart { message } => {
-                print!("\n[{}] starting message...", message.role);
-                std::io::stdout().flush()?;
-            }
             AgentEvent::MessageUpdate { delta } => {
                 print!("{}", delta);
                 std::io::stdout().flush()?;
             }
-            AgentEvent::MessageEnd { .. } => {
-                println!("\n[Message ended]");
-            }
-            AgentEvent::ToolExecutionStart { tool_name, tool_call_id, arguments } => {
+            AgentEvent::ToolExecutionStart {
+                tool_name,
+                tool_call_id,
+                arguments,
+            } => {
                 println!(
-                    "\n>>> [Tool executing: {} (ID: {}) with args: {}]",
+                    "\n>>> [Tool: {} ({})] args: {}",
                     tool_name, tool_call_id, arguments
                 );
             }
-            AgentEvent::ToolExecutionEnd { tool_call_id, result } => {
-                if result.is_error {
-                    println!("<<< [Tool execution completed (ID: {}): ERROR: {}]", tool_call_id, result.content);
-                } else {
-                    println!("<<< [Tool execution completed (ID: {}): OK: {}]", tool_call_id, result.content);
-                }
-            }
-            AgentEvent::TurnEnd => {
-                println!("[Turn ended]");
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                result,
+            } => {
+                let prefix = if result.is_error { "ERR" } else { "OK" };
+                println!(
+                    "<<< [Tool {} ({}): {}]",
+                    prefix, tool_call_id, result.content
+                );
             }
             AgentEvent::AgentEnd => {
-                println!("[Agent ended]");
+                println!();
             }
+            _ => {}
         }
     }
 
     prompt_task.await?;
-    println!("=== Ignis Completed ===");
     Ok(())
 }

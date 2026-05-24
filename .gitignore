@@ -1,3 +1,37 @@
-target/
+# Rust
+/target/
+Cargo.lock
+
+# IDE / Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Backup / Merge
+*.bak
+*.orig
+
+# Profiling / Coverage
+*.profraw
+grcov.profraw*
+*.profdata
+
+# Logs
+*.log
 raw_run.log
+
+# Project specific
 .context/

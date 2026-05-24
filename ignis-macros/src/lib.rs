@@ -1,7 +1,10 @@
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
-use syn::{parse_macro_input, FnArg, ItemFn, LitStr, Token, Pat, Type, parse::{Parse, ParseStream}};
+use syn::{
+    parse::{Parse, ParseStream},
+    parse_macro_input, FnArg, ItemFn, LitStr, Pat, Token, Type,
+};
 
 struct ToolArgs {
     name: Option<String>,
@@ -25,7 +28,7 @@ impl Parse for ToolArgs {
             } else {
                 return Err(syn::Error::new_spanned(
                     ident,
-                    "Unknown attribute argument. Allowed: 'name', 'description'"
+                    "Unknown attribute argument. Allowed: 'name', 'description'",
                 ));
             }
 
@@ -64,8 +67,9 @@ fn map_type_to_json_schema(ty: &Type) -> &'static str {
             let ident_str = segment.ident.to_string();
             match ident_str.as_str() {
                 "String" | "str" | "char" => "string",
-                "i8" | "i16" | "i32" | "i64" | "isize" |
-                "u8" | "u16" | "u32" | "u64" | "usize" => "integer",
+                "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
+                    "integer"
+                }
                 "f32" | "f64" => "number",
                 "bool" => "boolean",
                 _ => "string", // Fallback to string
