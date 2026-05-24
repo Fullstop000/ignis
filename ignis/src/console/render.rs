@@ -65,17 +65,20 @@ pub(crate) fn draw_loading(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!("{}… ", label), Style::default().fg(SUBTEXT)),
             Span::styled(app.elapsed_str(), Style::default().fg(TEXT_DIM)),
         ];
-        // Live token stats once the reply is flowing (estimated chars/4).
-        if app.stream_tokens() > 0 {
-            spans.push(Span::styled(
-                format!(
-                    "  ·  {} tok · {}/s",
-                    format_tokens(app.stream_tokens()),
-                    format_tokens(app.stream_rate()),
-                ),
-                Style::default().fg(TEXT_DIM),
-            ));
-        }
+        // Token stats: ↑ input/context (real when known) and ↓ live output
+        // (chars/4 estimate) + rate once the reply is flowing.
+        let (ctx_tokens, _) = app.context_usage();
+        let tok_segment = if app.stream_tokens() > 0 {
+            format!(
+                "  ·  ↑ {} ↓ {} tok · {}/s",
+                format_tokens(ctx_tokens as usize),
+                format_tokens(app.stream_tokens()),
+                format_tokens(app.stream_rate()),
+            )
+        } else {
+            format!("  ·  ↑ {} tok", format_tokens(ctx_tokens as usize))
+        };
+        spans.push(Span::styled(tok_segment, Style::default().fg(TEXT_DIM)));
         spans.push(Span::styled(
             "  ·  ctrl+c to interrupt",
             Style::default().fg(TEXT_DIM),
@@ -872,14 +875,22 @@ mod tests {
         app.mode = Mode::Thinking;
         app.stream_start = Some(std::time::Instant::now());
         app.stream_chars = 400; // ~100 estimated output tokens
+        app.last_usage = Some(crate::Usage {
+            input_tokens: 2000,
+            ..Default::default()
+        });
 
-        let mut term = test_terminal(80, 24);
+        let mut term = test_terminal(100, 24);
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let content = buffer_content(&term);
         assert!(
-            content.contains("100 tok"),
+            content.contains("↓ 100 tok"),
             "should show live output tokens"
+        );
+        assert!(
+            content.contains("↑ 2.0k"),
+            "should show real input/context tokens"
         );
     }
 
