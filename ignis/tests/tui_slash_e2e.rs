@@ -33,6 +33,10 @@ impl TuiProcess {
             })
             .unwrap();
 
+        // Canonicalize so the cwd matches what the child's std::env::current_dir()
+        // reports (macOS resolves /var -> /private/var), keeping the session slug
+        // consistent with seed_session.
+        let project = std::fs::canonicalize(project).unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_ignis"));
         command.arg("--tui");
         command.cwd(project.as_os_str());
@@ -125,7 +129,8 @@ impl Drop for TuiProcess {
 }
 
 fn seed_session(project: &Path, home: &Path, id: &str, user: &str, assistant: &str) {
-    let storage_dir = project_sessions_dir(&home.join(".ignis"), project);
+    let project = std::fs::canonicalize(project).unwrap();
+    let storage_dir = project_sessions_dir(&home.join(".ignis"), &project);
     std::fs::create_dir_all(&storage_dir).unwrap();
     let records = [
         json!({
