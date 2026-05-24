@@ -398,9 +398,9 @@ pub(crate) fn render_tool_block(
     lines.push(Line::from(Span::styled("  └", Style::default().fg(color))));
 }
 
-/// Produce a compact arg summary from JSON, e.g. `read_file(src/main.rs)`.
-/// Path-valued args render bare (no `key=`, no quotes) and relative to `cwd`;
-/// other args keep `key=value`.
+/// Produce a compact arg summary from JSON, showing **values only** (never the
+/// parameter names): `grep("fn main")`, `read_file(src/main.rs)`. Path-valued
+/// args render bare and relative to `cwd`; other strings keep their quotes.
 pub(crate) fn compact_tool_args(json_str: &str, cwd: &Path) -> String {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
         return truncate(json_str, 60);
@@ -414,16 +414,10 @@ pub(crate) fn compact_tool_args(json_str: &str, cwd: &Path) -> String {
             serde_json::Value::String(s) if is_path_key(k) => {
                 truncate(&relativize_path(s, cwd), 60)
             }
-            serde_json::Value::String(s) => {
-                let t = truncate(s, 40);
-                format!("{}=\"{}\"", k, t)
-            }
-            serde_json::Value::Number(n) => format!("{}={}", k, n),
-            serde_json::Value::Bool(b) => format!("{}={}", k, b),
-            _ => {
-                let t = truncate(&v.to_string(), 30);
-                format!("{}={}", k, t)
-            }
+            serde_json::Value::String(s) => format!("\"{}\"", truncate(s, 40)),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            other => truncate(&other.to_string(), 30),
         };
         parts.push(s);
     }
@@ -592,10 +586,10 @@ mod tests {
             compact_tool_args(r#"{"path":"ignis/src/main.rs"}"#, &cwd),
             "src/main.rs"
         );
-        // Non-path args keep key="value".
+        // Non-path string args show the value only (quoted), never the param name.
         assert_eq!(
-            compact_tool_args(r#"{"command":"echo hi"}"#, &cwd),
-            "command=\"echo hi\""
+            compact_tool_args(r#"{"pattern":"fn main"}"#, &cwd),
+            "\"fn main\""
         );
     }
 
