@@ -17,8 +17,12 @@ TUI and a one-shot CLI, with built-in tools and a simple plugin system.
   `bash`, and `web_search` (switchable Brave / Tavily backends).
 - **Plugins** — add external tools with a small YAML manifest; no recompile.
 - **Sessions** — project-scoped JSONL history, `--resume`, auto-resume, and
-  slash commands (`/resume`, `/clear`, `/compact`).
+  slash commands (`/resume`, `/clear`, `/compact`, `/copy`).
 - **Single binary** — no external runtime dependencies.
+
+> `/copy` (copy the last reply to the clipboard) uses a platform clipboard tool:
+> `pbcopy` (macOS), `clip` (Windows), `clip.exe` (WSL) — all built in. On a Linux
+> desktop, install `wl-clipboard` (`wl-copy`) or `xclip`.
 
 ## Install
 
