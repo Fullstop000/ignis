@@ -428,7 +428,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            vec!["/resume", "/new", "/clear"]
+            vec!["/resume", "/new", "/clear", "/compact"]
         );
     }
 

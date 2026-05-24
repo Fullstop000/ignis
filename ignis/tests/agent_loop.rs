@@ -334,3 +334,54 @@ async fn agent_reasoning_content_is_preserved() {
     );
     assert_eq!(assistant_msg.content.as_deref(), Some("Answer"));
 }
+
+#[tokio::test]
+async fn session_compact_summarizes_old_history() {
+    // Seed a 10-message conversation (5 user/assistant pairs).
+    let storage = InMemoryStorage::new();
+    let mut seed = Vec::new();
+    for i in 0..5 {
+        for role in ["user", "assistant"] {
+            seed.push(Message {
+                role: role.to_string(),
+                content: Some(format!("{role}-{i}")),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+    }
+    storage
+        .save_session("c", &seed, Some("/tmp"))
+        .await
+        .unwrap();
+
+    // The single complete() call during compaction returns this summary.
+    let provider = MockProvider::new(vec![vec![LlmResponseDelta::Text("SUMMARY".to_string())]]);
+    let mut session = Session::open(
+        "c".to_string(),
+        "system".to_string(),
+        Box::new(provider),
+        Box::new(storage.clone()),
+        "/tmp".to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(session.history().len(), 10);
+
+    let removed = session.compact().await.unwrap();
+    assert_eq!(removed, 4); // keep last 6, cut at the user boundary at index 4
+
+    let h = session.history();
+    assert_eq!(h.len(), 7); // 1 summary + 6 recent
+    assert_eq!(h[0].role, "user");
+    assert!(h[0].content.as_deref().unwrap().contains("SUMMARY"));
+    // The kept tail must start at a clean turn boundary (a user message),
+    // so no tool result is ever orphaned.
+    assert_eq!(h[1].role, "user");
+
+    // Compaction is persisted.
+    let persisted = storage.load_session("c").await.unwrap();
+    assert_eq!(persisted.len(), 7);
+}

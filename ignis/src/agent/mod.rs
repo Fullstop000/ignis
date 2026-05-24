@@ -38,6 +38,28 @@ impl Agent {
         self.hooks = Some(hooks);
     }
 
+    /// One-shot, tool-less completion: stream a response for `messages` and
+    /// return the concatenated text. Used by [`crate::Session::compact`] to
+    /// summarize history.
+    pub async fn complete(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+    ) -> Result<String, anyhow::Error> {
+        use futures_util::stream::StreamExt;
+        let mut stream = self
+            .provider
+            .chat_stream(system_prompt, messages, &[])
+            .await?;
+        let mut out = String::new();
+        while let Some(delta) = stream.next().await {
+            if let Ok(LlmResponseDelta::Text(text)) = delta {
+                out.push_str(&text);
+            }
+        }
+        Ok(out)
+    }
+
     fn sanitize_and_truncate_error(err: &str) -> String {
         // Redact potential API keys/secrets patterns
         let redacted = err.replace(r"sk-[a-zA-Z0-9]{32,}", "[REDACTED_API_KEY]");

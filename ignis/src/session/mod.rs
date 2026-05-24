@@ -75,11 +75,74 @@ impl Session {
         self.persist().await
     }
 
+    /// Summarize older history into a single message, keeping the most recent
+    /// turns verbatim, to shrink context. Returns the number of messages
+    /// replaced by the summary (0 if nothing was compacted).
+    pub async fn compact(&mut self) -> Result<usize, anyhow::Error> {
+        const KEEP_RECENT: usize = 6;
+        if self.history.len() <= KEEP_RECENT {
+            return Ok(0);
+        }
+        let target = self.history.len() - KEEP_RECENT;
+        // Cut at a turn boundary (a user message) so we never orphan a tool
+        // result whose originating assistant message got summarized away.
+        let cut = match (1..=target).rev().find(|&i| self.history[i].role == "user") {
+            Some(c) => c,
+            None => return Ok(0),
+        };
+
+        let transcript = render_transcript(&self.history[..cut]);
+        let summary = self
+            .agent
+            .complete(
+                "You compress conversations. Produce a concise summary of the \
+                 conversation so far, preserving decisions, facts, file paths, and \
+                 open tasks as a few short bullet points.",
+                &[Message {
+                    role: "user".to_string(),
+                    content: Some(format!("Summarize this conversation:\n\n{transcript}")),
+                    reasoning_content: None,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                }],
+            )
+            .await?;
+
+        let summary_msg = Message {
+            role: "user".to_string(),
+            content: Some(format!("[Summary of earlier conversation]\n{summary}")),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        };
+
+        let mut compacted = Vec::with_capacity(1 + self.history.len() - cut);
+        compacted.push(summary_msg);
+        compacted.extend_from_slice(&self.history[cut..]);
+        self.history = compacted;
+        self.persist().await?;
+        Ok(cut)
+    }
+
     async fn persist(&self) -> Result<(), anyhow::Error> {
         self.storage
             .save_session(&self.id, &self.history, Some(&self.start_dir))
             .await
     }
+}
+
+/// Render messages as a plain `role: content` transcript for summarization.
+fn render_transcript(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        out.push_str(m.role.as_str());
+        out.push_str(": ");
+        out.push_str(m.content.as_deref().unwrap_or(""));
+        out.push('\n');
+    }
+    out
 }
 
 pub fn project_slug(cwd: &Path) -> String {

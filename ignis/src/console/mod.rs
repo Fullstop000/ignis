@@ -14,7 +14,7 @@ use crate::console::app::{App, Mode};
 use crate::console::render::draw;
 use crate::session::SessionManager;
 use crate::storage::{FileStorage, SessionStorage};
-use crate::{AgentEvent, Session};
+use crate::{AgentEvent, Message, Session};
 
 // ==========================================
 // Color Palette
@@ -58,6 +58,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/clear",
         description: "Alias for /new",
     },
+    SlashCommand {
+        name: "/compact",
+        description: "Summarize earlier history to free up context",
+    },
 ];
 
 // ==========================================
@@ -67,9 +71,9 @@ pub mod app;
 pub mod markdown;
 pub mod render;
 
-pub(crate) struct AgentRequest {
-    pub(crate) session_id: String,
-    pub(crate) prompt: String,
+pub(crate) enum AgentRequest {
+    Prompt { session_id: String, prompt: String },
+    Compact { session_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -178,6 +182,10 @@ pub async fn run_console(
     // Background agent runner
     tokio::spawn(async move {
         while let Some(request) = prompt_rx.recv().await {
+            let (session_id, prompt) = match request {
+                AgentRequest::Prompt { session_id, prompt } => (session_id, Some(prompt)),
+                AgentRequest::Compact { session_id } => (session_id, None),
+            };
             let provider = match crate::config::build_provider(&agent_config) {
                 Ok(p) => p,
                 Err(e) => {
@@ -188,7 +196,7 @@ pub async fn run_console(
             };
             let storage = crate::storage::FileStorage::new(agent_storage_dir.clone());
             let mut session = match Session::open(
-                request.session_id,
+                session_id,
                 agent_system_prompt.clone(),
                 provider,
                 Box::new(storage),
@@ -215,15 +223,52 @@ pub async fn run_console(
                 session.register_tool(Arc::new(plugin));
             }
 
+            let notice_msg = |content: &str| Message {
+                role: "assistant".to_string(),
+                content: Some(content.to_string()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            };
             let tx = agent_tx.clone();
-            tokio::select! {
-                result = session.prompt(&request.prompt, tx) => {
-                    if let Err(e) = result {
-                        let _ = agent_tx.send(AgentEvent::AgentEnd).await;
-                        log::error!("Agent error: {}", e);
+            match prompt {
+                Some(prompt) => {
+                    tokio::select! {
+                        result = session.prompt(&prompt, tx) => {
+                            if let Err(e) = result {
+                                let _ = agent_tx.send(AgentEvent::AgentEnd).await;
+                                log::error!("Agent error: {}", e);
+                            }
+                        }
+                        _ = cancel_rx.recv() => {
+                            let _ = agent_tx.send(AgentEvent::AgentEnd).await;
+                        }
                     }
                 }
-                _ = cancel_rx.recv() => {
+                None => {
+                    // /compact: summarize earlier history and report a notice.
+                    let _ = agent_tx.send(AgentEvent::AgentStart).await;
+                    let notice = match session.compact().await {
+                        Ok(0) => "Nothing to compact yet.".to_string(),
+                        Ok(n) => format!("Compacted {n} earlier messages into a summary."),
+                        Err(e) => format!("Compact failed: {e}"),
+                    };
+                    let _ = agent_tx
+                        .send(AgentEvent::MessageStart {
+                            message: notice_msg(""),
+                        })
+                        .await;
+                    let _ = agent_tx
+                        .send(AgentEvent::MessageUpdate {
+                            delta: notice.clone(),
+                        })
+                        .await;
+                    let _ = agent_tx
+                        .send(AgentEvent::MessageEnd {
+                            message: notice_msg(&notice),
+                        })
+                        .await;
                     let _ = agent_tx.send(AgentEvent::AgentEnd).await;
                 }
             }
@@ -413,11 +458,17 @@ async fn handle_key(
                     let storage = crate::storage::FileStorage::new(storage_dir.to_path_buf());
                     let _ = storage.save_session(&new_id, &[], None).await;
                     app.start_new_session(new_id);
+                } else if command == "/compact" && arg_count == 1 {
+                    let _ = prompt_tx
+                        .send(AgentRequest::Compact {
+                            session_id: app.session_id.clone(),
+                        })
+                        .await;
                 } else if text.starts_with('/') {
                     app.add_assistant_notice(format!("Unknown command `{}`.", command));
                 } else {
                     let _ = prompt_tx
-                        .send(AgentRequest {
+                        .send(AgentRequest::Prompt {
                             session_id: app.session_id.clone(),
                             prompt: text,
                         })
