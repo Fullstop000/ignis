@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-24
+
+### Changed
+- Tool headers show path args bare and relative to the working dir (e.g. `read_file(src/main.rs)` instead of `read_file(path="…/src/main.rs")`).
+- Internal layout: `tool.rs` → `tools/tool.rs`, `storage.rs` → `session/storage.rs` (crate-root paths preserved via re-exports).
+- CI/release actions bumped off deprecated Node 20 (`checkout` v5, `action-gh-release` v3).
+
+### Removed
+- `scratch/`, `docs/`, and the bundled sample `.ignis/extensions` plugin.
+
 ## [0.2.0] - 2026-05-24
 
 ### Added
