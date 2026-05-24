@@ -42,17 +42,25 @@ pub(crate) const CODE_BG: Color = Color::Rgb(30, 30, 46);
 
 pub(crate) const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Playful status verbs cycled while the model is generating, for a livelier
-/// "Thinking" indicator. First entry is the default at t=0.
+/// Playful status verbs cycled while the model is generating (Claude Code
+/// style), for a livelier "Thinking" indicator. First entry is the default at t=0.
 pub(crate) const THINKING_VERBS: &[&str] = &[
     "Thinking",
     "Pondering",
-    "Reasoning",
-    "Cooking",
-    "Crunching",
-    "Brewing",
+    "Noodling",
+    "Cogitating",
+    "Ruminating",
+    "Marinating",
+    "Percolating",
+    "Nebulizing",
     "Conjuring",
+    "Brewing",
+    "Simmering",
+    "Tinkering",
+    "Scheming",
     "Synthesizing",
+    "Incubating",
+    "Galaxy-braining",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
