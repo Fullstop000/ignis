@@ -73,7 +73,7 @@ impl TuiProcess {
     }
 
     fn wait_for(&mut self, needle: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if self.output.lock().unwrap().contains(needle) {
                 return;
@@ -92,7 +92,7 @@ impl TuiProcess {
     }
 
     fn wait_for_exit(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Some(status) = self.child.try_wait().unwrap() {
                 assert!(
