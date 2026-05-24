@@ -1,4 +1,6 @@
-use super::{bytes_to_lines, ChatCompletionsRequest, Chunk, LlmProvider, LlmResponseDelta};
+use super::{
+    bytes_to_lines, ChatCompletionsRequest, Chunk, LlmProvider, LlmResponseDelta, StreamOptions,
+};
 use crate::Message;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -48,7 +50,9 @@ impl LlmProvider for DeepSeekProvider {
             messages: request_messages,
             tools,
             stream: true,
-            stream_options: None,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
         };
 
         let endpoint = if self.api_url.ends_with("/chat/completions") {
@@ -128,6 +132,9 @@ impl LlmProvider for DeepSeekProvider {
                                         }
                                     }
                                 }
+                            }
+                            if let Some(u) = &chunk.usage {
+                                return Some(Ok(LlmResponseDelta::Usage(u.to_usage())));
                             }
                             None
                         }

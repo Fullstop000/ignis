@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - 2026-05-24
 
 ### Added
-- Real token usage: OpenAI-compatible providers (incl. kimi) report actual `usage`; captured via `LlmResponseDelta::Usage` / `AgentEvent::Usage`.
+- Real token usage: OpenAI-compatible providers (kimi, DeepSeek) report actual `usage` (incl. DeepSeek's `prompt_cache_hit_tokens`); captured via `LlmResponseDelta::Usage` / `AgentEvent::Usage`.
 - Token usage is persisted per session (`<id>.usage.json`) and reloaded on open.
 - Footer shows real context tokens (e.g. `1.6k tok (1%)`), falling back to a chars/4 estimate when a provider doesn't report usage.
 

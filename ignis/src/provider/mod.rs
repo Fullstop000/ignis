@@ -72,7 +72,10 @@ pub struct Chunk {
     pub usage: Option<ChunkUsage>,
 }
 
-/// OpenAI-compatible usage object from the final stream chunk.
+/// OpenAI-compatible usage object from the final stream chunk. `prompt_tokens`
+/// is the full input (cache hits included); cache reads appear either as
+/// OpenAI's `prompt_tokens_details.cached_tokens` or DeepSeek's
+/// `prompt_cache_hit_tokens`.
 #[derive(Deserialize, Debug)]
 pub struct ChunkUsage {
     #[serde(default)]
@@ -81,6 +84,8 @@ pub struct ChunkUsage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -95,9 +100,10 @@ impl ChunkUsage {
             .prompt_tokens_details
             .as_ref()
             .map(|d| d.cached_tokens)
+            .or(self.prompt_cache_hit_tokens)
             .unwrap_or(0);
         crate::types::Usage {
-            // prompt_tokens already includes cached tokens (OpenAI semantics).
+            // prompt_tokens already includes cached tokens.
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,
             cache_read_tokens: cache_read,
@@ -185,5 +191,18 @@ mod tests {
         assert_eq!(u.output_tokens, 42);
         assert_eq!(u.cache_read_tokens, 600);
         assert_eq!(u.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn chunk_usage_maps_deepseek_cache_field() {
+        // DeepSeek reports cache reads as `prompt_cache_hit_tokens`.
+        let chunk: Chunk = serde_json::from_str(
+            r#"{"choices":[],"usage":{"prompt_tokens":2157,"completion_tokens":2,"prompt_cache_hit_tokens":1920,"prompt_cache_miss_tokens":237}}"#,
+        )
+        .unwrap();
+        let u = chunk.usage.unwrap().to_usage();
+        assert_eq!(u.input_tokens, 2157);
+        assert_eq!(u.output_tokens, 2);
+        assert_eq!(u.cache_read_tokens, 1920);
     }
 }
