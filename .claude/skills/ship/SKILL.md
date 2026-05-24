@@ -77,13 +77,31 @@ git push -u origin HEAD
 gh pr create --base master --title "<concise>" --body "<concise summary + checklist>"
 ```
 
-### 5. Make CI pass
+### 5. Review (ask the human which reviewer)
+Get a code review of the PR diff before chasing CI. **Ask the human which reviewer
+to use — don't pick silently:**
+
+- **Subagent** — dispatch one Claude review agent over the branch diff:
+  `Agent(subagent_type: "general-purpose")` with: *"Review `git diff
+  origin/master...HEAD` in this repo for bugs, regressions, and risky changes.
+  Report only real issues as file:line + severity; skip style nits."*
+- **Codex** — `codex exec review --base master`
+- **Gemini** — `git diff origin/master...HEAD | gemini -p "Review this diff for
+  bugs, regressions, and risky changes. List only real issues as file:line +
+  severity; be concise."`
+
+Then read the findings, **fix real issues and push**, and note any dismissed
+finding with a one-line rationale. An *intended* breaking change is triaged
+(documented in the CHANGELOG), not patched with compat code — see CLAUDE.md.
+Proceed only when the diff is clean or every finding is triaged.
+
+### 6. Make CI pass
 ```bash
 gh pr checks --watch
 ```
 If red: open the failing job, root-cause, fix, push, re-watch. Proceed only when every check is green.
 
-### 6. Version + CHANGELOG (commit to the PR, then STOP)
+### 7. Version + CHANGELOG (commit to the PR, then STOP)
 1. Pick the bump from commits since the last tag — `feat:` → minor, `fix:`/`chore:`/`docs:` → patch, `!`/`BREAKING CHANGE` → major:
    ```bash
    git log "$(git describe --tags --abbrev=0 2>/dev/null || echo)"..HEAD --pretty=%s
@@ -98,12 +116,12 @@ If red: open the failing job, root-cause, fix, push, re-watch. Proceed only when
 5. Re-confirm CI is green on the new commit.
 6. **STOP.** Tell the user: "PR <url> is green, bumped to vX.Y.Z — approve squash-merge?" Wait for an explicit yes.
 
-### 7. Squash-merge (only after approval)
+### 8. Squash-merge (only after approval)
 ```bash
 gh pr merge <num> --squash --delete-branch
 ```
 
-### 8. Tag + await release
+### 9. Tag + await release
 ```bash
 git switch master && git pull
 git tag vX.Y.Z && git push origin vX.Y.Z      # triggers the Release workflow
