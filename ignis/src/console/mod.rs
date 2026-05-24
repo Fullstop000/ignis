@@ -39,6 +39,9 @@ pub(crate) const PEACH: Color = Color::Rgb(250, 179, 135);
 pub(crate) const TEAL: Color = Color::Rgb(148, 226, 213);
 pub(crate) const MAUVE: Color = Color::Rgb(203, 166, 247);
 pub(crate) const CODE_BG: Color = Color::Rgb(30, 30, 46);
+// Solid diff backgrounds (added / removed lines), dark tints of green / red.
+pub(crate) const DIFF_ADD_BG: Color = Color::Rgb(25, 46, 36);
+pub(crate) const DIFF_DEL_BG: Color = Color::Rgb(51, 29, 37);
 
 pub(crate) const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -97,6 +100,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 
 pub mod app;
 pub mod clipboard;
+pub mod highlight;
 pub mod markdown;
 pub mod render;
 
