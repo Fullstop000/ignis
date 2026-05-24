@@ -531,7 +531,9 @@ fn push_diff_line(
 
     // Content area = width − "  │ " (4) − "± " (2); fill it so the bg spans the row.
     let content_w = (width as usize).saturating_sub(6).max(8);
-    let code = truncate(&sanitize(raw.get(2..).unwrap_or("")), content_w);
+    // `truncate` appends `…` past its limit, so cap at content_w − 1: a truncated
+    // line is then exactly content_w cells and never wraps off the bg bar.
+    let code = truncate(&sanitize(raw.get(2..).unwrap_or("")), content_w - 1);
 
     let mut spans = vec![
         prefix,
@@ -950,6 +952,44 @@ mod tests {
         assert!(
             add_fg.len() > 1,
             "added line should be syntax-highlighted (multiple colors), got {add_fg:?}"
+        );
+    }
+
+    #[test]
+    fn long_diff_line_stays_on_one_row() {
+        // Regression: truncation appended `…` past the width, making the line one
+        // cell too wide so its solid bg wrapped onto a second row.
+        let mut app = App::new(
+            "p".to_string(),
+            "m".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        let long =
+            "+ let x = a_really_long_identifier_that_far_exceeds_the_narrow_terminal_width = 1;";
+        app.blocks.push(UIBlock::Tool(ToolCallEntry {
+            id: "c".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path":"src/x.rs"}"#.to_string(),
+            status: ToolStatus::Success(long.to_string()),
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 1,
+        }));
+        let mut term = test_terminal(40, 24); // narrow → forces truncation
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let mut rows = std::collections::HashSet::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf.get(x, y).bg == DIFF_ADD_BG {
+                    rows.insert(y);
+                }
+            }
+        }
+        assert_eq!(
+            rows.len(),
+            1,
+            "one added line must occupy one row, got {rows:?}"
         );
     }
 
