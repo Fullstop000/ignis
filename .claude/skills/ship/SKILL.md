@@ -57,13 +57,21 @@ New behavior must have tests.
 ```bash
 cargo build --release
 ```
-Optional live check (only if `~/.ignis/config.toml` has a working provider — needs
-network, spends tokens):
-```bash
-./target/release/ignis "use the bash tool to run: echo ok; then reply only ok"
-```
 
-### 3. Secret scan — must be clean
+### 3. Dogfood (ask the human if it's needed)
+**Ask the human whether this change needs dogfooding before shipping** — don't
+decide silently. Dogfooding means using the built binary the way a real user
+would, to catch what unit tests miss (TUI layout, real provider behavior, the
+exact path you changed). Skip only with their OK (e.g. docs/CI-only changes).
+
+If yes — needs a working provider in `~/.ignis/config.toml` (network, spends tokens):
+```bash
+./target/release/ignis "<a real task that exercises this change>"
+# or launch the TUI and drive the new path by hand
+```
+Report what you exercised and the result.
+
+### 4. Secret scan — must be clean
 ```bash
 git diff origin/master...HEAD | \
   grep -nE 'sk-[A-Za-z0-9-]{24,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|BSA[A-Za-z0-9]{20,}' \
@@ -71,13 +79,13 @@ git diff origin/master...HEAD | \
 ```
 Any hit → stop, remove it, re-scan. Never push a secret.
 
-### 4. Open PR
+### 5. Open PR
 ```bash
 git push -u origin HEAD
 gh pr create --base master --title "<concise>" --body "<concise summary + checklist>"
 ```
 
-### 5. Review (ask the human which reviewer)
+### 6. Review (ask the human which reviewer)
 Get a code review of the PR diff before chasing CI. **Ask the human which reviewer
 to use — don't pick silently:**
 
@@ -95,13 +103,13 @@ finding with a one-line rationale. An *intended* breaking change is triaged
 (documented in the CHANGELOG), not patched with compat code — see CLAUDE.md.
 Proceed only when the diff is clean or every finding is triaged.
 
-### 6. Make CI pass
+### 7. Make CI pass
 ```bash
 gh pr checks --watch
 ```
 If red: open the failing job, root-cause, fix, push, re-watch. Proceed only when every check is green.
 
-### 7. Version + CHANGELOG (commit to the PR, then STOP)
+### 8. Version + CHANGELOG (commit to the PR, then STOP)
 1. Pick the bump from commits since the last tag — `feat:` → minor, `fix:`/`chore:`/`docs:` → patch, `!`/`BREAKING CHANGE` → major:
    ```bash
    git log "$(git describe --tags --abbrev=0 2>/dev/null || echo)"..HEAD --pretty=%s
@@ -116,12 +124,12 @@ If red: open the failing job, root-cause, fix, push, re-watch. Proceed only when
 5. Re-confirm CI is green on the new commit.
 6. **STOP.** Tell the user: "PR <url> is green, bumped to vX.Y.Z — approve squash-merge?" Wait for an explicit yes.
 
-### 8. Squash-merge (only after approval)
+### 9. Squash-merge (only after approval)
 ```bash
 gh pr merge <num> --squash --delete-branch
 ```
 
-### 9. Tag + await release
+### 10. Tag + await release
 ```bash
 git switch master && git pull
 git tag vX.Y.Z && git push origin vX.Y.Z      # triggers the Release workflow
