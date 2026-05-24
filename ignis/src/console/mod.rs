@@ -86,6 +86,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/copy",
         description: "Copy the last assistant message to clipboard",
     },
+    SlashCommand {
+        name: "/model",
+        description: "Switch model and reasoning effort",
+    },
 ];
 
 // ==========================================
@@ -97,8 +101,19 @@ pub mod markdown;
 pub mod render;
 
 pub(crate) enum AgentRequest {
-    Prompt { session_id: String, prompt: String },
-    Compact { session_id: String },
+    Prompt {
+        session_id: String,
+        prompt: String,
+    },
+    Compact {
+        session_id: String,
+    },
+    /// Switch the active provider/model/effort for subsequent prompts.
+    SetModel {
+        provider: String,
+        model: String,
+        effort: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -219,6 +234,7 @@ pub async fn run_console(
 
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
     app.set_context_window(config.compaction.threshold_tokens);
+    app.set_model_options(config.model_options(), config.active_effort());
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
@@ -229,7 +245,7 @@ pub async fn run_console(
     let agent_storage_dir = storage_dir.clone();
     let ui_storage_dir = storage_dir;
     let agent_cwd = cwd;
-    let agent_config = config;
+    let mut agent_config = config;
 
     // Background agent runner
     tokio::spawn(async move {
@@ -237,6 +253,17 @@ pub async fn run_console(
             let (session_id, prompt) = match request {
                 AgentRequest::Prompt { session_id, prompt } => (session_id, Some(prompt)),
                 AgentRequest::Compact { session_id } => (session_id, None),
+                AgentRequest::SetModel {
+                    provider,
+                    model,
+                    effort,
+                } => {
+                    // Apply to the config the runner rebuilds the provider from;
+                    // the next prompt picks it up. No session work needed.
+                    agent_config.model = Some(format!("{provider}/{model}"));
+                    agent_config.reasoning_effort = effort;
+                    continue;
+                }
             };
             let provider = match crate::config::build_provider(&agent_config) {
                 Ok(p) => p,
@@ -400,6 +427,7 @@ async fn handle_key(
         (_, KeyCode::Esc) => {
             app.clear_exit_hint();
             app.session_picker = None;
+            app.model_picker = None;
             return;
         }
         (m, KeyCode::Char('d')) if m.contains(KeyModifiers::CONTROL) => {
@@ -440,6 +468,52 @@ async fn handle_key(
 
     if app.mode != Mode::Idle {
         return;
+    }
+
+    if app.model_picker.is_some() {
+        match key.code {
+            KeyCode::Enter => {
+                if let Some((provider, model, effort)) = app.apply_model_selection() {
+                    let _ = prompt_tx.try_send(AgentRequest::SetModel {
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        effort: effort.clone(),
+                    });
+                    if let Err(e) =
+                        crate::config::persist_model_selection(&provider, &model, effort.as_deref())
+                    {
+                        app.add_assistant_notice(format!("Switched (not saved: {e})"));
+                    } else {
+                        let suffix = effort
+                            .as_deref()
+                            .map(|e| format!(" · effort {e}"))
+                            .unwrap_or_default();
+                        app.add_assistant_notice(format!("Model → {provider}/{model}{suffix}"));
+                    }
+                }
+                return;
+            }
+            KeyCode::Up => {
+                app.select_model_picker(SelectionDirection::Previous);
+                return;
+            }
+            KeyCode::Down => {
+                app.select_model_picker(SelectionDirection::Next);
+                return;
+            }
+            KeyCode::Left => {
+                app.cycle_effort(SelectionDirection::Previous);
+                return;
+            }
+            KeyCode::Right => {
+                app.cycle_effort(SelectionDirection::Next);
+                return;
+            }
+            KeyCode::Char(_) => {
+                app.model_picker = None;
+            }
+            _ => {}
+        }
     }
 
     if app.session_picker.is_some() {
@@ -525,6 +599,8 @@ async fn handle_key(
                         .await;
                 } else if command == "/copy" && arg_count == 1 {
                     app.copy_last_assistant_message();
+                } else if command == "/model" && arg_count == 1 {
+                    app.show_model_picker();
                 } else if text.starts_with('/') {
                     app.add_assistant_notice(format!("Unknown command `{}`.", command));
                 } else {

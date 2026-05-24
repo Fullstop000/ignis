@@ -1,36 +1,46 @@
 # Ignis configuration — copy to ~/.ignis/config.toml and fill in your keys.
 # ========================================================================
 
-active_provider = "kimi-code"
+# Active selection as "provider/model" (an optional default). `/model` switches
+# it at runtime, saving the choice to ~/.ignis/state.json — this file is yours
+# to edit and is never auto-written.
+model = "kimi-code/kimi-for-coding"
 auto_resume_last_session = false
 
 [providers."kimi-code"]
 api_key = "sk-your-kimi-key"
 api_url = "https://api.kimi.com/coding/v1"
-model   = "kimi-for-coding"
+models  = ["kimi-for-coding"]
 
-# Other providers — uncomment and configure as needed.
+# Other providers — uncomment and configure as needed. Each provider lists the
+# models it offers in `models`; the active one is the top-level `model` above.
 # [providers.openai]
 # api_key = "sk-your-openai-key"
 # api_url = "https://api.openai.com/v1"
-# model   = "gpt-4o"
+# models  = ["gpt-4o", "o3"]
+# [providers.openai.reasoning]
+# # Reasoning-effort levels differ by model, so declare them per model. The
+# # picker shows the effort control only for models listed here.
+# o3 = ["low", "medium", "high"]
 #
 # [providers.deepseek]
 # api_key = "sk-your-deepseek-key"
 # api_url = "https://api.deepseek.com/v1"
-# model   = "deepseek-reasoner"
+# models  = ["deepseek-v4-flash", "deepseek-v4-pro"]
+# [providers.deepseek.reasoning]
+# deepseek-v4-pro = ["high", "max"]
 #
 # [providers.anthropic]
 # api_key = "your-anthropic-key"
-# model   = "claude-sonnet-4-20250514"
+# models  = ["claude-sonnet-4-20250514"]
 #
 # [providers.gemini]
 # api_key = "your-gemini-key"
-# model   = "gemini-2.5-pro"
+# models  = ["gemini-2.5-pro"]
 #
 # [providers.ollama]
 # api_url = "http://localhost:11434"
-# model   = "llama3"
+# models  = ["llama3"]
 
 # Web search tool (optional). Switch backends via `provider`.
 # See docs/web-search.md for details.

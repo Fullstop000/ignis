@@ -12,6 +12,7 @@ pub struct OpenAiProvider {
     api_url: String,
     model: String,
     user_agent: String,
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -20,6 +21,7 @@ impl OpenAiProvider {
         api_url: String,
         model: String,
         user_agent: Option<String>,
+        reasoning_effort: Option<String>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -27,6 +29,7 @@ impl OpenAiProvider {
             api_url,
             model,
             user_agent: user_agent.unwrap_or_else(|| "ignis/0.1.0".to_string()),
+            reasoning_effort,
         }
     }
 }
@@ -57,6 +60,7 @@ impl LlmProvider for OpenAiProvider {
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
+            reasoning_effort: self.reasoning_effort.as_deref(),
         };
 
         let endpoint = if self.api_url.ends_with("/chat/completions") {

@@ -57,13 +57,21 @@ New behavior must have tests.
 ```bash
 cargo build --release
 ```
-Optional live check (only if `~/.ignis/config.toml` has a working provider — needs
-network, spends tokens):
-```bash
-./target/release/ignis "use the bash tool to run: echo ok; then reply only ok"
-```
 
-### 3. Secret scan — must be clean
+### 3. Dogfood (ask the human if it's needed)
+**Ask the human whether this change needs dogfooding before shipping** — don't
+decide silently. Dogfooding means using the built binary the way a real user
+would, to catch what unit tests miss (TUI layout, real provider behavior, the
+exact path you changed). Skip only with their OK (e.g. docs/CI-only changes).
+
+If yes — needs a working provider in `~/.ignis/config.toml` (network, spends tokens):
+```bash
+./target/release/ignis "<a real task that exercises this change>"
+# or launch the TUI and drive the new path by hand
+```
+Report what you exercised and the result.
+
+### 4. Secret scan — must be clean
 ```bash
 git diff origin/master...HEAD | \
   grep -nE 'sk-[A-Za-z0-9-]{24,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|BSA[A-Za-z0-9]{20,}' \
@@ -71,36 +79,57 @@ git diff origin/master...HEAD | \
 ```
 Any hit → stop, remove it, re-scan. Never push a secret.
 
-### 4. Open PR
+### 5. Open PR
 ```bash
 git push -u origin HEAD
 gh pr create --base master --title "<concise>" --body "<concise summary + checklist>"
 ```
 
-### 5. Make CI pass
+### 6. Review (ask the human which reviewer)
+Get a code review of the PR diff before chasing CI. **Ask the human which reviewer
+to use — don't pick silently:**
+
+- **Subagent** — dispatch one Claude review agent over the branch diff:
+  `Agent(subagent_type: "general-purpose")` with: *"Review `git diff
+  origin/master...HEAD` in this repo for bugs, regressions, and risky changes.
+  Report only real issues as file:line + severity; skip style nits."*
+- **Codex** — `codex exec review --base master`
+- **Gemini** — `git diff origin/master...HEAD | gemini -p "Review this diff for
+  bugs, regressions, and risky changes. List only real issues as file:line +
+  severity; be concise."`
+
+Then read the findings, **fix real issues and push**, and note any dismissed
+finding with a one-line rationale. An *intended* breaking change is triaged
+(documented in the CHANGELOG), not patched with compat code — see CLAUDE.md.
+Proceed only when the diff is clean or every finding is triaged.
+
+### 7. Make CI pass
 ```bash
 gh pr checks --watch
 ```
 If red: open the failing job, root-cause, fix, push, re-watch. Proceed only when every check is green.
 
-### 6. Version + CHANGELOG (commit to the PR, then STOP)
+### 8. Version + CHANGELOG (commit to the PR, then STOP)
 1. Pick the bump from commits since the last tag — `feat:` → minor, `fix:`/`chore:`/`docs:` → patch, `!`/`BREAKING CHANGE` → major:
    ```bash
    git log "$(git describe --tags --abbrev=0 2>/dev/null || echo)"..HEAD --pretty=%s
    ```
    No prior tag → this is the initial release; keep the current version.
 2. Set `version` in `ignis/Cargo.toml` to `X.Y.Z`, then `cargo build` to refresh `Cargo.lock`.
-3. `CHANGELOG.md`: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]`. Keep entries terse — one line each, no prose.
+3. `CHANGELOG.md`: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]`.
+   **Entries are one-line summaries only.** State *what changed* for a user, nothing more. No detail, no how-it-works, no implementation list, no rationale or trade-offs, no parentheticals enumerating internals. One short line per change.
+   - Good: `` - `/copy` — copy the last assistant reply to the system clipboard. ``
+   - Bad: `` - `/copy` slash command — copies the last reply via a platform CLI tool (`pbcopy`/`clip`/`clip.exe`/`wl-copy`/…); 1 MiB cap, no native-clipboard dependency. ``
 4. `git commit -am "chore(release): vX.Y.Z" && git push`
 5. Re-confirm CI is green on the new commit.
 6. **STOP.** Tell the user: "PR <url> is green, bumped to vX.Y.Z — approve squash-merge?" Wait for an explicit yes.
 
-### 7. Squash-merge (only after approval)
+### 9. Squash-merge (only after approval)
 ```bash
 gh pr merge <num> --squash --delete-branch
 ```
 
-### 8. Tag + await release
+### 10. Tag + await release
 ```bash
 git switch master && git pull
 git tag vX.Y.Z && git push origin vX.Y.Z      # triggers the Release workflow

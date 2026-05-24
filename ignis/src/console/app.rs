@@ -53,6 +53,15 @@ pub(crate) struct SessionPicker {
     pub(crate) selected: usize,
 }
 
+/// `/model` picker state. Options live on `App.model_options`; this tracks the
+/// highlighted row and, for a reasoning-capable model, the chosen effort level.
+#[derive(Debug, Clone)]
+pub(crate) struct ModelPicker {
+    pub(crate) selected: usize,
+    /// Index into the selected option's `effort_levels` (ignored if empty).
+    pub(crate) effort_idx: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Mode {
     Idle,
@@ -63,6 +72,8 @@ pub(crate) enum Mode {
 pub(crate) struct App {
     pub(crate) provider: String,
     pub(crate) model: String,
+    /// Active reasoning effort level (shown in the footer); `None` = not set.
+    pub(crate) effort: Option<String>,
     pub(crate) session_id: String,
     pub(crate) cwd: PathBuf,
 
@@ -74,6 +85,9 @@ pub(crate) struct App {
     pub(crate) saved_input: String, // saved input when browsing history
     pub(crate) slash_selection: usize,
     pub(crate) session_picker: Option<SessionPicker>,
+    /// Choices for the `/model` picker, flattened from config.
+    pub(crate) model_options: Vec<crate::config::ModelOption>,
+    pub(crate) model_picker: Option<ModelPicker>,
 
     pub(crate) mode: Mode,
     pub(crate) tick: u64,
@@ -105,6 +119,7 @@ impl App {
         Self {
             provider,
             model,
+            effort: None,
             session_id,
             cwd,
             blocks: Vec::new(),
@@ -115,6 +130,8 @@ impl App {
             saved_input: String::new(),
             slash_selection: 0,
             session_picker: None,
+            model_options: Vec::new(),
+            model_picker: None,
             mode: Mode::Idle,
             tick: 0,
             stream_start: None,
@@ -414,6 +431,97 @@ impl App {
             .map(|session| session.id.clone())
     }
 
+    /// Supply the `/model` picker choices and the active effort level.
+    pub(crate) fn set_model_options(
+        &mut self,
+        options: Vec<crate::config::ModelOption>,
+        effort: Option<String>,
+    ) {
+        self.model_options = options;
+        self.effort = effort;
+    }
+
+    pub(crate) fn show_model_picker(&mut self) {
+        self.exit_pending = false;
+        if self.model_options.is_empty() {
+            self.add_assistant_notice("No models configured.".to_string());
+            return;
+        }
+        let selected = self
+            .model_options
+            .iter()
+            .position(|o| o.provider == self.provider && o.model == self.model)
+            .unwrap_or(0);
+        let effort_idx = self
+            .effort
+            .as_deref()
+            .and_then(|e| {
+                self.model_options[selected]
+                    .effort_levels
+                    .iter()
+                    .position(|l| l == e)
+            })
+            .unwrap_or(0);
+        self.model_picker = Some(ModelPicker {
+            selected,
+            effort_idx,
+        });
+        self.user_scrolled = false;
+        self.auto_scroll();
+    }
+
+    pub(crate) fn select_model_picker(&mut self, direction: SelectionDirection) {
+        self.exit_pending = false;
+        let len = self.model_options.len();
+        if len == 0 {
+            return;
+        }
+        let Some(picker) = &mut self.model_picker else {
+            return;
+        };
+        picker.selected = next_selection(picker.selected, len, direction);
+        let sel = picker.selected;
+        // `picker` borrow ends above; clamp effort to the new model's levels.
+        let levels = self.model_options[sel].effort_levels.len();
+        if let Some(picker) = &mut self.model_picker {
+            if picker.effort_idx >= levels {
+                picker.effort_idx = 0;
+            }
+        }
+    }
+
+    pub(crate) fn cycle_effort(&mut self, direction: SelectionDirection) {
+        self.exit_pending = false;
+        let Some(picker) = &self.model_picker else {
+            return;
+        };
+        let (sel, cur) = (picker.selected, picker.effort_idx);
+        let levels = self.model_options[sel].effort_levels.len();
+        if levels == 0 {
+            return;
+        }
+        let idx = next_selection(cur, levels, direction);
+        if let Some(picker) = &mut self.model_picker {
+            picker.effort_idx = idx;
+        }
+    }
+
+    /// Apply the highlighted selection: update the displayed provider/model/effort,
+    /// close the picker, and return `(provider, model, effort)` to act on.
+    pub(crate) fn apply_model_selection(&mut self) -> Option<(String, String, Option<String>)> {
+        let picker = self.model_picker.take()?;
+        let opt = self.model_options.get(picker.selected)?.clone();
+        let effort = if opt.effort_levels.is_empty() {
+            None
+        } else {
+            opt.effort_levels.get(picker.effort_idx).cloned()
+        };
+        self.provider = opt.provider.clone();
+        self.model = opt.model.clone();
+        self.effort = effort.clone();
+        Some((opt.provider, opt.model, effort))
+    }
+
     pub(crate) fn render_session_history(
         &mut self,
         session_id: String,
@@ -706,7 +814,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            vec!["/resume", "/clear", "/compact", "/copy"]
+            vec!["/resume", "/clear", "/compact", "/copy", "/model"]
         );
     }
 
@@ -732,6 +840,83 @@ mod tests {
             "s".to_string(),
             PathBuf::from("/tmp"),
         )
+    }
+
+    fn picker_app() -> App {
+        let mut app = App::new(
+            "deepseek".to_string(),
+            "deepseek-v4-flash".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        let opt = |provider: &str, model: &str, levels: &[&str]| crate::config::ModelOption {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            effort_levels: levels.iter().map(|s| s.to_string()).collect(),
+        };
+        app.set_model_options(
+            vec![
+                opt("deepseek", "deepseek-v4-flash", &[]),
+                opt("deepseek", "deepseek-v4-pro", &["high", "max"]),
+                opt("kimi-code", "kimi-for-coding", &[]),
+            ],
+            None,
+        );
+        app
+    }
+
+    #[test]
+    fn show_model_picker_highlights_active_model() {
+        let mut app = picker_app();
+        app.show_model_picker();
+        assert_eq!(app.model_picker.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn cycle_effort_wraps_and_is_inert_for_non_reasoning_models() {
+        let mut app = picker_app();
+        app.show_model_picker();
+        // Move to deepseek-v4-pro (has levels high/max).
+        app.select_model_picker(SelectionDirection::Next);
+        assert_eq!(app.model_picker.as_ref().unwrap().selected, 1);
+        app.cycle_effort(SelectionDirection::Next); // high -> max
+        assert_eq!(app.model_picker.as_ref().unwrap().effort_idx, 1);
+        app.cycle_effort(SelectionDirection::Next); // wraps max -> high
+        assert_eq!(app.model_picker.as_ref().unwrap().effort_idx, 0);
+        // Moving to kimi-code (no levels) clamps effort and cycling no-ops.
+        app.cycle_effort(SelectionDirection::Next); // -> max (idx 1)
+        app.select_model_picker(SelectionDirection::Next);
+        assert_eq!(app.model_picker.as_ref().unwrap().effort_idx, 0);
+        app.cycle_effort(SelectionDirection::Next);
+        assert_eq!(app.model_picker.as_ref().unwrap().effort_idx, 0);
+    }
+
+    #[test]
+    fn apply_model_selection_returns_choice_and_updates_display() {
+        let mut app = picker_app();
+        app.show_model_picker();
+        app.select_model_picker(SelectionDirection::Next); // deepseek-v4-pro
+        app.cycle_effort(SelectionDirection::Next); // max
+        let (provider, model, effort) = app.apply_model_selection().unwrap();
+        assert_eq!(
+            (provider.as_str(), model.as_str(), effort.as_deref()),
+            ("deepseek", "deepseek-v4-pro", Some("max"))
+        );
+        assert_eq!(app.provider, "deepseek");
+        assert_eq!(app.model, "deepseek-v4-pro");
+        assert_eq!(app.effort.as_deref(), Some("max"));
+        assert!(app.model_picker.is_none());
+    }
+
+    #[test]
+    fn apply_non_reasoning_model_clears_effort() {
+        let mut app = picker_app();
+        app.effort = Some("max".to_string()); // a stale prior effort
+        app.show_model_picker(); // selected = deepseek-v4-flash (no levels)
+        let (_, model, effort) = app.apply_model_selection().unwrap();
+        assert_eq!(model, "deepseek-v4-flash");
+        assert_eq!(effort, None);
+        assert_eq!(app.effort, None);
     }
 
     #[test]
