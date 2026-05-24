@@ -1,6 +1,6 @@
 # Rust
 /target/
-Cargo.lock
+# Cargo.lock is committed: this workspace ships a binary application.
 
 # IDE / Editors
 .idea/
@@ -35,3 +35,7 @@ raw_run.log
 
 # Project specific
 .context/
+
+# Local Ignis config — may contain API keys. Use config.example.toml as a template.
+/config.toml
+/config.yaml
