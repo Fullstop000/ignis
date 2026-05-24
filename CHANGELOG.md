@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI workflow (`fmt` + `clippy -D warnings` + tests on Linux/macOS) and a
   cross-platform release workflow triggered by `v*` tags.
 - `config.example.toml` template.
+- `/ship` skill (`.claude/skills/ship/`) — the release runbook for this repo.
 
 ### Changed
 - Configuration format migrated from YAML to TOML; config is loaded from
