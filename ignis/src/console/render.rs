@@ -148,6 +148,12 @@ pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
                     }
                 }
                 UIBlock::Assistant(text) => {
+                    // Skip empty assistant placeholders (e.g. tool-only turns,
+                    // or before the first streamed delta) so we don't render a
+                    // bare "> Ignis" header with nothing under it.
+                    if text.is_empty() {
+                        continue;
+                    }
                     lines.push(Line::from(""));
                     lines.push(Line::from(vec![
                         Span::styled("  > ", Style::default().fg(MAUVE)),

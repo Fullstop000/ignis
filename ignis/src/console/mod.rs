@@ -1,5 +1,8 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -161,7 +164,7 @@ pub async fn run_console(
 ) -> Result<(), anyhow::Error> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -296,16 +299,24 @@ pub async fn run_console(
             app.handle_event(ev);
         }
         while event::poll(std::time::Duration::ZERO)? {
-            if let Event::Key(key) = event::read()? {
-                handle_key(
-                    &mut app,
-                    key,
-                    &prompt_tx,
-                    &cancel_tx,
-                    &session_manager,
-                    &ui_storage_dir,
-                )
-                .await;
+            match event::read()? {
+                Event::Key(key) => {
+                    handle_key(
+                        &mut app,
+                        key,
+                        &prompt_tx,
+                        &cancel_tx,
+                        &session_manager,
+                        &ui_storage_dir,
+                    )
+                    .await;
+                }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => app.scroll_up(3),
+                    MouseEventKind::ScrollDown => app.scroll_down(3),
+                    _ => {}
+                },
+                _ => {}
             }
         }
 
@@ -322,7 +333,11 @@ pub async fn run_console(
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
