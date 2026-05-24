@@ -90,7 +90,10 @@ If red: open the failing job, root-cause, fix, push, re-watch. Proceed only when
    ```
    No prior tag → this is the initial release; keep the current version.
 2. Set `version` in `ignis/Cargo.toml` to `X.Y.Z`, then `cargo build` to refresh `Cargo.lock`.
-3. `CHANGELOG.md`: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]`. Keep entries terse — one line each, no prose.
+3. `CHANGELOG.md`: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]`.
+   **Entries are one-line summaries only.** State *what changed* for a user, nothing more. No detail, no how-it-works, no implementation list, no rationale or trade-offs, no parentheticals enumerating internals. One short line per change.
+   - Good: `` - `/copy` — copy the last assistant reply to the system clipboard. ``
+   - Bad: `` - `/copy` slash command — copies the last reply via a platform CLI tool (`pbcopy`/`clip`/`clip.exe`/`wl-copy`/…); 1 MiB cap, no native-clipboard dependency. ``
 4. `git commit -am "chore(release): vX.Y.Z" && git push`
 5. Re-confirm CI is green on the new commit.
 6. **STOP.** Tell the user: "PR <url> is green, bumped to vX.Y.Z — approve squash-merge?" Wait for an explicit yes.

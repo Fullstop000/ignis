@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `/model` — switch provider/model and reasoning effort at runtime, remembered across restarts.
+
 ## [0.5.0] - 2026-05-25
 
 ### Added

@@ -11,18 +11,30 @@ pub struct DeepSeekProvider {
     api_key: String,
     api_url: String,
     model: String,
+    reasoning_effort: Option<String>,
 }
 
 impl DeepSeekProvider {
     pub fn new(api_key: String, model: String) -> Self {
-        Self::with_url(api_key, "https://api.deepseek.com/v1".to_string(), model)
+        Self::with_url(
+            api_key,
+            "https://api.deepseek.com/v1".to_string(),
+            model,
+            None,
+        )
     }
-    pub fn with_url(api_key: String, api_url: String, model: String) -> Self {
+    pub fn with_url(
+        api_key: String,
+        api_url: String,
+        model: String,
+        reasoning_effort: Option<String>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key,
             api_url,
             model,
+            reasoning_effort,
         }
     }
 }
@@ -53,6 +65,7 @@ impl LlmProvider for DeepSeekProvider {
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
+            reasoning_effort: self.reasoning_effort.as_deref(),
         };
 
         let endpoint = if self.api_url.ends_with("/chat/completions") {

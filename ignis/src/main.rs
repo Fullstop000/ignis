@@ -114,16 +114,17 @@ async fn main() -> Result<(), anyhow::Error> {
     let auto_resume = config.auto_resume_last_session.unwrap_or(false);
     let session_request = resolve_session_request(cli, &session_manager, auto_resume, &cwd);
     let system_prompt = build_system_prompt(&cwd);
+    let active_provider = config
+        .active_provider()
+        .unwrap_or_else(|| "default".to_string());
     let active_model = config
-        .providers
-        .get(&config.active_provider)
-        .and_then(|p| p.model.clone())
+        .active_model()
         .unwrap_or_else(|| "default".to_string());
 
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {
         return ignis::console::run_console(
-            config.active_provider.clone(),
+            active_provider,
             active_model,
             session_request.session_id,
             system_prompt,
@@ -136,7 +137,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Route: One-shot CLI mode (ignis "do something")
     println!("=== Ignis (one-shot) ===");
-    println!("Provider: {}/{}", config.active_provider, active_model);
+    println!("Provider: {}/{}", active_provider, active_model);
     println!("Session: {}", session_request.session_id);
 
     let provider = build_provider(&config)?;

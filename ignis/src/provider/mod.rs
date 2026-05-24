@@ -54,6 +54,10 @@ pub struct ChatCompletionsRequest<'a> {
     /// Ask the API to emit a final usage chunk (OpenAI-compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    /// Reasoning effort (`low`/`medium`/`high`); omitted when the model/provider
+    /// doesn't support it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Serialize)]

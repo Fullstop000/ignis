@@ -8,7 +8,7 @@ use ratatui::{
 use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{App, Mode, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
+use super::app::{App, Mode, ModelPicker, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
 use super::markdown::render_md_block;
 use super::{
     format_duration, format_tokens, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, GREEN,
@@ -91,10 +91,13 @@ pub(crate) fn draw_loading(f: &mut Frame, area: Rect, app: &App) {
 /// Status footer under the input: working dir (left) and model + token usage (right).
 pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let (ctx_tokens, ctx_pct) = app.context_usage();
+    let model_str = match &app.effort {
+        Some(e) => format!("{}/{} ({})", app.provider, app.model, e),
+        None => format!("{}/{}", app.provider, app.model),
+    };
     let right_str = format!(
-        " {}/{}  ·  {} tok ({}%) ",
-        app.provider,
-        app.model,
+        " {}  ·  {} tok ({}%) ",
+        model_str,
         format_tokens(ctx_tokens as usize),
         ctx_pct
     );
@@ -125,7 +128,9 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
 
-    if let Some(picker) = &app.session_picker {
+    if let Some(picker) = &app.model_picker {
+        render_model_picker(&mut lines, picker, &app.model_options);
+    } else if let Some(picker) = &app.session_picker {
         // Resume view: show only the picker, never the prior conversation.
         render_session_picker(&mut lines, picker);
     } else if app.blocks.is_empty() {
@@ -300,6 +305,74 @@ pub(crate) fn render_session_picker(lines: &mut Vec<Line<'static>>, picker: &Ses
 
     lines.push(Line::from(Span::styled(
         "  Use Up/Down to choose, Enter to resume.",
+        Style::default().fg(TEXT_DIM),
+    )));
+}
+
+pub(crate) fn render_model_picker(
+    lines: &mut Vec<Line<'static>>,
+    picker: &ModelPicker,
+    options: &[crate::config::ModelOption],
+) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ◆ ", Style::default().fg(MAUVE)),
+        Span::styled(
+            "Switch model",
+            Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    if options.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No models configured.",
+            Style::default().fg(TEXT_DIM),
+        )));
+        return;
+    }
+
+    // Effort row, shown only when the highlighted model declares levels.
+    let sel = picker.selected.min(options.len() - 1);
+    let levels = &options[sel].effort_levels;
+    if !levels.is_empty() {
+        let mut spans = vec![Span::styled("  effort:", Style::default().fg(TEXT_DIM))];
+        for (i, level) in levels.iter().enumerate() {
+            let style = if i == picker.effort_idx {
+                Style::default()
+                    .fg(BG)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(SUBTEXT)
+            };
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!(" {} ", level), style));
+        }
+        spans.push(Span::styled("   ←/→", Style::default().fg(TEXT_DIM)));
+        lines.push(Line::from(spans));
+    }
+
+    for (idx, opt) in options.iter().enumerate() {
+        let selected = idx == picker.selected;
+        let marker = if selected { ">" } else { " " };
+        let style = if selected {
+            Style::default().fg(BG).bg(ACCENT)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        let label = if opt.effort_levels.is_empty() {
+            format!("{}/{}", opt.provider, opt.model)
+        } else {
+            format!("{}/{} ◆", opt.provider, opt.model)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} ", marker), style.add_modifier(Modifier::BOLD)),
+            Span::styled(label, style.add_modifier(Modifier::BOLD)),
+        ]));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  Up/Down model · ←/→ effort · Enter apply · Esc cancel",
         Style::default().fg(TEXT_DIM),
     )));
 }
@@ -587,6 +660,50 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    #[test]
+    fn render_model_picker_shows_effort_only_for_reasoning_models() {
+        let mut app = App::new(
+            "deepseek".to_string(),
+            "deepseek-v4-flash".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        let opt = |p: &str, m: &str, l: &[&str]| crate::config::ModelOption {
+            provider: p.to_string(),
+            model: m.to_string(),
+            effort_levels: l.iter().map(|s| s.to_string()).collect(),
+        };
+        app.set_model_options(
+            vec![
+                opt("deepseek", "deepseek-v4-flash", &[]),
+                opt("deepseek", "deepseek-v4-pro", &["high", "max"]),
+            ],
+            None,
+        );
+        app.show_model_picker(); // highlights flash (no effort)
+
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let content = buffer_content(&term);
+        assert!(content.contains("Switch model"));
+        assert!(
+            content.contains("deepseek-v4-pro ◆"),
+            "reasoning models get a ◆"
+        );
+        assert!(
+            !content.contains("effort:"),
+            "no effort row when a non-reasoning model is highlighted"
+        );
+
+        // Highlight the reasoning model → the effort row appears.
+        app.select_model_picker(crate::console::SelectionDirection::Next);
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let content = buffer_content(&term);
+        assert!(content.contains("effort:"));
+        assert!(content.contains("high") && content.contains("max"));
     }
 
     #[test]

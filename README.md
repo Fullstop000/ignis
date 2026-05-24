@@ -17,7 +17,9 @@ TUI and a one-shot CLI, with built-in tools and a simple plugin system.
   `bash`, and `web_search` (switchable Brave / Tavily backends).
 - **Plugins** — add external tools with a small YAML manifest; no recompile.
 - **Sessions** — project-scoped JSONL history, `--resume`, auto-resume, and
-  slash commands (`/resume`, `/clear`, `/compact`, `/copy`).
+  slash commands (`/resume`, `/clear`, `/compact`, `/copy`, `/model`).
+- **Runtime model switching** — `/model` picks the provider/model and (for
+  reasoning models) the effort level, and saves it back to your config.
 - **Single binary** — no external runtime dependencies.
 
 > `/copy` (copy the last reply to the clipboard) uses a platform clipboard tool:
@@ -48,15 +50,33 @@ cp config.example.toml ~/.ignis/config.toml
 # then edit ~/.ignis/config.toml and add your API key(s)
 ```
 
-Minimal `config.toml`:
+Minimal `config.toml` — the top-level `model` is the active selection
+(`provider/model`, an optional default); each provider lists the models it offers:
 
 ```toml
-active_provider = "kimi-code"
+model = "kimi-code/kimi-for-coding"
 
 [providers."kimi-code"]
 api_key = "sk-your-kimi-key"
 api_url = "https://api.kimi.com/coding/v1"
-model   = "kimi-for-coding"
+models  = ["kimi-for-coding"]
+```
+
+`/model` switches the active selection at runtime. It writes the choice to
+`~/.ignis/state.json` (which takes priority over the config default) — your
+`config.toml` is never auto-edited. Reasoning-effort levels differ by model, so
+declare them per model — the picker shows the effort control only for models
+that have levels:
+
+```toml
+model = "deepseek/deepseek-v4-flash"
+
+[providers.deepseek]
+api_key = "sk-your-deepseek-key"
+models  = ["deepseek-v4-flash", "deepseek-v4-pro"]
+
+[providers.deepseek.reasoning]
+deepseek-v4-pro = ["high", "max"]
 ```
 
 > Your `~/.ignis/config.toml` holds secrets. The repo-level `config.toml` /
