@@ -596,12 +596,10 @@ impl App {
         });
 
         match text {
-            Some(content) => {
-                match super::clipboard::set_clipboard(&content) {
-                    Ok(()) => self.add_assistant_notice("Copied to clipboard.".to_string()),
-                    Err(e) => self.add_assistant_notice(format!("Copy failed: {e}")),
-                }
-            }
+            Some(content) => match super::clipboard::set_clipboard(&content) {
+                Ok(()) => self.add_assistant_notice("Copied to clipboard.".to_string()),
+                Err(e) => self.add_assistant_notice(format!("Copy failed: {e}")),
+            },
             None => self.add_assistant_notice("Nothing to copy.".to_string()),
         }
     }
@@ -625,9 +623,11 @@ mod copy_tests {
     fn copy_finds_last_assistant_message() {
         let mut app = test_app();
         app.blocks.push(UIBlock::User("user msg".to_string()));
-        app.blocks.push(UIBlock::Assistant("first reply".to_string()));
+        app.blocks
+            .push(UIBlock::Assistant("first reply".to_string()));
         app.blocks.push(UIBlock::User("user msg 2".to_string()));
-        app.blocks.push(UIBlock::Assistant("last reply".to_string()));
+        app.blocks
+            .push(UIBlock::Assistant("last reply".to_string()));
 
         app.copy_last_assistant_message();
 

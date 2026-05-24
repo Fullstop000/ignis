@@ -21,10 +21,10 @@ fn try_platform_clipboard(text: &str) -> Result<(), String> {
         "windows" => vec![("clip", vec![])],
         "macos" => vec![("pbcopy", vec![])],
         "linux" => vec![
-            ("clip.exe", vec![]),                 // WSL
-            ("wl-copy", vec![]),                  // Wayland
+            ("clip.exe", vec![]),                       // WSL
+            ("wl-copy", vec![]),                        // Wayland
             ("xclip", vec!["-selection", "clipboard"]), // X11
-            ("xsel", vec!["-b"]),                 // X11 alternative
+            ("xsel", vec!["-b"]),                       // X11 alternative
         ],
         _ => vec![],
     };
@@ -41,16 +41,21 @@ fn try_platform_clipboard(text: &str) -> Result<(), String> {
 fn try_clip_command(cmd: &str, args: &[&str], text: &str) -> Result<(), String> {
     let mut command = Command::new(cmd);
     command.args(args).stdin(Stdio::piped());
-    let mut child = command.spawn().map_err(|_| "not found")?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("{cmd} not found: {e}"))?;
     if let Some(stdin) = child.stdin.take() {
         let mut writer = std::io::BufWriter::new(stdin);
-        writer.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        writer
+            .write_all(text.as_bytes())
+            .map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())?;
     }
     let status = child.wait().map_err(|e| e.to_string())?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("{} exited with status {}", cmd, status))
+        Err(format!("{cmd} exited with status {status}"))
     }
 }
 
