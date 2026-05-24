@@ -230,11 +230,7 @@ pub async fn run_console(
             };
             session.set_compaction(agent_config.compaction.clone());
 
-            crate::tools::register_native_tools(
-                &mut session,
-                &agent_cwd,
-                agent_config.web_search.clone(),
-            );
+            crate::tools::register_native_tools(&mut session, &agent_cwd, &agent_config);
             let ext_dirs = crate::tools::plugin::default_extension_dirs();
             let plugins = crate::tools::plugin::load_extensions(&ext_dirs);
             for plugin in plugins {

@@ -67,9 +67,38 @@ impl AgentTool for EditFileTool {
 
         let new_content = content.replacen(old_text, new_text, 1);
         match tokio::fs::write(&resolved, &new_content).await {
-            Ok(()) => ToolResult::ok(format!("Edited file: {}", resolved.display())),
+            Ok(()) => ToolResult::ok(render_edit_diff(old_text, new_text)),
             Err(e) => ToolResult::error(format!("Failed to write file: {e}")),
         }
+    }
+}
+
+/// Lines shown per side before truncating a large hunk.
+const MAX_DIFF_LINES_PER_SIDE: usize = 25;
+
+/// Render the replacement as a git-style hunk: removed lines prefixed `-`,
+/// added lines prefixed `+`. The console colors these red/green.
+fn render_edit_diff(old_text: &str, new_text: &str) -> String {
+    let mut out = String::new();
+    push_diff_side(&mut out, old_text, '-');
+    push_diff_side(&mut out, new_text, '+');
+    if out.is_empty() {
+        out.push_str("(no changes)");
+    }
+    out
+}
+
+fn push_diff_side(out: &mut String, text: &str, sign: char) {
+    let lines: Vec<&str> = text.lines().collect();
+    let shown = lines.len().min(MAX_DIFF_LINES_PER_SIDE);
+    for line in &lines[..shown] {
+        out.push(sign);
+        out.push(' ');
+        out.push_str(line);
+        out.push('\n');
+    }
+    if lines.len() > shown {
+        out.push_str(&format!("{sign} … ({} more lines)\n", lines.len() - shown));
     }
 }
 
@@ -94,7 +123,9 @@ mod tests {
             .await;
 
         assert!(!res.is_error);
-        assert!(res.content.contains("Edited file"));
+        // Output is a git-style diff of the replaced text.
+        assert!(res.content.contains("- brown fox"), "got: {}", res.content);
+        assert!(res.content.contains("+ red panda"), "got: {}", res.content);
 
         let edited_content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(

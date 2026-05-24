@@ -356,20 +356,30 @@ pub(crate) fn render_tool_block(
             ]));
         }
         ToolStatus::Success(out) => {
-            // Show first 3 lines of output
-            for sl in out.lines().take(3) {
-                let display = truncate(&sanitize(sl), 100);
+            // edit_file returns a git-style diff: show the whole hunk with
+            // red/green +/- coloring. Other tools get a compact 3-line preview.
+            let is_diff = entry.name == "edit_file";
+            let max = if is_diff { 30 } else { 3 };
+            for sl in out.lines().take(max) {
+                let display = truncate(&sanitize(sl), 200);
+                let line_style = if is_diff && display.starts_with('+') {
+                    Style::default().fg(GREEN)
+                } else if is_diff && display.starts_with('-') {
+                    Style::default().fg(RED)
+                } else {
+                    Style::default().fg(TEXT_DIM)
+                };
                 lines.push(Line::from(vec![
                     Span::styled("  │ ", Style::default().fg(color)),
-                    Span::styled(display, Style::default().fg(TEXT_DIM)),
+                    Span::styled(display, line_style),
                 ]));
             }
             let total_lines = out.lines().count();
-            if total_lines > 3 {
+            if total_lines > max {
                 lines.push(Line::from(vec![
                     Span::styled("  │ ", Style::default().fg(color)),
                     Span::styled(
-                        format!("… {} more lines", total_lines - 3),
+                        format!("… {} more lines", total_lines - max),
                         Style::default().fg(TEXT_DIM),
                     ),
                 ]));
@@ -388,9 +398,9 @@ pub(crate) fn render_tool_block(
     lines.push(Line::from(Span::styled("  └", Style::default().fg(color))));
 }
 
-/// Produce a compact arg summary from JSON, e.g. `read_file(src/main.rs)`.
-/// Path-valued args render bare (no `key=`, no quotes) and relative to `cwd`;
-/// other args keep `key=value`.
+/// Produce a compact arg summary from JSON, showing **values only** (never the
+/// parameter names): `grep("fn main")`, `read_file(src/main.rs)`. Path-valued
+/// args render bare and relative to `cwd`; other strings keep their quotes.
 pub(crate) fn compact_tool_args(json_str: &str, cwd: &Path) -> String {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
         return truncate(json_str, 60);
@@ -404,16 +414,10 @@ pub(crate) fn compact_tool_args(json_str: &str, cwd: &Path) -> String {
             serde_json::Value::String(s) if is_path_key(k) => {
                 truncate(&relativize_path(s, cwd), 60)
             }
-            serde_json::Value::String(s) => {
-                let t = truncate(s, 40);
-                format!("{}=\"{}\"", k, t)
-            }
-            serde_json::Value::Number(n) => format!("{}={}", k, n),
-            serde_json::Value::Bool(b) => format!("{}={}", k, b),
-            _ => {
-                let t = truncate(&v.to_string(), 30);
-                format!("{}={}", k, t)
-            }
+            serde_json::Value::String(s) => format!("\"{}\"", truncate(s, 40)),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            other => truncate(&other.to_string(), 30),
         };
         parts.push(s);
     }
@@ -582,10 +586,10 @@ mod tests {
             compact_tool_args(r#"{"path":"ignis/src/main.rs"}"#, &cwd),
             "src/main.rs"
         );
-        // Non-path args keep key="value".
+        // Non-path string args show the value only (quoted), never the param name.
         assert_eq!(
-            compact_tool_args(r#"{"command":"echo hi"}"#, &cwd),
-            "command=\"echo hi\""
+            compact_tool_args(r#"{"pattern":"fn main"}"#, &cwd),
+            "\"fn main\""
         );
     }
 
@@ -676,6 +680,35 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("read_file"), "should show tool name");
         assert!(content.contains("file content"), "should show tool output");
+    }
+
+    #[test]
+    fn render_edit_file_shows_diff_lines() {
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        app.blocks.push(UIBlock::Tool(ToolCallEntry {
+            id: "c".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path":"src/x.rs"}"#.to_string(),
+            status: ToolStatus::Success("- let x = 1;\n+ let x = 2;".to_string()),
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 5,
+        }));
+
+        let mut term = test_terminal(100, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(content.contains("- let x = 1;"), "should show removed line");
+        assert!(content.contains("+ let x = 2;"), "should show added line");
+        assert!(
+            !content.contains("Edited file"),
+            "old message should be gone"
+        );
     }
 
     #[test]

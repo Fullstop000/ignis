@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-24
+
+### Added
+- `grep` tool — regex content search across the project, gitignore-aware (ripgrep's `ignore` + `regex`).
+- `glob` tool — find files by glob pattern (`**/*.rs`), gitignore-aware.
+- `web_fetch` tool — fetch a URL and return its readable text (HTML stripped); pairs with `web_search`.
+- `agent` tool — delegate a self-contained task to a one-level sub-agent that has the base toolset and returns its final answer.
+
+### Changed
+- Tool-call headers show argument values only, never parameter names (e.g. `grep("fn main")`).
+- `edit_file` returns a git-style diff; the console renders removed lines red and added lines green.
+
 ## [0.2.1] - 2026-05-24
 
 ### Changed
