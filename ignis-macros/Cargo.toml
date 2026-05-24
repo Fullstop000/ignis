@@ -2,6 +2,9 @@
 name = "ignis-macros"
 version = "0.1.0"
 edition = "2021"
+description = "Procedural macros for the ignis agent framework (the #[tool] attribute)."
+license = "Apache-2.0"
+repository = "https://github.com/Fullstop000/ignis"
 
 [lib]
 proc-macro = true

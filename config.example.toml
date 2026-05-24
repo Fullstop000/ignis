@@ -1,0 +1,39 @@
+# Ignis configuration — copy to ~/.ignis/config.toml and fill in your keys.
+# ========================================================================
+
+active_provider = "kimi-code"
+auto_resume_last_session = false
+
+[providers."kimi-code"]
+api_key = "sk-your-kimi-key"
+api_url = "https://api.kimi.com/coding/v1"
+model   = "kimi-for-coding"
+
+# Other providers — uncomment and configure as needed.
+# [providers.openai]
+# api_key = "sk-your-openai-key"
+# api_url = "https://api.openai.com/v1"
+# model   = "gpt-4o"
+#
+# [providers.deepseek]
+# api_key = "sk-your-deepseek-key"
+# api_url = "https://api.deepseek.com/v1"
+# model   = "deepseek-reasoner"
+#
+# [providers.anthropic]
+# api_key = "your-anthropic-key"
+# model   = "claude-sonnet-4-20250514"
+#
+# [providers.gemini]
+# api_key = "your-gemini-key"
+# model   = "gemini-2.5-pro"
+#
+# [providers.ollama]
+# api_url = "http://localhost:11434"
+# model   = "llama3"
+
+# Web search tool (optional). Switch backends via `provider`.
+# See docs/web-search.md for details.
+# [web_search]
+# provider = "brave"   # supported: brave, tavily
+# api_key  = "your-search-api-key"
