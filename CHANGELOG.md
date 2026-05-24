@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-24
+
+### Added
+- Real token usage: OpenAI-compatible providers (incl. kimi) report actual `usage`; captured via `LlmResponseDelta::Usage` / `AgentEvent::Usage`.
+- Token usage is persisted per session (`<id>.usage.json`) and reloaded on open.
+- Footer shows real context tokens (e.g. `1.6k tok (1%)`), falling back to a chars/4 estimate when a provider doesn't report usage.
+
+### Changed
+- Loader is livelier: rotating whimsical verbs (Thinking → Pondering → Nebulizing → …) plus live output tokens & tok/s while streaming.
+
 ## [0.3.0] - 2026-05-24
 
 ### Added
