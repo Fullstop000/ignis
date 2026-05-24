@@ -276,50 +276,48 @@ pub async fn run_console(
         }
     });
 
-    // 60fps tick
-    let tick = std::time::Duration::from_millis(16);
+    // Render at a capped frame rate. Agent events and keystrokes are coalesced
+    // between frames and the screen is redrawn at most once per frame, so a fast
+    // token stream never triggers a redraw per delta — which tears/flickers on
+    // slow terminals (e.g. Windows Terminal over WSL2).
+    let frame = std::time::Duration::from_millis(33); // ~30fps cap
+    let mut last_draw = std::time::Instant::now();
+    terminal.draw(|f| draw(f, &mut app))?;
 
     loop {
-        terminal.draw(|f| draw(f, &mut app))?;
-
+        // Wake on either the next frame deadline or an incoming agent event.
         tokio::select! {
-            _ = tokio::time::sleep(tick) => {
-                app.tick_update();
-                while event::poll(std::time::Duration::ZERO)? {
-                    if let Event::Key(key) = event::read()? {
-                        handle_key(
-                            &mut app,
-                            key,
-                            &prompt_tx,
-                            &cancel_tx,
-                            &session_manager,
-                            &ui_storage_dir,
-                        ).await;
-                    }
-                }
-            }
-            Some(ev) = agent_rx.recv() => {
-                app.handle_event(ev);
-                while let Ok(ev) = agent_rx.try_recv() {
-                    app.handle_event(ev);
-                }
-                while event::poll(std::time::Duration::ZERO)? {
-                    if let Event::Key(key) = event::read()? {
-                        handle_key(
-                            &mut app,
-                            key,
-                            &prompt_tx,
-                            &cancel_tx,
-                            &session_manager,
-                            &ui_storage_dir,
-                        ).await;
-                    }
-                }
+            _ = tokio::time::sleep(frame) => {}
+            Some(ev) = agent_rx.recv() => app.handle_event(ev),
+        }
+
+        // Drain any other pending agent events and key input — state only, no draw.
+        while let Ok(ev) = agent_rx.try_recv() {
+            app.handle_event(ev);
+        }
+        while event::poll(std::time::Duration::ZERO)? {
+            if let Event::Key(key) = event::read()? {
+                handle_key(
+                    &mut app,
+                    key,
+                    &prompt_tx,
+                    &cancel_tx,
+                    &session_manager,
+                    &ui_storage_dir,
+                )
+                .await;
             }
         }
 
         if app.should_quit {
             break;
+        }
+
+        // Coalesced redraw: at most once per frame interval.
+        if last_draw.elapsed() >= frame {
+            app.tick_update();
+            terminal.draw(|f| draw(f, &mut app))?;
+            last_draw = std::time::Instant::now();
         }
     }
 
