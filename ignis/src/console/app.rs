@@ -507,7 +507,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            vec!["/resume", "/new", "/clear", "/compact"]
+            vec!["/resume", "/clear", "/compact"]
         );
     }
 
@@ -515,7 +515,9 @@ mod tests {
     fn slash_suggestions_filter_by_command_name_or_description() {
         assert_eq!(slash_suggestions("/res")[0].name, "/resume");
         assert_eq!(slash_suggestions("/list")[0].name, "/resume");
-        assert_eq!(slash_suggestions("/new")[0].name, "/new");
+        // `/new` is merged into `/clear`: typing it still surfaces /clear via
+        // its description ("Start a new session").
+        assert_eq!(slash_suggestions("/new")[0].name, "/clear");
         assert_eq!(slash_suggestions("/clear")[0].name, "/clear");
     }
 

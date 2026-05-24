@@ -17,7 +17,7 @@ TUI and a one-shot CLI, with built-in tools and a simple plugin system.
   `bash`, and `web_search` (switchable Brave / Tavily backends).
 - **Plugins** — add external tools with a small YAML manifest; no recompile.
 - **Sessions** — project-scoped JSONL history, `--resume`, auto-resume, and
-  slash commands (`/resume`, `/new`, `/clear`).
+  slash commands (`/resume`, `/clear`, `/compact`).
 - **Single binary** — no external runtime dependencies.
 
 ## Install

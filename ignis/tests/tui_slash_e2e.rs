@@ -174,8 +174,8 @@ fn slash_autocomplete_can_run_resume_and_render_selected_history() {
 
     tui.send("/");
     tui.wait_for("/resume");
-    tui.wait_for("/new");
     tui.wait_for("/clear");
+    tui.wait_for("/compact");
 
     // First item (/resume) is already selected, just press Enter
     tui.send("\r");
@@ -216,7 +216,10 @@ fn resume_command_lists_sessions_and_enter_resumes_selection() {
 }
 
 #[test]
-fn new_command_starts_a_fresh_session() {
+fn new_typed_resolves_to_clear() {
+    // `/new` was merged into `/clear`; typing it still starts a fresh session
+    // because the suggestion menu surfaces /clear (matched on its description)
+    // and Enter runs the selected command.
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
 

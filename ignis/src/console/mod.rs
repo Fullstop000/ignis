@@ -54,12 +54,8 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "List and resume sessions",
     },
     SlashCommand {
-        name: "/new",
-        description: "Start a new session",
-    },
-    SlashCommand {
         name: "/clear",
-        description: "Alias for /new",
+        description: "Start a new session",
     },
     SlashCommand {
         name: "/compact",
@@ -467,7 +463,7 @@ async fn handle_key(
                         sessions.sort_by_key(|s| std::cmp::Reverse(s.last_modified));
                     }
                     app.show_session_picker(sessions);
-                } else if (command == "/new" || command == "/clear") && arg_count == 1 {
+                } else if command == "/clear" && arg_count == 1 {
                     let new_id = crate::session::SessionManager::create_id();
                     // Create an empty session file so /sessions can see it
                     let storage = crate::storage::FileStorage::new(storage_dir.to_path_buf());
