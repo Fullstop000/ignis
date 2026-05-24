@@ -528,6 +528,15 @@ async fn handle_key(
         (_, KeyCode::Down) => {
             app.history_next();
         }
+        (m, KeyCode::Char('j'))
+            if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
+        {
+            // Ctrl/Cmd+J inserts a newline (Enter still submits).
+            app.clear_exit_hint();
+            app.input.insert(app.cursor, '\n');
+            app.cursor += 1;
+            app.reset_slash_selection();
+        }
         (_, KeyCode::Char(c)) => {
             app.clear_exit_hint();
             app.input.insert(app.cursor, c);

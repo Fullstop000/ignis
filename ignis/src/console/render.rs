@@ -17,42 +17,62 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let size = f.size();
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
+    // Input box grows with its line count (Ctrl/Cmd+J inserts newlines).
+    let input_text_lines = app.input.split('\n').count().max(1) as u16;
+    let input_height = (input_text_lines + 2).clamp(3, 10);
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Min(6),    // messages
-            Constraint::Length(3), // input
-            Constraint::Length(1), // status bar
+            Constraint::Length(1),            // header
+            Constraint::Min(3),               // messages (borderless)
+            Constraint::Length(1),            // loading status (above input)
+            Constraint::Length(input_height), // input
         ])
         .split(size);
 
     draw_header(f, layout[0], app);
     draw_messages(f, layout[1], app);
     draw_slash_suggestions(f, layout[1], app);
-    draw_input(f, layout[2], app);
-    draw_status(f, layout[3], app);
+    draw_loading(f, layout[2], app);
+    draw_input(f, layout[3], app);
+}
+
+/// Loading/status line shown directly above the input box (Claude Code style).
+pub(crate) fn draw_loading(f: &mut Frame, area: Rect, app: &App) {
+    let line = if app.exit_pending {
+        Line::from(Span::styled(
+            "  Press Ctrl-D again to exit",
+            Style::default().fg(YELLOW),
+        ))
+    } else if let Some((msg, _)) = &app.error_flash {
+        Line::from(Span::styled(
+            format!("  ✗ {}", msg),
+            Style::default().fg(RED),
+        ))
+    } else {
+        let label = match app.mode {
+            Mode::Thinking => "Thinking…",
+            Mode::ToolRunning => "Running tool…",
+            Mode::Idle => "",
+        };
+        if label.is_empty() {
+            Line::from("")
+        } else {
+            Line::from(vec![
+                Span::styled(format!("  {} ", app.spinner()), Style::default().fg(ACCENT)),
+                Span::styled(label, Style::default().fg(SUBTEXT)),
+                Span::styled(
+                    format!("  {}  ·  ctrl+c to interrupt", app.elapsed_str()),
+                    Style::default().fg(TEXT_DIM),
+                ),
+            ])
+        }
+    };
+    f.render_widget(Paragraph::new(line).style(Style::default().bg(BG)), area);
 }
 
 pub(crate) fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let mode_span = match app.mode {
-        Mode::Idle => Span::styled(" > ", Style::default().fg(TEXT_DIM)),
-        Mode::Thinking => Span::styled(format!(" {} ", app.spinner()), Style::default().fg(ACCENT)),
-        Mode::ToolRunning => {
-            Span::styled(format!(" {} ", app.spinner()), Style::default().fg(YELLOW))
-        }
-    };
-
-    let elapsed = if app.mode != Mode::Idle {
-        // Fixed-width elapsed so pad doesn't jitter as ms grows
-        Span::styled(
-            format!(" {:>6}", app.elapsed_str()),
-            Style::default().fg(TEXT_DIM),
-        )
-    } else {
-        Span::styled("        ", Style::default().fg(TEXT_DIM))
-    };
-
     let cwd_str = format!(" {} ", app.cwd.display());
     let header_layout = Layout::default()
         .direction(Direction::Horizontal)
@@ -60,7 +80,7 @@ pub(crate) fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     let left = Line::from(vec![
-        mode_span,
+        Span::styled(" 🔥 ", Style::default()),
         Span::styled(
             "ignis",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -74,7 +94,6 @@ pub(crate) fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             format!("  {}", app.session_id),
             Style::default().fg(TEXT_DIM),
         ),
-        elapsed,
     ]);
 
     let right = Line::from(Span::styled(cwd_str, Style::default().fg(TEXT_DIM)));
@@ -176,8 +195,8 @@ pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    // Calculate scroll bounds
-    let visible = area.height.saturating_sub(2); // borders
+    // Calculate scroll bounds (borderless: full height is visible)
+    let visible = area.height;
     let total = lines.len() as u16;
     app.max_scroll = total.saturating_sub(visible);
     if !app.user_scrolled {
@@ -187,13 +206,8 @@ pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
     app.scroll = app.scroll.min(app.max_scroll);
 
     let text = Text::from(lines);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(BG));
-
     let paragraph = Paragraph::new(text)
-        .block(block)
+        .style(Style::default().bg(BG))
         .wrap(Wrap { trim: false })
         .scroll((app.scroll, 0));
     f.render_widget(paragraph, area);
@@ -411,23 +425,24 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     let active = app.mode == Mode::Idle;
     let border_color = if active { BORDER_ACTIVE } else { BORDER };
 
-    let content = if app.input.is_empty() && active {
-        Text::from(Span::styled(
-            " Type a message…",
-            Style::default().fg(TEXT_DIM),
-        ))
-    } else if app.input.is_empty() {
-        let label = match app.mode {
-            Mode::Thinking => format!(" {} Thinking…", app.spinner()),
-            Mode::ToolRunning => format!(" {} Running tool…", app.spinner()),
-            Mode::Idle => String::new(),
-        };
-        Text::from(Span::styled(label, Style::default().fg(TEXT_DIM)))
+    let content = if app.input.is_empty() {
+        if active {
+            Text::from(Span::styled(
+                "Type a message…",
+                Style::default().fg(TEXT_DIM),
+            ))
+        } else {
+            Text::from("")
+        }
     } else {
-        Text::from(Span::styled(
-            format!(" {}", &app.input),
-            Style::default().fg(TEXT),
-        ))
+        // Build one Line per newline-separated row (a Span with embedded "\n"
+        // does not wrap, so we split explicitly).
+        Text::from(
+            app.input
+                .split('\n')
+                .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(TEXT))))
+                .collect::<Vec<_>>(),
+        )
     };
 
     let block = Block::default()
@@ -443,8 +458,11 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 
     if active {
-        // cursor: +2 for border + leading space
-        f.set_cursor(area.x + app.cursor as u16 + 2, area.y + 1);
+        // Place the cursor at its (row, col) within the multi-line input.
+        let before = &app.input[..app.cursor];
+        let row = before.matches('\n').count() as u16;
+        let col = (before.len() - before.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u16;
+        f.set_cursor(area.x + 1 + col, area.y + 1 + row);
     }
 }
 
@@ -501,70 +519,6 @@ pub(crate) fn draw_slash_suggestions(f: &mut Frame, messages_area: Rect, app: &A
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-pub(crate) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let mut spans: Vec<Span> = vec![Span::styled(" ", Style::default())];
-
-    if app.exit_pending {
-        spans.push(Span::styled(
-            " Press Ctrl-D again to exit ",
-            Style::default().fg(BG).bg(YELLOW),
-        ));
-        spans.push(Span::styled("  ", Style::default()));
-    }
-
-    // Error flash
-    if let Some((msg, _)) = &app.error_flash {
-        spans.push(Span::styled(
-            format!(" x {} ", msg),
-            Style::default().fg(BG).bg(RED),
-        ));
-        spans.push(Span::styled("  ", Style::default()));
-    }
-
-    let keybinds: Vec<(&str, &str)> = match app.mode {
-        Mode::Idle if app.session_picker.is_some() => vec![
-            ("↑↓", "pick"),
-            ("enter", "resume"),
-            ("esc", "cancel"),
-            ("ctrl+d", "exit"),
-        ],
-        Mode::Idle if !app.slash_suggestions().is_empty() => vec![
-            ("↑↓", "pick"),
-            ("enter", "run"),
-            ("shift+↑↓", "scroll"),
-            ("esc", "cancel"),
-            ("ctrl+d", "exit"),
-        ],
-        Mode::Idle => vec![
-            ("enter", "send"),
-            ("↑↓", "history"),
-            ("shift+↑↓", "scroll"),
-            ("ctrl+u", "clear"),
-            ("ctrl+d", "exit"),
-        ],
-        _ => vec![
-            ("ctrl+c", "stop"),
-            ("shift+↑↓", "scroll"),
-            ("ctrl+d", "exit"),
-        ],
-    };
-
-    for (key, desc) in keybinds {
-        spans.push(Span::styled(
-            format!(" {} ", key),
-            Style::default().fg(SURFACE).bg(SUBTEXT),
-        ));
-        spans.push(Span::styled(
-            format!(" {} ", desc),
-            Style::default().fg(TEXT_DIM),
-        ));
-    }
-
-    let line = Line::from(spans);
-    let bar = Paragraph::new(line).style(Style::default().bg(SURFACE));
-    f.render_widget(bar, area);
 }
 
 // ==========================================
@@ -713,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn render_status_bar_shows_idle_keybinds() {
+    fn render_idle_has_no_keybinding_bar() {
         let mut app = App::new(
             "test".to_string(),
             "model".to_string(),
@@ -725,12 +679,19 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let content = buffer_content(&term);
-        assert!(content.contains("enter"), "should show send keybind");
-        assert!(content.contains("ctrl+d"), "should show exit keybind");
+        // The permanent keybinding hint bar is gone; the input placeholder shows.
+        assert!(
+            !content.contains("ctrl+u"),
+            "keybinding bar should be removed"
+        );
+        assert!(
+            content.contains("Type a message"),
+            "should show input prompt"
+        );
     }
 
     #[test]
-    fn render_status_bar_shows_thinking_keybinds() {
+    fn render_loading_line_shows_thinking() {
         let mut app = App::new(
             "test".to_string(),
             "model".to_string(),
@@ -743,7 +704,11 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let content = buffer_content(&term);
-        assert!(content.contains("ctrl+c"), "should show stop keybind");
+        assert!(content.contains("Thinking"), "should show loading status");
+        assert!(
+            content.contains("ctrl+c to interrupt"),
+            "should show interrupt hint while busy",
+        );
     }
 
     #[test]
