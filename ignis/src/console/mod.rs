@@ -42,6 +42,19 @@ pub(crate) const CODE_BG: Color = Color::Rgb(30, 30, 46);
 
 pub(crate) const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Playful status verbs cycled while the model is generating, for a livelier
+/// "Thinking" indicator. First entry is the default at t=0.
+pub(crate) const THINKING_VERBS: &[&str] = &[
+    "Thinking",
+    "Pondering",
+    "Reasoning",
+    "Cooking",
+    "Crunching",
+    "Brewing",
+    "Conjuring",
+    "Synthesizing",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SlashCommand {
     pub(crate) name: &'static str,
@@ -90,6 +103,15 @@ pub(crate) fn format_duration(ms: u128) -> String {
         format!("{}ms", ms)
     } else {
         format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
+/// Human-friendly token count: `999`, `1.5k`, `120k`.
+pub(crate) fn format_tokens(n: usize) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", n as f64 / 1000.0)
     }
 }
 

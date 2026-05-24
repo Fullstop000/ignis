@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use super::{
     format_duration, next_selection, slash_suggestions, SelectionDirection, SlashCommand, SPINNERS,
+    THINKING_VERBS,
 };
 use crate::types::AgentEvent;
 
@@ -75,6 +76,8 @@ pub(crate) struct App {
     pub(crate) tick: u64,
     pub(crate) stream_start: Option<Instant>,
     pub(crate) current_chunk_idx: Option<usize>,
+    /// Output chars streamed in the current turn (for live token estimate).
+    pub(crate) stream_chars: usize,
 
     pub(crate) scroll: u16,
     pub(crate) max_scroll: u16,
@@ -108,6 +111,7 @@ impl App {
             tick: 0,
             stream_start: None,
             current_chunk_idx: None,
+            stream_chars: 0,
             scroll: 0,
             max_scroll: 0,
             user_scrolled: false,
@@ -122,12 +126,9 @@ impl App {
         self.context_window = window;
     }
 
-    /// Estimated share of the context budget used by the transcript (chars/4),
-    /// capped at 100. Doubles as "% until auto-compaction".
-    pub(crate) fn context_pct(&self) -> u8 {
-        if self.context_window == 0 {
-            return 0;
-        }
+    /// Estimated tokens used by the whole transcript (chars/4). Estimate, not
+    /// the provider's exact count.
+    pub(crate) fn context_tokens(&self) -> usize {
         let chars: usize = self
             .blocks
             .iter()
@@ -142,8 +143,45 @@ impl App {
                 }
             })
             .sum();
-        let tokens = chars / 4;
-        ((tokens * 100 / self.context_window).min(100)) as u8
+        chars / 4
+    }
+
+    /// Estimated share of the context budget used (capped at 100). Doubles as
+    /// "% until auto-compaction".
+    pub(crate) fn context_pct(&self) -> u8 {
+        if self.context_window == 0 {
+            return 0;
+        }
+        ((self.context_tokens() * 100 / self.context_window).min(100)) as u8
+    }
+
+    /// Estimated output tokens streamed so far in the current turn (chars/4).
+    pub(crate) fn stream_tokens(&self) -> usize {
+        self.stream_chars / 4
+    }
+
+    /// Estimated output tokens/second for the current turn (0 until ~0.5s in).
+    pub(crate) fn stream_rate(&self) -> usize {
+        match self.stream_start {
+            Some(t) => {
+                let secs = t.elapsed().as_secs_f64();
+                if secs >= 0.5 {
+                    (self.stream_tokens() as f64 / secs).round() as usize
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        }
+    }
+
+    /// Current "Thinking" verb, cycling every 3s while generating.
+    pub(crate) fn thinking_label(&self) -> &'static str {
+        let secs = self
+            .stream_start
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        THINKING_VERBS[(secs as usize / 3) % THINKING_VERBS.len()]
     }
 
     pub(crate) fn spinner(&self) -> &str {
@@ -162,6 +200,7 @@ impl App {
             AgentEvent::AgentStart => {
                 self.mode = Mode::Thinking;
                 self.stream_start = Some(Instant::now());
+                self.stream_chars = 0;
             }
             AgentEvent::TurnStart => {}
             AgentEvent::MessageStart { .. } => {
@@ -170,6 +209,7 @@ impl App {
                 self.auto_scroll();
             }
             AgentEvent::MessageUpdate { delta } => {
+                self.stream_chars += delta.len();
                 if let Some(i) = self.current_chunk_idx {
                     if let Some(UIBlock::Assistant(ref mut s)) = self.blocks.get_mut(i) {
                         s.push_str(&delta);
@@ -616,6 +656,15 @@ mod tests {
         assert_eq!(sanitize("a\r\nb"), "ab"); // CR and LF dropped (lines split upstream)
         assert_eq!(sanitize("x\x1b[31my"), "x[31my"); // ESC dropped
         assert_eq!(sanitize("正常 text"), "正常 text"); // multibyte untouched
+    }
+
+    #[test]
+    fn format_tokens_is_human_friendly() {
+        use super::super::format_tokens;
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1500), "1.5k");
+        assert_eq!(format_tokens(120_000), "120.0k");
     }
 
     #[test]
