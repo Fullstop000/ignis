@@ -1,18 +1,20 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// Copy text to the system clipboard, trying multiple strategies:
-/// 1. Native clipboard API via `arboard`
-/// 2. Platform-specific CLI tools (clip, pbcopy, xclip, wl-copy, etc.)
-pub fn set_clipboard(text: &str) -> Result<(), String> {
-    // 1. Try arboard (works on Windows, macOS, and Linux with X11)
-    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-        if clipboard.set_text(text).is_ok() {
-            return Ok(());
-        }
-    }
+/// Cap on copied text so a runaway block can't be shoved at the clipboard.
+const MAX_CLIPBOARD_BYTES: usize = 1_048_576; // 1 MiB
 
-    // 2. Fallback to external clipboard utilities
+/// Copy text to the system clipboard via a platform CLI tool: `clip`/`clip.exe`
+/// (Windows/WSL), `pbcopy` (macOS), or `wl-copy`/`xclip`/`xsel` (Linux). No
+/// native-clipboard dependency — ignis stays a single binary.
+pub fn set_clipboard(text: &str) -> Result<(), String> {
+    if text.len() > MAX_CLIPBOARD_BYTES {
+        return Err(format!(
+            "Content too large ({} bytes, max {})",
+            text.len(),
+            MAX_CLIPBOARD_BYTES
+        ));
+    }
     try_platform_clipboard(text)
 }
 

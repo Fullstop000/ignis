@@ -7,6 +7,9 @@ use super::{
 };
 use crate::types::AgentEvent;
 
+/// Clipboard function type: takes text, returns Ok/Err.
+type ClipFn = for<'a> fn(&'a str) -> Result<(), String>;
+
 /// Decode a persisted tool message's content `{"result": <str>, "is_error": <bool>}`
 /// back into the (display text, is_error) the live UI shows. Falls back to the
 /// raw string if it isn't the expected JSON shape.
@@ -92,6 +95,9 @@ pub(crate) struct App {
     /// Token budget the context-usage % is measured against (the auto-compact
     /// threshold). Estimated, not exact.
     pub(crate) context_window: usize,
+
+    /// Clipboard function, injectable for testing.
+    pub(crate) clipboard_fn: ClipFn,
 }
 
 impl App {
@@ -122,6 +128,7 @@ impl App {
             error_flash: None,
             exit_pending: false,
             context_window: 120_000,
+            clipboard_fn: super::clipboard::set_clipboard,
         }
     }
 
@@ -596,7 +603,7 @@ impl App {
         });
 
         match text {
-            Some(content) => match super::clipboard::set_clipboard(&content) {
+            Some(content) => match (self.clipboard_fn)(&content) {
                 Ok(()) => self.add_assistant_notice("Copied to clipboard.".to_string()),
                 Err(e) => self.add_assistant_notice(format!("Copy failed: {e}")),
             },
@@ -610,13 +617,20 @@ mod copy_tests {
     use super::{App, UIBlock};
     use std::path::PathBuf;
 
+    /// A clipboard mock that always succeeds.
+    fn mock_clipboard(_text: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     fn test_app() -> App {
-        App::new(
+        let mut app = App::new(
             "p".to_string(),
             "m".to_string(),
             "s".to_string(),
             PathBuf::from("/tmp"),
-        )
+        );
+        app.clipboard_fn = mock_clipboard;
+        app
     }
 
     #[test]
