@@ -55,8 +55,6 @@ api_url = "https://api.kimi.com/coding/v1"
 model   = "kimi-for-coding"
 ```
 
-For web search, see **[docs/web-search.md](docs/web-search.md)**.
-
 > Your `~/.ignis/config.toml` holds secrets. The repo-level `config.toml` /
 > `config.yaml` are git-ignored on purpose — commit `config.example.toml` only.
 
