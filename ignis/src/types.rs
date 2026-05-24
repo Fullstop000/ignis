@@ -50,7 +50,7 @@ pub enum AgentEvent {
     #[serde(rename = "tool_execution_end")]
     ToolExecutionEnd {
         tool_call_id: String,
-        result: crate::tool::ToolResult,
+        result: crate::tools::tool::ToolResult,
     },
     #[serde(rename = "turn_end")]
     TurnEnd,

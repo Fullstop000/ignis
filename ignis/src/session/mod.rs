@@ -2,12 +2,14 @@ use crate::agent::Agent;
 use crate::config::CompactionConfig;
 use crate::provider::LlmProvider;
 use crate::storage::SessionStorage;
-use crate::tool::{AgentTool, ToolHooks};
+use crate::tools::tool::{AgentTool, ToolHooks};
 use crate::types::AgentEvent;
 use crate::Message;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+pub mod storage;
 
 pub const DEFAULT_SESSION_ID: &str = "default";
 

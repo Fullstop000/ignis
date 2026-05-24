@@ -4,7 +4,7 @@ use ignis::{
     config::CompactionConfig,
     provider::{LlmProvider, LlmResponseDelta},
     storage::{InMemoryStorage, SessionStorage},
-    tool::{AgentTool, ToolResult},
+    tools::tool::{AgentTool, ToolResult},
     types::{AgentEvent, Message},
     Session,
 };
