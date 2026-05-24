@@ -14,7 +14,7 @@ use crate::console::app::{App, Mode};
 use crate::console::render::draw;
 use crate::session::SessionManager;
 use crate::storage::{FileStorage, SessionStorage};
-use crate::{Agent, AgentEvent};
+use crate::{AgentEvent, Session};
 
 // ==========================================
 // Color Palette
@@ -187,28 +187,37 @@ pub async fn run_console(
                 }
             };
             let storage = crate::storage::FileStorage::new(agent_storage_dir.clone());
-            let mut agent = Agent::new(
+            let mut session = match Session::open(
                 request.session_id,
                 agent_system_prompt.clone(),
                 provider,
                 Box::new(storage),
                 agent_cwd.to_string_lossy().to_string(),
-            );
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = agent_tx.send(AgentEvent::AgentEnd).await;
+                    log::error!("Session open error: {}", e);
+                    continue;
+                }
+            };
 
             crate::tools::register_native_tools(
-                &mut agent,
+                &mut session,
                 &agent_cwd,
                 agent_config.web_search.clone(),
             );
             let ext_dirs = crate::tools::plugin::default_extension_dirs();
             let plugins = crate::tools::plugin::load_extensions(&ext_dirs);
             for plugin in plugins {
-                agent.register_tool(Arc::new(plugin));
+                session.register_tool(Arc::new(plugin));
             }
 
             let tx = agent_tx.clone();
             tokio::select! {
-                result = agent.prompt(&request.prompt, tx) => {
+                result = session.prompt(&request.prompt, tx) => {
                     if let Err(e) = result {
                         let _ = agent_tx.send(AgentEvent::AgentEnd).await;
                         log::error!("Agent error: {}", e);
@@ -221,8 +230,8 @@ pub async fn run_console(
         }
     });
 
-    // 30fps tick
-    let tick = std::time::Duration::from_millis(33);
+    // 60fps tick
+    let tick = std::time::Duration::from_millis(16);
 
     loop {
         terminal.draw(|f| draw(f, &mut app))?;

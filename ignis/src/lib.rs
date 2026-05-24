@@ -16,5 +16,6 @@ pub use ignis_macros::tool;
 
 // Re-exports for backward compatibility
 pub use agent::Agent;
+pub use session::Session;
 pub use tool::{AgentTool, ExecutionMode, IntoToolResult, ToolHooks, ToolResult};
 pub use types::{AgentEvent, Message, ToolCall, ToolCallFunction};

@@ -1,8 +1,86 @@
+use crate::agent::Agent;
+use crate::provider::LlmProvider;
+use crate::storage::SessionStorage;
+use crate::tool::{AgentTool, ToolHooks};
+use crate::types::AgentEvent;
 use crate::Message;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const DEFAULT_SESSION_ID: &str = "default";
+
+/// The core conversational model. Owns the message `history` and its
+/// persistence, and wraps an [`Agent`] (the execution engine) to advance the
+/// conversation via [`Session::prompt`].
+pub struct Session {
+    id: String,
+    history: Vec<Message>,
+    storage: Box<dyn SessionStorage>,
+    start_dir: String,
+    agent: Agent,
+}
+
+impl Session {
+    /// Open a session, loading any persisted history for `id`.
+    pub async fn open(
+        id: String,
+        system_prompt: String,
+        provider: Box<dyn LlmProvider>,
+        storage: Box<dyn SessionStorage>,
+        start_dir: String,
+    ) -> Result<Self, anyhow::Error> {
+        let history = storage.load_session(&id).await?;
+        Ok(Self {
+            id,
+            history,
+            storage,
+            start_dir,
+            agent: Agent::new(system_prompt, provider),
+        })
+    }
+
+    pub fn register_tool(&mut self, tool: Arc<dyn AgentTool>) {
+        self.agent.register_tool(tool);
+    }
+
+    pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
+        self.agent.set_hooks(hooks);
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn history(&self) -> &[Message] {
+        &self.history
+    }
+
+    /// Append the user's message, run the agent loop over the history, and
+    /// persist the result.
+    pub async fn prompt(
+        &mut self,
+        text: &str,
+        tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<(), anyhow::Error> {
+        self.history.push(Message {
+            role: "user".to_string(),
+            content: Some(text.to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        });
+        self.agent.run(&mut self.history, tx).await?;
+        self.persist().await
+    }
+
+    async fn persist(&self) -> Result<(), anyhow::Error> {
+        self.storage
+            .save_session(&self.id, &self.history, Some(&self.start_dir))
+            .await
+    }
+}
 
 pub fn project_slug(cwd: &Path) -> String {
     let raw = cwd.to_string_lossy();
