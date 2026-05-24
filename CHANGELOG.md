@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-byte (CJK) input no longer panics; cursor stays on UTF-8 char boundaries and uses display-width columns.
 - Tool output and markdown no longer garble the screen — tabs expand to spaces and control chars are stripped before rendering.
 - `truncate()` is char-safe (was byte-slicing and could panic on multi-byte previews).
+- Chat no longer hides its last lines behind the input box — scroll bounds count wrapped rows, not logical lines.
+- Resumed sessions render tool calls as proper blocks instead of raw `{"result":…}` JSON; the resume picker shows a clean screen without the prior conversation.
 
 ## [0.1.0] - 2026-05-24
 

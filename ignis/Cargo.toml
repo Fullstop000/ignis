@@ -19,7 +19,7 @@ bytes = "1.0"
 ignis-macros = { path = "../ignis-macros" }
 serde_yaml = "0.9"
 toml = "0.8"
-ratatui = "0.26"
+ratatui = { version = "0.26", features = ["unstable-rendered-line-info"] }
 crossterm = "0.27"
 unicode-width = "0.1"
 log = "0.4"

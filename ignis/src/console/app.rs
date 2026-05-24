@@ -6,6 +6,19 @@ use super::{
 };
 use crate::types::AgentEvent;
 
+/// Decode a persisted tool message's content `{"result": <str>, "is_error": <bool>}`
+/// back into the (display text, is_error) the live UI shows. Falls back to the
+/// raw string if it isn't the expected JSON shape.
+pub(crate) fn parse_tool_result(content: &str) -> (String, bool) {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(result) = v.get("result").and_then(|r| r.as_str()) {
+            let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+            return (result.to_string(), is_error);
+        }
+    }
+    (content.to_string(), false)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallEntry {
     pub(crate) id: String,
@@ -363,38 +376,67 @@ impl App {
         for message in messages {
             match message.role.as_str() {
                 "user" => {
-                    if let Some(content) = message.content {
+                    if let Some(content) = message.content.filter(|c| !c.is_empty()) {
                         self.blocks.push(UIBlock::User(content));
                     }
                 }
                 "assistant" => {
-                    let mut content = message.content.unwrap_or_default();
-                    if content.is_empty() {
-                        if let Some(reasoning) = &message.reasoning_content {
-                            if !reasoning.is_empty() {
-                                content = format!("<thinking>\n{}\n</thinking>", reasoning);
-                            }
-                        }
-                    }
-                    if content.is_empty() {
-                        if let Some(tool_calls) = message.tool_calls {
-                            let names = tool_calls
-                                .iter()
-                                .map(|tc| tc.function.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            content = format!("Called tool(s): {}", names);
-                        }
-                    }
-                    if !content.is_empty() {
+                    if let Some(content) = message.content.filter(|c| !c.is_empty()) {
                         self.blocks.push(UIBlock::Assistant(content));
+                    } else if let Some(reasoning) =
+                        message.reasoning_content.filter(|r| !r.is_empty())
+                    {
+                        self.blocks
+                            .push(UIBlock::Assistant(format!("💭 {reasoning}")));
+                    }
+                    // Reconstruct tool blocks from this turn's calls; the
+                    // following `tool` messages fill in each result by id.
+                    if let Some(tool_calls) = message.tool_calls {
+                        for tc in tool_calls {
+                            self.blocks.push(UIBlock::Tool(ToolCallEntry {
+                                id: tc.id,
+                                name: tc.function.name,
+                                arguments: tc.function.arguments,
+                                status: ToolStatus::Success(String::new()),
+                                started_at: Instant::now(),
+                                elapsed_ms: 0,
+                            }));
+                        }
                     }
                 }
                 "tool" => {
-                    let name = message.name.unwrap_or_else(|| "tool".to_string());
-                    let content = message.content.unwrap_or_default();
-                    self.blocks
-                        .push(UIBlock::Assistant(format!("Tool `{}`: {}", name, content)));
+                    // Persisted tool content is {"result": <str>, "is_error": <bool>};
+                    // parse it and attach to the matching pending tool block.
+                    let (result, is_error) =
+                        parse_tool_result(message.content.as_deref().unwrap_or(""));
+                    let status = if is_error {
+                        ToolStatus::Error(result)
+                    } else {
+                        ToolStatus::Success(result)
+                    };
+                    let idx = message.tool_call_id.as_deref().and_then(|id| {
+                        self.blocks
+                            .iter()
+                            .rposition(|b| matches!(b, UIBlock::Tool(t) if t.id == id))
+                    });
+                    match idx {
+                        Some(i) => {
+                            if let UIBlock::Tool(t) = &mut self.blocks[i] {
+                                t.status = status;
+                            }
+                        }
+                        None => {
+                            // Orphaned result (no matching call) — show it standalone.
+                            self.blocks.push(UIBlock::Tool(ToolCallEntry {
+                                id: String::new(),
+                                name: message.name.unwrap_or_else(|| "tool".to_string()),
+                                arguments: String::new(),
+                                status,
+                                started_at: Instant::now(),
+                                elapsed_ms: 0,
+                            }));
+                        }
+                    }
                 }
                 _ => {}
             }

@@ -108,7 +108,10 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
 
-    if app.blocks.is_empty() {
+    if let Some(picker) = &app.session_picker {
+        // Resume view: show only the picker, never the prior conversation.
+        render_session_picker(&mut lines, picker);
+    } else if app.blocks.is_empty() {
         // Welcome screen
         lines.push(Line::from(""));
         lines.push(Line::from(""));
@@ -178,27 +181,25 @@ pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
                 }
             }
         }
-        if let Some(picker) = &app.session_picker {
-            render_session_picker(&mut lines, picker);
-        }
     }
-
-    // Calculate scroll bounds (borderless: full height is visible)
-    let visible = area.height;
-    let total = lines.len() as u16;
-    app.max_scroll = total.saturating_sub(visible);
-    if !app.user_scrolled {
-        app.scroll = app.max_scroll;
-    }
-    // Clamp scroll
-    app.scroll = app.scroll.min(app.max_scroll);
 
     let text = Text::from(lines);
     let paragraph = Paragraph::new(text)
         .style(Style::default().bg(BG))
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0));
-    f.render_widget(paragraph, area);
+        .wrap(Wrap { trim: false });
+
+    // Scroll bounds in *rendered* rows: lines word-wrap, so the visible height
+    // is line_count(width), not the logical line count — otherwise auto-scroll
+    // under-shoots and the last wrapped rows hide behind the input box.
+    let visible = area.height;
+    let total = paragraph.line_count(area.width) as u16;
+    app.max_scroll = total.saturating_sub(visible);
+    if !app.user_scrolled {
+        app.scroll = app.max_scroll;
+    }
+    app.scroll = app.scroll.min(app.max_scroll);
+
+    f.render_widget(paragraph.scroll((app.scroll, 0)), area);
 
     // Scrollbar
     if app.max_scroll > 0 {
@@ -782,6 +783,130 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("中"), "should render wide chars");
         assert!(content.contains("试"), "should render the full input");
+    }
+
+    #[test]
+    fn last_line_stays_visible_when_content_wraps() {
+        // Regression (bug 1): scroll bounds must count wrapped rows, not logical
+        // lines. With long wrapping blocks, auto-scroll-to-bottom must still
+        // reveal the most recent turn instead of clipping it behind the input.
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        for i in 0..6 {
+            app.blocks.push(UIBlock::Assistant(format!(
+                "Block {i}: {}",
+                "word ".repeat(40)
+            )));
+        }
+        app.blocks.push(UIBlock::User("FINAL_MARKER".to_string()));
+
+        let mut term = test_terminal(40, 16);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(
+            content.contains("FINAL_MARKER"),
+            "auto-scroll must reveal the latest line despite wrapping"
+        );
+        assert!(app.max_scroll > 0, "wrapped content should be scrollable");
+    }
+
+    #[test]
+    fn resumed_tool_call_renders_as_block_not_raw_json() {
+        // Regression (bug 2a): a resumed tool result must render as a tool block,
+        // not the raw persisted {"result":…,"is_error":…} JSON.
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        let messages = vec![
+            crate::Message {
+                role: "user".to_string(),
+                content: Some("list".to_string()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            crate::Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![crate::types::ToolCall {
+                    id: "call_1".to_string(),
+                    r#type: "function".to_string(),
+                    function: crate::types::ToolCallFunction {
+                        name: "list_dir".to_string(),
+                        arguments: r#"{"path":"."}"#.to_string(),
+                    },
+                }]),
+            },
+            crate::Message {
+                role: "tool".to_string(),
+                // \t here is escaped in the JSON string, as it is on disk.
+                content: Some(r#"{"result":"dir\t4096\t.claude","is_error":false}"#.to_string()),
+                reasoning_content: None,
+                name: Some("list_dir".to_string()),
+                tool_call_id: Some("call_1".to_string()),
+                tool_calls: None,
+            },
+        ];
+        app.render_session_history("s".to_string(), messages);
+
+        let mut term = test_terminal(100, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(
+            content.contains("list_dir"),
+            "tool name should show in a block"
+        );
+        assert!(content.contains(".claude"), "tool result should render");
+        assert!(!content.contains("is_error"), "raw JSON must not leak");
+        assert!(!content.contains('\t'), "tabs must be expanded");
+    }
+
+    #[test]
+    fn resume_picker_hides_prior_conversation() {
+        // Regression (bug 2b): while the resume picker is open, the prior
+        // conversation must not be shown.
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        app.blocks
+            .push(UIBlock::User("PRE_RESUME_MESSAGE".to_string()));
+        app.session_picker = Some(SessionPicker {
+            sessions: vec![crate::session::SessionMeta {
+                id: "alpha".to_string(),
+                message_count: 1,
+                last_modified: 1,
+                preview: "hi".to_string(),
+                start_dir: None,
+            }],
+            selected: 0,
+        });
+
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(content.contains("Sessions"), "picker should render");
+        assert!(content.contains("alpha"), "picker should list sessions");
+        assert!(
+            !content.contains("PRE_RESUME_MESSAGE"),
+            "prior conversation must be hidden during resume"
+        );
     }
 
     #[test]
