@@ -1,3 +1,5 @@
+pub mod tool;
+
 mod bash;
 mod create_file;
 mod edit_file;

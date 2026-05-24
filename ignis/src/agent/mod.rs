@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::provider::{LlmProvider, LlmResponseDelta};
-use crate::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
+use crate::tools::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
 use crate::types::{AgentEvent, Message, ToolCall, ToolCallFunction};
 
 /// Execution engine: given a conversation `history`, runs the model + tool
