@@ -18,8 +18,8 @@ impl TuiProcess {
         let ignis_home = home.join(".ignis");
         std::fs::create_dir_all(&ignis_home).unwrap();
         std::fs::write(
-            ignis_home.join("config.yaml"),
-            "active_provider: ollama\nproviders:\n  ollama:\n    api_url: http://127.0.0.1:11434\n    model: test-model\n",
+            ignis_home.join("config.toml"),
+            "active_provider = \"ollama\"\n\n[providers.ollama]\napi_url = \"http://127.0.0.1:11434\"\nmodel = \"test-model\"\n",
         )
         .unwrap();
 

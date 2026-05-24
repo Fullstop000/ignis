@@ -35,10 +35,7 @@ impl LlmProvider for MockProvider {
         _system_prompt: &str,
         _messages: &[Message],
         _tools: &[serde_json::Value],
-    ) -> Result<
-        BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
-        anyhow::Error,
-    > {
+    ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error> {
         let idx = self.index.fetch_add(1, Ordering::SeqCst);
         let deltas = self.responses.get(idx).cloned().unwrap_or_default();
         Ok(stream::iter(deltas.into_iter().map(Ok)).boxed())
@@ -246,9 +243,7 @@ async fn agent_handles_tool_error_gracefully() {
 
 #[tokio::test]
 async fn agent_persists_messages_to_storage() {
-    let provider = MockProvider::new(vec![vec![LlmResponseDelta::Text(
-        "Reply".to_string(),
-    )]]);
+    let provider = MockProvider::new(vec![vec![LlmResponseDelta::Text("Reply".to_string())]]);
     let storage = InMemoryStorage::new();
     let agent = Agent::new(
         "persist-test".to_string(),

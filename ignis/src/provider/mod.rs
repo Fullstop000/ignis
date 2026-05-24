@@ -22,10 +22,7 @@ pub trait LlmProvider: Send + Sync + 'static {
         system_prompt: &str,
         messages: &[Message],
         tools: &[serde_json::Value],
-    ) -> Result<
-        BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
-        anyhow::Error,
-    >;
+    ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error>;
 }
 
 mod anthropic;
@@ -89,9 +86,7 @@ pub struct ChunkFunction {
     pub arguments: Option<String>,
 }
 
-pub(crate) fn bytes_to_lines<S, E>(
-    stream: S,
-) -> impl Stream<Item = Result<String, anyhow::Error>>
+pub(crate) fn bytes_to_lines<S, E>(stream: S) -> impl Stream<Item = Result<String, anyhow::Error>>
 where
     S: Stream<Item = Result<bytes::Bytes, E>> + Send + Unpin + 'static,
     E: std::error::Error + Send + Sync + 'static,
@@ -112,10 +107,7 @@ where
                         buffer.extend_from_slice(&bytes);
                     }
                     Some(Err(err)) => {
-                        return Some((
-                            Err(anyhow::Error::new(err)),
-                            (stream, buffer),
-                        ));
+                        return Some((Err(anyhow::Error::new(err)), (stream, buffer)));
                     }
                     None => {
                         if !buffer.is_empty() {

@@ -2,6 +2,9 @@
 name = "ignis"
 version = "0.1.0"
 edition = "2021"
+description = "A single-binary, multi-provider AI coding agent for your terminal."
+license = "Apache-2.0"
+repository = "https://github.com/Fullstop000/ignis"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -15,6 +18,7 @@ uuid = { version = "1.0", features = ["v4"] }
 bytes = "1.0"
 ignis-macros = { path = "../ignis-macros" }
 serde_yaml = "0.9"
+toml = "0.8"
 ratatui = "0.26"
 crossterm = "0.27"
 log = "0.4"

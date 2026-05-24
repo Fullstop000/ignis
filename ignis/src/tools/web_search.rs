@@ -2,17 +2,92 @@ use crate::{AgentTool, ExecutionMode, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 
-pub struct WebSearchTool;
+const RESULT_COUNT: u32 = 5;
 
-impl WebSearchTool {
-    pub fn new() -> Self {
-        Self
+/// A normalized search hit, independent of which backend produced it.
+struct SearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+/// Switchable web search backends. Add a variant + a `search_*` method to
+/// support a new provider.
+enum Backend {
+    Brave,
+    Tavily,
+}
+
+impl Backend {
+    fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_lowercase().as_str() {
+            "brave" => Some(Backend::Brave),
+            "tavily" => Some(Backend::Tavily),
+            _ => None,
+        }
     }
 }
 
-impl Default for WebSearchTool {
-    fn default() -> Self {
-        Self::new()
+pub struct WebSearchTool {
+    provider: String,
+    api_key: Option<String>,
+    client: reqwest::Client,
+}
+
+impl WebSearchTool {
+    pub fn new(provider: Option<String>, api_key: Option<String>) -> Self {
+        Self {
+            provider: provider.unwrap_or_else(|| "brave".to_string()),
+            api_key,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    async fn search_brave(&self, query: &str, key: &str) -> Result<Vec<SearchResult>, String> {
+        let count = RESULT_COUNT.to_string();
+        let resp = self
+            .client
+            .get("https://api.search.brave.com/res/v1/web/search")
+            .query(&[("q", query), ("count", count.as_str())])
+            .header("Accept", "application/json")
+            .header("X-Subscription-Token", key)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Brave API error {status}: {}", truncate(&body)));
+        }
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        Ok(parse_brave(&json))
+    }
+
+    async fn search_tavily(&self, query: &str, key: &str) -> Result<Vec<SearchResult>, String> {
+        let resp = self
+            .client
+            .post("https://api.tavily.com/search")
+            .json(&json!({
+                "api_key": key,
+                "query": query,
+                "max_results": RESULT_COUNT,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Tavily API error {status}: {}", truncate(&body)));
+        }
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        Ok(parse_tavily(&json))
     }
 }
 
@@ -23,7 +98,7 @@ impl AgentTool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web using DuckDuckGo and return result titles and URLs."
+        "Search the web and return result titles, URLs, and snippets."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -42,143 +117,76 @@ impl AgentTool for WebSearchTool {
 
     async fn call(&self, args: serde_json::Value) -> ToolResult {
         let query = match args["query"].as_str() {
-            Some(q) => q,
-            None => return ToolResult::error("Missing required parameter: query".to_string()),
+            Some(q) if !q.trim().is_empty() => q,
+            _ => return ToolResult::error("Missing required parameter: query".to_string()),
         };
 
-        let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoded(query));
-        let client = reqwest::Client::new();
-        let response = client
-            .get(&url)
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
-            .send()
-            .await;
-
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => return ToolResult::error(format!("HTTP request failed: {e}")),
-        };
-
-        let body = match response.text().await {
-            Ok(t) => t,
-            Err(e) => return ToolResult::error(format!("Failed to read response: {e}")),
-        };
-
-        let results = parse_duckduckgo_results(&body);
-        if results.is_empty() {
-            return ToolResult::ok("No results found.".to_string());
-        }
-
-        let formatted: Vec<String> = results
-            .iter()
-            .enumerate()
-            .map(|(i, (title, url))| format!("{}. {} - {}", i + 1, title, url))
-            .collect();
-        ToolResult::ok(formatted.join("\n"))
-    }
-}
-
-fn urlencoded(s: &str) -> String {
-    let mut result = String::new();
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                result.push(byte as char);
+        let backend = match Backend::from_name(&self.provider) {
+            Some(b) => b,
+            None => {
+                return ToolResult::error(format!(
+                    "Unknown web_search provider '{}' (supported: brave, tavily)",
+                    self.provider
+                ))
             }
-            b' ' => result.push('+'),
+        };
+
+        let key = match &self.api_key {
+            Some(k) if !k.is_empty() => k.as_str(),
             _ => {
-                result.push('%');
-                result.push_str(&format!("{byte:02X}"));
+                return ToolResult::error(format!(
+                    "web_search provider '{}' requires an API key (set web_search.api_key in config.toml)",
+                    self.provider
+                ))
+            }
+        };
+
+        let results = match backend {
+            Backend::Brave => self.search_brave(query, key).await,
+            Backend::Tavily => self.search_tavily(query, key).await,
+        };
+
+        match results {
+            Err(e) => ToolResult::error(e),
+            Ok(items) if items.is_empty() => ToolResult::ok("No results found.".to_string()),
+            Ok(items) => {
+                let formatted: Vec<String> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| format!("{}. {} - {}\n   {}", i + 1, r.title, r.url, r.snippet))
+                    .collect();
+                ToolResult::ok(formatted.join("\n"))
             }
         }
     }
-    result
 }
 
-fn parse_duckduckgo_results(html: &str) -> Vec<(String, String)> {
-    let mut results = Vec::new();
-    let marker = "class=\"result__a\"";
+fn parse_brave(json: &serde_json::Value) -> Vec<SearchResult> {
+    json["web"]["results"]
+        .as_array()
+        .map(|items| items.iter().map(extract_result("description")).collect())
+        .unwrap_or_default()
+}
 
-    let mut search_from = 0;
-    while let Some(marker_pos) = html[search_from..].find(marker) {
-        let abs_marker = search_from + marker_pos;
+fn parse_tavily(json: &serde_json::Value) -> Vec<SearchResult> {
+    json["results"]
+        .as_array()
+        .map(|items| items.iter().map(extract_result("content")).collect())
+        .unwrap_or_default()
+}
 
-        let tag_start = match html[..abs_marker].rfind("<a ") {
-            Some(pos) => pos,
-            None => {
-                search_from = abs_marker + marker.len();
-                continue;
-            }
-        };
-
-        let tag_end = match html[abs_marker..].find('>') {
-            Some(pos) => abs_marker + pos,
-            None => break,
-        };
-
-        let tag = &html[tag_start..tag_end + 1];
-
-        let href = match extract_attr(tag, "href") {
-            Some(h) => h,
-            None => {
-                search_from = tag_end;
-                continue;
-            }
-        };
-
-        let content_start = tag_end + 1;
-        let title = match html[content_start..].find("</a>") {
-            Some(pos) => {
-                let raw = &html[content_start..content_start + pos];
-                strip_html_tags(raw).trim().to_string()
-            }
-            None => {
-                search_from = content_start;
-                continue;
-            }
-        };
-
-        if !title.is_empty() && !href.is_empty() {
-            results.push((title, href));
-        }
-
-        search_from = content_start;
+/// Build an extractor that pulls title/url plus a snippet from the given field.
+fn extract_result(snippet_field: &str) -> impl Fn(&serde_json::Value) -> SearchResult + '_ {
+    move |item| SearchResult {
+        title: item["title"].as_str().unwrap_or_default().to_string(),
+        url: item["url"].as_str().unwrap_or_default().to_string(),
+        snippet: item[snippet_field].as_str().unwrap_or_default().to_string(),
     }
-
-    results
 }
 
-fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
-    let pattern = format!("{attr_name}=\"");
-    let start = tag.find(&pattern)? + pattern.len();
-    let end = tag[start..].find('"')? + start;
-    Some(html_decode(&tag[start..end]))
-}
-
-fn strip_html_tags(s: &str) -> String {
-    let mut result = String::new();
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => result.push(ch),
-            _ => {}
-        }
-    }
-    result
-}
-
-fn html_decode(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
+/// Truncate an error body so a failed request doesn't flood the context.
+fn truncate(body: &str) -> String {
+    body.chars().take(300).collect()
 }
 
 #[cfg(test)]
@@ -186,40 +194,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_urlencoded() {
-        assert_eq!(urlencoded("hello world"), "hello+world");
-        assert_eq!(urlencoded("rust & cargo"), "rust+%26+cargo");
+    fn backend_resolves_known_names_only() {
+        assert!(Backend::from_name("brave").is_some());
+        assert!(Backend::from_name("Tavily").is_some());
+        assert!(Backend::from_name("google").is_none());
     }
 
     #[test]
-    fn test_html_decode_and_strip() {
-        assert_eq!(html_decode("A &amp; B"), "A & B");
-        assert_eq!(strip_html_tags("<a href=\"url\">Title</a>"), "Title");
+    fn parse_brave_extracts_results() {
+        let j = json!({"web":{"results":[
+            {"title":"Rust","url":"https://rust-lang.org","description":"systems lang"},
+            {"title":"Docs","url":"https://doc.rust-lang.org","description":"the docs"}
+        ]}});
+        let r = parse_brave(&j);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].title, "Rust");
+        assert_eq!(r[0].url, "https://rust-lang.org");
+        assert_eq!(r[1].snippet, "the docs");
     }
 
     #[test]
-    fn test_parse_duckduckgo_results() {
-        let sample_html = r#"
-            <div class="result">
-                <a class="result__a" href="https://example.com/1">Example <b>Title 1</b></a>
-            </div>
-            <div class="result">
-                <a class="result__a" href="https://example.com/2">Example Title 2</a>
-            </div>
-        "#;
-        let parsed = parse_duckduckgo_results(sample_html);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].0, "Example Title 1");
-        assert_eq!(parsed[0].1, "https://example.com/1");
-        assert_eq!(parsed[1].0, "Example Title 2");
-        assert_eq!(parsed[1].1, "https://example.com/2");
+    fn parse_tavily_reads_content_field() {
+        let j = json!({"results":[
+            {"title":"Rust","url":"https://rust-lang.org","content":"systems lang"}
+        ]});
+        let r = parse_tavily(&j);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].snippet, "systems lang");
     }
 
     #[tokio::test]
-    async fn test_web_search_args_error() {
-        let tool = WebSearchTool::new();
+    async fn missing_query_returns_error() {
+        let tool = WebSearchTool::new(Some("brave".into()), Some("k".into()));
         let res = tool.call(json!({})).await;
         assert!(res.is_error);
         assert!(res.content.contains("Missing required parameter"));
+    }
+
+    #[tokio::test]
+    async fn missing_api_key_returns_loud_error() {
+        let tool = WebSearchTool::new(Some("brave".into()), None);
+        let res = tool.call(json!({ "query": "rust" })).await;
+        assert!(res.is_error);
+        assert!(res.content.contains("API key"));
+    }
+
+    #[tokio::test]
+    async fn unknown_provider_returns_error() {
+        let tool = WebSearchTool::new(Some("google".into()), Some("k".into()));
+        let res = tool.call(json!({ "query": "rust" })).await;
+        assert!(res.is_error);
+        assert!(res.content.contains("Unknown web_search provider"));
     }
 }

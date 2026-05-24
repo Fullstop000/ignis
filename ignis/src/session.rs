@@ -190,7 +190,11 @@ impl SessionManager {
         let start_dir = content.lines().next().and_then(|first_line| {
             let record: serde_json::Value = serde_json::from_str(first_line.trim()).ok()?;
             if record.get("type")?.as_str()? == "session_meta" {
-                record.get("payload")?.get("start_dir")?.as_str().map(|s| s.to_string())
+                record
+                    .get("payload")?
+                    .get("start_dir")?
+                    .as_str()
+                    .map(|s| s.to_string())
             } else {
                 None
             }
@@ -205,8 +209,6 @@ impl SessionManager {
         })
     }
 }
-
-
 
 /// Print a formatted table of sessions to stdout
 pub fn print_sessions(sessions: &[SessionMeta]) {
@@ -242,8 +244,6 @@ pub fn print_sessions(sessions: &[SessionMeta]) {
 mod tests {
     use super::*;
     use crate::storage::{FileStorage, SessionStorage};
-
-
 
     #[test]
     fn project_slug_matches_claude_style_path_slug() {
@@ -289,7 +289,10 @@ mod tests {
             },
         ];
 
-        storage.save_session("default", &messages, Some("/tmp")).await.unwrap();
+        storage
+            .save_session("default", &messages, Some("/tmp"))
+            .await
+            .unwrap();
 
         let session_path = dir.join("default.jsonl");
         assert!(session_path.exists());

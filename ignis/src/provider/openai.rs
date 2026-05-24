@@ -1,6 +1,6 @@
-use anyhow::anyhow;
 use super::{bytes_to_lines, ChatCompletionsRequest, Chunk, LlmProvider, LlmResponseDelta};
 use crate::Message;
+use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
 
@@ -13,7 +13,12 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    pub fn new(api_key: String, api_url: String, model: String, user_agent: Option<String>) -> Self {
+    pub fn new(
+        api_key: String,
+        api_url: String,
+        model: String,
+        user_agent: Option<String>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key,
@@ -31,10 +36,7 @@ impl LlmProvider for OpenAiProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[serde_json::Value],
-    ) -> Result<
-        BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
-        anyhow::Error,
-    > {
+    ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error> {
         let mut request_messages = vec![Message {
             role: "system".to_string(),
             content: Some(system_prompt.to_string()),

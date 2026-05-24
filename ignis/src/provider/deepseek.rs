@@ -1,6 +1,6 @@
-use anyhow::anyhow;
 use super::{bytes_to_lines, ChatCompletionsRequest, Chunk, LlmProvider, LlmResponseDelta};
 use crate::Message;
+use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
 
@@ -32,10 +32,7 @@ impl LlmProvider for DeepSeekProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[serde_json::Value],
-    ) -> Result<
-        BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
-        anyhow::Error,
-    > {
+    ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error> {
         let mut request_messages = vec![Message {
             role: "system".to_string(),
             content: Some(system_prompt.to_string()),

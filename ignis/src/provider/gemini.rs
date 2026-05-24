@@ -1,6 +1,6 @@
-use anyhow::anyhow;
 use super::{bytes_to_lines, LlmProvider, LlmResponseDelta};
 use crate::Message;
+use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -85,10 +85,7 @@ impl LlmProvider for GeminiProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[serde_json::Value],
-    ) -> Result<
-        BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
-        anyhow::Error,
-    > {
+    ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error> {
         let decls: Vec<serde_json::Value> = tools
             .iter()
             .map(|ot| {

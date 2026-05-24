@@ -13,7 +13,6 @@ impl ReadFileTool {
             cwd: cwd.to_path_buf(),
         }
     }
-
 }
 
 #[async_trait]

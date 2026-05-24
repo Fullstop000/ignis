@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use super::{
+    format_duration, next_selection, slash_suggestions, SelectionDirection, SlashCommand, SPINNERS,
+};
 use crate::types::AgentEvent;
-use super::{format_duration, next_selection, slash_suggestions, SelectionDirection, SlashCommand, SPINNERS};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallEntry {
@@ -260,7 +262,11 @@ impl App {
             .map(|session| session.id.clone())
     }
 
-    pub(crate) fn render_session_history(&mut self, session_id: String, messages: Vec<crate::Message>) {
+    pub(crate) fn render_session_history(
+        &mut self,
+        session_id: String,
+        messages: Vec<crate::Message>,
+    ) {
         self.exit_pending = false;
         self.session_id = session_id.clone();
         self.blocks.clear();
@@ -446,4 +452,3 @@ mod tests {
         assert_eq!(next_selection(0, 0, SelectionDirection::Next), 0);
     }
 }
-

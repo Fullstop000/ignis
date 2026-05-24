@@ -79,10 +79,7 @@ fn cli_tui_and_resume_together() {
 
 #[test]
 fn cli_ignores_unknown_flags_as_prompt_args() {
-    let parsed = parse_cli_args(vec![
-        "--unknown".to_string(),
-        "hello".to_string(),
-    ]);
+    let parsed = parse_cli_args(vec!["--unknown".to_string(), "hello".to_string()]);
     assert!(!parsed.is_tui);
     assert_eq!(parsed.prompt_args, vec!["--unknown", "hello"]);
 }
@@ -118,7 +115,12 @@ fn resolve_empty_prompt_goes_to_tui() {
     std::fs::create_dir_all(&dir).unwrap();
     let manager = SessionManager::new(dir.clone());
 
-    let request = resolve_session_request(parse_cli_args(vec![]), &manager, false, std::path::Path::new("/tmp"));
+    let request = resolve_session_request(
+        parse_cli_args(vec![]),
+        &manager,
+        false,
+        std::path::Path::new("/tmp"),
+    );
 
     assert!(request.is_tui);
     // With auto_resume=false, creates a new session instead of "default"
@@ -136,10 +138,20 @@ fn resolve_resume_picks_latest_session() {
     // Touch beta so it's newer
     let beta_path = dir.join("beta.jsonl");
     std::thread::sleep(std::time::Duration::from_millis(100));
-    std::fs::OpenOptions::new().append(true).open(&beta_path).unwrap().write_all(b"\n").unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&beta_path)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
 
     let manager = SessionManager::new(dir.clone());
-    let request = resolve_session_request(parse_cli_args(vec!["--resume".to_string()]), &manager, false, std::path::Path::new("/tmp"));
+    let request = resolve_session_request(
+        parse_cli_args(vec!["--resume".to_string()]),
+        &manager,
+        false,
+        std::path::Path::new("/tmp"),
+    );
 
     // Note: the exact session picked depends on file-system ordering and mtime.
     // We just verify it picked *some* existing session rather than "default".

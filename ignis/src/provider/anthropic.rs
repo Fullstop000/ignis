@@ -1,6 +1,6 @@
-use anyhow::anyhow;
 use super::{bytes_to_lines, LlmProvider, LlmResponseDelta};
 use crate::Message;
+use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -76,10 +76,7 @@ impl LlmProvider for AnthropicProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[serde_json::Value],
-    ) -> Result<
-        BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
-        anyhow::Error,
-    > {
+    ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error> {
         // Map OpenAI format tools to Anthropic format:
         // OpenAI: { "type": "function", "function": { "name": "...", "description": "...", "parameters": { ... } } }
         // Anthropic: { "name": "...", "description": "...", "input_schema": { ... } }

@@ -22,44 +22,46 @@ impl ProviderConfig {
     }
 }
 
+/// Web search backend configuration. `provider` selects the backend
+/// (default "brave"); `api_key` is the credential for that backend.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WebSearchConfig {
+    pub provider: Option<String>,
+    pub api_key: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub active_provider: String,
     pub auto_resume_last_session: Option<bool>,
     pub providers: HashMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
 }
 
 pub fn load_config() -> Result<Config, anyhow::Error> {
     let mut paths = Vec::new();
     if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".ignis/config.yaml"));
+        paths.push(home.join(".ignis/config.toml"));
     }
 
     let mut last_err = None;
     for path in paths {
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(content) => match serde_yaml::from_str::<Config>(&content) {
+                Ok(content) => match toml::from_str::<Config>(&content) {
                     Ok(config) => return Ok(config),
-                    Err(e) => {
-                        last_err =
-                            Some(anyhow!("Failed to parse {}: {}", path.display(), e))
-                    }
+                    Err(e) => last_err = Some(anyhow!("Failed to parse {}: {}", path.display(), e)),
                 },
-                Err(e) => {
-                    last_err =
-                        Some(anyhow!("Failed to read {}: {}", path.display(), e))
-                }
+                Err(e) => last_err = Some(anyhow!("Failed to read {}: {}", path.display(), e)),
             }
         }
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow!("config.yaml not found")))
+    Err(last_err.unwrap_or_else(|| anyhow!("config.toml not found")))
 }
 
-pub fn build_provider(
-    config: &Config,
-) -> Result<Box<dyn LlmProvider>, anyhow::Error> {
+pub fn build_provider(config: &Config) -> Result<Box<dyn LlmProvider>, anyhow::Error> {
     let provider_name = &config.active_provider;
     let prov_cfg = config.providers.get(provider_name).ok_or_else(|| {
         anyhow!(
@@ -74,7 +76,10 @@ pub fn build_provider(
             let api_url = prov_cfg.require(prov_cfg.api_url.clone(), "openai", "api_url")?;
             let model = prov_cfg.require(prov_cfg.model.clone(), "openai", "model")?;
             Ok(Box::new(crate::provider::OpenAiProvider::new(
-                api_key, api_url, model, prov_cfg.user_agent.clone(),
+                api_key,
+                api_url,
+                model,
+                prov_cfg.user_agent.clone(),
             )))
         }
         "deepseek" => {
@@ -96,17 +101,29 @@ pub fn build_provider(
                 .unwrap_or_else(|| "https://api.kimi.com/coding/v1".to_string());
             let model = prov_cfg.require(prov_cfg.model.clone(), "kimi-code", "model")?;
             // Kimi Coding Plan requires a whitelisted User-Agent
-            let ua = prov_cfg.user_agent.clone().unwrap_or_else(|| "KimiCLI/1.44.0".to_string());
+            let ua = prov_cfg
+                .user_agent
+                .clone()
+                .unwrap_or_else(|| "KimiCLI/1.44.0".to_string());
             Ok(Box::new(crate::provider::OpenAiProvider::new(
-                api_key, api_url, model, Some(ua),
+                api_key,
+                api_url,
+                model,
+                Some(ua),
             )))
         }
         "Moonshot Platform CN" => {
-            let api_key = prov_cfg.require(prov_cfg.api_key.clone(), "Moonshot Platform CN", "api_key")?;
-            let api_url = prov_cfg.require(prov_cfg.api_url.clone(), "Moonshot Platform CN", "api_url")?;
-            let model = prov_cfg.require(prov_cfg.model.clone(), "Moonshot Platform CN", "model")?;
+            let api_key =
+                prov_cfg.require(prov_cfg.api_key.clone(), "Moonshot Platform CN", "api_key")?;
+            let api_url =
+                prov_cfg.require(prov_cfg.api_url.clone(), "Moonshot Platform CN", "api_url")?;
+            let model =
+                prov_cfg.require(prov_cfg.model.clone(), "Moonshot Platform CN", "model")?;
             Ok(Box::new(crate::provider::OpenAiProvider::new(
-                api_key, api_url, model, prov_cfg.user_agent.clone(),
+                api_key,
+                api_url,
+                model,
+                prov_cfg.user_agent.clone(),
             )))
         }
         "anthropic" => {

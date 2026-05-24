@@ -8,10 +8,7 @@ use tokio::sync::RwLock;
 
 #[async_trait]
 pub trait SessionStorage: Send + Sync + 'static {
-    async fn load_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<Message>, anyhow::Error>;
+    async fn load_session(&self, session_id: &str) -> Result<Vec<Message>, anyhow::Error>;
     async fn save_session(
         &self,
         session_id: &str,
@@ -41,10 +38,7 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl SessionStorage for InMemoryStorage {
-    async fn load_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<Message>, anyhow::Error> {
+    async fn load_session(&self, session_id: &str) -> Result<Vec<Message>, anyhow::Error> {
         let lock = self.sessions.read().await;
         if let Some(history) = lock.get(session_id) {
             Ok(history.clone())
@@ -87,29 +81,22 @@ impl FileStorage {
         }
     }
 
-    fn sanitize_session_id(
-        &self,
-        session_id: &str,
-    ) -> Result<String, anyhow::Error> {
+    fn sanitize_session_id(&self, session_id: &str) -> Result<String, anyhow::Error> {
         let sanitized = crate::util::sanitize_session_id(session_id);
         if sanitized.is_empty() {
-            return Err(anyhow::anyhow!("Invalid session_id: contains no alphanumeric characters"));
+            return Err(anyhow::anyhow!(
+                "Invalid session_id: contains no alphanumeric characters"
+            ));
         }
         Ok(sanitized)
     }
 
-    fn get_session_path(
-        &self,
-        session_id: &str,
-    ) -> Result<PathBuf, anyhow::Error> {
+    fn get_session_path(&self, session_id: &str) -> Result<PathBuf, anyhow::Error> {
         let clean_id = self.sanitize_session_id(session_id)?;
         Ok(self.base_dir.join(format!("{}.jsonl", clean_id)))
     }
 
-    fn get_legacy_session_path(
-        &self,
-        session_id: &str,
-    ) -> Result<PathBuf, anyhow::Error> {
+    fn get_legacy_session_path(&self, session_id: &str) -> Result<PathBuf, anyhow::Error> {
         let clean_id = self.sanitize_session_id(session_id)?;
         Ok(self.base_dir.join(format!("{}.json", clean_id)))
     }
@@ -160,16 +147,11 @@ impl FileStorage {
 
         Ok(out.into_bytes())
     }
-
-
 }
 
 #[async_trait]
 impl SessionStorage for FileStorage {
-    async fn load_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<Message>, anyhow::Error> {
+    async fn load_session(&self, session_id: &str) -> Result<Vec<Message>, anyhow::Error> {
         let path = self.get_session_path(session_id)?;
         if !path.exists() {
             let legacy_path = self.get_legacy_session_path(session_id)?;

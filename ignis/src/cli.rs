@@ -60,7 +60,7 @@ pub fn resolve_session_request(
             session_manager
                 .latest()
                 .map(|s| s.id)
-                .unwrap_or_else(|| SessionManager::create_id())
+                .unwrap_or_else(SessionManager::create_id)
         }
     } else if auto_resume {
         // Find the latest session whose start_dir matches current cwd
@@ -69,7 +69,7 @@ pub fn resolve_session_request(
             .into_iter()
             .find(|s| s.start_dir.as_ref() == Some(&cwd_str))
             .map(|s| s.id)
-            .unwrap_or_else(|| SessionManager::create_id())
+            .unwrap_or_else(SessionManager::create_id)
     } else {
         SessionManager::create_id()
     };
@@ -125,7 +125,11 @@ mod tests {
 
     #[test]
     fn parse_cli_args_oneshot_with_multiple_words() {
-        let parsed = parse_cli_args(vec!["write".to_string(), "a".to_string(), "test".to_string()]);
+        let parsed = parse_cli_args(vec![
+            "write".to_string(),
+            "a".to_string(),
+            "test".to_string(),
+        ]);
 
         assert!(!parsed.is_tui);
         assert_eq!(parsed.prompt_args, vec!["write", "a", "test"]);
@@ -158,8 +162,12 @@ mod tests {
         std::fs::write(dir.join("default.jsonl"), "{}\n").unwrap();
         let manager = SessionManager::new(dir.clone());
 
-        let request =
-            resolve_session_request(parse_cli_args(vec!["--resume".to_string()]), &manager, false, std::path::Path::new("/tmp"));
+        let request = resolve_session_request(
+            parse_cli_args(vec!["--resume".to_string()]),
+            &manager,
+            false,
+            std::path::Path::new("/tmp"),
+        );
 
         assert_eq!(request.session_id, "default");
         assert!(request.is_tui);
@@ -290,7 +298,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let older_file = std::fs::OpenOptions::new().write(true).open(&older_path).unwrap();
+        let older_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&older_path)
+            .unwrap();
         let times = std::fs::FileTimes::new()
             .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2));
         older_file.set_times(times).unwrap();

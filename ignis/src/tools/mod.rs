@@ -13,12 +13,19 @@ pub use list_dir::ListDirTool;
 pub use read_file::ReadFileTool;
 pub use web_search::WebSearchTool;
 
-pub fn register_native_tools(agent: &mut crate::Agent, cwd: &std::path::Path) {
+pub fn register_native_tools(
+    agent: &mut crate::Agent,
+    cwd: &std::path::Path,
+    web_search: crate::config::WebSearchConfig,
+) {
     use std::sync::Arc;
     agent.register_tool(Arc::new(ReadFileTool::new(cwd)));
     agent.register_tool(Arc::new(CreateFileTool::new(cwd)));
     agent.register_tool(Arc::new(ListDirTool::new(cwd)));
     agent.register_tool(Arc::new(BashTool::new(cwd)));
     agent.register_tool(Arc::new(EditFileTool::new(cwd)));
-    agent.register_tool(Arc::new(WebSearchTool::new()));
+    agent.register_tool(Arc::new(WebSearchTool::new(
+        web_search.provider,
+        web_search.api_key,
+    )));
 }

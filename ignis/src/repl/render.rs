@@ -8,8 +8,10 @@ use ratatui::{
 
 use super::app::{App, Mode, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
 use super::markdown::render_md_block;
-use super::{truncate, format_duration, SPINNERS, BG, SURFACE, SURFACE_2, BORDER, BORDER_ACTIVE, TEXT, TEXT_DIM, SUBTEXT, ACCENT, GREEN, RED, YELLOW, MAUVE};
-
+use super::{
+    format_duration, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, GREEN, MAUVE, RED, SPINNERS,
+    SUBTEXT, SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
+};
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let size = f.size();
@@ -75,13 +77,18 @@ pub(crate) fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         elapsed,
     ]);
 
-    let right = Line::from(Span::styled(
-        cwd_str,
-        Style::default().fg(TEXT_DIM),
-    ));
+    let right = Line::from(Span::styled(cwd_str, Style::default().fg(TEXT_DIM)));
 
-    f.render_widget(Paragraph::new(left).style(Style::default().bg(SURFACE)), header_layout[0]);
-    f.render_widget(Paragraph::new(right).style(Style::default().bg(SURFACE)).alignment(ratatui::layout::Alignment::Right), header_layout[1]);
+    f.render_widget(
+        Paragraph::new(left).style(Style::default().bg(SURFACE)),
+        header_layout[0],
+    );
+    f.render_widget(
+        Paragraph::new(right)
+            .style(Style::default().bg(SURFACE))
+            .alignment(ratatui::layout::Alignment::Right),
+        header_layout[1],
+    );
 }
 
 pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
@@ -558,7 +565,6 @@ pub(crate) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
 // Render Tests
 // ==========================================
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,7 +631,8 @@ mod tests {
             "default".to_string(),
             PathBuf::from("."),
         );
-        app.blocks.push(UIBlock::Assistant("Code block".to_string()));
+        app.blocks
+            .push(UIBlock::Assistant("Code block".to_string()));
 
         let mut term = test_terminal(80, 24);
         term.draw(|f| draw(f, &mut app)).unwrap();
@@ -746,7 +753,10 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let content = buffer_content(&term);
-        assert!(content.contains("openai/gpt-4"), "should show provider/model");
+        assert!(
+            content.contains("openai/gpt-4"),
+            "should show provider/model"
+        );
         assert!(content.contains("work"), "should show session id");
         assert!(content.contains("/tmp"), "should show cwd");
     }
@@ -782,7 +792,10 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let content = buffer_content(&term);
         assert!(content.contains("hello"), "should show user message");
-        assert!(content.contains("hi there"), "should show assistant message");
+        assert!(
+            content.contains("hi there"),
+            "should show assistant message"
+        );
     }
 
     #[test]
@@ -816,6 +829,9 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let content = buffer_content(&term);
         println!("content: {:?}", content);
-        assert!(content.contains("deep reasoning here"), "should show reasoning content");
+        assert!(
+            content.contains("deep reasoning here"),
+            "should show reasoning content"
+        );
     }
 }

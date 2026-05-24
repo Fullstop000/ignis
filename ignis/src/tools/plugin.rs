@@ -122,8 +122,6 @@ pub fn load_extensions(dirs: &[PathBuf]) -> Vec<PluginTool> {
 
             let working_dir = dir.to_path_buf();
 
-
-
             log::info!("Loaded plugin: {} from {}", manifest.name, path.display());
 
             plugins_by_name.insert(

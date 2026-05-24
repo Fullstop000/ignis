@@ -3,11 +3,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    style::Color,
-    Terminal,
-};
+use ratatui::{backend::CrosstermBackend, style::Color, Terminal};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,7 +62,6 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 
 // ==========================================
 // UI State
-
 
 pub mod app;
 pub mod markdown;
@@ -151,8 +146,6 @@ pub(crate) fn next_selection(current: usize, len: usize, direction: SelectionDir
     }
 }
 
-
-
 pub async fn run_repl(
     provider_name: String,
     model_name: String,
@@ -202,7 +195,11 @@ pub async fn run_repl(
                 agent_cwd.to_string_lossy().to_string(),
             );
 
-            crate::tools::register_native_tools(&mut agent, &agent_cwd);
+            crate::tools::register_native_tools(
+                &mut agent,
+                &agent_cwd,
+                agent_config.web_search.clone(),
+            );
             let ext_dirs = crate::tools::plugin::default_extension_dirs();
             let plugins = crate::tools::plugin::load_extensions(&ext_dirs);
             for plugin in plugins {
@@ -378,11 +375,19 @@ async fn handle_key(
                 if command == "/resume" && arg_count == 1 {
                     let mut sessions = session_manager.list();
                     if !sessions.iter().any(|s| s.id == app.session_id) {
-                        let user_count = app.blocks.iter().filter(|b| matches!(b, crate::repl::app::UIBlock::User(_))).count();
-                        let preview = app.blocks.iter().find_map(|b| match b {
-                            crate::repl::app::UIBlock::User(text) => Some(text.clone()),
-                            _ => None,
-                        }).unwrap_or_default();
+                        let user_count = app
+                            .blocks
+                            .iter()
+                            .filter(|b| matches!(b, crate::repl::app::UIBlock::User(_)))
+                            .count();
+                        let preview = app
+                            .blocks
+                            .iter()
+                            .find_map(|b| match b {
+                                crate::repl::app::UIBlock::User(text) => Some(text.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
                         sessions.push(crate::session::SessionMeta {
                             id: app.session_id.clone(),
                             message_count: user_count,

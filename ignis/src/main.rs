@@ -99,7 +99,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let config = load_config()?;
 
     // 2. Resolve paths
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not locate home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not locate home directory"))?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let ignis_home = home.join(".ignis");
     let storage_root = ignis_home.clone();
@@ -135,7 +136,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Route: One-shot CLI mode (ignis "do something")
     println!("=== Ignis (one-shot) ===");
-    println!("Provider: {}/{}" , config.active_provider, active_model);
+    println!("Provider: {}/{}", config.active_provider, active_model);
     println!("Session: {}", session_request.session_id);
 
     let provider = build_provider(&config)?;
@@ -149,7 +150,7 @@ async fn main() -> Result<(), anyhow::Error> {
     );
 
     // Register tools
-    ignis::tools::register_native_tools(&mut agent, &cwd);
+    ignis::tools::register_native_tools(&mut agent, &cwd, config.web_search.clone());
     let ext_dirs = ignis::plugin::default_extension_dirs();
     for d in &ext_dirs {
         if !d.exists() {
