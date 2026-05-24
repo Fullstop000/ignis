@@ -11,8 +11,9 @@ use unicode_width::UnicodeWidthStr;
 use super::app::{App, Mode, ModelPicker, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
 use super::markdown::render_md_block;
 use super::{
-    format_duration, format_tokens, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, GREEN,
-    MAUVE, RED, SPINNERS, SUBTEXT, SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
+    format_duration, format_tokens, highlight, sanitize, truncate, ACCENT, BG, BORDER,
+    BORDER_ACTIVE, DIFF_ADD_BG, DIFF_DEL_BG, GREEN, MAUVE, RED, SPINNERS, SUBTEXT, SURFACE,
+    SURFACE_2, TEXT, TEXT_DIM, YELLOW,
 };
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
@@ -199,7 +200,7 @@ pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
                     lines.extend(md_lines);
                 }
                 UIBlock::Tool(entry) => {
-                    render_tool_block(&mut lines, entry, app.tick, &app.cwd);
+                    render_tool_block(&mut lines, entry, app.tick, &app.cwd, area.width);
                 }
             }
         }
@@ -382,6 +383,7 @@ pub(crate) fn render_tool_block(
     entry: &ToolCallEntry,
     tick: u64,
     cwd: &Path,
+    width: u16,
 ) {
     let (icon, color, status_line, elapsed) = match &entry.status {
         ToolStatus::Pending => {
@@ -445,23 +447,23 @@ pub(crate) fn render_tool_block(
             ]));
         }
         ToolStatus::Success(out) => {
-            // edit_file returns a git-style diff: show the whole hunk with
-            // red/green +/- coloring. Other tools get a compact 3-line preview.
+            // edit_file returns a git-style diff: render the hunk with solid
+            // red/green backgrounds and syntax-highlighted code. Other tools get
+            // a compact 3-line preview.
             let is_diff = entry.name == "edit_file";
             let max = if is_diff { 30 } else { 3 };
-            for sl in out.lines().take(max) {
-                let display = truncate(&sanitize(sl), 200);
-                let line_style = if is_diff && display.starts_with('+') {
-                    Style::default().fg(GREEN)
-                } else if is_diff && display.starts_with('-') {
-                    Style::default().fg(RED)
-                } else {
-                    Style::default().fg(TEXT_DIM)
-                };
-                lines.push(Line::from(vec![
-                    Span::styled("  │ ", Style::default().fg(color)),
-                    Span::styled(display, line_style),
-                ]));
+            if is_diff {
+                let ext = diff_file_ext(&entry.arguments);
+                for sl in out.lines().take(max) {
+                    push_diff_line(lines, sl, &ext, color, width);
+                }
+            } else {
+                for sl in out.lines().take(max) {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(color)),
+                        Span::styled(truncate(&sanitize(sl), 200), Style::default().fg(TEXT_DIM)),
+                    ]));
+                }
             }
             let total_lines = out.lines().count();
             if total_lines > max {
@@ -485,6 +487,73 @@ pub(crate) fn render_tool_block(
     }
 
     lines.push(Line::from(Span::styled("  └", Style::default().fg(color))));
+}
+
+/// The active file's extension (for syntax highlighting), from the tool args.
+fn diff_file_ext(args_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(args_json)
+        .ok()
+        .and_then(|v| {
+            ["path", "file_path"]
+                .iter()
+                .find_map(|k| v.get(k).and_then(|p| p.as_str()).map(String::from))
+        })
+        .and_then(|p| {
+            Path::new(&p)
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
+}
+
+/// Render one diff line. Added (`+`) and removed (`-`) lines get a solid
+/// background filling the row and syntax-highlighted code; other lines render
+/// plain. `width` is the messages-area width (for the full-row background).
+fn push_diff_line(
+    lines: &mut Vec<Line<'static>>,
+    raw: &str,
+    ext: &str,
+    border: ratatui::style::Color,
+    width: u16,
+) {
+    let prefix = Span::styled("  │ ", Style::default().fg(border));
+    let (sign, bg, sign_fg) = match raw.as_bytes().first() {
+        Some(b'+') => ('+', DIFF_ADD_BG, GREEN),
+        Some(b'-') => ('-', DIFF_DEL_BG, RED),
+        _ => {
+            lines.push(Line::from(vec![
+                prefix,
+                Span::styled(truncate(&sanitize(raw), 200), Style::default().fg(TEXT_DIM)),
+            ]));
+            return;
+        }
+    };
+
+    // Content area = width − "  │ " (4) − "± " (2); fill it so the bg spans the row.
+    let content_w = (width as usize).saturating_sub(6).max(8);
+    // `truncate` appends `…` past its limit, so cap at content_w − 1: a truncated
+    // line is then exactly content_w cells and never wraps off the bg bar.
+    let code = truncate(&sanitize(raw.get(2..).unwrap_or("")), content_w - 1);
+
+    let mut spans = vec![
+        prefix,
+        Span::styled(
+            format!("{sign} "),
+            Style::default()
+                .fg(sign_fg)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut used = 0usize;
+    for (fg, text) in highlight::highlight_line(&code, ext) {
+        used += UnicodeWidthStr::width(text.as_str());
+        spans.push(Span::styled(text, Style::default().fg(fg).bg(bg)));
+    }
+    if let Some(pad) = content_w.checked_sub(used).filter(|p| *p > 0) {
+        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
+    }
+    lines.push(Line::from(spans));
 }
 
 /// Produce a compact arg summary from JSON, showing **values only** (never the
@@ -841,6 +910,86 @@ mod tests {
         assert!(
             !content.contains("Edited file"),
             "old message should be gone"
+        );
+    }
+
+    #[test]
+    fn diff_lines_have_solid_background_and_syntax_colors() {
+        let mut app = App::new(
+            "p".to_string(),
+            "m".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        app.blocks.push(UIBlock::Tool(ToolCallEntry {
+            id: "c".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path":"src/x.rs"}"#.to_string(),
+            status: ToolStatus::Success("- let x = 1;\n+ let y = vec![2];".to_string()),
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 5,
+        }));
+
+        let mut term = test_terminal(100, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+
+        let mut add_bg = false;
+        let mut del_bg = false;
+        let mut add_fg = std::collections::HashSet::new();
+        for cell in buf.content.iter() {
+            if cell.bg == DIFF_ADD_BG {
+                add_bg = true;
+                add_fg.insert(cell.fg);
+            }
+            if cell.bg == DIFF_DEL_BG {
+                del_bg = true;
+            }
+        }
+        assert!(add_bg, "added line must have a solid green background");
+        assert!(del_bg, "removed line must have a solid red background");
+        // Multiple foreground colors on the added line ⇒ syntax highlighting is on.
+        assert!(
+            add_fg.len() > 1,
+            "added line should be syntax-highlighted (multiple colors), got {add_fg:?}"
+        );
+    }
+
+    #[test]
+    fn long_diff_line_stays_on_one_row() {
+        // Regression: truncation appended `…` past the width, making the line one
+        // cell too wide so its solid bg wrapped onto a second row.
+        let mut app = App::new(
+            "p".to_string(),
+            "m".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        let long =
+            "+ let x = a_really_long_identifier_that_far_exceeds_the_narrow_terminal_width = 1;";
+        app.blocks.push(UIBlock::Tool(ToolCallEntry {
+            id: "c".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path":"src/x.rs"}"#.to_string(),
+            status: ToolStatus::Success(long.to_string()),
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 1,
+        }));
+        let mut term = test_terminal(40, 24); // narrow → forces truncation
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let mut rows = std::collections::HashSet::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf.get(x, y).bg == DIFF_ADD_BG {
+                    rows.insert(y);
+                }
+            }
+        }
+        assert_eq!(
+            rows.len(),
+            1,
+            "one added line must occupy one row, got {rows:?}"
         );
     }
 

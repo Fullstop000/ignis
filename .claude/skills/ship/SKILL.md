@@ -64,12 +64,11 @@ decide silently. Dogfooding means using the built binary the way a real user
 would, to catch what unit tests miss (TUI layout, real provider behavior, the
 exact path you changed). Skip only with their OK (e.g. docs/CI-only changes).
 
-If yes — needs a working provider in `~/.ignis/config.toml` (network, spends tokens):
-```bash
-./target/release/ignis "<a real task that exercises this change>"
-# or launch the TUI and drive the new path by hand
-```
-Report what you exercised and the result.
+If yes, use the **`dogfood`** skill (`.claude/skills/dogfood/`) for how — it covers
+both behavioral checks (one-shot CLI / state) and **visual** checks. For anything
+visual (TUI), you can't judge colors or layout from tool output: screenshot the
+real TUI to a PNG with `dogfood/tui_shot.py` and actually `Read` it. Report what
+you exercised and the result.
 
 ### 4. Secret scan — must be clean
 ```bash
