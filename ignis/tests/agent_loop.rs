@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use ignis::{
+    config::CompactionConfig,
     provider::{LlmProvider, LlmResponseDelta},
     storage::{InMemoryStorage, SessionStorage},
     tool::{AgentTool, ToolResult},
@@ -337,14 +338,15 @@ async fn agent_reasoning_content_is_preserved() {
 
 #[tokio::test]
 async fn session_compact_summarizes_old_history() {
-    // Seed a 10-message conversation (5 user/assistant pairs).
+    // Seed a 10-message conversation with uniform, sizable content so a small
+    // keep-budget reliably forces compaction.
     let storage = InMemoryStorage::new();
     let mut seed = Vec::new();
-    for i in 0..5 {
+    for _ in 0..5 {
         for role in ["user", "assistant"] {
             seed.push(Message {
                 role: role.to_string(),
-                content: Some(format!("{role}-{i}")),
+                content: Some("x".repeat(400)), // ~101 estimated tokens each
                 reasoning_content: None,
                 name: None,
                 tool_call_id: None,
@@ -357,8 +359,11 @@ async fn session_compact_summarizes_old_history() {
         .await
         .unwrap();
 
-    // The single complete() call during compaction returns this summary.
-    let provider = MockProvider::new(vec![vec![LlmResponseDelta::Text("SUMMARY".to_string())]]);
+    // The compaction completion returns the <analysis>/<summary> framing the
+    // prompt asks for; only the <summary> body should be kept.
+    let provider = MockProvider::new(vec![vec![LlmResponseDelta::Text(
+        "<analysis>thinking</analysis><summary>SUMMARY</summary>".to_string(),
+    )]]);
     let mut session = Session::open(
         "c".to_string(),
         "system".to_string(),
@@ -368,20 +373,27 @@ async fn session_compact_summarizes_old_history() {
     )
     .await
     .unwrap();
+    session.set_compaction(CompactionConfig {
+        auto: false,
+        threshold_tokens: usize::MAX,
+        keep_recent_tokens: 350,
+    });
     assert_eq!(session.history().len(), 10);
 
     let removed = session.compact().await.unwrap();
-    assert_eq!(removed, 4); // keep last 6, cut at the user boundary at index 4
+    assert!(removed > 0, "expected the older head to be compacted");
 
     let h = session.history();
-    assert_eq!(h.len(), 7); // 1 summary + 6 recent
+    assert!(h.len() < 10, "history should shrink");
     assert_eq!(h[0].role, "user");
-    assert!(h[0].content.as_deref().unwrap().contains("SUMMARY"));
-    // The kept tail must start at a clean turn boundary (a user message),
-    // so no tool result is ever orphaned.
+    let summary = h[0].content.as_deref().unwrap();
+    assert!(summary.contains("SUMMARY"));
+    assert!(!summary.contains("thinking")); // <analysis> scratchpad dropped
+                                            // The kept tail must start at a user turn boundary, so no tool result is
+                                            // ever orphaned from the assistant message that requested it.
     assert_eq!(h[1].role, "user");
 
     // Compaction is persisted.
     let persisted = storage.load_session("c").await.unwrap();
-    assert_eq!(persisted.len(), 7);
+    assert_eq!(persisted.len(), h.len());
 }

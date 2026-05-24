@@ -211,6 +211,7 @@ pub async fn run_console(
                     continue;
                 }
             };
+            session.set_compaction(agent_config.compaction.clone());
 
             crate::tools::register_native_tools(
                 &mut session,

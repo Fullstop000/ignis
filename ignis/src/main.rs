@@ -149,6 +149,7 @@ async fn main() -> Result<(), anyhow::Error> {
         cwd.to_string_lossy().to_string(),
     )
     .await?;
+    session.set_compaction(config.compaction.clone());
 
     // Register tools
     ignis::tools::register_native_tools(&mut session, &cwd, config.web_search.clone());
