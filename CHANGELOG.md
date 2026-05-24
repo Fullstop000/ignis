@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-24
+
+### Added
+- `Session` core model wrapping a stateless `Agent`, exposing `prompt()` and `compact()`.
+- Context compaction: token-budget range, auto-trigger threshold, 9-section summary prompt; `/compact` command and `[compaction]` config.
+
+### Changed
+- Renamed `repl` → `console`; `agent`/`session`/`cli`/`console` are now directory modules.
+- TUI: frame-capped coalesced rendering, borderless Claude Code-style layout, status footer (dir · model · ctx%), loading status above input, mouse-wheel scroll, Ctrl/Cmd+J newline.
+- Merged `/new` into `/clear` (single session-reset command).
+
+### Fixed
+- Multi-byte (CJK) input no longer panics; cursor stays on UTF-8 char boundaries and uses display-width columns.
+
 ## [0.1.0] - 2026-05-24
 
 ### Added
