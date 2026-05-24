@@ -534,34 +534,31 @@ async fn handle_key(
         {
             // Ctrl/Cmd+J inserts a newline (Enter still submits).
             app.clear_exit_hint();
-            app.input.insert(app.cursor, '\n');
-            app.cursor += 1;
+            app.insert_char('\n');
             app.reset_slash_selection();
         }
         (_, KeyCode::Char(c)) => {
             app.clear_exit_hint();
-            app.input.insert(app.cursor, c);
-            app.cursor += 1;
+            app.insert_char(c);
             app.reset_slash_selection();
         }
         (_, KeyCode::Backspace) if app.cursor > 0 => {
             app.clear_exit_hint();
-            app.cursor -= 1;
-            app.input.remove(app.cursor);
+            app.backspace();
             app.reset_slash_selection();
         }
         (_, KeyCode::Delete) if app.cursor < app.input.len() => {
             app.clear_exit_hint();
-            app.input.remove(app.cursor);
+            app.delete_forward();
             app.reset_slash_selection();
         }
         (_, KeyCode::Left) if app.cursor > 0 => {
             app.clear_exit_hint();
-            app.cursor -= 1;
+            app.move_left();
         }
         (_, KeyCode::Right) if app.cursor < app.input.len() => {
             app.clear_exit_hint();
-            app.cursor += 1;
+            app.move_right();
         }
         (_, KeyCode::Home) => {
             app.clear_exit_hint();

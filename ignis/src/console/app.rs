@@ -230,6 +230,52 @@ impl App {
         }
     }
 
+    /// Byte offset of the char boundary one character left of the cursor.
+    /// `cursor` indexes `input` by byte, so movement must step whole UTF-8
+    /// chars — a naive `cursor -= 1` lands mid-character and panics on slice.
+    fn prev_char_boundary(&self) -> usize {
+        self.input[..self.cursor]
+            .chars()
+            .next_back()
+            .map_or(0, |c| self.cursor - c.len_utf8())
+    }
+
+    /// Byte offset of the char boundary one character right of the cursor.
+    fn next_char_boundary(&self) -> usize {
+        self.input[self.cursor..]
+            .chars()
+            .next()
+            .map_or(self.cursor, |c| self.cursor + c.len_utf8())
+    }
+
+    pub(crate) fn insert_char(&mut self, c: char) {
+        self.input.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.prev_char_boundary();
+        self.input.remove(prev);
+        self.cursor = prev;
+    }
+
+    pub(crate) fn delete_forward(&mut self) {
+        if self.cursor < self.input.len() {
+            self.input.remove(self.cursor);
+        }
+    }
+
+    pub(crate) fn move_left(&mut self) {
+        self.cursor = self.prev_char_boundary();
+    }
+
+    pub(crate) fn move_right(&mut self) {
+        self.cursor = self.next_char_boundary();
+    }
+
     pub(crate) fn submit(&mut self) -> Option<String> {
         let text = self.input.trim().to_string();
         if text.is_empty() || self.mode != Mode::Idle {
@@ -476,6 +522,47 @@ mod tests {
     #[test]
     fn slash_suggestions_stop_after_first_argument() {
         assert!(slash_suggestions("/resume default").is_empty());
+    }
+
+    fn test_app() -> App {
+        App::new(
+            "p".to_string(),
+            "m".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    #[test]
+    fn editing_multibyte_chars_keeps_cursor_on_boundary() {
+        // Regression: typing a CJK char (3 bytes) used to advance the cursor by
+        // 1 byte, landing mid-character and panicking on the next slice/render.
+        let mut app = test_app();
+        for c in "中a文".chars() {
+            app.insert_char(c);
+            assert!(
+                app.input.is_char_boundary(app.cursor),
+                "cursor must stay on a char boundary after insert"
+            );
+        }
+        assert_eq!(app.input, "中a文");
+        assert_eq!(app.cursor, app.input.len());
+
+        // Slicing at the cursor (what draw_input does) must not panic.
+        let _ = &app.input[..app.cursor];
+
+        // Walk left across every char, then delete them.
+        for _ in 0..3 {
+            app.move_left();
+            assert!(app.input.is_char_boundary(app.cursor));
+        }
+        assert_eq!(app.cursor, 0);
+
+        app.cursor = app.input.len();
+        app.backspace(); // removes "文"
+        assert_eq!(app.input, "中a");
+        assert!(app.input.is_char_boundary(app.cursor));
+        assert_eq!(app.cursor, app.input.len());
     }
 
     #[test]

@@ -5,6 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, Mode, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
 use super::markdown::render_md_block;
@@ -453,9 +454,13 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 
     if active {
         // Place the cursor at its (row, col) within the multi-line input.
+        // `cursor` is a byte offset; the column is the *display width* of the
+        // current row up to it (wide CJK glyphs span two cells), matching how
+        // ratatui lays the text out.
         let before = &app.input[..app.cursor];
         let row = before.matches('\n').count() as u16;
-        let col = (before.len() - before.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u16;
+        let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let col = UnicodeWidthStr::width(&app.input[line_start..app.cursor]) as u16;
         f.set_cursor(area.x + 1 + col, area.y + 1 + row);
     }
 }
@@ -724,6 +729,29 @@ mod tests {
         );
         assert!(content.contains("/tmp"), "footer should show cwd");
         assert!(content.contains("% ctx"), "footer should show context %");
+    }
+
+    #[test]
+    fn render_input_with_wide_chars_does_not_panic() {
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        // Mixed CJK + ASCII, cursor mid-string on a char boundary.
+        app.input = "中文a测试".to_string();
+        app.cursor = "中文a".len();
+
+        let mut term = test_terminal(80, 24);
+        // Would panic on a non-char-boundary slice if cursor math were byte-naive.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        // (ratatui pads the trailing cell of a wide glyph with a space, so the
+        // CJK chars don't appear contiguously — assert each is present.)
+        let content = buffer_content(&term);
+        assert!(content.contains("中"), "should render wide chars");
+        assert!(content.contains("试"), "should render the full input");
     }
 
     #[test]
