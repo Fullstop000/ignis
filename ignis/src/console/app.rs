@@ -305,15 +305,22 @@ impl App {
                 self.last_usage = Some(usage);
             }
             AgentEvent::AgentEnd => {
+                // Only treat this as a real turn-end if we were actually in a
+                // turn. A duplicate `AgentEnd` (e.g. a persistence error after the
+                // agent loop already emitted one) arrives while we're already
+                // `Idle` and must NOT trigger a second queue drain.
+                let was_busy = self.mode != Mode::Idle;
                 self.mode = Mode::Idle;
                 self.current_chunk_idx = None;
                 self.stream_start = None;
-                self.turn_just_ended = true;
-                // Any inject that lost the end-of-turn race fires next turn.
-                if !self.pending_injects.is_empty() {
-                    let mut stranded = std::mem::take(&mut self.pending_injects);
-                    stranded.append(&mut self.queue);
-                    self.queue = stranded;
+                if was_busy {
+                    self.turn_just_ended = true;
+                    // Any inject that lost the end-of-turn race fires next turn.
+                    if !self.pending_injects.is_empty() {
+                        let mut stranded = std::mem::take(&mut self.pending_injects);
+                        stranded.append(&mut self.queue);
+                        self.queue = stranded;
+                    }
                 }
             }
             AgentEvent::UserInjected { text } => {
@@ -1141,6 +1148,22 @@ mod tests {
         assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "steer"));
         assert_eq!(app.history.last().map(|s| s.as_str()), Some("steer"));
         assert!(app.pending_injects.is_empty());
+    }
+
+    #[test]
+    fn duplicate_agent_end_does_not_double_drain() {
+        // A persistence error after the agent loop already emitted AgentEnd can
+        // produce a second AgentEnd. Only the first (while busy) arms the drain;
+        // the duplicate (already Idle) must not, or the queue would drain twice.
+        let mut app = test_app();
+        app.mode = Mode::Thinking;
+        app.handle_event(AgentEvent::AgentEnd);
+        assert!(app.take_turn_just_ended(), "real turn-end arms the drain");
+        app.handle_event(AgentEvent::AgentEnd); // stale duplicate, already Idle
+        assert!(
+            !app.take_turn_just_ended(),
+            "duplicate AgentEnd must not re-arm the drain"
+        );
     }
 
     #[test]

@@ -363,6 +363,10 @@ pub async fn run_console(
             let tx = agent_tx.clone();
             match prompt {
                 Some(prompt) => {
+                    // Discard any cancel that arrived after the previous turn
+                    // already ended (its end-of-turn window) — it must not cancel
+                    // this fresh prompt.
+                    while cancel_rx.try_recv().is_ok() {}
                     let (inj_tx, inj_rx) = mpsc::channel::<String>(8);
                     *active_inject_runner.lock().unwrap() = Some(inj_tx);
                     session.set_inject_source(inj_rx);
@@ -607,32 +611,38 @@ async fn handle_key(
         _ => {}
     }
 
-    // Ctrl+S: inject into the live turn (steer). Falls back to enqueue when no
-    // prompt run is active (idle / compact), so text is never silently dropped.
+    // Ctrl+S: steer the live turn. Busy only — when idle there is no turn to
+    // steer and the idle UI hides the queue (a queued item would vanish and only
+    // fire at some later turn), so idle Ctrl+S is a no-op. We still `return` so it
+    // never falls through to the idle handler and types a literal 's'.
     if matches!(key.code, KeyCode::Char('s')) && key.modifiers.contains(KeyModifiers::CONTROL) {
-        let text = app.input.trim().to_string();
-        if !text.is_empty() {
-            let sender = active_inject.lock().unwrap().clone();
-            match sender {
-                Some(tx) => match tx.try_send(text.clone()) {
-                    Ok(()) => {
-                        app.pending_injects.push(text);
+        if app.mode != Mode::Idle {
+            let text = app.input.trim().to_string();
+            if !text.is_empty() {
+                let sender = active_inject.lock().unwrap().clone();
+                match sender {
+                    Some(tx) => match tx.try_send(text.clone()) {
+                        Ok(()) => {
+                            app.pending_injects.push(text);
+                            app.input.clear();
+                            app.cursor = 0;
+                            app.reset_slash_selection();
+                        }
+                        Err(_) => {
+                            app.error_flash = Some((
+                                "Couldn't steer — try again".to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    },
+                    // Busy but no live prompt run (e.g. /compact): queue it — the
+                    // queue is visible while busy and drains at the next AgentEnd.
+                    None => {
+                        app.enqueue(text);
                         app.input.clear();
                         app.cursor = 0;
                         app.reset_slash_selection();
                     }
-                    Err(_) => {
-                        app.error_flash = Some((
-                            "Couldn't steer — try again".to_string(),
-                            std::time::Instant::now(),
-                        ));
-                    }
-                },
-                None => {
-                    app.enqueue(text);
-                    app.input.clear();
-                    app.cursor = 0;
-                    app.reset_slash_selection();
                 }
             }
         }
