@@ -18,4 +18,5 @@ pub use ignis_macros::tool;
 pub use agent::{Agent, AgentEvent};
 pub use provider::{Message, ToolCall, ToolCallFunction, Usage};
 pub use session::Session;
+pub use skills::{Skill, SkillRegistry, SkillScope};
 pub use tools::tool::{AgentTool, ExecutionMode, IntoToolResult, ToolHooks, ToolResult};
