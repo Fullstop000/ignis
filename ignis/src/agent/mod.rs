@@ -123,6 +123,31 @@ fn get_current_date() -> String {
         .unwrap_or_else(|_| "Unknown Date".to_string())
 }
 
+/// Drain any pending inject messages into `history` as user turns, emitting a
+/// `UserInjected` event for each. Returns how many were drained.
+async fn drain_injected(
+    inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+    history: &mut Vec<Message>,
+    tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) -> usize {
+    let mut n = 0;
+    if let Some(rx) = inject_rx {
+        while let Ok(text) = rx.try_recv() {
+            history.push(Message {
+                role: "user".to_string(),
+                content: Some(text.clone()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            });
+            let _ = tx.send(AgentEvent::UserInjected { text }).await;
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Execution engine: given a conversation `history`, runs the model + tool
 /// loop and emits events. State and persistence live in [`crate::Session`].
 pub struct Agent {
@@ -196,6 +221,7 @@ impl Agent {
         &self,
         history: &mut Vec<Message>,
         tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        mut inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     ) -> Result<Usage, anyhow::Error> {
         let _ = tx.send(AgentEvent::AgentStart).await;
         let mut total_usage = Usage::default();
@@ -216,6 +242,7 @@ impl Agent {
             .collect();
 
         loop {
+            drain_injected(inject_rx.as_deref_mut(), history, &tx).await;
             let _ = tx.send(AgentEvent::TurnStart).await;
 
             let mut stream = match self
@@ -640,8 +667,14 @@ impl Agent {
                 let _ = tx.send(AgentEvent::TurnEnd).await;
                 // Continue Turn loop since we provided tool results back to LLM
             } else {
+                // No tools: this round would end the turn. But if a steering
+                // message arrived, fold it in and run one more round so the model
+                // actually responds to it (keep-the-turn-alive).
+                let injected = drain_injected(inject_rx.as_deref_mut(), history, &tx).await;
                 let _ = tx.send(AgentEvent::TurnEnd).await;
-                break; // Break turn loop if no tools were called
+                if injected == 0 {
+                    break;
+                }
             }
         }
 

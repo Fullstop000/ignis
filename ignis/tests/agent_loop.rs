@@ -7,7 +7,7 @@ use ignis::{
     tools::tool::{AgentTool, ToolResult},
     AgentEvent, Message, Session, Usage,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // ==========================================
@@ -395,6 +395,109 @@ async fn session_compact_summarizes_old_history() {
     // Compaction is persisted.
     let persisted = storage.load_session("c").await.unwrap();
     assert_eq!(persisted.len(), h.len());
+}
+
+/// Provider that, on its first `chat_stream` call, pushes a steering message into
+/// an inject channel (simulating Ctrl+S landing mid-turn), then returns canned
+/// responses per call.
+struct SteerOnceProvider {
+    inject: tokio::sync::mpsc::Sender<String>,
+    steer_text: String,
+    fired: AtomicBool,
+    responses: Vec<Vec<LlmResponseDelta>>,
+    index: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for SteerOnceProvider {
+    async fn chat_stream(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _tools: &[serde_json::Value],
+    ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error> {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            let _ = self.inject.try_send(self.steer_text.clone());
+        }
+        let idx = self.index.fetch_add(1, Ordering::SeqCst);
+        let deltas = self.responses.get(idx).cloned().unwrap_or_default();
+        Ok(stream::iter(deltas.into_iter().map(Ok)).boxed())
+    }
+}
+
+#[tokio::test]
+async fn inject_buffered_before_run_is_drained_into_history() {
+    let provider = MockProvider::new(vec![vec![LlmResponseDelta::Text("ok".to_string())]]);
+    let storage = InMemoryStorage::new();
+    let mut session = Session::open(
+        "inj".to_string(),
+        "system".to_string(),
+        Box::new(provider),
+        Box::new(storage.clone()),
+        "/tmp".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let (inj_tx, inj_rx) = tokio::sync::mpsc::channel::<String>(8);
+    inj_tx.try_send("INJECT".to_string()).unwrap();
+    session.set_inject_source(inj_rx);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    session.prompt("hi", tx).await.unwrap();
+    let events = collect_events(&mut rx).await;
+
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::UserInjected { text } if text == "INJECT")));
+
+    let history = storage.load_session("inj").await.unwrap();
+    let user_msgs: Vec<&str> = history
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .collect();
+    assert_eq!(user_msgs, vec!["hi", "INJECT"]);
+}
+
+#[tokio::test]
+async fn inject_on_final_round_keeps_turn_alive_one_more_round() {
+    let (inj_tx, inj_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let provider = SteerOnceProvider {
+        inject: inj_tx,
+        steer_text: "STEER".to_string(),
+        fired: AtomicBool::new(false),
+        responses: vec![
+            vec![LlmResponseDelta::Text("first".to_string())],
+            vec![LlmResponseDelta::Text("second".to_string())],
+        ],
+        index: AtomicUsize::new(0),
+    };
+    let storage = InMemoryStorage::new();
+    let mut session = Session::open(
+        "keep".to_string(),
+        "system".to_string(),
+        Box::new(provider),
+        Box::new(storage.clone()),
+        "/tmp".to_string(),
+    )
+    .await
+    .unwrap();
+    session.set_inject_source(inj_rx);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    session.prompt("go", tx).await.unwrap();
+    let events = collect_events(&mut rx).await;
+
+    // The first round had no tools; the inject kept the turn alive for a second.
+    assert_eq!(find_text(&events), "firstsecond");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::UserInjected { text } if text == "STEER")));
+    let history = storage.load_session("keep").await.unwrap();
+    assert!(history
+        .iter()
+        .any(|m| m.role == "user" && m.content.as_deref() == Some("STEER")));
 }
 
 #[tokio::test]
