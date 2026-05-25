@@ -385,8 +385,6 @@ impl App {
 
     /// Push a user prompt into the transcript + input history (shared by submit
     /// and the queue drain). Does not send anything.
-    // Used by the queue drain in console/mod.rs (Task 4) and UserInjected handler.
-    #[allow(dead_code)]
     pub(crate) fn push_user_prompt(&mut self, text: String) {
         self.exit_pending = false;
         self.history.push(text.clone());
