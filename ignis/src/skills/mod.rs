@@ -417,6 +417,9 @@ mod tests {
 
     #[test]
     fn toggle_round_trips_through_state() {
+        let _env = crate::util::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = crate::util::unique_temp_dir("ignis-skills-toggle");
         let cwd = tmp.join("proj");
         write_skill(&cwd.join(".ignis/skills"), "react", "body");

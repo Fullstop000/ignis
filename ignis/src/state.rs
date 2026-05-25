@@ -99,6 +99,9 @@ mod tests {
 
     #[test]
     fn model_persist_preserves_disabled_skills_and_vice_versa() {
+        let _env = crate::util::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = crate::util::unique_temp_dir("ignis-state-rmw");
         std::fs::create_dir_all(&tmp).unwrap();
         let prev = std::env::var_os("HOME");

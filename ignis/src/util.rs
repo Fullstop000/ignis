@@ -45,6 +45,12 @@ pub fn parse_jsonl_messages(content: &str) -> Vec<Message> {
     messages
 }
 
+/// Serializes tests that mutate the process-global `$HOME` (state.json lives
+/// under it). `$HOME` is shared across the whole process, so such tests must
+/// not run in parallel or they clobber each other's state file.
+#[cfg(test)]
+pub static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Generate a unique temporary directory path for tests.
 pub fn unique_temp_dir(prefix: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
