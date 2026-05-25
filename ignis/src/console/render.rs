@@ -303,6 +303,33 @@ pub(crate) fn render_block_into(buf: &mut ratatui::buffer::Buffer, lines: &[Line
         .style(Style::default().bg(BG))
         .wrap(Wrap { trim: false })
         .render(area, buf);
+    blank_wide_char_continuations(buf);
+}
+
+/// Empty the cell that follows each double-width glyph (CJK, emoji).
+///
+/// `Terminal::insert_before` flushes *every* buffer cell to the backend — it
+/// skips the `diff` step that, in a normal draw, drops the blank continuation
+/// cell after a wide glyph. The crossterm backend then prints that blank `" "`
+/// at the column the wide glyph already advanced past, leaving a stray space
+/// after every wide char. Clearing the continuation symbol makes the backend
+/// print nothing there, so the glyph keeps its natural two columns.
+fn blank_wide_char_continuations(buf: &mut ratatui::buffer::Buffer) {
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        let mut x = area.left();
+        while x < area.right() {
+            let w = UnicodeWidthStr::width(buf.get(x, y).symbol());
+            if w >= 2 {
+                if x + 1 < area.right() {
+                    buf.get_mut(x + 1, y).set_symbol("");
+                }
+                x += 2;
+            } else {
+                x += 1;
+            }
+        }
+    }
 }
 
 /// The startup banner, committed once to scrollback at launch.
@@ -930,6 +957,23 @@ mod queue_render_tests {
             queued_hint(&a).as_deref(),
             Some("↑ edit last · Enter queue · Ctrl+S send now")
         );
+    }
+
+    #[test]
+    fn render_block_blanks_wide_char_continuations() {
+        // Regression: `insert_before` flushes every cell, so the blank cell after
+        // a double-width glyph would print as a stray space in scrollback. We
+        // empty it. "ab的cd" → 的 occupies cells 2-3; cell 3 must be "".
+        use ratatui::{buffer::Buffer, layout::Rect, text::Line};
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_block_into(&mut buf, &[Line::from("ab的cd")]);
+        assert_eq!(buf.get(2, 0).symbol(), "的");
+        assert_eq!(
+            buf.get(3, 0).symbol(),
+            "",
+            "wide-char continuation must be emptied"
+        );
+        assert_eq!(buf.get(4, 0).symbol(), "c");
     }
 
     #[test]
