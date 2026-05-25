@@ -410,6 +410,11 @@ pub async fn run_console(
         let term_rows = terminal.size()?.height;
         let want_vh = render::live_height(&app, term_rows);
         if want_vh != cur_vh {
+            // Clear the current live band first: this erases its rows and parks
+            // the cursor at the band's top, so the rebuilt viewport re-anchors
+            // there instead of leaving stale rows or pushing live UI into
+            // scrollback.
+            terminal.clear()?;
             terminal = make_inline_terminal(want_vh)?;
             cur_vh = want_vh;
         }
