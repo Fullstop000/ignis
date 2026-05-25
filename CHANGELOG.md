@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Skills — define reusable `SKILL.md` instruction sets the model loads on demand; force-load with `/skill-name` and manage with `/skills`.
+
 ## [0.11.0] - 2026-05-25
 
 ### Added
