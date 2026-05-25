@@ -20,6 +20,9 @@ use super::{
 
 /// Max queued rows shown before collapsing to a "+N more" row.
 const MAX_QUEUE_ROWS: usize = 5;
+/// Max slash-suggestion rows shown at once; the list scrolls to keep the
+/// selected entry visible when there are more (e.g. many skills + `/skills`).
+const MAX_SLASH_ROWS: u16 = 8;
 
 /// Adaptive hint shown above the input while busy (None = no hint row).
 pub(crate) fn queued_hint(app: &App) -> Option<String> {
@@ -75,7 +78,7 @@ pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
     let input_h = input_height(app, cap);
     let sugg = app.slash_suggestions();
     let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
-        (sugg.len() as u16).min(5)
+        (sugg.len() as u16).min(MAX_SLASH_ROWS)
     } else {
         0
     };
@@ -117,7 +120,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
         size.height
             .saturating_sub(input_h + 2)
-            .min((sugg.len() as u16).min(5))
+            .min((sugg.len() as u16).min(MAX_SLASH_ROWS))
     } else {
         0
     };
@@ -948,15 +951,32 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 
 /// Render the slash-command suggestions into `area` (the band reserved above the
 /// input). One row per suggestion; the highlighted row is inverted.
+/// First index of the visible slash-suggestion window so that `sel` stays in
+/// view: `[start, start+visible)` always contains `sel`.
+fn slash_window_start(sel: usize, visible: usize, len: usize) -> usize {
+    let visible = visible.max(1);
+    let sel = sel.min(len.saturating_sub(1));
+    if sel >= visible {
+        sel - visible + 1
+    } else {
+        0
+    }
+}
+
 pub(crate) fn draw_slash_suggestions(f: &mut Frame, area: Rect, app: &App) {
     let suggestions = app.slash_suggestions();
     if suggestions.is_empty() || area.height == 0 {
         return;
     }
-    let visible = area.height as usize;
+    let visible = (area.height as usize).max(1);
+    let sel = app.slash_selection.min(suggestions.len() - 1);
+    // Scroll the window so the selected entry is always shown (the list can be
+    // longer than `visible` once skills + `/skills` are present).
+    let start = slash_window_start(sel, visible, suggestions.len());
+    let end = (start + visible).min(suggestions.len());
     let mut lines = Vec::new();
-    for (idx, suggestion) in suggestions.iter().take(visible).enumerate() {
-        let selected = idx == app.slash_selection.min(suggestions.len() - 1);
+    for (idx, suggestion) in suggestions.iter().enumerate().take(end).skip(start) {
+        let selected = idx == sel;
         let style = if selected {
             Style::default().fg(BG).bg(ACCENT)
         } else {
@@ -992,6 +1012,19 @@ mod queue_render_tests {
 
     fn app() -> App {
         App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"))
+    }
+
+    #[test]
+    fn slash_window_keeps_selection_visible() {
+        // Within the first window → no scroll.
+        assert_eq!(slash_window_start(0, 5, 10), 0);
+        assert_eq!(slash_window_start(4, 5, 10), 0);
+        // Past the window → scroll so the selection is the last visible row.
+        assert_eq!(slash_window_start(5, 5, 10), 1);
+        assert_eq!(slash_window_start(9, 5, 10), 5);
+        // Fewer items than the window, or zero height → start at 0.
+        assert_eq!(slash_window_start(2, 8, 3), 0);
+        assert_eq!(slash_window_start(0, 0, 1), 0);
     }
 
     #[test]
