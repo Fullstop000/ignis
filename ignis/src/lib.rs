@@ -5,6 +5,7 @@ pub mod logger;
 pub mod models;
 pub mod provider;
 pub mod session;
+pub mod skills;
 pub mod state;
 pub mod tools;
 pub use session::storage;
