@@ -15,6 +15,12 @@ use crate::session::SessionManager;
 use crate::storage::{FileStorage, SessionStorage};
 use crate::{AgentEvent, Message, Session};
 
+/// Shared handle to the *current* prompt run's inject sender. `Some` iff a prompt
+/// run is live and accepting `Ctrl+S` injects (and `Ctrl+C` cancels); `None`
+/// during idle / `/compact` / provider setup.
+pub(crate) type ActiveInject =
+    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<String>>>>;
+
 // ==========================================
 // Color Palette
 // ==========================================
@@ -289,6 +295,8 @@ pub async fn run_console(
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
     let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
+    let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let active_inject_runner = active_inject.clone();
     let session_manager = SessionManager::new(storage_dir.clone());
 
     let agent_system_prompt = system_prompt;
@@ -355,6 +363,9 @@ pub async fn run_console(
             let tx = agent_tx.clone();
             match prompt {
                 Some(prompt) => {
+                    let (inj_tx, inj_rx) = mpsc::channel::<String>(8);
+                    *active_inject_runner.lock().unwrap() = Some(inj_tx);
+                    session.set_inject_source(inj_rx);
                     tokio::select! {
                         result = session.prompt(&prompt, tx) => {
                             if let Err(e) = result {
@@ -366,6 +377,7 @@ pub async fn run_console(
                             let _ = agent_tx.send(AgentEvent::AgentEnd).await;
                         }
                     }
+                    *active_inject_runner.lock().unwrap() = None;
                 }
                 None => {
                     // /compact: summarize earlier history and report a notice.
@@ -415,6 +427,20 @@ pub async fn run_console(
         while let Ok(ev) = agent_rx.try_recv() {
             app.handle_event(ev);
         }
+
+        // Edge-triggered: exactly one queued prompt per turn-end (AgentEnd).
+        if app.take_turn_just_ended() {
+            if let Some(text) = app.take_queued_front() {
+                app.push_user_prompt(text.clone());
+                let _ = prompt_tx
+                    .send(AgentRequest::Prompt {
+                        session_id: app.session_id.clone(),
+                        prompt: text,
+                    })
+                    .await;
+            }
+        }
+
         while event::poll(std::time::Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
                 handle_key(
@@ -422,6 +448,7 @@ pub async fn run_console(
                     key,
                     &prompt_tx,
                     &cancel_tx,
+                    &active_inject,
                     &session_manager,
                     &ui_storage_dir,
                 )
@@ -478,9 +505,11 @@ async fn handle_key(
     key: KeyEvent,
     prompt_tx: &mpsc::Sender<AgentRequest>,
     cancel_tx: &mpsc::Sender<()>,
+    active_inject: &ActiveInject,
     session_manager: &SessionManager,
     storage_dir: &std::path::Path,
 ) {
+    let _ = active_inject; // wired in the next task (Ctrl+S / Ctrl+C gating)
     // Global
     match (key.modifiers, key.code) {
         (_, KeyCode::Esc) => {
