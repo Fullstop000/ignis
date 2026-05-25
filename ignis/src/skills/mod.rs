@@ -40,6 +40,11 @@ pub fn valid_skill_name(name: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Leading-space count of a line (for YAML block-scalar indentation).
+fn indent_width(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
 /// Parse a `SKILL.md` body. Returns `(name, description, body)` or an `Err`
 /// reason explaining why the file is skipped.
 pub(crate) fn parse_skill_md(content: &str) -> Result<(String, Option<String>, String), String> {
@@ -50,28 +55,59 @@ pub(crate) fn parse_skill_md(content: &str) -> Result<(String, Option<String>, S
     if lines.next().map(str::trim) != Some("---") {
         return Err("missing opening frontmatter fence".to_string());
     }
-    let mut name: Option<String> = None;
-    let mut description: Option<String> = None;
+    // Collect the frontmatter lines up to the closing fence; the rest is the body.
+    let mut front: Vec<&str> = Vec::new();
     let mut closed = false;
     for line in lines.by_ref() {
         if line.trim() == "---" {
             closed = true;
             break;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
-            match k.trim() {
-                "name" => name = Some(val),
-                "description" if !val.is_empty() => description = Some(val),
-                _ => {}
-            }
-        }
+        front.push(line);
     }
     if !closed {
         return Err("missing closing frontmatter fence".to_string());
     }
     let body = lines.collect::<Vec<_>>().join("\n");
     let body = body.trim();
+
+    let mut name: Option<String> = None;
+    let mut description: Option<String> = None;
+    let mut i = 0;
+    while i < front.len() {
+        let Some((k, v)) = front[i].split_once(':') else {
+            i += 1;
+            continue;
+        };
+        let key = k.trim();
+        let raw = v.trim();
+        // A YAML block scalar (`|`/`>`, with optional chomping like `|-`): the
+        // value is the following more-indented lines, collapsed to one line.
+        let value = if raw.starts_with('|') || raw.starts_with('>') {
+            let key_indent = indent_width(front[i]);
+            let mut block: Vec<&str> = Vec::new();
+            i += 1;
+            while i < front.len()
+                && (front[i].trim().is_empty() || indent_width(front[i]) > key_indent)
+            {
+                block.push(front[i].trim());
+                i += 1;
+            }
+            block
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            i += 1;
+            raw.trim_matches('"').trim_matches('\'').to_string()
+        };
+        match key {
+            "name" if !value.is_empty() => name = Some(value),
+            "description" if !value.is_empty() => description = Some(value),
+            _ => {}
+        }
+    }
 
     let name = name.ok_or("missing required `name`")?;
     if !valid_skill_name(&name) {
@@ -273,6 +309,22 @@ mod tests {
         let (n, d, _) = parse_skill_md(&md("name: rust-style", "body")).unwrap();
         assert_eq!(n, "rust-style");
         assert!(d.is_none());
+    }
+
+    #[test]
+    fn parses_block_scalar_description() {
+        // `description: |` followed by indented lines (common in cross-tool SKILL.md).
+        let content = "---\nname: react\ndescription: |\n  Use for React work.\n  Hooks and state.\n---\nbody";
+        let (n, d, _) = parse_skill_md(content).unwrap();
+        assert_eq!(n, "react");
+        assert_eq!(d.as_deref(), Some("Use for React work. Hooks and state."));
+    }
+
+    #[test]
+    fn parses_folded_block_scalar_description() {
+        let content = "---\nname: react\ndescription: >\n  one\n  two\n---\nbody";
+        let (_, d, _) = parse_skill_md(content).unwrap();
+        assert_eq!(d.as_deref(), Some("one two"));
     }
 
     #[test]
