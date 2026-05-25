@@ -72,9 +72,15 @@ def main():
             r, _, _ = select.select([fd], [], [], 0.2)
             if r:
                 try:
-                    buf.extend(os.read(fd, 65536))
+                    chunk = os.read(fd, 65536)
                 except OSError:
                     return
+                buf.extend(chunk)
+                # Answer cursor-position queries (DSR ESC[6n) so an inline-viewport
+                # TUI (ratatui Viewport::Inline) can initialize — a real terminal
+                # replies; pyte does not.
+                for _ in range(chunk.count(b"\x1b[6n")):
+                    os.write(fd, b"\x1b[1;1R")
 
     drain(1.0)
     for step in args.step:

@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 use std::path::Path;
@@ -16,29 +16,165 @@ use super::{
     SURFACE_2, TEXT, TEXT_DIM, YELLOW,
 };
 
+/// Live-region height (rows) the inline viewport needs for the current state.
+/// Finalized transcript blocks live in the terminal's own scrollback; only this
+/// band is repainted. The band grows for the multi-line input, slash
+/// suggestions, and the modal pickers, and collapses to a tidy strip at rest.
+pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
+    let cap = term_rows.saturating_sub(1).max(3);
+    if app.model_picker.is_some() {
+        let rows = app.model_options.len() as u16 + 4;
+        return rows.clamp(4, cap);
+    }
+    if let Some(p) = &app.session_picker {
+        let rows = p.sessions.len().max(1) as u16 + 4;
+        return rows.clamp(4, cap);
+    }
+    let input_h = input_height(app, cap);
+    let sugg = app.slash_suggestions();
+    let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
+        (sugg.len() as u16).min(5)
+    } else {
+        0
+    };
+    (1 + sugg_h + input_h + 1).min(cap) // status + suggestions + input + footer
+}
+
+/// Input box height (incl. borders), growing with newline-separated lines.
+fn input_height(app: &App, cap: u16) -> u16 {
+    let lines = app.input.split('\n').count().max(1) as u16;
+    (lines + 2).clamp(3, cap.saturating_sub(2).max(3))
+}
+
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let size = f.size();
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
-    // Input box grows with its line count (Ctrl/Cmd+J inserts newlines).
-    let input_text_lines = app.input.split('\n').count().max(1) as u16;
-    let input_height = (input_text_lines + 2).clamp(3, 10);
+    // Modal pickers own the whole live band.
+    if app.model_picker.is_some() || app.session_picker.is_some() {
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(picker) = &app.model_picker {
+            render_model_picker(&mut lines, picker, &app.model_options);
+        } else if let Some(picker) = &app.session_picker {
+            render_session_picker(&mut lines, picker);
+        }
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().bg(BG))
+                .wrap(Wrap { trim: false }),
+            size,
+        );
+        return;
+    }
 
+    let input_h = input_height(app, size.height);
+    let sugg = app.slash_suggestions();
+    let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
+        size.height
+            .saturating_sub(input_h + 2)
+            .min((sugg.len() as u16).min(5))
+    } else {
+        0
+    };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),               // messages (borderless)
-            Constraint::Length(1),            // loading status (above input)
-            Constraint::Length(input_height), // input
-            Constraint::Length(1),            // footer: dir · model · context%
+            Constraint::Length(1),       // loading / status
+            Constraint::Length(sugg_h),  // slash suggestions (0 when none)
+            Constraint::Length(input_h), // input
+            Constraint::Length(1),       // footer
         ])
         .split(size);
 
-    draw_messages(f, layout[0], app);
-    draw_slash_suggestions(f, layout[0], app);
-    draw_loading(f, layout[1], app);
+    draw_loading(f, layout[0], app);
+    if sugg_h > 0 {
+        draw_slash_suggestions(f, layout[1], app);
+    }
     draw_input(f, layout[2], app);
     draw_footer(f, layout[3], app);
+}
+
+/// Build the rendered lines for one transcript block, for committing to the
+/// terminal scrollback via `insert_before`. Empty (placeholder) assistant blocks
+/// yield no lines.
+pub(crate) fn block_lines(
+    block: &UIBlock,
+    tick: u64,
+    cwd: &Path,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match block {
+        UIBlock::User(text) => {
+            lines.push(Line::from(""));
+            for (i, l) in text.lines().enumerate() {
+                let prefix = if i == 0 { "👤 " } else { "   " };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(ACCENT)),
+                    Span::styled(
+                        sanitize(l),
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+        }
+        UIBlock::Assistant(text) => {
+            if text.is_empty() {
+                return lines;
+            }
+            lines.push(Line::from(""));
+            lines.extend(render_md_block(text, false));
+        }
+        UIBlock::Tool(entry) => {
+            render_tool_block(&mut lines, entry, tick, cwd, width);
+        }
+    }
+    lines
+}
+
+/// Wrapped row count of `lines` at `width` — the height to reserve in scrollback.
+pub(crate) fn block_height(lines: &[Line<'static>], width: u16) -> u16 {
+    Paragraph::new(Text::from(lines.to_vec()))
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1)) as u16
+}
+
+/// Render `lines` into a scrollback buffer slice (used by `insert_before`).
+pub(crate) fn render_block_into(buf: &mut ratatui::buffer::Buffer, lines: &[Line<'static>]) {
+    use ratatui::widgets::Widget;
+    let area = buf.area;
+    Paragraph::new(Text::from(lines.to_vec()))
+        .style(Style::default().bg(BG))
+        .wrap(Wrap { trim: false })
+        .render(area, buf);
+}
+
+/// The startup banner, committed once to scrollback at launch.
+pub(crate) fn welcome_lines(app: &App) -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("🔥 ", Style::default()),
+            Span::styled(
+                "ignis",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  Your AI coding agent, right in the terminal.",
+                Style::default().fg(SUBTEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Provider  ", Style::default().fg(TEXT_DIM)),
+            Span::styled(
+                format!("{}/{}", app.provider, app.model),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled("   Directory  ", Style::default().fg(TEXT_DIM)),
+            Span::styled(format!("{}", app.cwd.display()), Style::default().fg(TEXT)),
+        ]),
+        Line::from(""),
+    ]
 }
 
 /// Loading/status line shown directly above the input box (Claude Code style).
@@ -124,135 +260,6 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             .alignment(ratatui::layout::Alignment::Right),
         split[1],
     );
-}
-
-pub(crate) fn draw_messages(f: &mut Frame, area: Rect, app: &mut App) {
-    let mut lines: Vec<Line> = Vec::new();
-
-    if let Some(picker) = &app.model_picker {
-        render_model_picker(&mut lines, picker, &app.model_options);
-    } else if let Some(picker) = &app.session_picker {
-        // Resume view: show only the picker, never the prior conversation.
-        render_session_picker(&mut lines, picker);
-    } else if app.blocks.is_empty() {
-        // Welcome screen
-        lines.push(Line::from(""));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled("🔥 ", Style::default()),
-            Span::styled(
-                "ignis",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Your AI coding agent, right in the terminal.",
-            Style::default().fg(SUBTEXT),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("  Provider  ", Style::default().fg(TEXT_DIM)),
-            Span::styled(
-                format!("{}/{}", app.provider, app.model),
-                Style::default().fg(TEXT),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Directory ", Style::default().fg(TEXT_DIM)),
-            Span::styled(format!("{}", app.cwd.display()), Style::default().fg(TEXT)),
-        ]));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Type a prompt below to get started.",
-            Style::default().fg(TEXT_DIM),
-        )));
-    } else {
-        for (bi, block) in app.blocks.iter().enumerate() {
-            match block {
-                UIBlock::User(text) => {
-                    // No "You" label — a 👤 prefix on the first line marks the
-                    // user turn; the prompt is bold to stand out from replies.
-                    lines.push(Line::from(""));
-                    for (i, l) in text.lines().enumerate() {
-                        let prefix = if i == 0 { "👤 " } else { "   " };
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(ACCENT)),
-                            Span::styled(
-                                sanitize(l),
-                                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    }
-                }
-                UIBlock::Assistant(text) => {
-                    // Skip empty assistant placeholders (tool-only turns, or
-                    // before the first streamed delta) so we don't render a
-                    // blank gap. No "Ignis" label — replies render as plain
-                    // (unprefixed) markdown, distinct from the 👤 user turn.
-                    if text.is_empty() {
-                        continue;
-                    }
-                    lines.push(Line::from(""));
-                    let is_active = app.current_chunk_idx == Some(bi);
-                    let md_lines = render_md_block(text, is_active);
-                    lines.extend(md_lines);
-                }
-                UIBlock::Tool(entry) => {
-                    render_tool_block(&mut lines, entry, app.tick, &app.cwd, area.width);
-                }
-            }
-        }
-    }
-
-    let text = Text::from(lines);
-    let paragraph = Paragraph::new(text)
-        .style(Style::default().bg(BG))
-        .wrap(Wrap { trim: false });
-
-    // Scroll bounds in *rendered* rows: lines word-wrap, so the visible height
-    // is line_count(width), not the logical line count — otherwise auto-scroll
-    // under-shoots and the last wrapped rows hide behind the input box.
-    let visible = area.height;
-    let total = paragraph.line_count(area.width) as u16;
-    app.max_scroll = total.saturating_sub(visible);
-    if !app.user_scrolled {
-        app.scroll = app.max_scroll;
-    }
-    app.scroll = app.scroll.min(app.max_scroll);
-
-    f.render_widget(paragraph.scroll((app.scroll, 0)), area);
-
-    // Scrollbar
-    if app.max_scroll > 0 {
-        let mut sb_state =
-            ScrollbarState::new(app.max_scroll as usize).position(app.scroll as usize);
-        f.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .track_symbol(Some("│"))
-                .thumb_symbol("┃"),
-            area,
-            &mut sb_state,
-        );
-    }
-
-    // "Scroll to bottom" indicator
-    if app.user_scrolled && app.scroll < app.max_scroll {
-        let indicator = Paragraph::new(Line::from(vec![Span::styled(
-            " ↓ new content below ",
-            Style::default().fg(BG).bg(ACCENT),
-        )]));
-        let ind_area = Rect {
-            x: area.x + area.width.saturating_sub(24),
-            y: area.y + area.height.saturating_sub(2),
-            width: 22,
-            height: 1,
-        };
-        f.render_widget(indicator, ind_area);
-    }
 }
 
 pub(crate) fn render_session_picker(lines: &mut Vec<Line<'static>>, picker: &SessionPicker) {
@@ -653,31 +660,16 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-pub(crate) fn draw_slash_suggestions(f: &mut Frame, messages_area: Rect, app: &App) {
-    if app.mode != Mode::Idle {
-        return;
-    }
-
+/// Render the slash-command suggestions into `area` (the band reserved above the
+/// input). One row per suggestion; the highlighted row is inverted.
+pub(crate) fn draw_slash_suggestions(f: &mut Frame, area: Rect, app: &App) {
     let suggestions = app.slash_suggestions();
-    if suggestions.is_empty() {
+    if suggestions.is_empty() || area.height == 0 {
         return;
     }
-
-    let height = (suggestions.len() as u16).min(4).saturating_add(2);
-    if messages_area.height <= height + 1 {
-        return;
-    }
-
-    let width = messages_area.width.saturating_sub(4).min(54);
-    let area = Rect {
-        x: messages_area.x + 2,
-        y: messages_area.y + messages_area.height.saturating_sub(height + 1),
-        width,
-        height,
-    };
-
+    let visible = area.height as usize;
     let mut lines = Vec::new();
-    for (idx, suggestion) in suggestions.iter().take(4).enumerate() {
+    for (idx, suggestion) in suggestions.iter().take(visible).enumerate() {
         let selected = idx == app.slash_selection.min(suggestions.len() - 1);
         let style = if selected {
             Style::default().fg(BG).bg(ACCENT)
@@ -696,16 +688,10 @@ pub(crate) fn draw_slash_suggestions(f: &mut Frame, messages_area: Rect, app: &A
             Span::styled(format!(" {}", suggestion.description), style),
         ]));
     }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER_ACTIVE))
-        .style(Style::default().bg(SURFACE))
-        .title(Span::styled(
-            " commands ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(SURFACE)),
+        area,
+    );
 }
 
 // ==========================================
@@ -729,6 +715,29 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    /// Render all of `app`'s transcript blocks the way they're committed to
+    /// scrollback (`block_lines`), into a TestBackend for assertions.
+    fn render_blocks(app: &App, w: u16, h: u16) -> Terminal<TestBackend> {
+        let mut term = test_terminal(w, h);
+        let blocks = app.blocks.clone();
+        let cwd = app.cwd.clone();
+        let tick = app.tick;
+        term.draw(|f| {
+            let mut lines: Vec<Line> = Vec::new();
+            for b in &blocks {
+                lines.extend(block_lines(b, tick, &cwd, w));
+            }
+            f.render_widget(
+                Paragraph::new(Text::from(lines))
+                    .style(Style::default().bg(BG))
+                    .wrap(Wrap { trim: false }),
+                f.size(),
+            );
+        })
+        .unwrap();
+        term
     }
 
     #[test]
@@ -796,24 +805,25 @@ mod tests {
     }
 
     #[test]
-    fn render_welcome_screen_when_empty() {
-        let mut app = App::new(
+    fn render_welcome_banner() {
+        // The welcome banner is committed once to scrollback at launch.
+        let app = App::new(
             "test".to_string(),
             "model".to_string(),
             "default".to_string(),
             PathBuf::from("/home/test"),
         );
-        let mut term = test_terminal(80, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
-
-        let content = buffer_content(&term);
-        assert!(content.contains("ignis"), "should show app name");
+        let text: String = welcome_lines(&app)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("ignis"), "should show app name");
         assert!(
-            content.contains("Your AI coding agent"),
+            text.contains("Your AI coding agent"),
             "should show welcome message"
         );
-        assert!(content.contains("test/model"), "should show provider/model");
-        assert!(content.contains("/home/test"), "should show cwd");
+        assert!(text.contains("test/model"), "should show provider/model");
+        assert!(text.contains("/home/test"), "should show cwd");
     }
 
     #[test]
@@ -826,8 +836,7 @@ mod tests {
         );
         app.blocks.push(UIBlock::User("Hello".to_string()));
 
-        let mut term = test_terminal(80, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        let term = render_blocks(&app, 80, 24);
 
         let content = buffer_content(&term);
         assert!(content.contains("Hello"), "should show user text");
@@ -848,8 +857,7 @@ mod tests {
         app.blocks
             .push(UIBlock::Assistant("Code block".to_string()));
 
-        let mut term = test_terminal(80, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        let term = render_blocks(&app, 80, 24);
 
         let content = buffer_content(&term);
         assert!(content.contains("Code block"), "should show assistant text");
@@ -876,8 +884,7 @@ mod tests {
             elapsed_ms: 42,
         }));
 
-        let mut term = test_terminal(80, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        let term = render_blocks(&app, 80, 24);
 
         let content = buffer_content(&term);
         assert!(content.contains("read_file"), "should show tool name");
@@ -901,8 +908,7 @@ mod tests {
             elapsed_ms: 5,
         }));
 
-        let mut term = test_terminal(100, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        let term = render_blocks(&app, 100, 24);
 
         let content = buffer_content(&term);
         assert!(content.contains("- let x = 1;"), "should show removed line");
@@ -930,8 +936,7 @@ mod tests {
             elapsed_ms: 5,
         }));
 
-        let mut term = test_terminal(100, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        let term = render_blocks(&app, 100, 24);
         let buf = term.backend().buffer();
 
         let mut add_bg = false;
@@ -975,8 +980,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             elapsed_ms: 1,
         }));
-        let mut term = test_terminal(40, 24); // narrow → forces truncation
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        let term = render_blocks(&app, 40, 24); // narrow → forces truncation
         let buf = term.backend().buffer();
         let mut rows = std::collections::HashSet::new();
         for y in 0..buf.area.height {
@@ -1013,8 +1017,7 @@ mod tests {
             elapsed_ms: 2,
         }));
 
-        let mut term = test_terminal(100, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        let term = render_blocks(&app, 100, 24);
 
         let content = buffer_content(&term);
         assert!(
@@ -1184,10 +1187,9 @@ mod tests {
     }
 
     #[test]
-    fn last_line_stays_visible_when_content_wraps() {
-        // Regression (bug 1): scroll bounds must count wrapped rows, not logical
-        // lines. With long wrapping blocks, auto-scroll-to-bottom must still
-        // reveal the most recent turn instead of clipping it behind the input.
+    fn wrapped_blocks_render_all_turns() {
+        // Long wrapping turns all become scrollback lines; the latest turn is
+        // present (the terminal's own scrollback handles viewing earlier ones).
         let mut app = App::new(
             "test".to_string(),
             "model".to_string(),
@@ -1202,15 +1204,13 @@ mod tests {
         }
         app.blocks.push(UIBlock::User("FINAL_MARKER".to_string()));
 
-        let mut term = test_terminal(40, 16);
-        term.draw(|f| draw(f, &mut app)).unwrap();
-
+        let term = render_blocks(&app, 40, 80);
         let content = buffer_content(&term);
         assert!(
             content.contains("FINAL_MARKER"),
-            "auto-scroll must reveal the latest line despite wrapping"
+            "the latest turn must render"
         );
-        assert!(app.max_scroll > 0, "wrapped content should be scrollable");
+        assert!(content.contains("Block 0"), "earlier turns must render too");
     }
 
     #[test]
@@ -1259,8 +1259,7 @@ mod tests {
         ];
         app.render_session_history("s".to_string(), messages);
 
-        let mut term = test_terminal(100, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        let term = render_blocks(&app, 100, 24);
 
         let content = buffer_content(&term);
         assert!(
@@ -1334,8 +1333,7 @@ mod tests {
             },
         ];
         app.render_session_history("default".to_string(), messages);
-        let mut term = test_terminal(80, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        let term = render_blocks(&app, 80, 24);
         let content = buffer_content(&term);
         assert!(content.contains("hello"), "should show user message");
         assert!(
@@ -1371,8 +1369,7 @@ mod tests {
             },
         ];
         app.render_session_history("default".to_string(), messages);
-        let mut term = test_terminal(80, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        let term = render_blocks(&app, 80, 24);
         let content = buffer_content(&term);
         println!("content: {:?}", content);
         assert!(

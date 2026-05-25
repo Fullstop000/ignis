@@ -1,12 +1,9 @@
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseEventKind,
-    },
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, style::Color, Terminal};
+use ratatui::{backend::CrosstermBackend, style::Color, Terminal, TerminalOptions, Viewport};
 use std::io;
 use std::path::PathBuf;
 
@@ -219,6 +216,18 @@ pub(crate) fn next_selection(current: usize, len: usize, direction: SelectionDir
     }
 }
 
+/// Create an inline-viewport terminal over stdout. Recreated when the live band
+/// needs to grow/shrink (the inline height is fixed per `Terminal`).
+fn make_inline_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    let backend = CrosstermBackend::new(io::stdout());
+    Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height.max(2)),
+        },
+    )
+}
+
 pub async fn run_console(
     provider_name: String,
     model_name: String,
@@ -228,16 +237,26 @@ pub async fn run_console(
     cwd: PathBuf,
     config: crate::config::Config,
 ) -> Result<(), anyhow::Error> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
-
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
     app.set_context_window(config.compaction.threshold_tokens);
     app.set_model_options(config.model_options(), config.active_effort());
+
+    // Render inline in the normal buffer (no alternate screen, no mouse capture):
+    // finished transcript blocks are pushed into the terminal's real scrollback
+    // via `insert_before`, so tmux/native scroll can page through history. Only a
+    // small live band (input + status + footer) is repainted.
+    enable_raw_mode()?;
+    let term_rows = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
+    let mut cur_vh = render::live_height(&app, term_rows);
+    let mut terminal = make_inline_terminal(cur_vh)?;
+
+    // Welcome banner: committed once to scrollback.
+    {
+        let w = terminal.size()?.width;
+        let lines = render::welcome_lines(&app);
+        let h = render::block_height(&lines, w).max(1);
+        terminal.insert_before(h, |buf| render::render_block_into(buf, &lines))?;
+    }
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
@@ -369,24 +388,16 @@ pub async fn run_console(
             app.handle_event(ev);
         }
         while event::poll(std::time::Duration::ZERO)? {
-            match event::read()? {
-                Event::Key(key) => {
-                    handle_key(
-                        &mut app,
-                        key,
-                        &prompt_tx,
-                        &cancel_tx,
-                        &session_manager,
-                        &ui_storage_dir,
-                    )
-                    .await;
-                }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => app.scroll_up(3),
-                    MouseEventKind::ScrollDown => app.scroll_down(3),
-                    _ => {}
-                },
-                _ => {}
+            if let Event::Key(key) = event::read()? {
+                handle_key(
+                    &mut app,
+                    key,
+                    &prompt_tx,
+                    &cancel_tx,
+                    &session_manager,
+                    &ui_storage_dir,
+                )
+                .await;
             }
         }
 
@@ -394,7 +405,27 @@ pub async fn run_console(
             break;
         }
 
-        // Coalesced redraw: at most once per frame interval.
+        // The inline viewport height is fixed per terminal, so recreate it when
+        // the live band needs to grow/shrink (pickers, slash menu, taller input).
+        let term_rows = terminal.size()?.height;
+        let want_vh = render::live_height(&app, term_rows);
+        if want_vh != cur_vh {
+            terminal = make_inline_terminal(want_vh)?;
+            cur_vh = want_vh;
+        }
+
+        // Flush newly-finalized leading blocks into the terminal scrollback.
+        let width = terminal.size()?.width;
+        while app.committed < app.blocks.len() && app.block_done(app.committed) {
+            let lines = render::block_lines(&app.blocks[app.committed], app.tick, &app.cwd, width);
+            if !lines.is_empty() {
+                let h = render::block_height(&lines, width).max(1);
+                terminal.insert_before(h, |buf| render::render_block_into(buf, &lines))?;
+            }
+            app.committed += 1;
+        }
+
+        // Coalesced redraw of the live band: at most once per frame interval.
         if last_draw.elapsed() >= frame {
             app.tick_update();
             terminal.draw(|f| draw(f, &mut app))?;
@@ -403,12 +434,9 @@ pub async fn run_console(
     }
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
     terminal.show_cursor()?;
+    // Drop below the live band so the shell prompt starts on a fresh line.
+    execute!(terminal.backend_mut(), crossterm::style::Print("\n"))?;
     Ok(())
 }
 
@@ -443,22 +471,6 @@ async fn handle_key(
                 app.stream_start = None;
                 app.add_assistant_notice("Cancelled.".to_string());
             }
-            return;
-        }
-        (m, KeyCode::Up) if m.contains(KeyModifiers::SHIFT) => {
-            app.scroll_up(3);
-            return;
-        }
-        (m, KeyCode::Down) if m.contains(KeyModifiers::SHIFT) => {
-            app.scroll_down(3);
-            return;
-        }
-        (_, KeyCode::PageUp) => {
-            app.scroll_up(15);
-            return;
-        }
-        (_, KeyCode::PageDown) => {
-            app.scroll_down(15);
             return;
         }
         _ => {}

@@ -98,9 +98,10 @@ pub(crate) struct App {
     /// Real token usage from the most recent completed turn (provider-reported).
     pub(crate) last_usage: Option<crate::Usage>,
 
-    pub(crate) scroll: u16,
-    pub(crate) max_scroll: u16,
-    pub(crate) user_scrolled: bool, // user manually scrolled up
+    /// Number of leading blocks already flushed to the terminal's scrollback
+    /// (committed via `insert_before`). The rest live in the in-memory transcript
+    /// and are flushed once finalized.
+    pub(crate) committed: usize,
 
     pub(crate) should_quit: bool,
     pub(crate) error_flash: Option<(String, Instant)>,
@@ -138,9 +139,7 @@ impl App {
             current_chunk_idx: None,
             stream_chars: 0,
             last_usage: None,
-            scroll: 0,
-            max_scroll: 0,
-            user_scrolled: false,
+            committed: 0,
             should_quit: false,
             error_flash: None,
             exit_pending: false,
@@ -238,7 +237,6 @@ impl App {
             AgentEvent::MessageStart { .. } => {
                 self.blocks.push(UIBlock::Assistant(String::new()));
                 self.current_chunk_idx = Some(self.blocks.len() - 1);
-                self.auto_scroll();
             }
             AgentEvent::MessageUpdate { delta } => {
                 self.stream_chars += delta.len();
@@ -247,7 +245,6 @@ impl App {
                         s.push_str(&delta);
                     }
                 }
-                self.auto_scroll();
             }
             AgentEvent::MessageEnd { .. } => {
                 self.current_chunk_idx = None;
@@ -266,7 +263,6 @@ impl App {
                     started_at: Instant::now(),
                     elapsed_ms: 0,
                 }));
-                self.auto_scroll();
             }
             AgentEvent::ToolExecutionEnd {
                 tool_call_id,
@@ -286,7 +282,6 @@ impl App {
                     }
                 }
                 self.mode = Mode::Thinking;
-                self.auto_scroll();
             }
             AgentEvent::TurnEnd => {}
             AgentEvent::Usage(usage) => {
@@ -301,21 +296,15 @@ impl App {
         }
     }
 
-    pub(crate) fn auto_scroll(&mut self) {
-        if !self.user_scrolled {
-            self.scroll = self.max_scroll;
-        }
-    }
-
-    pub(crate) fn scroll_up(&mut self, n: u16) {
-        self.scroll = self.scroll.saturating_sub(n);
-        self.user_scrolled = self.scroll < self.max_scroll;
-    }
-
-    pub(crate) fn scroll_down(&mut self, n: u16) {
-        self.scroll = (self.scroll + n).min(self.max_scroll);
-        if self.scroll >= self.max_scroll {
-            self.user_scrolled = false;
+    /// Whether block `i` is finalized and safe to flush to scrollback:
+    /// user prompts always are; assistant blocks once they stop streaming; tool
+    /// calls once they leave the pending state.
+    pub(crate) fn block_done(&self, i: usize) -> bool {
+        match self.blocks.get(i) {
+            Some(UIBlock::User(_)) => true,
+            Some(UIBlock::Assistant(_)) => self.current_chunk_idx != Some(i),
+            Some(UIBlock::Tool(t)) => !matches!(t.status, ToolStatus::Pending),
+            None => false,
         }
     }
 
@@ -376,8 +365,6 @@ impl App {
         self.blocks.push(UIBlock::User(text.clone()));
         self.input.clear();
         self.cursor = 0;
-        self.user_scrolled = false;
-        self.auto_scroll();
         Some(text)
     }
 
@@ -385,17 +372,14 @@ impl App {
         self.exit_pending = false;
         self.session_picker = None;
         self.blocks.push(UIBlock::Assistant(text));
-        self.auto_scroll();
     }
 
     pub(crate) fn start_new_session(&mut self, session_id: String) {
         self.exit_pending = false;
         self.session_id = session_id;
         self.blocks.clear();
+        self.committed = 0;
         self.current_chunk_idx = None;
-        self.scroll = 0;
-        self.max_scroll = 0;
-        self.user_scrolled = false;
         self.history_idx = None;
         self.last_usage = None;
         self.session_picker = None;
@@ -408,8 +392,6 @@ impl App {
             sessions,
             selected: 0,
         });
-        self.user_scrolled = false;
-        self.auto_scroll();
     }
 
     pub(crate) fn select_session_picker(&mut self, direction: SelectionDirection) -> bool {
@@ -466,8 +448,6 @@ impl App {
             selected,
             effort_idx,
         });
-        self.user_scrolled = false;
-        self.auto_scroll();
     }
 
     pub(crate) fn select_model_picker(&mut self, direction: SelectionDirection) {
@@ -530,11 +510,9 @@ impl App {
         self.exit_pending = false;
         self.session_id = session_id.clone();
         self.blocks.clear();
+        self.committed = 0;
         self.current_chunk_idx = None;
         self.session_picker = None;
-        self.scroll = 0;
-        self.max_scroll = 0;
-        self.user_scrolled = false;
         self.last_usage = None;
 
         if messages.is_empty() {

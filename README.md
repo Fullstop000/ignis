@@ -93,8 +93,9 @@ cargo run -- --resume     # resume the latest session (TUI)
 cargo run -- --resume <id> "follow-up prompt"   # resume a session, one-shot
 ```
 
-In the TUI: `Enter` sends, `↑/↓` history, `Shift+↑/↓` scroll, `Ctrl+D` exit.
-Type `/` for slash-command suggestions.
+In the TUI: `Enter` sends, `↑/↓` history, `Ctrl+D` exit. Output renders inline in
+the normal buffer, so scroll with your terminal/tmux as usual. Type `/` for
+slash-command suggestions.
 
 ## Development
 
