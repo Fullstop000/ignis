@@ -11,8 +11,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::app::{App, Mode, ModelPicker, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
 use super::markdown::render_md_block;
 use super::{
-    format_duration, format_tokens, highlight, sanitize, truncate, ACCENT, BG, BORDER,
-    BORDER_ACTIVE, DIFF_ADD_BG, DIFF_DEL_BG, GREEN, MAUVE, RED, SPINNERS, SUBTEXT, SURFACE,
+    format_context, format_duration, format_tokens, highlight, sanitize, truncate, ACCENT, BG,
+    BORDER, BORDER_ACTIVE, DIFF_ADD_BG, DIFF_DEL_BG, GREEN, MAUVE, RED, SPINNERS, SUBTEXT, SURFACE,
     SURFACE_2, TEXT, TEXT_DIM, YELLOW,
 };
 
@@ -434,7 +434,7 @@ pub(crate) fn render_session_picker(lines: &mut Vec<Line<'static>>, picker: &Ses
 pub(crate) fn render_model_picker(
     lines: &mut Vec<Line<'static>>,
     picker: &ModelPicker,
-    options: &[crate::config::ModelOption],
+    options: &[crate::models::ModelOption],
 ) {
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -487,10 +487,22 @@ pub(crate) fn render_model_picker(
         } else {
             format!("{}/{} ◆", opt.provider, opt.model)
         };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(format!("  {} ", marker), style.add_modifier(Modifier::BOLD)),
             Span::styled(label, style.add_modifier(Modifier::BOLD)),
-        ]));
+        ];
+        if let Some(ctx) = opt.context {
+            let ctx_style = if selected {
+                style
+            } else {
+                Style::default().fg(TEXT_DIM)
+            };
+            spans.push(Span::styled(
+                format!("  {} ctx", format_context(ctx)),
+                ctx_style,
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     lines.push(Line::from(Span::styled(
@@ -862,10 +874,11 @@ mod tests {
             "s".to_string(),
             PathBuf::from("/tmp"),
         );
-        let opt = |p: &str, m: &str, l: &[&str]| crate::config::ModelOption {
+        let opt = |p: &str, m: &str, l: &[&str]| crate::models::ModelOption {
             provider: p.to_string(),
             model: m.to_string(),
             effort_levels: l.iter().map(|s| s.to_string()).collect(),
+            context: None,
         };
         app.set_model_options(
             vec![
@@ -916,6 +929,17 @@ mod tests {
             compact_tool_args(r#"{"pattern":"fn main"}"#, &cwd),
             "\"fn main\""
         );
+    }
+
+    #[test]
+    fn format_context_is_compact() {
+        assert_eq!(format_context(131_072), "128K"); // binary
+        assert_eq!(format_context(262_144), "256K"); // binary (kimi-k2.6)
+        assert_eq!(format_context(200_000), "200K"); // decimal (claude)
+        assert_eq!(format_context(1_048_576), "1M"); // binary
+        assert_eq!(format_context(1_000_000), "1M"); // decimal
+        assert_eq!(format_context(2_000_000), "2M");
+        assert_eq!(format_context(1_300_000), "1.3M");
     }
 
     #[test]

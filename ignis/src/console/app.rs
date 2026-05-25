@@ -86,7 +86,7 @@ pub(crate) struct App {
     pub(crate) slash_selection: usize,
     pub(crate) session_picker: Option<SessionPicker>,
     /// Choices for the `/model` picker, flattened from config.
-    pub(crate) model_options: Vec<crate::config::ModelOption>,
+    pub(crate) model_options: Vec<crate::models::ModelOption>,
     pub(crate) model_picker: Option<ModelPicker>,
 
     pub(crate) mode: Mode,
@@ -416,7 +416,7 @@ impl App {
     /// Supply the `/model` picker choices and the active effort level.
     pub(crate) fn set_model_options(
         &mut self,
-        options: Vec<crate::config::ModelOption>,
+        options: Vec<crate::models::ModelOption>,
         effort: Option<String>,
     ) {
         self.model_options = options;
@@ -499,6 +499,10 @@ impl App {
         self.provider = opt.provider.clone();
         self.model = opt.model.clone();
         self.effort = effort.clone();
+        // Switch the footer's context gauge to the new model's window if known.
+        if let Some(ctx) = opt.context {
+            self.context_window = ctx as usize;
+        }
         Some((opt.provider, opt.model, effort))
     }
 
@@ -827,10 +831,11 @@ mod tests {
             "s".to_string(),
             PathBuf::from("/tmp"),
         );
-        let opt = |provider: &str, model: &str, levels: &[&str]| crate::config::ModelOption {
+        let opt = |provider: &str, model: &str, levels: &[&str]| crate::models::ModelOption {
             provider: provider.to_string(),
             model: model.to_string(),
             effort_levels: levels.iter().map(|s| s.to_string()).collect(),
+            context: None,
         };
         app.set_model_options(
             vec![

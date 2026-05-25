@@ -1,52 +1,9 @@
+use crate::models::{ModelCatalog, ModelOption, ProviderConfig};
 use crate::provider::LlmProvider;
 use crate::state::{load_state, State};
 use anyhow::anyhow;
 use serde::Deserialize;
 use std::collections::HashMap;
-
-/// A provider entry: credentials plus the catalog of models it offers. The
-/// *active* model/effort live at the top level (see [`Config::model`]), not here.
-#[derive(Debug, Deserialize, Clone)]
-pub struct ProviderConfig {
-    pub api_key: Option<String>,
-    pub api_url: Option<String>,
-    pub user_agent: Option<String>,
-    /// Models this provider offers in the `/model` picker.
-    pub models: Option<Vec<String>>,
-    /// Per-model reasoning-effort levels, e.g. `{ "deepseek-v4-pro" = ["high",
-    /// "max"] }`. Levels differ by model (GPT: minimal..xhigh, Opus: low..max),
-    /// so they're declared, not hardcoded. A model absent here has no effort.
-    pub reasoning: Option<HashMap<String, Vec<String>>>,
-}
-
-impl ProviderConfig {
-    /// Declared effort levels for `model`, in display order (empty = no effort).
-    fn effort_levels(&self, model: &str) -> Vec<String> {
-        self.reasoning
-            .as_ref()
-            .and_then(|r| r.get(model))
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn require(
-        &self,
-        field: Option<String>,
-        provider: &str,
-        name: &str,
-    ) -> Result<String, anyhow::Error> {
-        field.ok_or_else(|| anyhow!("{} provider requires {}", provider, name))
-    }
-}
-
-/// One selectable entry in the `/model` picker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelOption {
-    pub provider: String,
-    pub model: String,
-    /// Effort levels this model accepts, in display order (empty = none).
-    pub effort_levels: Vec<String>,
-}
 
 /// Web search backend configuration. `provider` selects the backend
 /// (default "brave"); `api_key` is the credential for that backend.
@@ -109,9 +66,8 @@ impl Config {
         names.into_iter().find_map(|name| {
             self.providers[name]
                 .models
-                .as_ref()
-                .and_then(|m| m.first())
-                .map(|m| (name.clone(), m.clone()))
+                .first()
+                .map(|m| (name.clone(), m.name().to_string()))
         })
     }
 
@@ -146,23 +102,36 @@ impl Config {
     }
 
     /// Flatten every provider's catalog into picker entries (sorted by provider,
-    /// then by the order models are listed).
-    pub fn model_options(&self) -> Vec<ModelOption> {
+    /// then by the order models are listed). Each model's context window is its
+    /// config-declared override, else the models.dev `catalog` value.
+    pub fn model_options(&self, catalog: &ModelCatalog) -> Vec<ModelOption> {
         let mut names: Vec<&String> = self.providers.keys().collect();
         names.sort();
         let mut out = Vec::new();
         for name in names {
             let pcfg = &self.providers[name];
-            for model in pcfg.models.clone().unwrap_or_default() {
-                let effort_levels = pcfg.effort_levels(&model);
+            for entry in &pcfg.models {
+                let model = entry.name().to_string();
+                let context = entry.context().or_else(|| catalog.context_for(&model));
                 out.push(ModelOption {
                     provider: name.clone(),
                     model,
-                    effort_levels,
+                    effort_levels: entry.reasoning().to_vec(),
+                    context,
                 });
             }
         }
         out
+    }
+
+    /// Context window of the active model: its config-declared override, else the
+    /// models.dev `catalog` value.
+    pub fn active_context(&self, catalog: &ModelCatalog) -> Option<u64> {
+        let (provider, model) = self.active_selection()?;
+        self.providers
+            .get(&provider)
+            .and_then(|p| p.context(&model))
+            .or_else(|| catalog.context_for(&model))
     }
 }
 
@@ -296,16 +265,14 @@ mod tests {
 model = "deepseek/deepseek-v4-flash"
 [providers.deepseek]
 api_key = "x"
-models = ["deepseek-v4-flash", "deepseek-v4-pro"]
-[providers.deepseek.reasoning]
-deepseek-v4-pro = ["high", "max"]
+models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
 [providers.kimi-code]
 api_key = "y"
 models = ["kimi-for-coding"]
 "#,
         )
         .unwrap();
-        let opts = cfg.model_options();
+        let opts = cfg.model_options(&ModelCatalog::default());
         // Sorted by provider name (deepseek before kimi-code).
         assert_eq!(opts.len(), 3);
         assert_eq!(
@@ -320,6 +287,24 @@ models = ["kimi-for-coding"]
             ("kimi-code", "kimi-for-coding")
         );
         assert!(opts[2].effort_levels.is_empty());
+    }
+
+    #[test]
+    fn inline_context_is_an_override() {
+        // A model's inline `context` wins; a bare model has none (empty catalog).
+        let cfg: Config = toml::from_str(
+            r#"
+model = "deepseek/deepseek-v4-pro"
+[providers.deepseek]
+api_key = "x"
+models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", context = 128000 }]
+"#,
+        )
+        .unwrap();
+        let opts = cfg.model_options(&ModelCatalog::default());
+        assert_eq!(opts[0].context, None);
+        assert_eq!(opts[1].context, Some(128000));
+        assert_eq!(cfg.active_context(&ModelCatalog::default()), Some(128000));
     }
 
     #[test]
@@ -369,9 +354,7 @@ model = "deepseek/deepseek-v4-pro"
 reasoning_effort = "max"
 [providers.deepseek]
 api_key = "x"
-models = ["deepseek-v4-flash", "deepseek-v4-pro"]
-[providers.deepseek.reasoning]
-deepseek-v4-pro = ["high", "max"]
+models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
 "#,
         )
         .unwrap();
@@ -386,9 +369,7 @@ model = "deepseek/deepseek-v4-flash"
 reasoning_effort = "max"
 [providers.deepseek]
 api_key = "x"
-models = ["deepseek-v4-flash", "deepseek-v4-pro"]
-[providers.deepseek.reasoning]
-deepseek-v4-pro = ["high", "max"]
+models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
 "#,
         )
         .unwrap();
@@ -404,9 +385,7 @@ model = "deepseek/deepseek-v4-pro"
 reasoning_effort = "ultra"
 [providers.deepseek]
 api_key = "x"
-models = ["deepseek-v4-pro"]
-[providers.deepseek.reasoning]
-deepseek-v4-pro = ["high", "max"]
+models = [{ name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
 "#,
         )
         .unwrap();
@@ -420,9 +399,7 @@ deepseek-v4-pro = ["high", "max"]
 model = "deepseek/deepseek-v4-flash"
 [providers.deepseek]
 api_key = "x"
-models = ["deepseek-v4-flash", "deepseek-v4-pro"]
-[providers.deepseek.reasoning]
-deepseek-v4-pro = ["high", "max"]
+models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
 "#,
         )
         .unwrap();
@@ -458,9 +435,7 @@ model = "deepseek/deepseek-v4-pro"
 reasoning_effort = "high"
 [providers.deepseek]
 api_key = "x"
-models = ["deepseek-v4-flash", "deepseek-v4-pro"]
-[providers.deepseek.reasoning]
-deepseek-v4-pro = ["high", "max"]
+models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
 "#,
         )
         .unwrap();
