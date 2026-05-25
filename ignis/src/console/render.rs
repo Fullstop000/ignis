@@ -388,7 +388,7 @@ pub(crate) fn draw_queued(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(""));
         for text in app.queue.iter().take(MAX_QUEUE_ROWS) {
             lines.push(Line::from(vec![
-                Span::styled("  ⤷ ", Style::default().fg(TEXT_DIM)),
+                Span::styled("  ↳ ", Style::default().fg(TEXT_DIM)),
                 Span::styled(truncate(&sanitize(text), 72), Style::default().fg(SUBTEXT)),
             ]));
         }
