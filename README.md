@@ -1,10 +1,11 @@
 # 🔥 Ignis
 
 [![CI](https://github.com/Fullstop000/ignis/actions/workflows/ci.yml/badge.svg)](https://github.com/Fullstop000/ignis/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Fullstop000/ignis/graph/badge.svg)](https://codecov.io/gh/Fullstop000/ignis)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A single-binary, multi-provider AI coding agent for your terminal — an interactive
-TUI and a one-shot CLI, with built-in tools and a simple plugin system.
+TUI and a one-shot CLI, with built-in tools.
 
 ## Features
 
@@ -14,8 +15,8 @@ TUI and a one-shot CLI, with built-in tools and a simple plugin system.
 - **Streaming agent loop** — incremental text + reasoning, with parallel or
   sequential tool execution and lifecycle hooks.
 - **Built-in tools** — `read_file`, `create_file`, `edit_file`, `list_dir`,
-  `bash`, and `web_search` (switchable Brave / Tavily backends).
-- **Plugins** — add external tools with a small YAML manifest; no recompile.
+  `grep`, `glob`, `bash`, `web_fetch`, `web_search` (switchable Brave / Tavily
+  backends), and `agent` (delegate a subtask to a one-level sub-agent).
 - **Sessions** — project-scoped JSONL history, `--resume`, auto-resume, and
   slash commands (`/resume`, `/clear`, `/compact`, `/copy`, `/model`).
 - **Runtime model switching** — `/model` picks the provider/model and (for
@@ -94,23 +95,6 @@ cargo run -- --resume <id> "follow-up prompt"   # resume a session, one-shot
 
 In the TUI: `Enter` sends, `↑/↓` history, `Shift+↑/↓` scroll, `Ctrl+D` exit.
 Type `/` for slash-command suggestions.
-
-## Tools & plugins
-
-Native tools are registered automatically. To add an external tool, drop a YAML
-manifest into `~/.ignis/extensions/` or `./.ignis/extensions/`:
-
-```yaml
-name: "hello_plugin"
-description: "Greets the user or a target."
-parameters:
-  type: object
-  properties:
-    name: { type: string, description: "Who to greet" }
-  required: []
-command: "python3 hello.py"     # receives the tool args as JSON on stdin
-execution_mode: "parallel"       # or "sequential"
-```
 
 ## Development
 

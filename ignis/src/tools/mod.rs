@@ -7,7 +7,6 @@ mod edit_file;
 mod glob;
 mod grep;
 mod list_dir;
-pub mod plugin;
 mod read_file;
 mod web_fetch;
 mod web_search;

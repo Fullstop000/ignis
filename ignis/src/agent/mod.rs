@@ -1,9 +1,125 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
-use crate::provider::{LlmProvider, LlmResponseDelta};
+use serde::Serialize;
+
+use crate::provider::{LlmProvider, LlmResponseDelta, Message, ToolCall, ToolCallFunction, Usage};
 use crate::tools::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
-use crate::types::{AgentEvent, Message, ToolCall, ToolCallFunction, Usage};
+
+/// Events emitted by the agent loop as it streams a turn.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum AgentEvent {
+    #[serde(rename = "agent_start")]
+    AgentStart,
+    #[serde(rename = "turn_start")]
+    TurnStart,
+    #[serde(rename = "message_start")]
+    MessageStart { message: Message },
+    #[serde(rename = "message_update")]
+    MessageUpdate { delta: String },
+    #[serde(rename = "message_end")]
+    MessageEnd { message: Message },
+    #[serde(rename = "tool_execution_start")]
+    ToolExecutionStart {
+        tool_call_id: String,
+        tool_name: String,
+        arguments: String,
+    },
+    #[serde(rename = "tool_execution_end")]
+    ToolExecutionEnd {
+        tool_call_id: String,
+        result: ToolResult,
+    },
+    #[serde(rename = "turn_end")]
+    TurnEnd,
+    #[serde(rename = "usage")]
+    Usage(Usage),
+    #[serde(rename = "agent_end")]
+    AgentEnd,
+}
+
+/// Build the system prompt for an interactive/one-shot run: the static agent
+/// instructions plus live environment and git context for `cwd`.
+pub fn build_system_prompt(cwd: &Path) -> String {
+    let git_status = get_git_status();
+    let git_diff = get_git_diff();
+    let current_date = get_current_date();
+    let os_name = std::env::consts::OS;
+
+    format!(
+        "You are Ignis, an interactive agent that helps users with software engineering tasks. \
+        Use the instructions below and the tools available to you to assist the user.
+
+# Guidelines
+ - All text you output outside of tool use is displayed to the user.
+ - Tools are executed in a user-selected permission mode.
+ - Read relevant code before changing it and keep changes tightly scoped to the request.
+ - Do not add speculative abstractions, compatibility shims, or unrelated cleanup.
+ - Do not create files unless they are required to complete the task.
+ - If an approach fails, diagnose the failure before switching tactics.
+ - Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.
+ - Report outcomes faithfully: if verification fails or was not run, say so explicitly.
+ - Carefully consider reversibility and blast radius. Local, reversible actions like editing files or running tests are usually fine. Actions that affect shared systems, publish state, delete data, or otherwise have high blast radius should be explicitly authorized by the user.
+
+# Tone & Style
+ - Be concise. Start work immediately. No conversational fillers or preambles.
+ - Answer directly without flattery or flippancy.
+ - Don't summarize what you did unless asked. Don't explain your code unless asked.
+
+# Environment Context
+ - Operating System: {}
+ - Working Directory: {}
+ - Current Date/Time: {}
+
+# Git Context
+Git Status:
+```
+{}
+```
+
+Git Diff:
+```
+{}
+```",
+        os_name,
+        cwd.display(),
+        current_date,
+        git_status,
+        git_diff
+    )
+}
+
+fn get_git_status() -> String {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "Not a git repository or git not installed".to_string())
+}
+
+fn get_git_diff() -> String {
+    let output = std::process::Command::new("git")
+        .args(["diff"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    if output.trim().is_empty() {
+        "No changes".to_string()
+    } else if output.len() > 2000 {
+        format!("{}... (truncated)", &output[..2000])
+    } else {
+        output
+    }
+}
+
+fn get_current_date() -> String {
+    std::process::Command::new("date")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "Unknown Date".to_string())
+}
 
 /// Execution engine: given a conversation `history`, runs the model + tool
 /// loop and emits events. State and persistence live in [`crate::Session`].

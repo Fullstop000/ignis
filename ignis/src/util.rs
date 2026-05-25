@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::types::Message;
+use crate::Message;
 
 /// Resolve a potentially relative path against a cwd.
 pub fn resolve_path(cwd: &Path, path: &str) -> PathBuf {

@@ -5,8 +5,7 @@ use ignis::{
     provider::{LlmProvider, LlmResponseDelta},
     storage::{InMemoryStorage, SessionStorage},
     tools::tool::{AgentTool, ToolResult},
-    types::{AgentEvent, Message, Usage},
-    Session,
+    AgentEvent, Message, Session, Usage,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

@@ -1,6 +1,7 @@
 use crate::provider::LlmProvider;
+use crate::state::{load_state, State};
 use anyhow::anyhow;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 
 /// A provider entry: credentials plus the catalog of models it offers. The
@@ -163,50 +164,6 @@ impl Config {
         }
         out
     }
-}
-
-fn state_path() -> Result<std::path::PathBuf, anyhow::Error> {
-    Ok(dirs::home_dir()
-        .ok_or_else(|| anyhow!("could not determine home directory"))?
-        .join(".ignis/state.json"))
-}
-
-/// Machine-written runtime state (the active `/model` selection). Lives apart
-/// from the hand-authored `config.toml`, which is never rewritten.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct State {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
-}
-
-/// Load `~/.ignis/state.json`; missing or unparseable yields the default.
-fn load_state() -> State {
-    state_path()
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-/// Persist a `/model` selection to `~/.ignis/state.json` (config is never
-/// touched). The selection takes priority over the config's optional default.
-pub fn persist_model_selection(
-    provider: &str,
-    model: &str,
-    effort: Option<&str>,
-) -> Result<(), anyhow::Error> {
-    let state = State {
-        model: Some(format!("{provider}/{model}")),
-        reasoning_effort: effort.map(str::to_string),
-    };
-    let path = state_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&state)?)?;
-    Ok(())
 }
 
 pub fn load_config() -> Result<Config, anyhow::Error> {
@@ -513,17 +470,5 @@ deepseek-v4-pro = ["high", "max"]
         });
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(cfg.active_effort(), None);
-    }
-
-    #[test]
-    fn state_round_trips_as_json() {
-        let state = State {
-            model: Some("deepseek/deepseek-v4-pro".to_string()),
-            reasoning_effort: Some("max".to_string()),
-        };
-        let json = serde_json::to_string(&state).unwrap();
-        let back: State = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
-        assert_eq!(back.reasoning_effort.as_deref(), Some("max"));
     }
 }
