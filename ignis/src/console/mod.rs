@@ -986,8 +986,13 @@ async fn handle_key(
 
 /// Build the prompt sent when a user force-loads a skill via `/skill-name`.
 /// `args` is the remainder of the input after the command (may be empty).
+/// The body is presented as already-loaded instructions so the model follows
+/// them directly instead of re-invoking the `skill` tool.
 pub(crate) fn build_skill_prompt(name: &str, body: &str, args: &str) -> String {
-    let head = format!("Use the \"{name}\" skill:\n\n{body}");
+    let head = format!(
+        "The \"{name}\" skill is now active — its instructions are below. Follow them \
+         for this task; they are already loaded, so do not call the skill tool.\n\n{body}"
+    );
     let args = args.trim();
     if args.is_empty() {
         head
@@ -1027,12 +1032,13 @@ mod slash_skill_tests {
     fn build_skill_prompt_with_and_without_args() {
         let body = "Follow these rules.";
         let with = super::build_skill_prompt("react", body, "fix this");
-        assert!(with.contains("Use the \"react\" skill:"));
+        assert!(with.contains("\"react\" skill"));
+        assert!(with.contains("do not call the skill tool")); // suppress redundant tool call
         assert!(with.contains("Follow these rules."));
         assert!(with.contains("fix this"));
 
         let bare = super::build_skill_prompt("react", body, "");
-        assert!(bare.contains("Use the \"react\" skill:"));
+        assert!(bare.contains("\"react\" skill"));
         assert!(bare.contains("Follow these rules."));
         assert!(!bare.contains("---")); // no args tail
     }
