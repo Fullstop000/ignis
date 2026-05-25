@@ -8,7 +8,9 @@ use ratatui::{
 use std::path::Path;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{App, Mode, ModelPicker, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
+use super::app::{
+    App, Mode, ModelPicker, SessionPicker, SkillPicker, ToolCallEntry, ToolStatus, UIBlock,
+};
 use super::markdown::render_md_block;
 use super::{
     format_context, format_duration, format_tokens, highlight, sanitize, truncate, ACCENT, BG,
@@ -66,6 +68,10 @@ pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
         let rows = p.sessions.len().max(1) as u16 + 4;
         return rows.clamp(4, cap);
     }
+    if let Some(_p) = &app.skill_picker {
+        let rows = app.skills.as_deref().map(|r| r.all().len()).unwrap_or(0) as u16 + 4;
+        return rows.clamp(4, cap);
+    }
     let input_h = input_height(app, cap);
     let sugg = app.slash_suggestions();
     let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
@@ -88,12 +94,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
     // Modal pickers own the whole live band.
-    if app.model_picker.is_some() || app.session_picker.is_some() {
+    if app.model_picker.is_some() || app.session_picker.is_some() || app.skill_picker.is_some() {
         let mut lines: Vec<Line> = Vec::new();
         if let Some(picker) = &app.model_picker {
             render_model_picker(&mut lines, picker, &app.model_options);
         } else if let Some(picker) = &app.session_picker {
             render_session_picker(&mut lines, picker);
+        } else if let Some(picker) = &app.skill_picker {
+            render_skill_picker(&mut lines, picker, app.skills.as_deref());
         }
         f.render_widget(
             Paragraph::new(Text::from(lines))
@@ -526,6 +534,58 @@ pub(crate) fn render_session_picker(lines: &mut Vec<Line<'static>>, picker: &Ses
 
     lines.push(Line::from(Span::styled(
         "  Use Up/Down to choose, Enter to resume.",
+        Style::default().fg(TEXT_DIM),
+    )));
+}
+
+pub(crate) fn render_skill_picker(
+    lines: &mut Vec<Line<'static>>,
+    picker: &SkillPicker,
+    registry: Option<&crate::skills::SkillRegistry>,
+) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ◆ ", Style::default().fg(MAUVE)),
+        Span::styled(
+            "Manage skills",
+            Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let Some(reg) = registry else { return };
+    for (idx, skill) in reg.all().iter().enumerate() {
+        let selected = idx == picker.selected;
+        let marker = if selected { ">" } else { " " };
+        let check = if reg.is_enabled(&skill.name) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let scope = match skill.scope {
+            crate::skills::SkillScope::Project => "project",
+            crate::skills::SkillScope::Global => "global",
+        };
+        let style = if selected {
+            Style::default().fg(BG).bg(ACCENT)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        let desc = skill.description.clone().unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {marker} {check} "),
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<18}", truncate(&skill.name, 18)),
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {}  ({scope})", truncate(&desc, 40)), style),
+        ]));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  Up/Down to move, Space/Enter to toggle, Esc to close.",
         Style::default().fg(TEXT_DIM),
     )));
 }

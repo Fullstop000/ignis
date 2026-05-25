@@ -53,6 +53,12 @@ pub(crate) struct SessionPicker {
     pub(crate) selected: usize,
 }
 
+/// `/skills` picker state. Rows come from `App.skills` registry `all()`.
+#[derive(Debug, Clone)]
+pub(crate) struct SkillPicker {
+    pub(crate) selected: usize,
+}
+
 /// `/model` picker state. Options live on `App.model_options`; this tracks the
 /// highlighted row and, for a reasoning-capable model, the chosen effort level.
 #[derive(Debug, Clone)]
@@ -88,6 +94,7 @@ pub(crate) struct App {
     /// Choices for the `/model` picker, flattened from config.
     pub(crate) model_options: Vec<crate::models::ModelOption>,
     pub(crate) model_picker: Option<ModelPicker>,
+    pub(crate) skill_picker: Option<SkillPicker>,
 
     pub(crate) mode: Mode,
     pub(crate) tick: u64,
@@ -153,6 +160,7 @@ impl App {
             session_picker: None,
             model_options: Vec::new(),
             model_picker: None,
+            skill_picker: None,
             mode: Mode::Idle,
             tick: 0,
             stream_start: None,
@@ -595,6 +603,37 @@ impl App {
             .map(|c| c as usize)
             .unwrap_or(self.fallback_context_window);
         Some((opt.provider, opt.model, effort))
+    }
+
+    pub(crate) fn show_skill_picker(&mut self) {
+        self.exit_pending = false;
+        match self.skills.as_deref() {
+            Some(reg) if !reg.is_empty() => {
+                self.skill_picker = Some(SkillPicker { selected: 0 });
+            }
+            _ => self.add_assistant_notice(
+                "No skills found. Add one at ~/.ignis/skills/<name>/SKILL.md".to_string(),
+            ),
+        }
+    }
+
+    pub(crate) fn select_skill_picker(&mut self, direction: SelectionDirection) {
+        let len = self.skills.as_deref().map(|r| r.all().len()).unwrap_or(0);
+        if len == 0 {
+            return;
+        }
+        if let Some(picker) = &mut self.skill_picker {
+            picker.selected = next_selection(picker.selected, len, direction);
+        }
+    }
+
+    /// Toggle the highlighted skill. Returns `(name, now_enabled)` for a notice.
+    pub(crate) fn toggle_selected_skill(&mut self) -> Option<(String, bool)> {
+        let picker = self.skill_picker.as_ref()?;
+        let reg = self.skills.as_deref()?;
+        let name = reg.all().get(picker.selected)?.name.clone();
+        let now_enabled = reg.toggle(&name);
+        Some((name, now_enabled))
     }
 
     pub(crate) fn render_session_history(
@@ -1204,5 +1243,41 @@ mod tests {
         });
         assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "from-start"));
         assert_eq!(app.history.last().map(|s| s.as_str()), Some("from-start"));
+    }
+
+    #[test]
+    fn skill_picker_toggles_selected() {
+        use std::sync::Arc;
+        let _env = crate::util::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = crate::util::unique_temp_dir("ignis-app-skillpicker");
+        let cwd = tmp.join("proj");
+        for n in ["alpha", "beta"] {
+            let dir = cwd.join(".ignis/skills").join(n);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("---\nname: {n}\n---\nbody")).unwrap();
+        }
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        let mut app = App::new("p".into(), "m".into(), "s".into(), cwd.clone());
+        app.skills = Some(Arc::new(crate::skills::SkillRegistry::load(
+            None,
+            &cwd,
+            std::collections::HashSet::new(),
+        )));
+        app.show_skill_picker();
+        assert!(app.skill_picker.is_some());
+        let (name, now) = app.toggle_selected_skill().unwrap();
+        assert_eq!(name, "alpha"); // row 0, sorted
+        assert!(!now); // disabled
+        assert!(!app.skills.as_deref().unwrap().is_enabled("alpha"));
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

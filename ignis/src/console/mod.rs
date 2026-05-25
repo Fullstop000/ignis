@@ -621,6 +621,7 @@ async fn handle_key(
             app.clear_exit_hint();
             app.session_picker = None;
             app.model_picker = None;
+            app.skill_picker = None;
             return;
         }
         (m, KeyCode::Char('d')) if m.contains(KeyModifiers::CONTROL) => {
@@ -781,6 +782,34 @@ async fn handle_key(
         }
     }
 
+    if app.skill_picker.is_some() {
+        match key.code {
+            KeyCode::Up => {
+                app.select_skill_picker(SelectionDirection::Previous);
+                return;
+            }
+            KeyCode::Down => {
+                app.select_skill_picker(SelectionDirection::Next);
+                return;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some((name, now)) = app.toggle_selected_skill() {
+                    let state = if now { "enabled" } else { "disabled" };
+                    app.add_assistant_notice(format!("Skill '{name}' {state}."));
+                }
+                return;
+            }
+            KeyCode::Esc => {
+                app.skill_picker = None;
+                return;
+            }
+            KeyCode::Char(_) => {
+                app.skill_picker = None;
+            }
+            _ => {}
+        }
+    }
+
     match (key.modifiers, key.code) {
         (_, KeyCode::Enter) => {
             let text = if let Some(cmd) = app.selected_slash_command() {
@@ -835,6 +864,8 @@ async fn handle_key(
                     app.copy_last_assistant_message();
                 } else if command == "/model" && arg_count == 1 {
                     app.show_model_picker();
+                } else if command == "/skills" && arg_count == 1 {
+                    app.show_skill_picker();
                 } else if command.starts_with('/')
                     && app
                         .skills
