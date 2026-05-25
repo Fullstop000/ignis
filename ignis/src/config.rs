@@ -406,6 +406,7 @@ models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", 
         cfg.apply_state(State {
             model: Some("deepseek/deepseek-v4-pro".to_string()),
             reasoning_effort: Some("high".to_string()),
+            disabled_skills: vec![],
         });
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(cfg.active_effort().as_deref(), Some("high"));
@@ -442,6 +443,7 @@ models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", 
         cfg.apply_state(State {
             model: Some("deepseek/deepseek-v4-flash".to_string()),
             reasoning_effort: None,
+            disabled_skills: vec![],
         });
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(cfg.active_effort(), None);
