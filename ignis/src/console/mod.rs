@@ -500,6 +500,78 @@ pub async fn run_console(
     Ok(())
 }
 
+/// Apply a text-editing keystroke to the input. Shared by idle and busy modes.
+/// Returns true if the key was consumed.
+fn apply_edit_key(app: &mut App, key: KeyEvent) -> bool {
+    match (key.modifiers, key.code) {
+        (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+            app.clear_exit_hint();
+            app.input.clear();
+            app.cursor = 0;
+            app.reset_slash_selection();
+        }
+        (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
+            app.clear_exit_hint();
+            app.cursor = 0;
+        }
+        (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
+            app.clear_exit_hint();
+            app.cursor = app.input.len();
+        }
+        (KeyModifiers::CONTROL, KeyCode::Char('w')) if app.cursor > 0 => {
+            app.clear_exit_hint();
+            let before = &app.input[..app.cursor];
+            let trimmed = before.trim_end();
+            let new_end = trimmed
+                .rfind(|c: char| c.is_whitespace())
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            app.input = format!("{}{}", &app.input[..new_end], &app.input[app.cursor..]);
+            app.cursor = new_end;
+        }
+        (m, KeyCode::Char('j'))
+            if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
+        {
+            app.clear_exit_hint();
+            app.insert_char('\n');
+            app.reset_slash_selection();
+        }
+        (_, KeyCode::Char(c)) => {
+            app.clear_exit_hint();
+            app.insert_char(c);
+            app.reset_slash_selection();
+        }
+        (_, KeyCode::Backspace) if app.cursor > 0 => {
+            app.clear_exit_hint();
+            app.backspace();
+            app.reset_slash_selection();
+        }
+        (_, KeyCode::Delete) if app.cursor < app.input.len() => {
+            app.clear_exit_hint();
+            app.delete_forward();
+            app.reset_slash_selection();
+        }
+        (_, KeyCode::Left) if app.cursor > 0 => {
+            app.clear_exit_hint();
+            app.move_left();
+        }
+        (_, KeyCode::Right) if app.cursor < app.input.len() => {
+            app.clear_exit_hint();
+            app.move_right();
+        }
+        (_, KeyCode::Home) => {
+            app.clear_exit_hint();
+            app.cursor = 0;
+        }
+        (_, KeyCode::End) => {
+            app.clear_exit_hint();
+            app.cursor = app.input.len();
+        }
+        _ => return false,
+    }
+    true
+}
+
 async fn handle_key(
     app: &mut App,
     key: KeyEvent,
@@ -509,7 +581,6 @@ async fn handle_key(
     session_manager: &SessionManager,
     storage_dir: &std::path::Path,
 ) {
-    let _ = active_inject; // wired in the next task (Ctrl+S / Ctrl+C gating)
     // Global
     match (key.modifiers, key.code) {
         (_, KeyCode::Esc) => {
@@ -526,19 +597,69 @@ async fn handle_key(
             if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
         {
             app.clear_exit_hint();
-            if app.mode != Mode::Idle {
+            // Only cancellable while a prompt run is live. The resulting AgentEnd
+            // drives the state transition + drain (keeps the queue).
+            if active_inject.lock().unwrap().is_some() {
                 let _ = cancel_tx.try_send(());
-                app.mode = Mode::Idle;
-                app.current_chunk_idx = None;
-                app.stream_start = None;
-                app.add_assistant_notice("Cancelled.".to_string());
             }
             return;
         }
         _ => {}
     }
 
+    // Ctrl+S: inject into the live turn (steer). Falls back to enqueue when no
+    // prompt run is active (idle / compact), so text is never silently dropped.
+    if matches!(key.code, KeyCode::Char('s')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        let text = app.input.trim().to_string();
+        if !text.is_empty() {
+            let sender = active_inject.lock().unwrap().clone();
+            match sender {
+                Some(tx) => match tx.try_send(text.clone()) {
+                    Ok(()) => {
+                        app.pending_injects.push(text);
+                        app.input.clear();
+                        app.cursor = 0;
+                        app.reset_slash_selection();
+                    }
+                    Err(_) => {
+                        app.error_flash = Some((
+                            "Couldn't steer — try again".to_string(),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                },
+                None => {
+                    app.enqueue(text);
+                    app.input.clear();
+                    app.cursor = 0;
+                    app.reset_slash_selection();
+                }
+            }
+        }
+        return;
+    }
+
+    // While busy: type to queue / steer. No pickers, no slash menu.
     if app.mode != Mode::Idle {
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Enter) => {
+                let text = app.input.trim().to_string();
+                if !text.is_empty() {
+                    app.enqueue(text);
+                    app.input.clear();
+                    app.cursor = 0;
+                    app.reset_slash_selection();
+                }
+            }
+            (_, KeyCode::Up) if app.input.is_empty() && !app.queue.is_empty() => {
+                app.recall_last_queued();
+            }
+            (_, KeyCode::Up) => app.history_prev(),
+            (_, KeyCode::Down) => app.history_next(),
+            _ => {
+                apply_edit_key(app, key);
+            }
+        }
         return;
     }
 

@@ -397,16 +397,12 @@ impl App {
     }
 
     /// Queue a prompt typed while busy (no transcript block until it fires).
-    // Used by handle_key in console/mod.rs (Task 5).
-    #[allow(dead_code)]
     pub(crate) fn enqueue(&mut self, text: String) {
         self.exit_pending = false;
         self.queue.push(text);
     }
 
     /// Pop the next queued prompt (FIFO) for the drain.
-    // Used by the queue drain in console/mod.rs (Task 4).
-    #[allow(dead_code)]
     pub(crate) fn take_queued_front(&mut self) -> Option<String> {
         if self.queue.is_empty() {
             None
@@ -416,8 +412,6 @@ impl App {
     }
 
     /// Move the most recent queued prompt back into the input for editing.
-    // Used by handle_key in console/mod.rs (Task 5).
-    #[allow(dead_code)]
     pub(crate) fn recall_last_queued(&mut self) -> bool {
         match self.queue.pop() {
             Some(text) => {
@@ -430,8 +424,6 @@ impl App {
     }
 
     /// Read and clear the edge-trigger flag set on `AgentEnd`.
-    // Used by the queue drain in console/mod.rs (Task 4).
-    #[allow(dead_code)]
     pub(crate) fn take_turn_just_ended(&mut self) -> bool {
         std::mem::take(&mut self.turn_just_ended)
     }
