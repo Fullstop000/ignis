@@ -9,7 +9,6 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, style::Color, Terminal};
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -297,11 +296,6 @@ pub async fn run_console(
             session.set_compaction(agent_config.compaction.clone());
 
             crate::tools::register_native_tools(&mut session, &agent_cwd, &agent_config);
-            let ext_dirs = crate::tools::plugin::default_extension_dirs();
-            let plugins = crate::tools::plugin::load_extensions(&ext_dirs);
-            for plugin in plugins {
-                session.register_tool(Arc::new(plugin));
-            }
 
             let notice_msg = |content: &str| Message {
                 role: "assistant".to_string(),
@@ -484,7 +478,7 @@ async fn handle_key(
                         effort: effort.clone(),
                     });
                     if let Err(e) =
-                        crate::config::persist_model_selection(&provider, &model, effort.as_deref())
+                        crate::state::persist_model_selection(&provider, &model, effort.as_deref())
                     {
                         app.add_assistant_notice(format!("Switched (not saved: {e})"));
                     } else {

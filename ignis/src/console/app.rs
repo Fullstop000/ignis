@@ -5,7 +5,7 @@ use super::{
     format_duration, next_selection, slash_suggestions, SelectionDirection, SlashCommand, SPINNERS,
     THINKING_VERBS,
 };
-use crate::types::AgentEvent;
+use crate::AgentEvent;
 
 /// Clipboard function type: takes text, returns Ok/Err.
 type ClipFn = for<'a> fn(&'a str) -> Result<(), String>;

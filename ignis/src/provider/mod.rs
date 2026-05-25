@@ -1,7 +1,9 @@
-use crate::Message;
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+
+mod message;
+pub use message::{Message, ToolCall, ToolCallFunction, Usage};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LlmResponseDelta {
@@ -14,7 +16,7 @@ pub enum LlmResponseDelta {
         arguments: String,
     },
     /// Real token usage for the completion (emitted once, near the end).
-    Usage(crate::types::Usage),
+    Usage(Usage),
 }
 
 #[async_trait]
@@ -99,14 +101,14 @@ pub struct PromptTokensDetails {
 }
 
 impl ChunkUsage {
-    pub fn to_usage(&self) -> crate::types::Usage {
+    pub fn to_usage(&self) -> Usage {
         let cache_read = self
             .prompt_tokens_details
             .as_ref()
             .map(|d| d.cached_tokens)
             .or(self.prompt_cache_hit_tokens)
             .unwrap_or(0);
-        crate::types::Usage {
+        Usage {
             // prompt_tokens already includes cached tokens.
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,

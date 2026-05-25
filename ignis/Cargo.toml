@@ -17,7 +17,6 @@ dirs = "5.0"
 uuid = { version = "1.0", features = ["v4"] }
 bytes = "1.0"
 ignis-macros = { path = "../ignis-macros" }
-serde_yaml = "0.9"
 toml = "0.8"
 ratatui = { version = "0.26", features = ["unstable-rendered-line-info"] }
 crossterm = "0.27"

@@ -1,3 +1,6 @@
+//! Conversation message types and token usage — the LLM protocol model shared
+//! across providers, the agent loop, and persisted sessions.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,36 +62,4 @@ impl Usage {
     pub fn is_zero(&self) -> bool {
         *self == Usage::default()
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", content = "payload")]
-pub enum AgentEvent {
-    #[serde(rename = "agent_start")]
-    AgentStart,
-    #[serde(rename = "turn_start")]
-    TurnStart,
-    #[serde(rename = "message_start")]
-    MessageStart { message: Message },
-    #[serde(rename = "message_update")]
-    MessageUpdate { delta: String },
-    #[serde(rename = "message_end")]
-    MessageEnd { message: Message },
-    #[serde(rename = "tool_execution_start")]
-    ToolExecutionStart {
-        tool_call_id: String,
-        tool_name: String,
-        arguments: String,
-    },
-    #[serde(rename = "tool_execution_end")]
-    ToolExecutionEnd {
-        tool_call_id: String,
-        result: crate::tools::tool::ToolResult,
-    },
-    #[serde(rename = "turn_end")]
-    TurnEnd,
-    #[serde(rename = "usage")]
-    Usage(Usage),
-    #[serde(rename = "agent_end")]
-    AgentEnd,
 }

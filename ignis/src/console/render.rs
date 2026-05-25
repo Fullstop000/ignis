@@ -1238,10 +1238,10 @@ mod tests {
                 reasoning_content: None,
                 name: None,
                 tool_call_id: None,
-                tool_calls: Some(vec![crate::types::ToolCall {
+                tool_calls: Some(vec![crate::ToolCall {
                     id: "call_1".to_string(),
                     r#type: "function".to_string(),
-                    function: crate::types::ToolCallFunction {
+                    function: crate::ToolCallFunction {
                         name: "list_dir".to_string(),
                         arguments: r#"{"path":"."}"#.to_string(),
                     },
