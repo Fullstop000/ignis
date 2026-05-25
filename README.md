@@ -130,9 +130,6 @@ description: Use when working with React components, hooks, or state.
 - Force-load one yourself: `/react-patterns refactor this component`.
 - Enable or disable skills at runtime: `/skills`.
 
-See [`examples/skills/commit-style/`](examples/skills/commit-style/SKILL.md) for a
-worked example.
-
 ## Development
 
 ```bash
