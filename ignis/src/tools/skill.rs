@@ -32,7 +32,8 @@ impl AgentTool for SkillTool {
 
     fn description(&self) -> &str {
         "Load a specialized skill by name when the task matches one listed in \
-         <available_skills>. Returns the skill's full instructions."
+         <available_skills>. Returns the skill's full instructions, plus a list \
+         of any supporting files it bundles."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -53,12 +54,14 @@ impl AgentTool for SkillTool {
             // The body is the skill's instructions — emitted verbatim, not
             // XML-escaped (unlike the catalog's metadata), so code samples and
             // markdown in it survive intact. `name` is validated to a safe
-            // charset, so the wrapper tag is well-formed. We deliberately do not
-            // advertise the skill's directory — skills are self-contained
-            // instructions, and a path only nudges the model to go read files.
+            // charset, so the wrapper tag is well-formed. The directory + file
+            // list is appended only when the skill actually bundles files (see
+            // `resources_note`), so pure-instruction skills stay clean.
             Some(skill) => ToolResult::ok(format!(
-                "<skill name=\"{}\">\n{}\n</skill>",
-                skill.name, skill.body
+                "<skill name=\"{}\">\n{}{}\n</skill>",
+                skill.name,
+                skill.body,
+                skill.resources_note().unwrap_or_default()
             )),
             None => ToolResult::error(format!(
                 "Skill '{name}' not found or disabled. Available: [{}]",
@@ -91,6 +94,28 @@ mod tests {
         assert!(!r.is_error);
         assert!(r.content.contains("React body."));
         assert!(r.content.contains("<skill name=\"react\">"));
+    }
+
+    #[tokio::test]
+    async fn loads_bundled_files_list() {
+        // Keep the skill dir alive through the call (resources_note reads it live).
+        let tmp = crate::util::unique_temp_dir("ignis-skilltool-bundled");
+        let dir = tmp.join("proj/.ignis/skills/bundled");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: bundled\n---\nuse helper.sh",
+        )
+        .unwrap();
+        std::fs::write(dir.join("helper.sh"), "echo hi").unwrap();
+        let reg = Arc::new(SkillRegistry::load(None, &tmp.join("proj"), HashSet::new()));
+
+        let tool = SkillTool::new(reg);
+        let r = tool.call(serde_json::json!({ "name": "bundled" })).await;
+        assert!(!r.is_error);
+        assert!(r.content.contains("use helper.sh"));
+        assert!(r.content.contains("helper.sh")); // bundled file advertised
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[tokio::test]

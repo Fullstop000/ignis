@@ -12,6 +12,9 @@ pub const MAX_SKILL_BODY_CHARS: usize = 50_000;
 /// Slash-command names a skill may not shadow.
 const BASE_SLASH_NAMES: &[&str] = &["resume", "clear", "compact", "copy", "model", "skills"];
 
+/// Most bundled (sibling) files advertised when a skill is loaded.
+const MAX_SKILL_FILES: usize = 10;
+
 /// Which root a skill was discovered under (for the `/skills` source tag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillScope {
@@ -26,6 +29,47 @@ pub struct Skill {
     pub dir: PathBuf,
     pub body: String,
     pub scope: SkillScope,
+}
+
+impl Skill {
+    /// A note listing the skill's bundled (sibling) files, or `None` if it has
+    /// none. Shown only when a skill is *loaded* (the `skill` tool or a
+    /// `/skill-name` force-load) — never in the always-on catalog — so
+    /// pure-instruction skills add no directory noise and don't nudge the model
+    /// into reading a directory that holds nothing but `SKILL.md`.
+    pub fn resources_note(&self) -> Option<String> {
+        let mut entries: Vec<String> = std::fs::read_dir(&self.dir)
+            .ok()?
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                if name == "SKILL.md" {
+                    return None;
+                }
+                // Mark directories with a trailing slash so the model knows to
+                // look inside (e.g. `scripts/`, `assets/`).
+                if e.path().is_dir() {
+                    Some(format!("{name}/"))
+                } else {
+                    Some(name)
+                }
+            })
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        entries.sort();
+        entries.truncate(MAX_SKILL_FILES);
+        let mut note = format!(
+            "\n\nThis skill bundles supporting files in {}:\n",
+            self.dir.display()
+        );
+        for e in &entries {
+            note.push_str(&format!("- {e}\n"));
+        }
+        note.push_str("Read them with read_file only if the instructions above reference them.");
+        Some(note)
+    }
 }
 
 /// A valid skill name: starts alphanumeric, then alphanumeric / `_` / `-`.
@@ -470,6 +514,36 @@ mod tests {
         let cat = reg.catalog_prompt().unwrap();
         assert!(cat.contains("<name>react</name>"));
         assert!(cat.contains("use &lt;tag&gt; &amp; stuff"));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn resources_note_lists_bundled_files_or_none() {
+        let tmp = crate::util::unique_temp_dir("ignis-skills-resources");
+        let cwd = tmp.join("proj");
+        // Skill with no siblings → no note.
+        write_skill(&cwd.join(".ignis/skills"), "plain", "body");
+        // Skill with a bundled file and a bundled dir.
+        let bundled = cwd.join(".ignis/skills/bundled");
+        std::fs::create_dir_all(bundled.join("scripts")).unwrap();
+        std::fs::write(
+            bundled.join("SKILL.md"),
+            "---\nname: bundled\n---\nuse scripts/run.sh",
+        )
+        .unwrap();
+        std::fs::write(bundled.join("ref.md"), "reference").unwrap();
+        std::fs::write(bundled.join("scripts/run.sh"), "echo hi").unwrap();
+
+        let reg = SkillRegistry::load(None, &cwd, HashSet::new());
+        assert!(reg.get_enabled("plain").unwrap().resources_note().is_none());
+        let note = reg
+            .get_enabled("bundled")
+            .unwrap()
+            .resources_note()
+            .unwrap();
+        assert!(note.contains("ref.md"));
+        assert!(note.contains("scripts/")); // dir shown with trailing slash
+        assert!(!note.contains("SKILL.md")); // never lists itself
         std::fs::remove_dir_all(&tmp).ok();
     }
 

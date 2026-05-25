@@ -876,7 +876,13 @@ async fn handle_key(
                     let reg = app.skills.clone().unwrap();
                     if let Some(skill) = reg.get_enabled(&name) {
                         let args = text[command.len()..].trim();
-                        let prompt = build_skill_prompt(&skill.name, &skill.body, args);
+                        let mut prompt = build_skill_prompt(&skill.name, &skill.body, args);
+                        // Bundled-file skills get their directory + file list so
+                        // the model can read referenced resources (no-op for
+                        // pure-instruction skills).
+                        if let Some(note) = skill.resources_note() {
+                            prompt.push_str(&note);
+                        }
                         app.turn_in_flight = true;
                         let _ = prompt_tx
                             .send(AgentRequest::Prompt {
