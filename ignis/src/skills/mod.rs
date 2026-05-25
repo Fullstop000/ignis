@@ -273,10 +273,6 @@ impl SkillRegistry {
                     xml_escape(d)
                 ));
             }
-            out.push_str(&format!(
-                "    <location>{}</location>\n",
-                xml_escape(&s.dir.display().to_string())
-            ));
             out.push_str("  </skill>\n");
         }
         out.push_str("</available_skills>");

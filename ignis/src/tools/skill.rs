@@ -53,13 +53,12 @@ impl AgentTool for SkillTool {
             // The body is the skill's instructions — emitted verbatim, not
             // XML-escaped (unlike the catalog's metadata), so code samples and
             // markdown in it survive intact. `name` is validated to a safe
-            // charset, so the wrapper tag is well-formed.
+            // charset, so the wrapper tag is well-formed. We deliberately do not
+            // advertise the skill's directory — skills are self-contained
+            // instructions, and a path only nudges the model to go read files.
             Some(skill) => ToolResult::ok(format!(
-                "<skill name=\"{}\">\n{}\n\n(Skill directory: {} — read bundled files with \
-                 read_file / list_dir if referenced.)\n</skill>",
-                skill.name,
-                skill.body,
-                skill.dir.display()
+                "<skill name=\"{}\">\n{}\n</skill>",
+                skill.name, skill.body
             )),
             None => ToolResult::error(format!(
                 "Skill '{name}' not found or disabled. Available: [{}]",
