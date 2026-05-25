@@ -4,6 +4,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{backend::CrosstermBackend, style::Color, Terminal, TerminalOptions, Viewport};
+use std::borrow::Cow;
 use std::io;
 use std::path::PathBuf;
 
@@ -68,32 +69,36 @@ pub(crate) const THINKING_VERBS: &[&str] = &[
     "Galaxy-braining",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SlashCommand {
-    pub(crate) name: &'static str,
-    pub(crate) description: &'static str,
+    pub(crate) name: Cow<'static, str>,
+    pub(crate) description: Cow<'static, str>,
 }
 
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
-        name: "/resume",
-        description: "List and resume sessions",
+        name: Cow::Borrowed("/resume"),
+        description: Cow::Borrowed("List and resume sessions"),
     },
     SlashCommand {
-        name: "/clear",
-        description: "Start a new session",
+        name: Cow::Borrowed("/clear"),
+        description: Cow::Borrowed("Start a new session"),
     },
     SlashCommand {
-        name: "/compact",
-        description: "Summarize earlier history to free up context",
+        name: Cow::Borrowed("/compact"),
+        description: Cow::Borrowed("Summarize earlier history to free up context"),
     },
     SlashCommand {
-        name: "/copy",
-        description: "Copy the last assistant message to clipboard",
+        name: Cow::Borrowed("/copy"),
+        description: Cow::Borrowed("Copy the last assistant message to clipboard"),
     },
     SlashCommand {
-        name: "/model",
-        description: "Switch model and reasoning effort",
+        name: Cow::Borrowed("/model"),
+        description: Cow::Borrowed("Switch model and reasoning effort"),
+    },
+    SlashCommand {
+        name: Cow::Borrowed("/skills"),
+        description: Cow::Borrowed("Manage skills (enable/disable)"),
     },
 ];
 
@@ -192,16 +197,28 @@ pub(crate) fn sanitize(s: &str) -> String {
     out
 }
 
-pub(crate) fn slash_suggestions(input: &str) -> Vec<SlashCommand> {
+pub(crate) fn slash_suggestions(
+    input: &str,
+    skills: Option<&crate::skills::SkillRegistry>,
+) -> Vec<SlashCommand> {
     let trimmed = input.trim_start();
     if !trimmed.starts_with('/') || trimmed.contains(' ') {
         return Vec::new();
     }
 
+    let mut candidates: Vec<SlashCommand> = SLASH_COMMANDS.to_vec();
+    if let Some(reg) = skills {
+        for (name, desc) in reg.enabled_entries() {
+            candidates.push(SlashCommand {
+                name: Cow::Owned(format!("/{name}")),
+                description: Cow::Owned(desc.unwrap_or_else(|| format!("Load the {name} skill"))),
+            });
+        }
+    }
+
     let query = trimmed.trim_start_matches('/').to_ascii_lowercase();
-    let mut matches: Vec<(usize, usize, SlashCommand)> = SLASH_COMMANDS
-        .iter()
-        .copied()
+    let mut matches: Vec<(usize, usize, SlashCommand)> = candidates
+        .into_iter()
         .enumerate()
         .filter_map(|(idx, command)| {
             if query.is_empty() {
@@ -307,8 +324,9 @@ pub async fn run_console(
     let agent_cwd = cwd;
     let mut agent_config = config;
 
-    let _ui_skill_registry = skill_registry.clone();
+    let ui_skill_registry = skill_registry.clone();
     let runner_skill_registry = skill_registry.clone();
+    app.skills = Some(ui_skill_registry);
 
     // Background agent runner
     tokio::spawn(async move {
@@ -908,5 +926,33 @@ async fn handle_key(
             app.cursor = app.input.len();
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod slash_skill_tests {
+    use super::slash_suggestions;
+
+    #[test]
+    fn slash_suggestions_include_enabled_skills_exclude_disabled() {
+        let tmp = crate::util::unique_temp_dir("ignis-slash-skills");
+        let cwd = tmp.join("proj");
+        for n in ["alpha", "beta"] {
+            let dir = cwd.join(".ignis/skills").join(n);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("---\nname: {n}\n---\nbody")).unwrap();
+        }
+        let mut disabled = std::collections::HashSet::new();
+        disabled.insert("beta".to_string());
+        let reg = crate::skills::SkillRegistry::load(None, &cwd, disabled);
+
+        let names: Vec<String> = slash_suggestions("/", Some(&reg))
+            .into_iter()
+            .map(|c| c.name.into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "/alpha"));
+        assert!(!names.iter().any(|n| n == "/beta")); // disabled
+        assert!(names.iter().any(|n| n == "/skills"));
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

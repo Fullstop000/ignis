@@ -130,6 +130,9 @@ pub(crate) struct App {
 
     /// Clipboard function, injectable for testing.
     pub(crate) clipboard_fn: ClipFn,
+
+    /// Skill registry for slash autocomplete; `None` when no skills are loaded.
+    pub(crate) skills: Option<std::sync::Arc<crate::skills::SkillRegistry>>,
 }
 
 impl App {
@@ -167,6 +170,7 @@ impl App {
             turn_just_ended: false,
             turn_in_flight: false,
             clipboard_fn: super::clipboard::set_clipboard,
+            skills: None,
         }
     }
 
@@ -683,7 +687,7 @@ impl App {
     }
 
     pub(crate) fn slash_suggestions(&self) -> Vec<SlashCommand> {
-        slash_suggestions(&self.input)
+        slash_suggestions(&self.input, self.skills.as_deref())
     }
 
     pub(crate) fn reset_slash_selection(&mut self) {
@@ -876,30 +880,30 @@ mod tests {
 
     #[test]
     fn slash_suggestions_show_all_commands_for_slash() {
-        let suggestions = slash_suggestions("/");
+        let suggestions = slash_suggestions("/", None);
 
         assert_eq!(
             suggestions
                 .iter()
-                .map(|command| command.name)
+                .map(|command| command.name.as_ref())
                 .collect::<Vec<_>>(),
-            vec!["/resume", "/clear", "/compact", "/copy", "/model"]
+            vec!["/resume", "/clear", "/compact", "/copy", "/model", "/skills"]
         );
     }
 
     #[test]
     fn slash_suggestions_filter_by_command_name_or_description() {
-        assert_eq!(slash_suggestions("/res")[0].name, "/resume");
-        assert_eq!(slash_suggestions("/list")[0].name, "/resume");
+        assert_eq!(slash_suggestions("/res", None)[0].name.as_ref(), "/resume");
+        assert_eq!(slash_suggestions("/list", None)[0].name.as_ref(), "/resume");
         // `/new` is merged into `/clear`: typing it still surfaces /clear via
         // its description ("Start a new session").
-        assert_eq!(slash_suggestions("/new")[0].name, "/clear");
-        assert_eq!(slash_suggestions("/clear")[0].name, "/clear");
+        assert_eq!(slash_suggestions("/new", None)[0].name.as_ref(), "/clear");
+        assert_eq!(slash_suggestions("/clear", None)[0].name.as_ref(), "/clear");
     }
 
     #[test]
     fn slash_suggestions_stop_after_first_argument() {
-        assert!(slash_suggestions("/resume default").is_empty());
+        assert!(slash_suggestions("/resume default", None).is_empty());
     }
 
     fn test_app() -> App {
