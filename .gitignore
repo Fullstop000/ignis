@@ -1,5 +1,6 @@
 # Rust
 /target/
+**/*.rs.bk
 # Cargo.lock is committed: this workspace ships a binary application.
 
 # IDE / Editors
@@ -39,3 +40,13 @@ raw_run.log
 # Local Ignis config — may contain API keys. Use config.example.toml as a template.
 /config.toml
 /config.yaml
+
+# Local Ignis runtime state (per machine, may reference local paths)
+/state.json
+
+# Claude Code — per-machine local state (shared skills/ stay tracked)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# MCP / tooling caches
+.code-review-graph/
