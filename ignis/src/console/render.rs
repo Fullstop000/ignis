@@ -16,6 +16,42 @@ use super::{
     SURFACE_2, TEXT, TEXT_DIM, YELLOW,
 };
 
+/// Max queued rows shown before collapsing to a "+N more" row.
+const MAX_QUEUE_ROWS: usize = 5;
+
+/// Adaptive hint shown above the input while busy (None = no hint row).
+pub(crate) fn queued_hint(app: &App) -> Option<String> {
+    if app.mode == Mode::Idle {
+        return None;
+    }
+    let has_queue = !app.queue.is_empty();
+    let typing = !app.input.is_empty();
+    if !has_queue && !typing {
+        return None;
+    }
+    Some(if has_queue {
+        "↑ edit last · Enter queue · Ctrl+S send now".to_string()
+    } else {
+        "Enter queue · Ctrl+S send now".to_string()
+    })
+}
+
+/// Height of the queued-rows + hint region between the status line and input.
+pub(crate) fn queued_region_height(app: &App) -> u16 {
+    if app.mode == Mode::Idle {
+        return 0;
+    }
+    let shown = app.queue.len().min(MAX_QUEUE_ROWS) as u16;
+    let overflow = if app.queue.len() > MAX_QUEUE_ROWS {
+        1
+    } else {
+        0
+    };
+    let rows = if shown > 0 { 1 + shown + overflow } else { 0 }; // leading blank
+    let hint = if queued_hint(app).is_some() { 1 } else { 0 };
+    rows + hint
+}
+
 /// Live-region height (rows) the inline viewport needs for the current state.
 /// Finalized transcript blocks live in the terminal's own scrollback; only this
 /// band is repainted. The band grows for the multi-line input, slash
@@ -37,7 +73,8 @@ pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
     } else {
         0
     };
-    (1 + sugg_h + input_h + 1).min(cap) // status + suggestions + input + footer
+    let queued_h = queued_region_height(app);
+    (1 + queued_h + sugg_h + input_h + 1).min(cap) // status + queued + suggestions + input + footer
 }
 
 /// Input box height (incl. borders), growing with newline-separated lines.
@@ -76,22 +113,27 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     } else {
         0
     };
+    let queued_h = queued_region_height(app);
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),       // loading / status
-            Constraint::Length(sugg_h),  // slash suggestions (0 when none)
-            Constraint::Length(input_h), // input
-            Constraint::Length(1),       // footer
+            Constraint::Length(1),        // loading / status
+            Constraint::Length(queued_h), // queued rows + hint (0 when idle/clean)
+            Constraint::Length(sugg_h),   // slash suggestions (0 when none)
+            Constraint::Length(input_h),  // input
+            Constraint::Length(1),        // footer
         ])
         .split(size);
 
     draw_loading(f, layout[0], app);
-    if sugg_h > 0 {
-        draw_slash_suggestions(f, layout[1], app);
+    if queued_h > 0 {
+        draw_queued(f, layout[1], app);
     }
-    draw_input(f, layout[2], app);
-    draw_footer(f, layout[3], app);
+    if sugg_h > 0 {
+        draw_slash_suggestions(f, layout[2], app);
+    }
+    draw_input(f, layout[3], app);
+    draw_footer(f, layout[4], app);
 }
 
 /// Build the rendered lines for one transcript block, for committing to the
@@ -261,6 +303,33 @@ pub(crate) fn render_block_into(buf: &mut ratatui::buffer::Buffer, lines: &[Line
         .style(Style::default().bg(BG))
         .wrap(Wrap { trim: false })
         .render(area, buf);
+    blank_wide_char_continuations(buf);
+}
+
+/// Empty the cell that follows each double-width glyph (CJK, emoji).
+///
+/// `Terminal::insert_before` flushes *every* buffer cell to the backend — it
+/// skips the `diff` step that, in a normal draw, drops the blank continuation
+/// cell after a wide glyph. The crossterm backend then prints that blank `" "`
+/// at the column the wide glyph already advanced past, leaving a stray space
+/// after every wide char. Clearing the continuation symbol makes the backend
+/// print nothing there, so the glyph keeps its natural two columns.
+fn blank_wide_char_continuations(buf: &mut ratatui::buffer::Buffer) {
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        let mut x = area.left();
+        while x < area.right() {
+            let w = UnicodeWidthStr::width(buf.get(x, y).symbol());
+            if w >= 2 {
+                if x + 1 < area.right() {
+                    buf.get_mut(x + 1, y).set_symbol("");
+                }
+                x += 2;
+            } else {
+                x += 1;
+            }
+        }
+    }
 }
 
 /// The startup banner, committed once to scrollback at launch.
@@ -337,6 +406,36 @@ pub(crate) fn draw_loading(f: &mut Frame, area: Rect, app: &App) {
         Line::from(spans)
     };
     f.render_widget(Paragraph::new(line).style(Style::default().bg(BG)), area);
+}
+
+/// Queued prompts (dim, truncated) + the adaptive hint, between status and input.
+pub(crate) fn draw_queued(f: &mut Frame, area: Rect, app: &App) {
+    let mut lines: Vec<Line> = Vec::new();
+    if !app.queue.is_empty() {
+        lines.push(Line::from(""));
+        for text in app.queue.iter().take(MAX_QUEUE_ROWS) {
+            lines.push(Line::from(vec![
+                Span::styled("  ↳ ", Style::default().fg(TEXT_DIM)),
+                Span::styled(truncate(&sanitize(text), 72), Style::default().fg(SUBTEXT)),
+            ]));
+        }
+        if app.queue.len() > MAX_QUEUE_ROWS {
+            lines.push(Line::from(Span::styled(
+                format!("    +{} more", app.queue.len() - MAX_QUEUE_ROWS),
+                Style::default().fg(TEXT_DIM),
+            )));
+        }
+    }
+    if let Some(hint) = queued_hint(app) {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", hint),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
+        area,
+    );
 }
 
 /// Status footer under the input: working dir (left) and model + token usage (right).
@@ -738,21 +837,17 @@ fn relativize_path(p: &str, cwd: &Path) -> String {
 }
 
 pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
-    let active = app.mode == Mode::Idle;
-    let border_color = if active { BORDER_ACTIVE } else { BORDER };
+    let idle = app.mode == Mode::Idle;
+    let border_color = if idle { BORDER_ACTIVE } else { BORDER };
 
     let content = if app.input.is_empty() {
-        if active {
-            Text::from(Span::styled(
-                "Type a message…",
-                Style::default().fg(TEXT_DIM),
-            ))
+        let placeholder = if idle {
+            "Type a message…"
         } else {
-            Text::from("")
-        }
+            "Type your next message…"
+        };
+        Text::from(Span::styled(placeholder, Style::default().fg(TEXT_DIM)))
     } else {
-        // Build one Line per newline-separated row (a Span with embedded "\n"
-        // does not wrap, so we split explicitly).
         Text::from(
             app.input
                 .split('\n')
@@ -761,29 +856,34 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         )
     };
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(SURFACE_2))
         .title(Span::styled(
-            if active { " > " } else { " … " },
-            Style::default().fg(if active { ACCENT } else { TEXT_DIM }),
+            if idle { " > " } else { " … " },
+            Style::default().fg(if idle { ACCENT } else { TEXT_DIM }),
         ));
+    if !app.queue.is_empty() {
+        block = block.title(
+            ratatui::widgets::block::Title::from(Span::styled(
+                format!(" · {} queued ", app.queue.len()),
+                Style::default().fg(SUBTEXT),
+            ))
+            .alignment(ratatui::layout::Alignment::Right),
+        );
+    }
 
     let p = Paragraph::new(content).block(block);
     f.render_widget(p, area);
 
-    if active {
-        // Place the cursor at its (row, col) within the multi-line input.
-        // `cursor` is a byte offset; the column is the *display width* of the
-        // current row up to it (wide CJK glyphs span two cells), matching how
-        // ratatui lays the text out.
-        let before = &app.input[..app.cursor];
-        let row = before.matches('\n').count() as u16;
-        let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let col = UnicodeWidthStr::width(&app.input[line_start..app.cursor]) as u16;
-        f.set_cursor(area.x + 1 + col, area.y + 1 + row);
-    }
+    // Cursor is shown whenever the input has focus — idle or busy (you can type
+    // while the agent works to queue / steer).
+    let before = &app.input[..app.cursor];
+    let row = before.matches('\n').count() as u16;
+    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let col = UnicodeWidthStr::width(&app.input[line_start..app.cursor]) as u16;
+    f.set_cursor(area.x + 1 + col, area.y + 1 + row);
 }
 
 /// Render the slash-command suggestions into `area` (the band reserved above the
@@ -823,6 +923,72 @@ pub(crate) fn draw_slash_suggestions(f: &mut Frame, area: Rect, app: &App) {
 // ==========================================
 // Render Tests
 // ==========================================
+
+#[cfg(test)]
+mod queue_render_tests {
+    use super::*;
+    use crate::console::app::{App, Mode};
+    use std::path::PathBuf;
+
+    fn app() -> App {
+        App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"))
+    }
+
+    #[test]
+    fn hint_is_none_when_idle_or_clean_busy() {
+        let mut a = app();
+        a.mode = Mode::Idle;
+        assert_eq!(queued_hint(&a), None);
+        a.mode = Mode::Thinking; // busy, empty input, empty queue
+        assert_eq!(queued_hint(&a), None);
+    }
+
+    #[test]
+    fn hint_text_depends_on_queue_presence() {
+        let mut a = app();
+        a.mode = Mode::Thinking;
+        a.input = "typing".into();
+        assert_eq!(
+            queued_hint(&a).as_deref(),
+            Some("Enter queue · Ctrl+S send now")
+        );
+        a.queue.push("q".into());
+        assert_eq!(
+            queued_hint(&a).as_deref(),
+            Some("↑ edit last · Enter queue · Ctrl+S send now")
+        );
+    }
+
+    #[test]
+    fn render_block_blanks_wide_char_continuations() {
+        // Regression: `insert_before` flushes every cell, so the blank cell after
+        // a double-width glyph would print as a stray space in scrollback. We
+        // empty it. "ab的cd" → 的 occupies cells 2-3; cell 3 must be "".
+        use ratatui::{buffer::Buffer, layout::Rect, text::Line};
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render_block_into(&mut buf, &[Line::from("ab的cd")]);
+        assert_eq!(buf.get(2, 0).symbol(), "的");
+        assert_eq!(
+            buf.get(3, 0).symbol(),
+            "",
+            "wide-char continuation must be emptied"
+        );
+        assert_eq!(buf.get(4, 0).symbol(), "c");
+    }
+
+    #[test]
+    fn region_height_grows_with_queue_and_hint() {
+        let mut a = app();
+        a.mode = Mode::Idle;
+        assert_eq!(queued_region_height(&a), 0);
+        a.mode = Mode::Thinking;
+        a.input = "x".into(); // hint only
+        assert_eq!(queued_region_height(&a), 1);
+        a.input.clear();
+        a.queue = vec!["one".into(), "two".into()]; // blank + 2 rows + hint
+        assert_eq!(queued_region_height(&a), 4);
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -24,6 +24,9 @@ pub struct Session {
     compaction: CompactionConfig,
     /// Cumulative real token usage for this session (persisted alongside it).
     usage: crate::Usage,
+    /// Per-run inject channel (set by the console runner before each prompt);
+    /// drained between rounds by the agent. `None` = no live inject source.
+    inject_rx: Option<tokio::sync::mpsc::Receiver<String>>,
 }
 
 impl Session {
@@ -45,6 +48,7 @@ impl Session {
             agent: Agent::new(system_prompt, provider),
             compaction: CompactionConfig::default(),
             usage,
+            inject_rx: None,
         })
     }
 
@@ -56,6 +60,11 @@ impl Session {
     /// Configure context-compaction behavior (auto-trigger + token budgets).
     pub fn set_compaction(&mut self, compaction: CompactionConfig) {
         self.compaction = compaction;
+    }
+
+    /// Install the inject source for the next `prompt` run (per-run channel).
+    pub fn set_inject_source(&mut self, rx: tokio::sync::mpsc::Receiver<String>) {
+        self.inject_rx = Some(rx);
     }
 
     pub fn register_tool(&mut self, tool: Arc<dyn AgentTool>) {
@@ -95,7 +104,10 @@ impl Session {
             tool_call_id: None,
             tool_calls: None,
         });
-        let turn_usage = self.agent.run(&mut self.history, tx).await?;
+        let turn_usage = self
+            .agent
+            .run(&mut self.history, tx, self.inject_rx.as_mut())
+            .await?;
         if !turn_usage.is_zero() {
             self.usage.add(&turn_usage);
             let _ = self.storage.save_usage(&self.id, &self.usage).await;

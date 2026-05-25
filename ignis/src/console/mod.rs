@@ -15,6 +15,12 @@ use crate::session::SessionManager;
 use crate::storage::{FileStorage, SessionStorage};
 use crate::{AgentEvent, Message, Session};
 
+/// Shared handle to the *current* prompt run's inject sender. `Some` iff a prompt
+/// run is live and accepting `Ctrl+S` injects (and `Ctrl+C` cancels); `None`
+/// during idle / `/compact` / provider setup.
+pub(crate) type ActiveInject =
+    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<String>>>>;
+
 // ==========================================
 // Color Palette
 // ==========================================
@@ -289,6 +295,8 @@ pub async fn run_console(
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
     let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
+    let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let active_inject_runner = active_inject.clone();
     let session_manager = SessionManager::new(storage_dir.clone());
 
     let agent_system_prompt = system_prompt;
@@ -355,6 +363,13 @@ pub async fn run_console(
             let tx = agent_tx.clone();
             match prompt {
                 Some(prompt) => {
+                    // Discard any cancel that arrived after the previous turn
+                    // already ended (its end-of-turn window) — it must not cancel
+                    // this fresh prompt.
+                    while cancel_rx.try_recv().is_ok() {}
+                    let (inj_tx, inj_rx) = mpsc::channel::<String>(8);
+                    *active_inject_runner.lock().unwrap() = Some(inj_tx);
+                    session.set_inject_source(inj_rx);
                     tokio::select! {
                         result = session.prompt(&prompt, tx) => {
                             if let Err(e) = result {
@@ -366,6 +381,7 @@ pub async fn run_console(
                             let _ = agent_tx.send(AgentEvent::AgentEnd).await;
                         }
                     }
+                    *active_inject_runner.lock().unwrap() = None;
                 }
                 None => {
                     // /compact: summarize earlier history and report a notice.
@@ -415,6 +431,21 @@ pub async fn run_console(
         while let Ok(ev) = agent_rx.try_recv() {
             app.handle_event(ev);
         }
+
+        // Edge-triggered: exactly one queued prompt per turn-end (AgentEnd).
+        if app.take_turn_just_ended() {
+            if let Some(text) = app.take_queued_front() {
+                app.push_user_prompt(text.clone());
+                app.turn_in_flight = true;
+                let _ = prompt_tx
+                    .send(AgentRequest::Prompt {
+                        session_id: app.session_id.clone(),
+                        prompt: text,
+                    })
+                    .await;
+            }
+        }
+
         while event::poll(std::time::Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
                 handle_key(
@@ -422,6 +453,7 @@ pub async fn run_console(
                     key,
                     &prompt_tx,
                     &cancel_tx,
+                    &active_inject,
                     &session_manager,
                     &ui_storage_dir,
                 )
@@ -473,11 +505,84 @@ pub async fn run_console(
     Ok(())
 }
 
+/// Apply a text-editing keystroke to the input. Shared by idle and busy modes.
+/// Returns true if the key was consumed.
+fn apply_edit_key(app: &mut App, key: KeyEvent) -> bool {
+    match (key.modifiers, key.code) {
+        (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+            app.clear_exit_hint();
+            app.input.clear();
+            app.cursor = 0;
+            app.reset_slash_selection();
+        }
+        (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
+            app.clear_exit_hint();
+            app.cursor = 0;
+        }
+        (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
+            app.clear_exit_hint();
+            app.cursor = app.input.len();
+        }
+        (KeyModifiers::CONTROL, KeyCode::Char('w')) if app.cursor > 0 => {
+            app.clear_exit_hint();
+            let before = &app.input[..app.cursor];
+            let trimmed = before.trim_end();
+            let new_end = trimmed
+                .rfind(|c: char| c.is_whitespace())
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            app.input = format!("{}{}", &app.input[..new_end], &app.input[app.cursor..]);
+            app.cursor = new_end;
+        }
+        (m, KeyCode::Char('j'))
+            if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
+        {
+            app.clear_exit_hint();
+            app.insert_char('\n');
+            app.reset_slash_selection();
+        }
+        (_, KeyCode::Char(c)) => {
+            app.clear_exit_hint();
+            app.insert_char(c);
+            app.reset_slash_selection();
+        }
+        (_, KeyCode::Backspace) if app.cursor > 0 => {
+            app.clear_exit_hint();
+            app.backspace();
+            app.reset_slash_selection();
+        }
+        (_, KeyCode::Delete) if app.cursor < app.input.len() => {
+            app.clear_exit_hint();
+            app.delete_forward();
+            app.reset_slash_selection();
+        }
+        (_, KeyCode::Left) if app.cursor > 0 => {
+            app.clear_exit_hint();
+            app.move_left();
+        }
+        (_, KeyCode::Right) if app.cursor < app.input.len() => {
+            app.clear_exit_hint();
+            app.move_right();
+        }
+        (_, KeyCode::Home) => {
+            app.clear_exit_hint();
+            app.cursor = 0;
+        }
+        (_, KeyCode::End) => {
+            app.clear_exit_hint();
+            app.cursor = app.input.len();
+        }
+        _ => return false,
+    }
+    true
+}
+
 async fn handle_key(
     app: &mut App,
     key: KeyEvent,
     prompt_tx: &mpsc::Sender<AgentRequest>,
     cancel_tx: &mpsc::Sender<()>,
+    active_inject: &ActiveInject,
     session_manager: &SessionManager,
     storage_dir: &std::path::Path,
 ) {
@@ -497,19 +602,75 @@ async fn handle_key(
             if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
         {
             app.clear_exit_hint();
-            if app.mode != Mode::Idle {
+            // Only cancellable while a prompt run is live. The resulting AgentEnd
+            // drives the state transition + drain (keeps the queue).
+            if active_inject.lock().unwrap().is_some() {
                 let _ = cancel_tx.try_send(());
-                app.mode = Mode::Idle;
-                app.current_chunk_idx = None;
-                app.stream_start = None;
-                app.add_assistant_notice("Cancelled.".to_string());
             }
             return;
         }
         _ => {}
     }
 
+    // Ctrl+S: steer the live turn. Busy only — when idle there is no turn to
+    // steer and the idle UI hides the queue (a queued item would vanish and only
+    // fire at some later turn), so idle Ctrl+S is a no-op. We still `return` so it
+    // never falls through to the idle handler and types a literal 's'.
+    if matches!(key.code, KeyCode::Char('s')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if app.mode != Mode::Idle {
+            let text = app.input.trim().to_string();
+            if !text.is_empty() {
+                let sender = active_inject.lock().unwrap().clone();
+                match sender {
+                    Some(tx) => match tx.try_send(text.clone()) {
+                        Ok(()) => {
+                            app.pending_injects.push(text);
+                            app.input.clear();
+                            app.cursor = 0;
+                            app.reset_slash_selection();
+                        }
+                        Err(_) => {
+                            app.error_flash = Some((
+                                "Couldn't steer — try again".to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    },
+                    // Busy but no live prompt run (e.g. /compact): queue it — the
+                    // queue is visible while busy and drains at the next AgentEnd.
+                    None => {
+                        app.enqueue(text);
+                        app.input.clear();
+                        app.cursor = 0;
+                        app.reset_slash_selection();
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // While busy: type to queue / steer. No pickers, no slash menu.
     if app.mode != Mode::Idle {
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Enter) => {
+                let text = app.input.trim().to_string();
+                if !text.is_empty() {
+                    app.enqueue(text);
+                    app.input.clear();
+                    app.cursor = 0;
+                    app.reset_slash_selection();
+                }
+            }
+            (_, KeyCode::Up) if app.input.is_empty() && !app.queue.is_empty() => {
+                app.recall_last_queued();
+            }
+            (_, KeyCode::Up) => app.history_prev(),
+            (_, KeyCode::Down) => app.history_next(),
+            _ => {
+                apply_edit_key(app, key);
+            }
+        }
         return;
     }
 
@@ -635,6 +796,7 @@ async fn handle_key(
                     let _ = storage.save_session(&new_id, &[], None).await;
                     app.start_new_session(new_id);
                 } else if command == "/compact" && arg_count == 1 {
+                    app.turn_in_flight = true;
                     let _ = prompt_tx
                         .send(AgentRequest::Compact {
                             session_id: app.session_id.clone(),
@@ -647,6 +809,7 @@ async fn handle_key(
                 } else if text.starts_with('/') {
                     app.add_assistant_notice(format!("Unknown command `{}`.", command));
                 } else {
+                    app.turn_in_flight = true;
                     let _ = prompt_tx
                         .send(AgentRequest::Prompt {
                             session_id: app.session_id.clone(),
