@@ -38,6 +38,8 @@ pub enum AgentEvent {
     Usage(Usage),
     #[serde(rename = "agent_end")]
     AgentEnd,
+    #[serde(rename = "user_injected")]
+    UserInjected { text: String },
 }
 
 /// Build the system prompt for an interactive/one-shot run: the static agent

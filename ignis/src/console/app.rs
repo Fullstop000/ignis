@@ -114,6 +114,15 @@ pub(crate) struct App {
     /// threshold) — so the gauge never sticks to a previous model's window.
     pub(crate) fallback_context_window: usize,
 
+    /// Prompts typed while busy, waiting to fire after the current turn (FIFO).
+    pub(crate) queue: Vec<String>,
+    /// Inject messages sent to the live turn but not yet confirmed via
+    /// `UserInjected`; reconciled on `AgentEnd` (leftovers → front of `queue`).
+    pub(crate) pending_injects: Vec<String>,
+    /// Set by `handle_event` on `AgentEnd`; the main loop drains one queued item
+    /// per turn-end (edge-triggered, never level-triggered on `mode == Idle`).
+    pub(crate) turn_just_ended: bool,
+
     /// Clipboard function, injectable for testing.
     pub(crate) clipboard_fn: ClipFn,
 }
@@ -148,6 +157,9 @@ impl App {
             exit_pending: false,
             context_window: 120_000,
             fallback_context_window: 120_000,
+            queue: Vec::new(),
+            pending_injects: Vec::new(),
+            turn_just_ended: false,
             clipboard_fn: super::clipboard::set_clipboard,
         }
     }
@@ -296,6 +308,19 @@ impl App {
                 self.mode = Mode::Idle;
                 self.current_chunk_idx = None;
                 self.stream_start = None;
+                self.turn_just_ended = true;
+                // Any inject that lost the end-of-turn race fires next turn.
+                if !self.pending_injects.is_empty() {
+                    let mut stranded = std::mem::take(&mut self.pending_injects);
+                    stranded.append(&mut self.queue);
+                    self.queue = stranded;
+                }
+            }
+            AgentEvent::UserInjected { text } => {
+                if !self.pending_injects.is_empty() {
+                    self.pending_injects.remove(0);
+                }
+                self.push_user_prompt(text);
             }
         }
     }
@@ -358,15 +383,63 @@ impl App {
         self.cursor = self.next_char_boundary();
     }
 
+    /// Push a user prompt into the transcript + input history (shared by submit
+    /// and the queue drain). Does not send anything.
+    // Used by the queue drain in console/mod.rs (Task 4) and UserInjected handler.
+    #[allow(dead_code)]
+    pub(crate) fn push_user_prompt(&mut self, text: String) {
+        self.exit_pending = false;
+        self.history.push(text.clone());
+        self.history_idx = None;
+        self.blocks.push(UIBlock::User(text));
+    }
+
+    /// Queue a prompt typed while busy (no transcript block until it fires).
+    // Used by handle_key in console/mod.rs (Task 5).
+    #[allow(dead_code)]
+    pub(crate) fn enqueue(&mut self, text: String) {
+        self.exit_pending = false;
+        self.queue.push(text);
+    }
+
+    /// Pop the next queued prompt (FIFO) for the drain.
+    // Used by the queue drain in console/mod.rs (Task 4).
+    #[allow(dead_code)]
+    pub(crate) fn take_queued_front(&mut self) -> Option<String> {
+        if self.queue.is_empty() {
+            None
+        } else {
+            Some(self.queue.remove(0))
+        }
+    }
+
+    /// Move the most recent queued prompt back into the input for editing.
+    // Used by handle_key in console/mod.rs (Task 5).
+    #[allow(dead_code)]
+    pub(crate) fn recall_last_queued(&mut self) -> bool {
+        match self.queue.pop() {
+            Some(text) => {
+                self.input = text;
+                self.cursor = self.input.len();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Read and clear the edge-trigger flag set on `AgentEnd`.
+    // Used by the queue drain in console/mod.rs (Task 4).
+    #[allow(dead_code)]
+    pub(crate) fn take_turn_just_ended(&mut self) -> bool {
+        std::mem::take(&mut self.turn_just_ended)
+    }
+
     pub(crate) fn submit(&mut self) -> Option<String> {
         let text = self.input.trim().to_string();
         if text.is_empty() || self.mode != Mode::Idle {
             return None;
         }
-        self.exit_pending = false;
-        self.history.push(text.clone());
-        self.history_idx = None;
-        self.blocks.push(UIBlock::User(text.clone()));
+        self.push_user_prompt(text.clone());
         self.input.clear();
         self.cursor = 0;
         Some(text)
@@ -1010,5 +1083,69 @@ mod tests {
         assert_eq!(next_selection(0, 2, SelectionDirection::Previous), 1);
         assert_eq!(next_selection(1, 2, SelectionDirection::Next), 0);
         assert_eq!(next_selection(0, 0, SelectionDirection::Next), 0);
+    }
+
+    #[test]
+    fn enqueue_appends_without_touching_blocks() {
+        let mut app = test_app();
+        app.enqueue("first".to_string());
+        app.enqueue("second".to_string());
+        assert_eq!(app.queue, vec!["first", "second"]);
+        // Queueing must NOT push a transcript block (ordering correctness).
+        assert!(app.blocks.is_empty());
+    }
+
+    #[test]
+    fn take_queued_front_is_fifo() {
+        let mut app = test_app();
+        app.enqueue("a".to_string());
+        app.enqueue("b".to_string());
+        assert_eq!(app.take_queued_front(), Some("a".to_string()));
+        assert_eq!(app.take_queued_front(), Some("b".to_string()));
+        assert_eq!(app.take_queued_front(), None);
+    }
+
+    #[test]
+    fn recall_last_queued_moves_last_item_into_input() {
+        let mut app = test_app();
+        app.enqueue("older".to_string());
+        app.enqueue("newest".to_string());
+        assert!(app.recall_last_queued());
+        assert_eq!(app.input, "newest");
+        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(app.queue, vec!["older"]);
+        // Empty queue → no-op.
+        app.input.clear();
+        app.queue.clear();
+        assert!(!app.recall_last_queued());
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn agent_end_sets_flag_and_reconciles_pending_injects() {
+        let mut app = test_app();
+        app.mode = Mode::Thinking;
+        app.pending_injects = vec!["stranded".to_string()];
+        app.queue = vec!["queued".to_string()];
+        app.handle_event(AgentEvent::AgentEnd);
+        assert_eq!(app.mode, Mode::Idle);
+        assert!(app.take_turn_just_ended());
+        // Second take clears it.
+        assert!(!app.take_turn_just_ended());
+        // Stranded inject prepended ahead of existing queue.
+        assert_eq!(app.queue, vec!["stranded", "queued"]);
+        assert!(app.pending_injects.is_empty());
+    }
+
+    #[test]
+    fn user_injected_pushes_block_records_history_pops_pending() {
+        let mut app = test_app();
+        app.pending_injects = vec!["steer".to_string()];
+        app.handle_event(AgentEvent::UserInjected {
+            text: "steer".to_string(),
+        });
+        assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "steer"));
+        assert_eq!(app.history.last().map(|s| s.as_str()), Some("steer"));
+        assert!(app.pending_injects.is_empty());
     }
 }
