@@ -43,6 +43,9 @@ pub fn valid_skill_name(name: &str) -> bool {
 /// Parse a `SKILL.md` body. Returns `(name, description, body)` or an `Err`
 /// reason explaining why the file is skipped.
 pub(crate) fn parse_skill_md(content: &str) -> Result<(String, Option<String>, String), String> {
+    // Strip a leading UTF-8 BOM (some Windows editors emit one) so the opening
+    // `---` fence still matches.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut lines = content.lines();
     if lines.next().map(str::trim) != Some("---") {
         return Err("missing opening frontmatter fence".to_string());
@@ -288,6 +291,13 @@ mod tests {
     #[test]
     fn no_opening_fence_is_skipped() {
         assert!(parse_skill_md("name: react\nbody").is_err());
+    }
+
+    #[test]
+    fn bom_prefixed_frontmatter_parses() {
+        let (n, _, b) = parse_skill_md(&format!("\u{feff}{}", md("name: react", "body"))).unwrap();
+        assert_eq!(n, "react");
+        assert_eq!(b, "body");
     }
 
     #[test]

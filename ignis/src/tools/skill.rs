@@ -50,6 +50,10 @@ impl AgentTool for SkillTool {
             return ToolResult::error("Missing required parameter: name".to_string());
         };
         match self.registry.get_enabled(name) {
+            // The body is the skill's instructions — emitted verbatim, not
+            // XML-escaped (unlike the catalog's metadata), so code samples and
+            // markdown in it survive intact. `name` is validated to a safe
+            // charset, so the wrapper tag is well-formed.
             Some(skill) => ToolResult::ok(format!(
                 "<skill name=\"{}\">\n{}\n\n(Skill directory: {} — read bundled files with \
                  read_file / list_dir if referenced.)\n</skill>",
