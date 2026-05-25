@@ -122,6 +122,11 @@ pub(crate) struct App {
     /// Set by `handle_event` on `AgentEnd`; the main loop drains one queued item
     /// per turn-end (edge-triggered, never level-triggered on `mode == Idle`).
     pub(crate) turn_just_ended: bool,
+    /// True from the moment a prompt/compact is dispatched until its `AgentEnd`.
+    /// Used to tell a real turn-end (drain the queue) from a stray/duplicate
+    /// `AgentEnd` — `mode` can't, since an early failure ends a turn that never
+    /// reached `AgentStart` (still `Idle`).
+    pub(crate) turn_in_flight: bool,
 
     /// Clipboard function, injectable for testing.
     pub(crate) clipboard_fn: ClipFn,
@@ -160,6 +165,7 @@ impl App {
             queue: Vec::new(),
             pending_injects: Vec::new(),
             turn_just_ended: false,
+            turn_in_flight: false,
             clipboard_fn: super::clipboard::set_clipboard,
         }
     }
@@ -305,15 +311,16 @@ impl App {
                 self.last_usage = Some(usage);
             }
             AgentEvent::AgentEnd => {
-                // Only treat this as a real turn-end if we were actually in a
-                // turn. A duplicate `AgentEnd` (e.g. a persistence error after the
-                // agent loop already emitted one) arrives while we're already
-                // `Idle` and must NOT trigger a second queue drain.
-                let was_busy = self.mode != Mode::Idle;
                 self.mode = Mode::Idle;
                 self.current_chunk_idx = None;
                 self.stream_start = None;
-                if was_busy {
+                // Only the AgentEnd of a turn we actually dispatched drains the
+                // queue. This catches both a duplicate AgentEnd (e.g. a persist
+                // error after the agent loop already emitted one) and a turn that
+                // ended *before* AgentStart (provider-build / session-open error,
+                // which still leaves `mode == Idle`).
+                if self.turn_in_flight {
+                    self.turn_in_flight = false;
                     self.turn_just_ended = true;
                     // Any inject that lost the end-of-turn race fires next turn.
                     if !self.pending_injects.is_empty() {
@@ -1125,6 +1132,7 @@ mod tests {
     #[test]
     fn agent_end_sets_flag_and_reconciles_pending_injects() {
         let mut app = test_app();
+        app.turn_in_flight = true;
         app.mode = Mode::Thinking;
         app.pending_injects = vec!["stranded".to_string()];
         app.queue = vec!["queued".to_string()];
@@ -1136,6 +1144,21 @@ mod tests {
         // Stranded inject prepended ahead of existing queue.
         assert_eq!(app.queue, vec!["stranded", "queued"]);
         assert!(app.pending_injects.is_empty());
+    }
+
+    #[test]
+    fn agent_end_drains_even_without_agent_start() {
+        // A provider-build / session-open error ends the turn *before* AgentStart,
+        // so `mode` is still Idle at AgentEnd. The drain must still fire (keyed on
+        // turn_in_flight, not mode) or a queued prompt after a failed one stalls.
+        let mut app = test_app();
+        app.turn_in_flight = true; // dispatched, but no AgentStart arrived
+        assert_eq!(app.mode, Mode::Idle);
+        app.handle_event(AgentEvent::AgentEnd);
+        assert!(
+            app.take_turn_just_ended(),
+            "a turn that failed before AgentStart still drains the queue"
+        );
     }
 
     #[test]
@@ -1153,13 +1176,13 @@ mod tests {
     #[test]
     fn duplicate_agent_end_does_not_double_drain() {
         // A persistence error after the agent loop already emitted AgentEnd can
-        // produce a second AgentEnd. Only the first (while busy) arms the drain;
-        // the duplicate (already Idle) must not, or the queue would drain twice.
+        // produce a second AgentEnd. Only the first (dispatched turn) arms the
+        // drain; the duplicate must not, or the queue would drain twice.
         let mut app = test_app();
-        app.mode = Mode::Thinking;
+        app.turn_in_flight = true;
         app.handle_event(AgentEvent::AgentEnd);
         assert!(app.take_turn_just_ended(), "real turn-end arms the drain");
-        app.handle_event(AgentEvent::AgentEnd); // stale duplicate, already Idle
+        app.handle_event(AgentEvent::AgentEnd); // duplicate, no turn in flight
         assert!(
             !app.take_turn_just_ended(),
             "duplicate AgentEnd must not re-arm the drain"

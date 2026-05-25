@@ -436,6 +436,7 @@ pub async fn run_console(
         if app.take_turn_just_ended() {
             if let Some(text) = app.take_queued_front() {
                 app.push_user_prompt(text.clone());
+                app.turn_in_flight = true;
                 let _ = prompt_tx
                     .send(AgentRequest::Prompt {
                         session_id: app.session_id.clone(),
@@ -795,6 +796,7 @@ async fn handle_key(
                     let _ = storage.save_session(&new_id, &[], None).await;
                     app.start_new_session(new_id);
                 } else if command == "/compact" && arg_count == 1 {
+                    app.turn_in_flight = true;
                     let _ = prompt_tx
                         .send(AgentRequest::Compact {
                             session_id: app.session_id.clone(),
@@ -807,6 +809,7 @@ async fn handle_key(
                 } else if text.starts_with('/') {
                     app.add_assistant_notice(format!("Unknown command `{}`.", command));
                 } else {
+                    app.turn_in_flight = true;
                     let _ = prompt_tx
                         .send(AgentRequest::Prompt {
                             session_id: app.session_id.clone(),
