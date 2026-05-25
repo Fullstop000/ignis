@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 use std::path::Path;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{App, Mode, ModelPicker, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
 use super::markdown::render_md_block;
@@ -109,13 +109,15 @@ pub(crate) fn block_lines(
             lines.push(Line::from(""));
             for (i, l) in text.lines().enumerate() {
                 let prefix = if i == 0 { "👤 " } else { "   " };
-                lines.push(Line::from(vec![
+                let line = Line::from(vec![
                     Span::styled(prefix, Style::default().fg(ACCENT)),
                     Span::styled(
                         sanitize(l),
                         Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                     ),
-                ]));
+                ]);
+                // Continuation rows align under the prompt text (past "👤 ").
+                lines.extend(wrap_line(&line, width, 3));
             }
         }
         UIBlock::Assistant(text) => {
@@ -123,13 +125,125 @@ pub(crate) fn block_lines(
                 return lines;
             }
             lines.push(Line::from(""));
-            lines.extend(render_md_block(text, false));
+            for line in render_md_block(text, false) {
+                let indent = leading_space_cols(&line);
+                lines.extend(wrap_line(&line, width, indent));
+            }
         }
         UIBlock::Tool(entry) => {
-            render_tool_block(&mut lines, entry, tick, cwd, width);
+            let mut raw: Vec<Line<'static>> = Vec::new();
+            render_tool_block(&mut raw, entry, tick, cwd, width);
+            for line in raw {
+                let indent = leading_space_cols(&line);
+                lines.extend(wrap_line(&line, width, indent));
+            }
         }
     }
     lines
+}
+
+/// Columns of leading spaces on a line (its natural indent).
+fn leading_space_cols(line: &Line) -> usize {
+    let mut n = 0;
+    for span in &line.spans {
+        for c in span.content.chars() {
+            if c == ' ' {
+                n += 1;
+            } else {
+                return n;
+            }
+        }
+    }
+    n
+}
+
+/// Group consecutive same-style cells back into spans.
+fn cells_to_spans(cells: &[(char, Style)]) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    for &(c, st) in cells {
+        if cur != Some(st) {
+            if let (Some(s), false) = (cur, buf.is_empty()) {
+                spans.push(Span::styled(std::mem::take(&mut buf), s));
+            }
+            cur = Some(st);
+        }
+        buf.push(c);
+    }
+    if let (Some(s), false) = (cur, buf.is_empty()) {
+        spans.push(Span::styled(buf, s));
+    }
+    spans
+}
+
+/// Word-wrap one rendered line to `width`, carrying `indent_cols` spaces onto
+/// each continuation row so wrapped text stays left-aligned (ratatui's own wrap
+/// drops the indent, leaving a ragged margin). Span styles are preserved.
+fn wrap_line(line: &Line<'static>, width: u16, indent_cols: usize) -> Vec<Line<'static>> {
+    let width = (width as usize).max(8);
+    let cells: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|s| {
+            let st = s.style;
+            s.content.chars().map(move |c| (c, st))
+        })
+        .collect();
+    let total: usize = cells
+        .iter()
+        .map(|(c, _)| UnicodeWidthChar::width(*c).unwrap_or(0))
+        .sum();
+    if total <= width {
+        return vec![line.clone()];
+    }
+
+    let indent_cols = indent_cols.min(width.saturating_sub(1));
+    let indent_style = cells.first().map(|(_, s)| *s).unwrap_or_default();
+    let indent_row = || -> Vec<(char, Style)> { vec![(' ', indent_style); indent_cols] };
+
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut cur: Vec<(char, Style)> = Vec::new();
+    let mut cur_w = 0usize;
+    let mut first_row = true;
+    let n = cells.len();
+    let mut i = 0;
+    while i < n {
+        let ws = i;
+        while i < n && cells[i].0 != ' ' {
+            i += 1;
+        }
+        let word = &cells[ws..i];
+        let word_w: usize = word
+            .iter()
+            .map(|(c, _)| UnicodeWidthChar::width(*c).unwrap_or(0))
+            .sum();
+        let floor = if first_row { 0 } else { indent_cols };
+        if cur_w + word_w > width && cur_w > floor {
+            rows.push(std::mem::take(&mut cur));
+            first_row = false;
+            cur = indent_row();
+            cur_w = indent_cols;
+        }
+        cur.extend_from_slice(word);
+        cur_w += word_w;
+        // Trailing run of spaces; keep only if it still fits the row.
+        let ss = i;
+        while i < n && cells[i].0 == ' ' {
+            i += 1;
+        }
+        let spaces = &cells[ss..i];
+        if cur_w + spaces.len() <= width {
+            cur.extend_from_slice(spaces);
+            cur_w += spaces.len();
+        }
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    rows.into_iter()
+        .map(|r| Line::from(cells_to_spans(&r)))
+        .collect()
 }
 
 /// Wrapped row count of `lines` at `width` — the height to reserve in scrollback.
@@ -1211,6 +1325,31 @@ mod tests {
             "the latest turn must render"
         );
         assert!(content.contains("Block 0"), "earlier turns must render too");
+    }
+
+    #[test]
+    fn long_lines_wrap_with_hanging_indent() {
+        // Regression: wrapped continuation rows must keep the line's indent, not
+        // fall back to column 0 (ragged left margin).
+        let block = UIBlock::Assistant("alpha bravo charlie ".repeat(8).trim().to_string());
+        let lines = block_lines(&block, 0, &PathBuf::from("."), 40);
+        let body: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+        assert!(
+            body.len() > 1,
+            "the long line should wrap into multiple rows"
+        );
+        for (i, row) in body.iter().enumerate() {
+            assert!(row.starts_with("  "), "row {i} lost its indent: {row:?}");
+        }
     }
 
     #[test]
