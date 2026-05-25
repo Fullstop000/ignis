@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::skills::SkillRegistry;
+
 use serde::Serialize;
 
 use crate::provider::{LlmProvider, LlmResponseDelta, Message, ToolCall, ToolCallFunction, Usage};
@@ -148,6 +150,14 @@ async fn drain_injected(
     n
 }
 
+/// Compose the effective system prompt: base + the enabled-skills catalog.
+fn with_catalog(base: &str, skills: Option<&SkillRegistry>) -> String {
+    match skills.and_then(|r| r.catalog_prompt()) {
+        Some(catalog) => format!("{base}\n\n{catalog}"),
+        None => base.to_string(),
+    }
+}
+
 /// Execution engine: given a conversation `history`, runs the model + tool
 /// loop and emits events. State and persistence live in [`crate::Session`].
 pub struct Agent {
@@ -155,6 +165,7 @@ pub struct Agent {
     provider: Box<dyn LlmProvider>,
     tools: Vec<Arc<dyn AgentTool>>,
     hooks: Option<Box<dyn ToolHooks>>,
+    skills: Option<Arc<SkillRegistry>>,
 }
 
 struct AccumulatingToolCall {
@@ -170,6 +181,7 @@ impl Agent {
             provider,
             tools: Vec::new(),
             hooks: None,
+            skills: None,
         }
     }
 
@@ -179,6 +191,10 @@ impl Agent {
 
     pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
         self.hooks = Some(hooks);
+    }
+
+    pub fn set_skills(&mut self, skills: Arc<SkillRegistry>) {
+        self.skills = Some(skills);
     }
 
     /// One-shot, tool-less completion: stream a response for `messages` and
@@ -225,6 +241,7 @@ impl Agent {
     ) -> Result<Usage, anyhow::Error> {
         let _ = tx.send(AgentEvent::AgentStart).await;
         let mut total_usage = Usage::default();
+        let effective_prompt = with_catalog(&self.system_prompt, self.skills.as_deref());
 
         let tool_schemas: Vec<serde_json::Value> = self
             .tools
@@ -247,7 +264,7 @@ impl Agent {
 
             let mut stream = match self
                 .provider
-                .chat_stream(&self.system_prompt, &*history, &tool_schemas)
+                .chat_stream(&effective_prompt, &*history, &tool_schemas)
                 .await
             {
                 Ok(s) => s,
@@ -680,5 +697,29 @@ impl Agent {
 
         let _ = tx.send(AgentEvent::AgentEnd).await;
         Ok(total_usage)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills::SkillRegistry;
+    use std::collections::HashSet;
+
+    #[test]
+    fn with_catalog_appends_when_skills_present() {
+        let tmp = crate::util::unique_temp_dir("ignis-agent-catalog");
+        let cwd = tmp.join("proj");
+        let dir = cwd.join(".ignis/skills/react");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: react\n---\nbody").unwrap();
+        let reg = Arc::new(SkillRegistry::load(None, &cwd, HashSet::new()));
+
+        let out = with_catalog("BASE", Some(reg.as_ref()));
+        assert!(out.starts_with("BASE\n\n"));
+        assert!(out.contains("<available_skills>"));
+
+        assert_eq!(with_catalog("BASE", None), "BASE");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
