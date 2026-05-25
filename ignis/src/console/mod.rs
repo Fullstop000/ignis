@@ -793,10 +793,9 @@ async fn handle_key(
                 return;
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if let Some((name, now)) = app.toggle_selected_skill() {
-                    let state = if now { "enabled" } else { "disabled" };
-                    app.add_assistant_notice(format!("Skill '{name}' {state}."));
-                }
+                // The picker's [x]/[ ] checkbox is the feedback; don't emit a
+                // notice into the transcript on every toggle.
+                app.toggle_selected_skill();
                 return;
             }
             KeyCode::Esc => {
