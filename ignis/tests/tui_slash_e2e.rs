@@ -9,7 +9,7 @@ use tempfile::TempDir;
 
 struct TuiProcess {
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     output: Arc<Mutex<String>>,
 }
 
@@ -46,9 +46,11 @@ impl TuiProcess {
 
         let child = pair.slave.spawn_command(command).unwrap();
         let mut reader = pair.master.try_clone_reader().unwrap();
-        let writer = pair.master.take_writer().unwrap();
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
         let output = Arc::new(Mutex::new(String::new()));
         let output_for_thread = Arc::clone(&output);
+        let writer_for_thread = Arc::clone(&writer);
 
         std::thread::spawn(move || {
             let mut buf = [0; 4096];
@@ -57,6 +59,15 @@ impl TuiProcess {
                     Ok(0) => break,
                     Ok(n) => {
                         let text = String::from_utf8_lossy(&buf[..n]);
+                        // Reply to cursor-position queries (DSR `ESC[6n`) so
+                        // ratatui's inline viewport can initialize: a real terminal
+                        // answers, a bare pty does not.
+                        for _ in 0..text.matches("\u{1b}[6n").count() {
+                            if let Ok(mut w) = writer_for_thread.lock() {
+                                let _ = w.write_all(b"\x1b[1;1R");
+                                let _ = w.flush();
+                            }
+                        }
                         output_for_thread.lock().unwrap().push_str(&text);
                     }
                     Err(_) => break,
@@ -72,8 +83,9 @@ impl TuiProcess {
     }
 
     fn send(&mut self, input: &str) {
-        self.writer.write_all(input.as_bytes()).unwrap();
-        self.writer.flush().unwrap();
+        let mut w = self.writer.lock().unwrap();
+        w.write_all(input.as_bytes()).unwrap();
+        w.flush().unwrap();
     }
 
     fn wait_for(&mut self, needle: &str) {
@@ -170,7 +182,7 @@ fn slash_autocomplete_can_run_resume_and_render_selected_history() {
     );
 
     let mut tui = TuiProcess::spawn(home.path(), project.path());
-    tui.wait_for("Type a prompt below");
+    tui.wait_for("Your AI coding agent");
 
     tui.send("/");
     tui.wait_for("/resume");
@@ -201,7 +213,7 @@ fn resume_command_lists_sessions_and_enter_resumes_selection() {
     );
 
     let mut tui = TuiProcess::spawn(home.path(), project.path());
-    tui.wait_for("Type a prompt below");
+    tui.wait_for("Your AI coding agent");
 
     tui.send("/resume\r");
     tui.wait_for("Sessions");
@@ -224,7 +236,7 @@ fn new_typed_resolves_to_clear() {
     let project = TempDir::new().unwrap();
 
     let mut tui = TuiProcess::spawn(home.path(), project.path());
-    tui.wait_for("Type a prompt below");
+    tui.wait_for("Your AI coding agent");
 
     tui.send("/new\r");
     tui.wait_for("Started new session");
@@ -236,7 +248,7 @@ fn clear_command_starts_a_fresh_session() {
     let project = TempDir::new().unwrap();
 
     let mut tui = TuiProcess::spawn(home.path(), project.path());
-    tui.wait_for("Type a prompt below");
+    tui.wait_for("Your AI coding agent");
 
     tui.send("/clear\r");
     tui.wait_for("Started new session");
@@ -248,7 +260,7 @@ fn ctrl_d_must_be_pressed_twice_to_exit() {
     let project = TempDir::new().unwrap();
 
     let mut tui = TuiProcess::spawn(home.path(), project.path());
-    tui.wait_for("Type a prompt below");
+    tui.wait_for("Your AI coding agent");
 
     tui.send("\x04");
     tui.wait_for("Press Ctrl-D again to exit");

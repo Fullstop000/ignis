@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-25
+
+### Changed
+- TUI renders inline in the normal buffer, so conversation history lives in terminal scrollback (tmux/native scroll now works).
+- While generating, the reply appears in full when complete instead of streaming token-by-token.
+
+### Removed
+- In-app scroll keybindings and mouse capture — the terminal handles scrolling and text selection now.
+
 ## [0.8.0] - 2026-05-25
 
 ### Removed
