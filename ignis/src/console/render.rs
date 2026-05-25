@@ -42,7 +42,11 @@ pub(crate) fn queued_region_height(app: &App) -> u16 {
         return 0;
     }
     let shown = app.queue.len().min(MAX_QUEUE_ROWS) as u16;
-    let overflow = if app.queue.len() > MAX_QUEUE_ROWS { 1 } else { 0 };
+    let overflow = if app.queue.len() > MAX_QUEUE_ROWS {
+        1
+    } else {
+        0
+    };
     let rows = if shown > 0 { 1 + shown + overflow } else { 0 }; // leading blank
     let hint = if queued_hint(app).is_some() { 1 } else { 0 };
     rows + hint
