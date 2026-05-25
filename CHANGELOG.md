@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-25
+
+### Added
+- `/model` picker shows each model's context window (config override, else models.dev).
+
+### Changed
+- **BREAKING:** per-model `reasoning`/`context` move into `models` entries (a bare name or an inline table); the `[providers.X.reasoning]` / `[providers.X.context]` sub-tables are removed.
+
 ## [0.9.0] - 2026-05-25
 
 ### Changed

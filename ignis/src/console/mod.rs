@@ -143,6 +143,24 @@ pub(crate) fn format_tokens(n: usize) -> String {
     }
 }
 
+/// Compact context-window label: `128K`, `256K`, `1M`. Providers quote windows
+/// in both binary (262144 = "256K") and decimal (200000 = "200K", 1000000 =
+/// "1M") units, so prefer whichever lands on a clean number.
+pub(crate) fn format_context(n: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if n != 0 && n.is_multiple_of(MIB) {
+        format!("{}M", n / MIB)
+    } else if n != 0 && n.is_multiple_of(1024) {
+        format!("{}K", n / 1024) // binary, e.g. 262144 -> 256K
+    } else if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else {
+        format!("{}K", (n as f64 / 1000.0).round() as u64) // decimal, e.g. 200000 -> 200K
+    }
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -238,8 +256,18 @@ pub async fn run_console(
     config: crate::config::Config,
 ) -> Result<(), anyhow::Error> {
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
-    app.set_context_window(config.compaction.threshold_tokens);
-    app.set_model_options(config.model_options(), config.active_effort());
+    // Context windows: config override → cached models.dev → compaction threshold.
+    // The cache loads instantly; refresh runs in the background for next launch.
+    let catalog = crate::models::catalog::load();
+    app.fallback_context_window = config.compaction.threshold_tokens;
+    app.set_context_window(
+        config
+            .active_context(&catalog)
+            .map(|c| c as usize)
+            .unwrap_or(config.compaction.threshold_tokens),
+    );
+    app.set_model_options(config.model_options(&catalog), config.active_effort());
+    tokio::spawn(crate::models::catalog::refresh_if_stale());
 
     // Render inline in the normal buffer (no alternate screen, no mouse capture):
     // finished transcript blocks are pushed into the terminal's real scrollback

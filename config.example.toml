@@ -10,25 +10,32 @@ auto_resume_last_session = false
 [providers."kimi-code"]
 api_key = "sk-your-kimi-key"
 api_url = "https://api.kimi.com/coding/v1"
-models  = ["kimi-for-coding"]
+# models.dev doesn't know this alias, so declare its window here (256K = 262144).
+models  = [{ name = "kimi-for-coding", context = 262144 }]
 
-# Other providers — uncomment and configure as needed. Each provider lists the
-# models it offers in `models`; the active one is the top-level `model` above.
+# Each provider lists the models it offers in `models`; the active one is the
+# top-level `model` above. A model entry is either a bare name or an inline table
+# with per-model metadata, all in one place:
+#   - `reasoning`: effort levels (the picker shows the control only for these).
+#   - `context`:   context window in tokens. Optional — windows are looked up from
+#                  models.dev by name (cached at ~/.ignis/models.json); set this
+#                  only to override or for a model models.dev doesn't know.
+#
 # [providers.openai]
 # api_key = "sk-your-openai-key"
 # api_url = "https://api.openai.com/v1"
-# models  = ["gpt-4o", "o3"]
-# [providers.openai.reasoning]
-# # Reasoning-effort levels differ by model, so declare them per model. The
-# # picker shows the effort control only for models listed here.
-# o3 = ["low", "medium", "high"]
+# models  = [
+#   "gpt-4o",
+#   { name = "o3", reasoning = ["low", "medium", "high"] },
+# ]
 #
 # [providers.deepseek]
 # api_key = "sk-your-deepseek-key"
 # api_url = "https://api.deepseek.com/v1"
-# models  = ["deepseek-v4-flash", "deepseek-v4-pro"]
-# [providers.deepseek.reasoning]
-# deepseek-v4-pro = ["high", "max"]
+# models  = [
+#   "deepseek-v4-flash",
+#   { name = "deepseek-v4-pro", reasoning = ["high", "max"], context = 128000 },
+# ]
 #
 # [providers.anthropic]
 # api_key = "your-anthropic-key"

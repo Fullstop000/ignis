@@ -2,6 +2,7 @@ pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod logger;
+pub mod models;
 pub mod provider;
 pub mod session;
 pub mod state;

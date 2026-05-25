@@ -65,20 +65,26 @@ models  = ["kimi-for-coding"]
 
 `/model` switches the active selection at runtime. It writes the choice to
 `~/.ignis/state.json` (which takes priority over the config default) — your
-`config.toml` is never auto-edited. Reasoning-effort levels differ by model, so
-declare them per model — the picker shows the effort control only for models
-that have levels:
+`config.toml` is never auto-edited. A model entry is either a bare name or an
+inline table carrying that model's metadata:
 
 ```toml
 model = "deepseek/deepseek-v4-flash"
 
 [providers.deepseek]
 api_key = "sk-your-deepseek-key"
-models  = ["deepseek-v4-flash", "deepseek-v4-pro"]
-
-[providers.deepseek.reasoning]
-deepseek-v4-pro = ["high", "max"]
+models  = [
+  "deepseek-v4-flash",
+  { name = "deepseek-v4-pro", reasoning = ["high", "max"], context = 128000 },
+]
 ```
+
+- `reasoning` — effort levels (differ by model); the picker shows the effort
+  control only for models that declare them.
+- `context` — the window shown in the picker. Optional: windows are looked up by
+  name from [models.dev](https://models.dev) (cached at `~/.ignis/models.json`,
+  refreshed in the background); set it only to override or for a model models.dev
+  doesn't know.
 
 > Your `~/.ignis/config.toml` holds secrets. The repo-level `config.toml` /
 > `config.yaml` are git-ignored on purpose — commit `config.example.toml` only.
