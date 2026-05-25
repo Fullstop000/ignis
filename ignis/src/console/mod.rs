@@ -259,6 +259,7 @@ pub async fn run_console(
     // Context windows: config override → cached models.dev → compaction threshold.
     // The cache loads instantly; refresh runs in the background for next launch.
     let catalog = crate::models::catalog::load();
+    app.fallback_context_window = config.compaction.threshold_tokens;
     app.set_context_window(
         config
             .active_context(&catalog)

@@ -107,9 +107,12 @@ pub(crate) struct App {
     pub(crate) error_flash: Option<(String, Instant)>,
     pub(crate) exit_pending: bool,
 
-    /// Token budget the context-usage % is measured against (the auto-compact
-    /// threshold). Estimated, not exact.
+    /// Token budget the context-usage % is measured against (the active model's
+    /// window, or the fallback below). Estimated, not exact.
     pub(crate) context_window: usize,
+    /// Window to use when the active model's context is unknown (the compaction
+    /// threshold) — so the gauge never sticks to a previous model's window.
+    pub(crate) fallback_context_window: usize,
 
     /// Clipboard function, injectable for testing.
     pub(crate) clipboard_fn: ClipFn,
@@ -144,6 +147,7 @@ impl App {
             error_flash: None,
             exit_pending: false,
             context_window: 120_000,
+            fallback_context_window: 120_000,
             clipboard_fn: super::clipboard::set_clipboard,
         }
     }
@@ -499,10 +503,12 @@ impl App {
         self.provider = opt.provider.clone();
         self.model = opt.model.clone();
         self.effort = effort.clone();
-        // Switch the footer's context gauge to the new model's window if known.
-        if let Some(ctx) = opt.context {
-            self.context_window = ctx as usize;
-        }
+        // Retarget the footer's context gauge to the new model's window, falling
+        // back when it's unknown so the % isn't measured against the old model.
+        self.context_window = opt
+            .context
+            .map(|c| c as usize)
+            .unwrap_or(self.fallback_context_window);
         Some((opt.provider, opt.model, effort))
     }
 
@@ -822,6 +828,45 @@ mod tests {
             "s".to_string(),
             PathBuf::from("/tmp"),
         )
+    }
+
+    #[test]
+    fn switching_models_retargets_context_window() {
+        let mut app = test_app();
+        app.fallback_context_window = 100_000;
+        app.context_window = 500_000; // pretend a prior known window
+        app.set_model_options(
+            vec![
+                crate::models::ModelOption {
+                    provider: "x".to_string(),
+                    model: "big".to_string(),
+                    effort_levels: vec![],
+                    context: Some(1_000_000),
+                },
+                crate::models::ModelOption {
+                    provider: "x".to_string(),
+                    model: "unknown".to_string(),
+                    effort_levels: vec![],
+                    context: None,
+                },
+            ],
+            None,
+        );
+        // Switch to a known-context model → gauge uses its window.
+        app.model_picker = Some(ModelPicker {
+            selected: 0,
+            effort_idx: 0,
+        });
+        app.apply_model_selection();
+        assert_eq!(app.context_window, 1_000_000);
+        // Switch to an unknown-context model → gauge resets to the fallback,
+        // not the previous model's window.
+        app.model_picker = Some(ModelPicker {
+            selected: 1,
+            effort_idx: 0,
+        });
+        app.apply_model_selection();
+        assert_eq!(app.context_window, 100_000);
     }
 
     fn picker_app() -> App {
