@@ -104,7 +104,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         } else if let Some(picker) = &app.session_picker {
             render_session_picker(&mut lines, picker);
         } else if let Some(picker) = &app.skill_picker {
-            render_skill_picker(&mut lines, picker, app.skills.as_deref());
+            // Rows available for skill items = band minus header (2) + footer (1).
+            let max_rows = (size.height as usize).saturating_sub(3).max(1);
+            render_skill_picker(&mut lines, picker, app.skills.as_deref(), max_rows);
         }
         f.render_widget(
             Paragraph::new(Text::from(lines))
@@ -545,6 +547,7 @@ pub(crate) fn render_skill_picker(
     lines: &mut Vec<Line<'static>>,
     picker: &SkillPicker,
     registry: Option<&crate::skills::SkillRegistry>,
+    max_rows: usize,
 ) {
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -556,8 +559,15 @@ pub(crate) fn render_skill_picker(
     ]));
 
     let Some(reg) = registry else { return };
-    for (idx, skill) in reg.all().iter().enumerate() {
-        let selected = idx == picker.selected;
+    let skills = reg.all();
+    // Scroll the window so the selected row stays visible when there are more
+    // skills than fit in the band.
+    let sel = picker.selected.min(skills.len().saturating_sub(1));
+    let visible = max_rows.max(1);
+    let start = slash_window_start(sel, visible, skills.len());
+    let end = (start + visible).min(skills.len());
+    for (idx, skill) in skills.iter().enumerate().take(end).skip(start) {
+        let selected = idx == sel;
         let marker = if selected { ">" } else { " " };
         let check = if reg.is_enabled(&skill.name) {
             "[x]"
