@@ -317,6 +317,10 @@ impl App {
                 }
             }
             AgentEvent::UserInjected { text } => {
+                // Events arrive on one ordered channel and the agent emits
+                // `UserInjected` in the same FIFO order injects were sent, so the
+                // front of `pending_injects` is this confirmation. (Empty when an
+                // inject was drained at run-start, not via Ctrl+S — still shown.)
                 if !self.pending_injects.is_empty() {
                     self.pending_injects.remove(0);
                 }
@@ -1145,5 +1149,18 @@ mod tests {
         assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "steer"));
         assert_eq!(app.history.last().map(|s| s.as_str()), Some("steer"));
         assert!(app.pending_injects.is_empty());
+    }
+
+    #[test]
+    fn user_injected_with_empty_pending_still_pushes() {
+        // An inject drained at run-start (not via Ctrl+S) has no pending entry,
+        // but must still appear in the transcript + history without panicking.
+        let mut app = test_app();
+        assert!(app.pending_injects.is_empty());
+        app.handle_event(AgentEvent::UserInjected {
+            text: "from-start".to_string(),
+        });
+        assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "from-start"));
+        assert_eq!(app.history.last().map(|s| s.as_str()), Some("from-start"));
     }
 }
