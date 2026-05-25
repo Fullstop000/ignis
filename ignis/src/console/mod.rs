@@ -835,6 +835,30 @@ async fn handle_key(
                     app.copy_last_assistant_message();
                 } else if command == "/model" && arg_count == 1 {
                     app.show_model_picker();
+                } else if command.starts_with('/')
+                    && app
+                        .skills
+                        .as_deref()
+                        .map(|r| r.all().iter().any(|s| format!("/{}", s.name) == command))
+                        .unwrap_or(false)
+                {
+                    let name = command.trim_start_matches('/').to_string();
+                    let reg = app.skills.clone().unwrap();
+                    if let Some(skill) = reg.get_enabled(&name) {
+                        let args = text[command.len()..].trim();
+                        let prompt = build_skill_prompt(&skill.name, &skill.body, args);
+                        app.turn_in_flight = true;
+                        let _ = prompt_tx
+                            .send(AgentRequest::Prompt {
+                                session_id: app.session_id.clone(),
+                                prompt,
+                            })
+                            .await;
+                    } else {
+                        app.add_assistant_notice(format!(
+                            "Skill '{name}' is disabled. Enable it with /skills."
+                        ));
+                    }
                 } else if text.starts_with('/') {
                     app.add_assistant_notice(format!("Unknown command `{}`.", command));
                 } else {
@@ -929,6 +953,18 @@ async fn handle_key(
     }
 }
 
+/// Build the prompt sent when a user force-loads a skill via `/skill-name`.
+/// `args` is the remainder of the input after the command (may be empty).
+pub(crate) fn build_skill_prompt(name: &str, body: &str, args: &str) -> String {
+    let head = format!("Use the \"{name}\" skill:\n\n{body}");
+    let args = args.trim();
+    if args.is_empty() {
+        head
+    } else {
+        format!("{head}\n\n---\n{args}")
+    }
+}
+
 #[cfg(test)]
 mod slash_skill_tests {
     use super::slash_suggestions;
@@ -954,5 +990,19 @@ mod slash_skill_tests {
         assert!(!names.iter().any(|n| n == "/beta")); // disabled
         assert!(names.iter().any(|n| n == "/skills"));
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn build_skill_prompt_with_and_without_args() {
+        let body = "Follow these rules.";
+        let with = super::build_skill_prompt("react", body, "fix this");
+        assert!(with.contains("Use the \"react\" skill:"));
+        assert!(with.contains("Follow these rules."));
+        assert!(with.contains("fix this"));
+
+        let bare = super::build_skill_prompt("react", body, "");
+        assert!(bare.contains("Use the \"react\" skill:"));
+        assert!(bare.contains("Follow these rules."));
+        assert!(!bare.contains("---")); // no args tail
     }
 }
