@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-25
+
+### Added
+- Queued messages — while the agent is busy, `Enter` queues your prompt to send after the current turn.
+- Message steering — `Ctrl+S` sends a message into the running turn; `↑` recalls the last queued message to edit.
+
+### Fixed
+- Stray space rendered after CJK / wide characters in scrollback.
+
 ## [0.10.0] - 2026-05-25
 
 ### Added
