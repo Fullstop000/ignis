@@ -252,6 +252,7 @@ fn make_inline_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<io:
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_console(
     provider_name: String,
     model_name: String,
@@ -260,6 +261,7 @@ pub async fn run_console(
     storage_dir: std::path::PathBuf,
     cwd: PathBuf,
     config: crate::config::Config,
+    skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
 ) -> Result<(), anyhow::Error> {
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
     // Context windows: config override → cached models.dev → compaction threshold.
@@ -304,6 +306,9 @@ pub async fn run_console(
     let ui_storage_dir = storage_dir;
     let agent_cwd = cwd;
     let mut agent_config = config;
+
+    let _ui_skill_registry = skill_registry.clone();
+    let runner_skill_registry = skill_registry.clone();
 
     // Background agent runner
     tokio::spawn(async move {
@@ -351,6 +356,12 @@ pub async fn run_console(
             session.set_compaction(agent_config.compaction.clone());
 
             crate::tools::register_native_tools(&mut session, &agent_cwd, &agent_config);
+            if !runner_skill_registry.is_empty() {
+                session.set_skills(runner_skill_registry.clone());
+                session.register_tool(std::sync::Arc::new(crate::tools::SkillTool::new(
+                    runner_skill_registry.clone(),
+                )));
+            }
 
             let notice_msg = |content: &str| Message {
                 role: "assistant".to_string(),
