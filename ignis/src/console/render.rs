@@ -64,6 +64,11 @@ pub(crate) fn queued_region_height(app: &App) -> u16 {
 /// suggestions, and the modal pickers, and collapses to a tidy strip at rest.
 pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
     let cap = term_rows.saturating_sub(1).max(3);
+    // `ask_user` runs while busy and owns the whole live band, same as the
+    // slash pickers.
+    if let Some(p) = &app.inline_picker {
+        return super::inline_picker::picker_height(p).clamp(4, cap);
+    }
     if app.model_picker.is_some() {
         let rows = app.model_options.len() as u16 + 4;
         return rows.clamp(4, cap);
@@ -101,14 +106,27 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let size = f.size();
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
+    // Inline (`ask_user`) picker with at least one option carrying a preview
+    // gets its own split layout — option list left, bordered Preview pane
+    // right. The other pickers fall through to the single-paragraph path.
+    if let Some(picker) = &app.inline_picker {
+        if picker.has_any_preview() {
+            render_inline_picker_split(f, size, picker);
+            return;
+        }
+    }
+
     // Modal pickers own the whole live band.
     if app.model_picker.is_some()
         || app.session_picker.is_some()
         || app.skill_picker.is_some()
         || app.mcp_picker.is_some()
+        || app.inline_picker.is_some()
     {
         let mut lines: Vec<Line> = Vec::new();
-        if let Some(picker) = &app.model_picker {
+        if let Some(picker) = &app.inline_picker {
+            super::inline_picker::render_inline_picker(&mut lines, picker);
+        } else if let Some(picker) = &app.model_picker {
             render_model_picker(&mut lines, picker, &app.model_options);
         } else if let Some(picker) = &app.session_picker {
             render_session_picker(&mut lines, picker);
@@ -161,6 +179,76 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     draw_footer(f, layout[4], app);
 }
 
+/// Split-layout render for the `ask_user` picker when at least one option
+/// carries a `preview`. The band is divided:
+///   - top: blank + header strip + question (3 rows)
+///   - middle: horizontal split — option list left (~45%), bordered Preview
+///     pane right (~55%) showing the focused option's title + description +
+///     preview text
+///   - bottom: blank + footer (2 rows)
+fn render_inline_picker_split(
+    f: &mut Frame,
+    size: Rect,
+    picker: &super::inline_picker::InlinePickerState,
+) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // header section
+            Constraint::Min(4),    // middle (split)
+            Constraint::Length(2), // footer section
+        ])
+        .split(size);
+
+    // Header section (full width)
+    let header_lines = super::inline_picker::header_lines(picker);
+    f.render_widget(
+        Paragraph::new(Text::from(header_lines))
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        outer[0],
+    );
+
+    // Middle horizontal split: options | preview
+    let middle = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(outer[1]);
+
+    let left_lines = super::inline_picker::options_pane_lines(picker);
+    f.render_widget(
+        Paragraph::new(Text::from(left_lines))
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        middle[0],
+    );
+
+    let right_lines = super::inline_picker::preview_pane_lines(picker);
+    let preview_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .title(Span::styled(
+            " Preview ",
+            Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(
+        Paragraph::new(Text::from(right_lines))
+            .block(preview_block)
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        middle[1],
+    );
+
+    // Footer section (full width)
+    let footer_lines = super::inline_picker::footer_lines(picker);
+    f.render_widget(
+        Paragraph::new(Text::from(footer_lines))
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        outer[2],
+    );
+}
+
 /// Build the rendered lines for one transcript block, for committing to the
 /// terminal scrollback via `insert_before`. Empty (placeholder) assistant blocks
 /// yield no lines.
@@ -198,6 +286,15 @@ pub(crate) fn block_lines(
             }
         }
         UIBlock::Tool(entry) => {
+            // The `ask_user` tool has its own purpose-built scrollback line
+            // (`inline_picker::trace_lines`); rendering the generic tool block
+            // would dump verbose JSON args+result twice. We still want a record
+            // on session resume — the live trace is ephemeral — so build a
+            // compact trace from the persisted entry instead.
+            if entry.name == "ask_user" {
+                lines.extend(ask_user_resume_trace(entry));
+                return lines;
+            }
             let mut raw: Vec<Line<'static>> = Vec::new();
             render_tool_block(&mut raw, entry, tick, cwd, width);
             for line in raw {
@@ -311,6 +408,98 @@ fn wrap_line(line: &Line<'static>, width: u16, indent_cols: usize) -> Vec<Line<'
     rows.into_iter()
         .map(|r| Line::from(cells_to_spans(&r)))
         .collect()
+}
+
+/// Compact one-line trace for a persisted `ask_user` tool entry. Parses the
+/// stored result JSON (`{"answers": [{"question": ..., "answer": ...}, ...]}`)
+/// and emits one row per answered question, plus a cancellation marker if the
+/// result was an error. Same look as the live trace from
+/// `inline_picker::trace_lines` so resumed sessions read identically.
+fn ask_user_resume_trace(entry: &ToolCallEntry) -> Vec<Line<'static>> {
+    let (result_text, is_error) = match &entry.status {
+        ToolStatus::Success(s) => (s.clone(), false),
+        ToolStatus::Error(s) => (s.clone(), true),
+        ToolStatus::Pending => return Vec::new(), // nothing to commit yet
+    };
+    let mut out = vec![Line::from("")];
+    if is_error {
+        // Distinguish a real cancellation (the tool's literal message) from
+        // other error paths (schema validation, console-closed, headless run,
+        // already-open). Anything that's not the cancellation sentence
+        // preserves the real error text instead of pretending the user
+        // cancelled.
+        let is_cancel = result_text.contains("User cancelled the question");
+        let label = if is_cancel {
+            " · cancelled by user".to_string()
+        } else {
+            format!(" · {}", result_text.trim())
+        };
+        out.push(Line::from(vec![
+            Span::styled("  ✗ ", Style::default().fg(RED)),
+            Span::styled(
+                "ask_user",
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(label, Style::default().fg(TEXT_DIM)),
+        ]));
+        return out;
+    }
+    // Parse the success JSON shape. Fall back to a generic line if it's
+    // anything unexpected — preserves the resume invariant ("never silent").
+    let parsed = serde_json::from_str::<serde_json::Value>(&result_text)
+        .ok()
+        .and_then(|v| {
+            v.get("answers")
+                .and_then(|a| a.as_array())
+                .map(|a| a.to_vec())
+        });
+    match parsed {
+        Some(answers) if !answers.is_empty() => {
+            // Header chips come from the request args; the result JSON only
+            // carries the question text, so reuse that as the label.
+            for a in answers {
+                let question = a
+                    .get("question")
+                    .and_then(|q| q.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let answer_text = match a.get("answer") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Array(items)) => items
+                        .iter()
+                        .filter_map(|i| i.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Some(other) => other.to_string(),
+                    None => String::new(),
+                };
+                out.push(Line::from(vec![
+                    Span::styled("  ✓ ", Style::default().fg(GREEN)),
+                    Span::styled(
+                        "ask_user",
+                        Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" · ", Style::default().fg(BORDER)),
+                    Span::styled(
+                        question,
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(": ", Style::default().fg(TEXT_DIM)),
+                    Span::styled(answer_text, Style::default().fg(TEXT)),
+                ]));
+            }
+        }
+        _ => {
+            out.push(Line::from(vec![
+                Span::styled("  ✓ ", Style::default().fg(GREEN)),
+                Span::styled(
+                    "ask_user",
+                    Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+    }
+    out
 }
 
 /// Wrapped row count of `lines` at `width` — the height to reserve in scrollback.

@@ -103,6 +103,14 @@ pub(crate) struct App {
     pub(crate) model_picker: Option<ModelPicker>,
     pub(crate) skill_picker: Option<SkillPicker>,
     pub(crate) mcp_picker: Option<McpPicker>,
+    /// Tool-initiated picker (the `ask_user` tool). Set by the main loop when
+    /// a `PickerRequest` arrives on `picker_rx`; cleared after the user picks
+    /// or cancels. Unlike the slash pickers, this one is active *while the
+    /// agent is running* (Thinking/ToolRunning), and keys go to it
+    /// regardless of mode. After picker close the trace gets committed
+    /// through the normal `UIBlock::Tool` flush path
+    /// (`block_lines` → `ask_user_resume_trace`) — no separate live channel.
+    pub(crate) inline_picker: Option<super::inline_picker::InlinePickerState>,
 
     pub(crate) mode: Mode,
     pub(crate) tick: u64,
@@ -172,6 +180,7 @@ impl App {
             model_picker: None,
             skill_picker: None,
             mcp_picker: None,
+            inline_picker: None,
             mode: Mode::Idle,
             tick: 0,
             stream_start: None,

@@ -112,7 +112,9 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 pub mod app;
 pub mod clipboard;
 pub mod highlight;
+pub(crate) mod inline_picker;
 pub mod markdown;
+pub(crate) mod picker;
 pub mod render;
 
 pub(crate) enum AgentRequest {
@@ -319,6 +321,11 @@ pub async fn run_console(
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
     let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
+    // Tool → console: the `ask_user` tool sends a PickerRequest when the model
+    // wants to ask the user something mid-turn. Capacity 4 — pickers serialize
+    // (one open at a time); the buffer just decouples send from console drain.
+    let (picker_tx, mut picker_rx) = mpsc::channel::<crate::console::picker::PickerRequest>(4);
+    let picker_tx_runner = picker_tx.clone();
     let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
     let active_inject_runner = active_inject.clone();
     let session_manager = SessionManager::new(storage_dir.clone());
@@ -391,6 +398,7 @@ pub async fn run_console(
                 &agent_cwd,
                 &agent_config,
                 mcp_for_subagent,
+                Some(picker_tx_runner.clone()),
             );
             if !runner_skill_registry.is_empty() {
                 session.set_skills(runner_skill_registry.clone());
@@ -472,15 +480,34 @@ pub async fn run_console(
     terminal.draw(|f| draw(f, &mut app))?;
 
     loop {
-        // Wake on either the next frame deadline or an incoming agent event.
+        // Wake on the next frame deadline, an agent event, or an `ask_user`
+        // picker request from a tool.
         tokio::select! {
             _ = tokio::time::sleep(frame) => {}
             Some(ev) = agent_rx.recv() => app.handle_event(ev),
+            Some(req) = picker_rx.recv() => {
+                if app.inline_picker.is_some() {
+                    // One picker at a time — reject the second so the tool
+                    // returns an error instead of stalling.
+                    let _ = req.reply.send(crate::console::picker::PickerResponse::Cancelled);
+                } else {
+                    app.inline_picker = Some(inline_picker::InlinePickerState::new(req));
+                }
+            }
         }
 
         // Drain any other pending agent events and key input — state only, no draw.
         while let Ok(ev) = agent_rx.try_recv() {
             app.handle_event(ev);
+        }
+        while let Ok(req) = picker_rx.try_recv() {
+            if app.inline_picker.is_some() {
+                let _ = req
+                    .reply
+                    .send(crate::console::picker::PickerResponse::Cancelled);
+            } else {
+                app.inline_picker = Some(inline_picker::InlinePickerState::new(req));
+            }
         }
 
         // Edge-triggered: exactly one queued prompt per turn-end (AgentEnd).
@@ -540,6 +567,11 @@ pub async fn run_console(
             }
             app.committed += 1;
         }
+
+        // The `ask_user` trace is committed via the usual block flush above
+        // (block_lines special-cases UIBlock::Tool{name:"ask_user"} into a
+        // compact trace via ask_user_resume_trace). No separate live-flush
+        // path — that used to double-emit.
 
         // Coalesced redraw of the live band: at most once per frame interval.
         if last_draw.elapsed() >= frame {
@@ -637,6 +669,36 @@ async fn handle_key(
     session_manager: &SessionManager,
     storage_dir: &std::path::Path,
 ) {
+    // Inline (tool-initiated) picker captures ALL keys while open, including
+    // ESC and Ctrl+C — must come before global handlers and the busy-mode
+    // gate, because the picker is the only thing the user is interacting with.
+    if let Some(state) = app.inline_picker.as_mut() {
+        use crate::console::picker::PickerResponse;
+        use inline_picker::KeyOutcome;
+        let outcome = state.on_key(key);
+        match outcome {
+            KeyOutcome::Continue => {}
+            KeyOutcome::Cancel => {
+                if let Some(mut picker) = app.inline_picker.take() {
+                    if let Some(reply) = picker.reply.take() {
+                        let _ = reply.send(PickerResponse::Cancelled);
+                    }
+                }
+            }
+            KeyOutcome::Done(answers) => {
+                if let Some(mut picker) = app.inline_picker.take() {
+                    if let Some(reply) = picker.reply.take() {
+                        let _ = reply.send(PickerResponse::Answered(answers));
+                    }
+                }
+            }
+        }
+        // No live-trace flush: the tool call's UIBlock::Tool will commit through
+        // block_lines → ask_user_resume_trace shortly after this, which renders
+        // the same compact trace. Avoiding the double-emit Codex flagged (P2).
+        return;
+    }
+
     // Global
     match (key.modifiers, key.code) {
         (_, KeyCode::Esc) => {

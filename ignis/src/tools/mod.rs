@@ -1,6 +1,7 @@
 pub mod tool;
 
 mod agent;
+pub(crate) mod ask_user;
 mod bash;
 mod create_file;
 mod edit_file;
@@ -13,6 +14,7 @@ mod web_fetch;
 mod web_search;
 
 pub use agent::SubagentTool;
+pub use ask_user::AskUserTool;
 pub use bash::BashTool;
 pub use create_file::CreateFileTool;
 pub use edit_file::EditFileTool;
@@ -52,16 +54,19 @@ pub fn register_native_tools(
     cwd: &Path,
     config: &crate::config::Config,
 ) {
-    register_native_tools_with_mcp(session, cwd, config, None)
+    register_native_tools_with_mcp(session, cwd, config, None, None)
 }
 
-/// Same as `register_native_tools` but also threads a shared MCP registry into
-/// the `SubagentTool` so sub-agents inherit MCP tools.
+/// Same as `register_native_tools` but threads a shared MCP registry into the
+/// `SubagentTool` (so sub-agents inherit MCP tools) and an optional picker
+/// channel into `AskUserTool` (so the model can interactively ask the user).
+/// `picker_tx = None` in headless contexts disables `ask_user` cleanly.
 pub fn register_native_tools_with_mcp(
     session: &mut crate::Session,
     cwd: &Path,
     config: &crate::config::Config,
     mcp: Option<Arc<crate::mcp::McpRegistry>>,
+    picker_tx: Option<tokio::sync::mpsc::Sender<crate::console::picker::PickerRequest>>,
 ) {
     for tool in native_tools(cwd, config.web_search.clone()) {
         session.register_tool(tool);
@@ -73,6 +78,9 @@ pub fn register_native_tools_with_mcp(
         subagent = subagent.with_mcp(mcp);
     }
     session.register_tool(Arc::new(subagent));
+    // The `ask_user` tool — registered only at the top level. Sub-agents are
+    // for self-contained work and shouldn't pause to interrogate the user.
+    session.register_tool(Arc::new(AskUserTool::new(picker_tx)));
 }
 
 /// Register every tool exposed by a connected MCP server as an `AgentTool`.

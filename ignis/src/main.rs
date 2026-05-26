@@ -111,7 +111,14 @@ async fn main() -> Result<(), anyhow::Error> {
     } else {
         None
     };
-    ignis::tools::register_native_tools_with_mcp(&mut session, &cwd, &config, mcp_for_subagent);
+    // One-shot CLI is headless — no interactive picker.
+    ignis::tools::register_native_tools_with_mcp(
+        &mut session,
+        &cwd,
+        &config,
+        mcp_for_subagent,
+        None,
+    );
     if !skill_registry.is_empty() {
         session.set_skills(skill_registry.clone());
         session.register_tool(std::sync::Arc::new(ignis::tools::SkillTool::new(

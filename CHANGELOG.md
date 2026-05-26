@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-05-26
+
+### Added
+- `ask_user` — model-initiated interactive picker; the model can pause mid-turn and ask the user a structured 2-4 option question (single- or multi-select, with a free-text "Other" row).
+
 ## [0.13.0] - 2026-05-26
 
 ### Added
