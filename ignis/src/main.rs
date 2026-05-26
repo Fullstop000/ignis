@@ -70,7 +70,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {
-        return ignis::console::run_console(
+        let res = ignis::console::run_console(
             active_provider,
             active_model,
             session_request.session_id,
@@ -82,6 +82,10 @@ async fn main() -> Result<(), anyhow::Error> {
             mcp_registry.clone(),
         )
         .await;
+        // Bring down MCP servers explicitly before tokio runtime tears down —
+        // relying on Drop alone races runtime shutdown and orphans children.
+        mcp_registry.shutdown().await;
+        return res;
     }
 
     // Route: One-shot CLI mode (ignis "do something")
@@ -164,5 +168,6 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     prompt_task.await?;
+    mcp_registry.shutdown().await;
     Ok(())
 }

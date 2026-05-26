@@ -31,6 +31,7 @@ syntect = { version = "5.3.0", default-features = false, features = ["default-fa
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-child-process"] }
 toml_edit = "0.22"
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 
 [dev-dependencies]
 portable-pty = "0.8"

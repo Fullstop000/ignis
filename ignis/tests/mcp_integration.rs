@@ -167,6 +167,53 @@ async fn tool_returning_is_error_surfaces_as_tool_result_error() {
 }
 
 #[tokio::test]
+async fn oversize_qualified_tool_name_is_skipped() {
+    // 60 chars + `mcp__skip__` (11) = 71 → over the 64-char OpenAI cap.
+    let huge_name = "x".repeat(60);
+    let mut servers = HashMap::new();
+    servers.insert(
+        "skip".to_string(),
+        server(&[("MOCK_EXTRA_TOOLS", huge_name.as_str())]),
+    );
+    let reg = McpRegistry::spawn_all(&servers, HashSet::new()).await;
+    let names: Vec<String> = reg
+        .wrappers()
+        .iter()
+        .map(|w| w.qualified_name().to_string())
+        .collect();
+    assert!(names.contains(&"mcp__skip__echo".to_string()));
+    assert!(names.contains(&"mcp__skip__add".to_string()));
+    assert!(
+        !names.iter().any(|n| n.contains("xxxxxxxx")),
+        "oversize tool should be skipped, got {names:?}"
+    );
+    reg.shutdown().await;
+}
+
+#[tokio::test]
+async fn sanitize_collision_is_skipped_not_silently_shadowed() {
+    // Both names sanitize to `read_file`. The second occurrence must be
+    // skipped, leaving only the first.
+    let mut servers = HashMap::new();
+    servers.insert(
+        "dup".to_string(),
+        server(&[("MOCK_EXTRA_TOOLS", "read.file;read/file")]),
+    );
+    let reg = McpRegistry::spawn_all(&servers, HashSet::new()).await;
+    let names: Vec<String> = reg
+        .wrappers()
+        .iter()
+        .map(|w| w.qualified_name().to_string())
+        .collect();
+    let read_file_count = names.iter().filter(|n| *n == "mcp__dup__read_file").count();
+    assert_eq!(
+        read_file_count, 1,
+        "exactly one read_file should win after sanitization, got {names:?}"
+    );
+    reg.shutdown().await;
+}
+
+#[tokio::test]
 async fn zero_servers_means_zero_overhead() {
     let servers: HashMap<String, McpServerConfig> = HashMap::new();
     let reg = McpRegistry::spawn_all(&servers, HashSet::new()).await;
@@ -213,7 +260,15 @@ async fn real_filesystem_server_list_and_call() {
         .expect("real fs server should expose read_text_file");
     let path = tmp.path().join("hello.txt").to_string_lossy().to_string();
     let res = ignis::AgentTool::call(read.as_ref(), serde_json::json!({ "path": path })).await;
-    assert!(!res.is_error, "real read_text_file returned error: {}", res.content);
-    assert!(res.content.contains("hi from ignis"), "got: {}", res.content);
+    assert!(
+        !res.is_error,
+        "real read_text_file returned error: {}",
+        res.content
+    );
+    assert!(
+        res.content.contains("hi from ignis"),
+        "got: {}",
+        res.content
+    );
     reg.shutdown().await;
 }

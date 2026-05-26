@@ -134,7 +134,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     validate_mcp_server_name(&args.name)?;
     let path = config_path()?;
     let mut doc = load_doc(&path)?;
-    let servers = ensure_servers_table(&mut doc);
+    let servers = ensure_servers_table(&mut doc)?;
     if servers.contains_key(&args.name) && !args.force {
         return Err(anyhow!(
             "MCP server '{}' already exists in {}; pass --force to overwrite",
@@ -181,7 +181,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
 fn cmd_remove(name: String) -> Result<()> {
     let path = config_path()?;
     let mut doc = load_doc(&path)?;
-    let servers = ensure_servers_table(&mut doc);
+    let servers = ensure_servers_table(&mut doc)?;
     if servers.remove(&name).is_none() {
         return Err(anyhow!(
             "MCP server '{}' not found in {}",
@@ -429,14 +429,18 @@ fn print_table(rows: &[Row]) {
 }
 
 /// Get-or-create the `[mcp.servers]` table inside the document, preserving any
-/// surrounding content.
-fn ensure_servers_table(doc: &mut DocumentMut) -> &mut Table {
+/// surrounding content. Returns `Err` (not panic) if the user has put
+/// something at `mcp` or `mcp.servers` that isn't a table — they get a clean
+/// CLI error instead of a stack trace.
+fn ensure_servers_table(doc: &mut DocumentMut) -> Result<&mut Table> {
     if !doc.as_table().contains_key("mcp") {
         let mut t = Table::new();
         t.set_implicit(true);
         doc["mcp"] = Item::Table(t);
     }
-    let mcp = doc["mcp"].as_table_mut().expect("mcp must be a table");
+    let mcp = doc["mcp"]
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("`mcp` in config.toml is not a table"))?;
     if !mcp.contains_key("servers") {
         let mut t = Table::new();
         t.set_implicit(true);
@@ -444,7 +448,7 @@ fn ensure_servers_table(doc: &mut DocumentMut) -> &mut Table {
     }
     mcp["servers"]
         .as_table_mut()
-        .expect("mcp.servers must be a table")
+        .ok_or_else(|| anyhow!("`mcp.servers` in config.toml is not a table"))
 }
 
 #[cfg(test)]
@@ -467,7 +471,7 @@ mod tests {
         let pre =
             "model = \"x/y\"\n# preserve me\n[providers.x]\napi_key = \"k\"\nmodels = [\"y\"]\n";
         let mut doc: DocumentMut = pre.parse().unwrap();
-        let servers = ensure_servers_table(&mut doc);
+        let servers = ensure_servers_table(&mut doc).unwrap();
         let mut block = Table::new();
         block["command"] = value("gh");
         let mut arr = Array::new();
@@ -486,9 +490,24 @@ mod tests {
     }
 
     #[test]
+    fn ensure_servers_table_returns_err_when_mcp_is_not_a_table() {
+        // User typo: `mcp = "x"` or `mcp.servers = []` should produce a clean
+        // CLI error, not panic.
+        for bad in ["mcp = \"x\"\n", "[mcp]\nservers = []\n"] {
+            let mut doc: DocumentMut = bad.parse().unwrap();
+            let err = ensure_servers_table(&mut doc).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not a table"),
+                "expected `not a table` message for `{bad}`, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn ensure_servers_table_on_empty_doc_creates_block() {
         let mut doc: DocumentMut = "".parse().unwrap();
-        let servers = ensure_servers_table(&mut doc);
+        let servers = ensure_servers_table(&mut doc).unwrap();
         servers.insert(
             "foo",
             Item::Table({

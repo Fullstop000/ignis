@@ -4,18 +4,27 @@
 use std::sync::Arc;
 
 use rmcp::model::{CallToolRequestParams, Tool};
-use rmcp::service::{RoleClient, RunningService};
+use rmcp::service::{Peer, RoleClient, RunningService};
+use tokio::sync::Mutex;
 
 use crate::tools::tool::ToolResult;
 
-/// A connected MCP server. Dropping this struct also drops the underlying
-/// `RunningService`, which terminates the child process (rmcp's
-/// `TokioChildProcess` has `kill_on_drop` semantics).
+/// A connected MCP server. `shutdown` is `&self` so the registry can drive it
+/// without consuming `Arc<McpServer>` (wrappers and sub-agents hold clones).
 pub struct McpServer {
     /// User-facing name (the config key, e.g. `"github"`).
     name: String,
-    /// Live rmcp service. Deref'd to `Peer<RoleClient>` for `call_tool` etc.
-    service: RunningService<RoleClient, ()>,
+    /// Cheap-to-clone handle for `call_tool` etc. (rmcp's `Peer` is `Clone`).
+    /// Keeping this alongside the `RunningService` means tool calls don't have
+    /// to lock the inner mutex on every invocation.
+    peer: Peer<RoleClient>,
+    /// Owned service; taken on shutdown so we can `cancel().await` (consumes).
+    /// `tokio::sync::Mutex` so the take can cross an `.await`.
+    inner: Mutex<Option<RunningService<RoleClient, ()>>>,
+    /// PID of the immediate child, captured before the transport was given to
+    /// rmcp. Used on Unix to `SIGTERM`/`SIGKILL` the whole process group so
+    /// shell- or npx-wrapped servers don't leave orphans.
+    child_pid: Option<u32>,
     /// Tools advertised at connect time. We don't refresh on
     /// `notifications/tools/list_changed` in v1.
     tools: Vec<Tool>,
@@ -29,13 +38,17 @@ impl McpServer {
     pub fn new(
         name: String,
         service: RunningService<RoleClient, ()>,
+        child_pid: Option<u32>,
         tools: Vec<Tool>,
         instructions: Option<String>,
         tool_timeout: std::time::Duration,
     ) -> Self {
+        let peer = service.peer().clone();
         Self {
             name,
-            service,
+            peer,
+            inner: Mutex::new(Some(service)),
+            child_pid,
             tools,
             instructions,
             tool_timeout,
@@ -56,11 +69,11 @@ impl McpServer {
 
     /// Invoke an MCP tool. Maps timeouts, transport errors, and server-side
     /// `is_error: true` results into `ToolResult::error` so the agent treats
-    /// them the same as any other tool failure.
+    /// them the same as any other tool failure. After shutdown, returns an
+    /// error.
     pub async fn call_tool(self: &Arc<Self>, params: CallToolRequestParams) -> ToolResult {
         let tool_name = params.name.to_string();
-        let fut = self.service.call_tool(params);
-        let outcome = tokio::time::timeout(self.tool_timeout, fut).await;
+        let outcome = tokio::time::timeout(self.tool_timeout, self.peer.call_tool(params)).await;
         match outcome {
             Err(_) => ToolResult::error(format!(
                 "mcp__{}__{} timed out after {}s",
@@ -83,11 +96,31 @@ impl McpServer {
         }
     }
 
-    /// Cancel the underlying rmcp service. Consumes `self`. Drop alone would
-    /// also kill the child, but cancelling first lets rmcp send a clean
-    /// `notifications/cancelled` and wait briefly for the child to exit.
-    pub async fn shutdown(self) {
-        let _ = self.service.cancel().await;
+    /// Tear down this server's connection. Steps in order:
+    ///   1. Cancel the rmcp service (this consumes it; rmcp closes the
+    ///      transport, the child sees EOF on stdin, and most servers exit).
+    ///   2. On Unix, SIGTERM the child's process group to catch descendants
+    ///      that wrapper commands like `npx` leave behind. SIGKILL after a
+    ///      short grace period if anything is still standing.
+    ///
+    /// Safe to call multiple times — the second call is a no-op.
+    pub async fn shutdown(&self) {
+        if let Some(service) = self.inner.lock().await.take() {
+            let _ = service.cancel().await;
+        }
+        #[cfg(unix)]
+        if let Some(pid) = self.child_pid {
+            // Negative PID = process group. The child was spawned with
+            // `process_group(0)` so its PGID equals its PID. Ignoring errors:
+            // ESRCH (already-dead) is the common case.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGTERM);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
     }
 }
 

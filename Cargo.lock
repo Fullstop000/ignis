@@ -911,6 +911,7 @@ dependencies = [
  "globset",
  "ignis-macros",
  "ignore",
+ "libc",
  "log",
  "portable-pty",
  "ratatui",

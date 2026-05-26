@@ -8,7 +8,10 @@
 //! - `MOCK_INSTRUCTIONS` (optional): included in the initialize response
 //! - `MOCK_SLEEP_MS`     (optional): block this many ms before responding to
 //!   initialize — exercises the startup-timeout path
-//! - `MOCK_ERROR_ON`    (optional): a tool name that always returns is_error=true
+//! - `MOCK_ERROR_ON`     (optional): a tool name that always returns is_error=true
+//! - `MOCK_EXTRA_TOOLS`  (optional): semicolon-separated bare tool names to
+//!   advertise on top of `echo` + `add`. Used by tests to exercise the
+//!   too-long-name and sanitize-collision skip paths in `McpRegistry::wrappers`.
 //!
 //! Tools advertised:
 //! - `echo` — returns its `text` argument verbatim
@@ -30,6 +33,10 @@ fn main() {
     }
     let instructions = env::var("MOCK_INSTRUCTIONS").ok();
     let error_on = env::var("MOCK_ERROR_ON").ok();
+    let extra_tools: Vec<String> = env::var("MOCK_EXTRA_TOOLS")
+        .ok()
+        .map(|s| s.split(';').map(str::to_string).collect())
+        .unwrap_or_default();
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -61,11 +68,21 @@ fn main() {
                 "result": initialize_result(instructions.as_deref()),
             })),
             ("notifications/initialized", _) | ("notifications/cancelled", _) => None,
-            ("tools/list", Some(id)) => Some(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "tools": tools_list() },
-            })),
+            ("tools/list", Some(id)) => {
+                let mut tools = tools_list();
+                for name in &extra_tools {
+                    tools.push(json!({
+                        "name": name,
+                        "description": "extra tool advertised via MOCK_EXTRA_TOOLS",
+                        "inputSchema": { "type": "object", "properties": {} },
+                    }));
+                }
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "tools": tools },
+                }))
+            }
             ("tools/call", Some(id)) => Some(json!({
                 "jsonrpc": "2.0",
                 "id": id,

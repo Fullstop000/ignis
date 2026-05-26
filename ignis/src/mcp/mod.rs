@@ -22,6 +22,11 @@ pub mod tool;
 pub use server::McpServer;
 pub use tool::{sanitize_tool_name, McpToolWrapper};
 
+/// Hard cap on the qualified MCP tool name (`mcp__<server>__<tool>`). Matches
+/// OpenAI's `^[a-zA-Z0-9_-]{1,64}$` for function names; oversize tools are
+/// dropped (with a warning) instead of being silently truncated.
+pub const MAX_TOOL_NAME_LEN: usize = 64;
+
 /// Why a server isn't currently usable (anything other than "connected").
 #[derive(Debug, Clone)]
 pub enum McpStatus {
@@ -104,7 +109,7 @@ impl McpRegistry {
         for handle in tasks {
             match handle.await {
                 Ok((name, ConnectResult::Connected(server))) => {
-                    connected.insert(name, Arc::new(server));
+                    connected.insert(name, Arc::from(server));
                 }
                 Ok((name, ConnectResult::Failed(reason))) => {
                     log::warn!("MCP server `{name}` failed to start: {reason}");
@@ -186,6 +191,11 @@ impl McpRegistry {
 
     /// Every `(McpToolWrapper)` from currently connected servers. The agent
     /// registers these alongside its native tools at session build time.
+    ///
+    /// Tools are skipped (with a warning) if their qualified name would
+    /// exceed OpenAI's 64-character tool-name limit or collide with another
+    /// tool from the same server after sanitization (e.g. `read.file` and
+    /// `read/file` both sanitize to `read_file`).
     pub fn wrappers(&self) -> Vec<Arc<McpToolWrapper>> {
         let mut out: Vec<Arc<McpToolWrapper>> = Vec::new();
         // Iterate `all_names` (sorted) so wrappers come out in a stable order.
@@ -193,7 +203,23 @@ impl McpRegistry {
             let Some(server) = self.connected.get(name) else {
                 continue;
             };
+            let mut seen: HashSet<String> = HashSet::new();
             for tool in server.tools() {
+                let real = tool.name.to_string();
+                let sanitized = tool::sanitize_tool_name(&real);
+                let qualified = format!("mcp__{name}__{sanitized}");
+                if qualified.len() > MAX_TOOL_NAME_LEN {
+                    log::warn!(
+                        "MCP tool `{name}/{real}` skipped: qualified name `{qualified}` exceeds {MAX_TOOL_NAME_LEN}-char limit"
+                    );
+                    continue;
+                }
+                if !seen.insert(qualified.clone()) {
+                    log::warn!(
+                        "MCP tool `{name}/{real}` skipped: name `{qualified}` collides with another tool from server `{name}`"
+                    );
+                    continue;
+                }
                 let description = tool
                     .description
                     .as_ref()
@@ -203,7 +229,7 @@ impl McpRegistry {
                 out.push(Arc::new(McpToolWrapper::new(
                     server.clone(),
                     name,
-                    tool.name.to_string(),
+                    real,
                     description,
                     schema,
                 )));
@@ -246,25 +272,17 @@ impl McpRegistry {
         Some(out)
     }
 
-    /// Cancel every live rmcp service. Should be called once on session
-    /// shutdown — after this the registry holds no live servers. Safe to call
-    /// against an empty registry.
-    pub async fn shutdown(self: Arc<Self>) {
-        // We need owned servers to call `service.cancel()` (which consumes).
-        // `Arc::try_unwrap` only succeeds when we're the last owner — the
-        // session shutdown path arranges that. If we aren't, fall back to
-        // best-effort drop (kill_on_drop still kicks in).
-        let this = match Arc::try_unwrap(self) {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-        let mut handles = Vec::new();
-        for (_name, server) in this.connected {
-            if let Some(server) = Arc::into_inner(server) {
-                handles.push(tokio::spawn(async move {
-                    server.shutdown().await;
-                }));
-            }
+    /// Cancel every live rmcp service in parallel, then SIGTERM/SIGKILL each
+    /// child's process group on Unix to catch any descendants left behind by
+    /// shell-/`npx`-style wrappers. Takes `&self` so the caller doesn't need
+    /// to own the only `Arc` (sub-agents and tool wrappers hold clones).
+    ///
+    /// Safe to call multiple times and against an empty registry.
+    pub async fn shutdown(&self) {
+        let mut handles = Vec::with_capacity(self.connected.len());
+        for server in self.connected.values() {
+            let server = server.clone();
+            handles.push(tokio::spawn(async move { server.shutdown().await }));
         }
         for h in handles {
             let _ = h.await;
@@ -273,7 +291,9 @@ impl McpRegistry {
 }
 
 enum ConnectResult {
-    Connected(McpServer),
+    // Boxed because `McpServer` carries the full rmcp service + mutex, which
+    // dwarfs the `Failed(String)` variant; clippy warns on size disparity.
+    Connected(Box<McpServer>),
     Failed(String),
 }
 
@@ -299,6 +319,11 @@ async fn connect_one(name: &str, cfg: &McpServerConfig) -> ConnectResult {
             .spawn()
             .map_err(|e| format!("spawn error: {e}"))?;
 
+        // Capture the PID before handing the transport off to rmcp's `serve`,
+        // which consumes it. Needed for the SIGTERM/SIGKILL fallback in
+        // `McpServer::shutdown` so wrapper-spawned descendants don't orphan.
+        let child_pid = transport.id();
+
         // Forward server stderr to ignis's log; named per-server. Lives until
         // the child exits.
         if let Some(stderr) = stderr {
@@ -321,13 +346,14 @@ async fn connect_one(name: &str, cfg: &McpServerConfig) -> ConnectResult {
             .await
             .map_err(|e| format!("list_tools failed: {e}"))?;
 
-        Ok::<_, String>(McpServer::new(
+        Ok::<_, String>(Box::new(McpServer::new(
             name.to_string(),
             service,
+            child_pid,
             tools,
             instructions,
             std::time::Duration::from_secs(cfg.tool_timeout_secs),
-        ))
+        )))
     };
 
     match tokio::time::timeout(timeout, attempt).await {
