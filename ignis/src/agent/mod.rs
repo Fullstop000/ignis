@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::mcp::McpRegistry;
 use crate::skills::SkillRegistry;
 
 use serde::Serialize;
@@ -150,12 +151,19 @@ async fn drain_injected(
     n
 }
 
-/// Compose the effective system prompt: base + the enabled-skills catalog.
-fn with_catalog(base: &str, skills: Option<&SkillRegistry>) -> String {
-    match skills.and_then(|r| r.catalog_prompt()) {
-        Some(catalog) => format!("{base}\n\n{catalog}"),
-        None => base.to_string(),
+/// Compose the effective system prompt: base + the enabled-skills catalog +
+/// the connected-MCP-servers' `instructions` block.
+fn with_catalog(base: &str, skills: Option<&SkillRegistry>, mcp: Option<&McpRegistry>) -> String {
+    let mut out = base.to_string();
+    if let Some(catalog) = skills.and_then(|r| r.catalog_prompt()) {
+        out.push_str("\n\n");
+        out.push_str(&catalog);
     }
+    if let Some(block) = mcp.and_then(|r| r.instructions_block()) {
+        out.push_str("\n\n");
+        out.push_str(&block);
+    }
+    out
 }
 
 /// Execution engine: given a conversation `history`, runs the model + tool
@@ -166,6 +174,7 @@ pub struct Agent {
     tools: Vec<Arc<dyn AgentTool>>,
     hooks: Option<Box<dyn ToolHooks>>,
     skills: Option<Arc<SkillRegistry>>,
+    mcp: Option<Arc<McpRegistry>>,
 }
 
 struct AccumulatingToolCall {
@@ -182,6 +191,7 @@ impl Agent {
             tools: Vec::new(),
             hooks: None,
             skills: None,
+            mcp: None,
         }
     }
 
@@ -195,6 +205,10 @@ impl Agent {
 
     pub fn set_skills(&mut self, skills: Arc<SkillRegistry>) {
         self.skills = Some(skills);
+    }
+
+    pub fn set_mcp(&mut self, mcp: Arc<McpRegistry>) {
+        self.mcp = Some(mcp);
     }
 
     /// One-shot, tool-less completion: stream a response for `messages` and
@@ -241,7 +255,11 @@ impl Agent {
     ) -> Result<Usage, anyhow::Error> {
         let _ = tx.send(AgentEvent::AgentStart).await;
         let mut total_usage = Usage::default();
-        let effective_prompt = with_catalog(&self.system_prompt, self.skills.as_deref());
+        let effective_prompt = with_catalog(
+            &self.system_prompt,
+            self.skills.as_deref(),
+            self.mcp.as_deref(),
+        );
 
         let tool_schemas: Vec<serde_json::Value> = self
             .tools
@@ -715,11 +733,11 @@ mod tests {
         std::fs::write(dir.join("SKILL.md"), "---\nname: react\n---\nbody").unwrap();
         let reg = Arc::new(SkillRegistry::load(None, &cwd, HashSet::new()));
 
-        let out = with_catalog("BASE", Some(reg.as_ref()));
+        let out = with_catalog("BASE", Some(reg.as_ref()), None);
         assert!(out.starts_with("BASE\n\n"));
         assert!(out.contains("<available_skills>"));
 
-        assert_eq!(with_catalog("BASE", None), "BASE");
+        assert_eq!(with_catalog("BASE", None, None), "BASE");
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

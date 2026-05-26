@@ -4,6 +4,7 @@ use crate::state::{load_state, State};
 use anyhow::anyhow;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Web search backend configuration. `provider` selects the backend
 /// (default "brave"); `api_key` is the credential for that backend.
@@ -51,6 +52,65 @@ pub struct Config {
     pub web_search: WebSearchConfig,
     #[serde(default)]
     pub compaction: CompactionConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
+}
+
+/// MCP (Model Context Protocol) server configuration. Each entry under
+/// `[mcp.servers.<name>]` becomes a connection ignis spawns at startup; tools
+/// the server advertises are exposed to the model as `mcp__<name>__<tool>`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerConfig>,
+}
+
+/// One MCP server entry. `command` is required; everything else has a default.
+/// `startup_timeout_secs` bounds the `initialize` handshake; `tool_timeout_secs`
+/// bounds each individual `tools/call`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct McpServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default = "default_startup_timeout_secs")]
+    pub startup_timeout_secs: u64,
+    #[serde(default = "default_tool_timeout_secs")]
+    pub tool_timeout_secs: u64,
+}
+
+fn default_startup_timeout_secs() -> u64 {
+    30
+}
+fn default_tool_timeout_secs() -> u64 {
+    120
+}
+
+/// Validate that an MCP server name is safe to embed in `mcp__<name>__<tool>`
+/// (which must satisfy the OpenAI tool-name regex `^[a-zA-Z0-9_-]{1,64}$`).
+/// Capping the server name at 40 leaves room for `mcp__` (5) + `__` (2) + tool
+/// name (up to 17) before hitting the 64-char limit.
+pub fn validate_mcp_server_name(name: &str) -> Result<(), anyhow::Error> {
+    if name.is_empty() || name.len() > 40 {
+        return Err(anyhow!(
+            "MCP server name '{}' must be 1-40 characters",
+            name
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(anyhow!(
+            "MCP server name '{}' contains invalid characters; allowed: [a-zA-Z0-9_-]",
+            name
+        ));
+    }
+    Ok(())
 }
 
 impl Config {
@@ -147,6 +207,9 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match toml::from_str::<Config>(&content) {
                     Ok(mut config) => {
+                        for name in config.mcp.servers.keys() {
+                            validate_mcp_server_name(name)?;
+                        }
                         config.apply_state(load_state());
                         return Ok(config);
                     }
@@ -407,6 +470,7 @@ models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", 
             model: Some("deepseek/deepseek-v4-pro".to_string()),
             reasoning_effort: Some("high".to_string()),
             disabled_skills: vec![],
+            disabled_mcp_servers: vec![],
         });
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(cfg.active_effort().as_deref(), Some("high"));
@@ -428,6 +492,97 @@ models = ["deepseek-v4-flash", "deepseek-v4-pro"]
     }
 
     #[test]
+    fn mcp_config_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.deepseek]
+api_key = "x"
+models = ["m"]
+
+[mcp.servers.github]
+command = "gh"
+args = ["mcp"]
+"#,
+        )
+        .unwrap();
+        let s = cfg.mcp.servers.get("github").unwrap();
+        assert_eq!(s.command, "gh");
+        assert_eq!(s.args, vec!["mcp"]);
+        assert!(s.env.is_empty());
+        assert_eq!(s.cwd, None);
+        assert_eq!(s.startup_timeout_secs, 30);
+        assert_eq!(s.tool_timeout_secs, 120);
+    }
+
+    #[test]
+    fn mcp_config_explicit_fields() {
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.deepseek]
+api_key = "x"
+models = ["m"]
+
+[mcp.servers.fs]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+env = { NODE_OPTIONS = "--max-old-space-size=4096" }
+cwd = "/work"
+startup_timeout_secs = 10
+tool_timeout_secs = 60
+"#,
+        )
+        .unwrap();
+        let s = cfg.mcp.servers.get("fs").unwrap();
+        assert_eq!(s.command, "npx");
+        assert_eq!(s.args.len(), 3);
+        assert_eq!(
+            s.env.get("NODE_OPTIONS").map(String::as_str),
+            Some("--max-old-space-size=4096")
+        );
+        assert_eq!(s.cwd.as_ref().unwrap().to_str(), Some("/work"));
+        assert_eq!(s.startup_timeout_secs, 10);
+        assert_eq!(s.tool_timeout_secs, 60);
+    }
+
+    #[test]
+    fn validate_mcp_server_name_accepts_alphanum_underscore_dash() {
+        for ok in ["github", "fs", "my-server", "my_server", "abc123", "a"] {
+            assert!(validate_mcp_server_name(ok).is_ok(), "expected '{ok}' ok");
+        }
+    }
+
+    #[test]
+    fn validate_mcp_server_name_rejects_invalid() {
+        for bad in [
+            "",
+            "with space",
+            "with.dot",
+            "with/slash",
+            "with:colon",
+            // 41 chars - over the cap
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(
+                validate_mcp_server_name(bad).is_err(),
+                "expected '{bad}' rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_mcp_section_is_default() {
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.deepseek]
+api_key = "x"
+models = ["m"]
+"#,
+        )
+        .unwrap();
+        assert!(cfg.mcp.servers.is_empty());
+    }
+
+    #[test]
     fn state_with_model_clears_stale_effort() {
         // Switching to a non-reasoning model via state drops a prior effort.
         let mut cfg: Config = toml::from_str(
@@ -444,6 +599,7 @@ models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", 
             model: Some("deepseek/deepseek-v4-flash".to_string()),
             reasoning_effort: None,
             disabled_skills: vec![],
+            disabled_mcp_servers: vec![],
         });
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(cfg.active_effort(), None);

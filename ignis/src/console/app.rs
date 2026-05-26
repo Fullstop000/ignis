@@ -59,6 +59,13 @@ pub(crate) struct SkillPicker {
     pub(crate) selected: usize,
 }
 
+/// `/mcp` picker state. Rows come from `App.mcp` registry `entries()` —
+/// includes connected, failed, and disabled servers in stable name order.
+#[derive(Debug, Clone)]
+pub(crate) struct McpPicker {
+    pub(crate) selected: usize,
+}
+
 /// `/model` picker state. Options live on `App.model_options`; this tracks the
 /// highlighted row and, for a reasoning-capable model, the chosen effort level.
 #[derive(Debug, Clone)]
@@ -95,6 +102,7 @@ pub(crate) struct App {
     pub(crate) model_options: Vec<crate::models::ModelOption>,
     pub(crate) model_picker: Option<ModelPicker>,
     pub(crate) skill_picker: Option<SkillPicker>,
+    pub(crate) mcp_picker: Option<McpPicker>,
 
     pub(crate) mode: Mode,
     pub(crate) tick: u64,
@@ -140,6 +148,8 @@ pub(crate) struct App {
 
     /// Skill registry for slash autocomplete; `None` when no skills are loaded.
     pub(crate) skills: Option<std::sync::Arc<crate::skills::SkillRegistry>>,
+    /// MCP registry for `/mcp` picker; `None` when no MCP servers are configured.
+    pub(crate) mcp: Option<std::sync::Arc<crate::mcp::McpRegistry>>,
 }
 
 impl App {
@@ -161,6 +171,7 @@ impl App {
             model_options: Vec::new(),
             model_picker: None,
             skill_picker: None,
+            mcp_picker: None,
             mode: Mode::Idle,
             tick: 0,
             stream_start: None,
@@ -179,6 +190,7 @@ impl App {
             turn_in_flight: false,
             clipboard_fn: super::clipboard::set_clipboard,
             skills: None,
+            mcp: None,
         }
     }
 
@@ -636,6 +648,38 @@ impl App {
         Some((name, now_enabled))
     }
 
+    pub(crate) fn show_mcp_picker(&mut self) {
+        self.exit_pending = false;
+        match self.mcp.as_deref() {
+            Some(reg) if !reg.is_empty() => {
+                self.mcp_picker = Some(McpPicker { selected: 0 });
+            }
+            _ => self.add_assistant_notice(
+                "No MCP servers configured. Add one with `ignis mcp add <name> -- <cmd> [args]`."
+                    .to_string(),
+            ),
+        }
+    }
+
+    pub(crate) fn select_mcp_picker(&mut self, direction: SelectionDirection) {
+        let len = self.mcp.as_deref().map(|r| r.len()).unwrap_or(0);
+        if len == 0 {
+            return;
+        }
+        if let Some(picker) = &mut self.mcp_picker {
+            picker.selected = next_selection(picker.selected, len, direction);
+        }
+    }
+
+    /// Toggle the highlighted MCP server. Returns `(name, now_enabled)`.
+    pub(crate) fn toggle_selected_mcp_server(&mut self) -> Option<(String, bool)> {
+        let picker = self.mcp_picker.as_ref()?;
+        let reg = self.mcp.as_deref()?;
+        let name = reg.entries().get(picker.selected)?.name.clone();
+        let now_enabled = reg.toggle(&name);
+        Some((name, now_enabled))
+    }
+
     pub(crate) fn render_session_history(
         &mut self,
         session_id: String,
@@ -926,7 +970,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name.as_ref())
                 .collect::<Vec<_>>(),
-            vec!["/resume", "/clear", "/compact", "/copy", "/model", "/skills"]
+            vec!["/resume", "/clear", "/compact", "/copy", "/model", "/skills", "/mcp"]
         );
     }
 

@@ -100,6 +100,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: Cow::Borrowed("/skills"),
         description: Cow::Borrowed("Manage skills (enable/disable)"),
     },
+    SlashCommand {
+        name: Cow::Borrowed("/mcp"),
+        description: Cow::Borrowed("Manage MCP servers (enable/disable)"),
+    },
 ];
 
 // ==========================================
@@ -279,6 +283,7 @@ pub async fn run_console(
     cwd: PathBuf,
     config: crate::config::Config,
     skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
+    mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
 ) -> Result<(), anyhow::Error> {
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
     // Context windows: config override → cached models.dev → compaction threshold.
@@ -328,6 +333,9 @@ pub async fn run_console(
     let runner_skill_registry = skill_registry.clone();
     app.skills = Some(ui_skill_registry);
 
+    let runner_mcp_registry = mcp_registry.clone();
+    app.mcp = Some(mcp_registry);
+
     // Background agent runner
     tokio::spawn(async move {
         while let Some(request) = prompt_rx.recv().await {
@@ -373,12 +381,26 @@ pub async fn run_console(
             };
             session.set_compaction(agent_config.compaction.clone());
 
-            crate::tools::register_native_tools(&mut session, &agent_cwd, &agent_config);
+            let mcp_for_subagent = if !runner_mcp_registry.is_empty() {
+                Some(runner_mcp_registry.clone())
+            } else {
+                None
+            };
+            crate::tools::register_native_tools_with_mcp(
+                &mut session,
+                &agent_cwd,
+                &agent_config,
+                mcp_for_subagent,
+            );
             if !runner_skill_registry.is_empty() {
                 session.set_skills(runner_skill_registry.clone());
                 session.register_tool(std::sync::Arc::new(crate::tools::SkillTool::new(
                     runner_skill_registry.clone(),
                 )));
+            }
+            if !runner_mcp_registry.is_empty() {
+                session.set_mcp(runner_mcp_registry.clone());
+                crate::tools::register_mcp_tools(&mut session, &runner_mcp_registry);
             }
 
             let notice_msg = |content: &str| Message {
@@ -809,6 +831,31 @@ async fn handle_key(
         }
     }
 
+    if app.mcp_picker.is_some() {
+        match key.code {
+            KeyCode::Up => {
+                app.select_mcp_picker(SelectionDirection::Previous);
+                return;
+            }
+            KeyCode::Down => {
+                app.select_mcp_picker(SelectionDirection::Next);
+                return;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                app.toggle_selected_mcp_server();
+                return;
+            }
+            KeyCode::Esc => {
+                app.mcp_picker = None;
+                return;
+            }
+            KeyCode::Char(_) => {
+                app.mcp_picker = None;
+            }
+            _ => {}
+        }
+    }
+
     match (key.modifiers, key.code) {
         (_, KeyCode::Enter) => {
             let text = if let Some(cmd) = app.selected_slash_command() {
@@ -865,6 +912,8 @@ async fn handle_key(
                     app.show_model_picker();
                 } else if command == "/skills" && arg_count == 1 {
                     app.show_skill_picker();
+                } else if command == "/mcp" && arg_count == 1 {
+                    app.show_mcp_picker();
                 } else if command.starts_with('/')
                     && app
                         .skills
@@ -1030,6 +1079,7 @@ mod slash_skill_tests {
         assert!(names.iter().any(|n| n == "/alpha"));
         assert!(!names.iter().any(|n| n == "/beta")); // disabled
         assert!(names.iter().any(|n| n == "/skills"));
+        assert!(names.iter().any(|n| n == "/mcp"));
         std::fs::remove_dir_all(&tmp).ok();
     }
 

@@ -81,6 +81,12 @@ impl Session {
         self.agent.set_skills(skills);
     }
 
+    /// Apply the shared MCP registry — pairs with `register_mcp_tools` to make
+    /// MCP servers' instructions appear in the system prompt.
+    pub fn set_mcp(&mut self, mcp: std::sync::Arc<crate::mcp::McpRegistry>) {
+        self.agent.set_mcp(mcp);
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }

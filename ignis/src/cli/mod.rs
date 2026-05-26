@@ -1,5 +1,7 @@
 use crate::session::SessionManager;
 
+pub mod mcp;
+
 #[derive(Debug, PartialEq)]
 pub struct CliArgs {
     pub is_tui: bool,
