@@ -423,13 +423,24 @@ fn ask_user_resume_trace(entry: &ToolCallEntry) -> Vec<Line<'static>> {
     };
     let mut out = vec![Line::from("")];
     if is_error {
+        // Distinguish a real cancellation (the tool's literal message) from
+        // other error paths (schema validation, console-closed, headless run,
+        // already-open). Anything that's not the cancellation sentence
+        // preserves the real error text instead of pretending the user
+        // cancelled.
+        let is_cancel = result_text.contains("User cancelled the question");
+        let label = if is_cancel {
+            " · cancelled by user".to_string()
+        } else {
+            format!(" · {}", result_text.trim())
+        };
         out.push(Line::from(vec![
             Span::styled("  ✗ ", Style::default().fg(RED)),
             Span::styled(
                 "ask_user",
                 Style::default().fg(RED).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" · cancelled by user", Style::default().fg(TEXT_DIM)),
+            Span::styled(label, Style::default().fg(TEXT_DIM)),
         ]));
         return out;
     }

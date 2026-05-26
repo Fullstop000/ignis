@@ -16,9 +16,7 @@ use crate::tools::ask_user::{MAX_OTHER_LEN, OTHER_LABEL};
 // The picker reuses the existing app palette. Importing concrete colors
 // here keeps the renderer self-contained; the names mirror the ones in
 // console/app.rs (BG/TEXT/ACCENT/MAUVE/TEXT_DIM).
-use super::{
-    ACCENT, BORDER as BORDER_DIM, GREEN as OK_GREEN, MAUVE, RED as ERR_RED, TEXT, TEXT_DIM,
-};
+use super::{ACCENT, BORDER as BORDER_DIM, MAUVE, TEXT, TEXT_DIM};
 
 /// What `on_key` tells the console to do.
 #[derive(Debug)]
@@ -240,12 +238,11 @@ pub(crate) fn header_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
 /// Blank + footer hint. Shared by both layouts.
 pub(crate) fn footer_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
     let multi = state.is_multi();
+    // When Other has focus, space is routed into the free-text buffer (NOT a
+    // toggle), so the hint must not advertise a toggle key — Other's
+    // inclusion is derived from buffer-non-empty in multi-select mode.
     let footer = if state.other_focused() {
-        if multi {
-            "type text · space toggle · ↵ confirm · esc cancel"
-        } else {
-            "type text · ↵ confirm · esc cancel"
-        }
+        "type text · ↵ confirm · esc cancel"
     } else if multi {
         "↑/↓ navigate · space toggle · ↵ confirm · esc cancel"
     } else {
@@ -563,15 +560,34 @@ pub(crate) fn picker_height(state: &InlinePickerState) -> u16 {
         // Split layout: max(left pane, right pane + border) + header + footer.
         // Left pane = N options (1 row each) + separator + Other = N + 2.
         let left = q.options.len() as u16 + 2;
-        // Right pane = title + (desc if any) + blank + preview lines, plus
-        // the bordered Block adds 2 rows (top + bottom border).
+        // Right pane is ~55% of the inline viewport width, minus the border
+        // padding. At a conservative 80-col terminal that's ≈40 usable cols,
+        // so any long description / preview line wraps to extra rows. Estimate
+        // wrap rows per line at the narrow-terminal bound (40 cols) so the
+        // live band stays generous enough to render without clipping.
+        const PANE_USABLE_COLS: usize = 40;
+        let wrapped = |s: &str| -> u16 {
+            s.lines()
+                .map(|line| {
+                    let cols = line.chars().count();
+                    1u16.max((cols as u16).div_ceil(PANE_USABLE_COLS as u16))
+                })
+                .sum()
+        };
         let max_right_body = q
             .options
             .iter()
             .map(|o| {
-                1 /*title*/
-                    + if o.description.is_empty() { 0 } else { 1 }
-                    + o.preview.as_deref().map_or(0, |p| 1 + p.lines().count() as u16)
+                // 1 title row (may wrap), optional desc (may wrap),
+                // optional preview block (blank + lines, each may wrap).
+                let mut rows: u16 = wrapped(&o.label);
+                if !o.description.is_empty() {
+                    rows += wrapped(&o.description);
+                }
+                if let Some(p) = &o.preview {
+                    rows += 1 /*blank*/ + wrapped(p);
+                }
+                rows
             })
             .max()
             .unwrap_or(1);
@@ -588,49 +604,6 @@ pub(crate) fn picker_height(state: &InlinePickerState) -> u16 {
         let separator: u16 = 1;
         let other_row: u16 = 1;
         header_rows + option_rows + separator + other_row + footer_rows
-    }
-}
-
-/// One-line trace committed to scrollback after the picker closes. Single-line
-/// answers stay on one line; multi answers are joined with ", "; cancellation
-/// gets a red marker.
-pub(crate) fn trace_lines(
-    questions: &[PickerQuestion],
-    response: &PickerResponse,
-) -> Vec<Line<'static>> {
-    match response {
-        PickerResponse::Cancelled => vec![Line::from(vec![
-            Span::styled("  ✗ ", Style::default().fg(ERR_RED)),
-            Span::styled(
-                "ask_user",
-                Style::default().fg(ERR_RED).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · cancelled by user", Style::default().fg(TEXT_DIM)),
-        ])],
-        PickerResponse::Answered(answers) => {
-            let mut out: Vec<Line<'static>> = Vec::with_capacity(answers.len());
-            for (q, a) in questions.iter().zip(answers) {
-                let answer_text = match a {
-                    PickerAnswer::Single(s) => s.clone(),
-                    PickerAnswer::Multi(v) => v.join(", "),
-                };
-                out.push(Line::from(vec![
-                    Span::styled("  ✓ ", Style::default().fg(OK_GREEN)),
-                    Span::styled(
-                        "ask_user",
-                        Style::default().fg(OK_GREEN).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(" · ", Style::default().fg(BORDER_DIM)),
-                    Span::styled(
-                        q.header.clone(),
-                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(": ", Style::default().fg(TEXT_DIM)),
-                    Span::styled(answer_text, Style::default().fg(TEXT)),
-                ]));
-            }
-            out
-        }
     }
 }
 

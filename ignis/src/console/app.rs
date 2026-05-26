@@ -107,12 +107,10 @@ pub(crate) struct App {
     /// a `PickerRequest` arrives on `picker_rx`; cleared after the user picks
     /// or cancels. Unlike the slash pickers, this one is active *while the
     /// agent is running* (Thinking/ToolRunning), and keys go to it
-    /// regardless of mode.
+    /// regardless of mode. After picker close the trace gets committed
+    /// through the normal `UIBlock::Tool` flush path
+    /// (`block_lines` → `ask_user_resume_trace`) — no separate live channel.
     pub(crate) inline_picker: Option<super::inline_picker::InlinePickerState>,
-    /// Trace lines committed to scrollback the next time the main loop flushes
-    /// (after the inline picker closes). `Some` between picker-close and the
-    /// next flush; `None` otherwise.
-    pub(crate) pending_picker_trace: Option<Vec<ratatui::text::Line<'static>>>,
 
     pub(crate) mode: Mode,
     pub(crate) tick: u64,
@@ -183,7 +181,6 @@ impl App {
             skill_picker: None,
             mcp_picker: None,
             inline_picker: None,
-            pending_picker_trace: None,
             mode: Mode::Idle,
             tick: 0,
             stream_start: None,

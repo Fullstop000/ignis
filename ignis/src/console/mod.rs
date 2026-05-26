@@ -568,12 +568,10 @@ pub async fn run_console(
             app.committed += 1;
         }
 
-        // Flush the `ask_user` trace into scrollback after the picker closes,
-        // so the conversation has a permanent record of the question + answer.
-        if let Some(lines) = app.pending_picker_trace.take() {
-            let h = render::block_height(&lines, width).max(1);
-            terminal.insert_before(h, |buf| render::render_block_into(buf, &lines))?;
-        }
+        // The `ask_user` trace is committed via the usual block flush above
+        // (block_lines special-cases UIBlock::Tool{name:"ask_user"} into a
+        // compact trace via ask_user_resume_trace). No separate live-flush
+        // path — that used to double-emit.
 
         // Coalesced redraw of the live band: at most once per frame interval.
         if last_draw.elapsed() >= frame {
@@ -685,23 +683,19 @@ async fn handle_key(
                     if let Some(reply) = picker.reply.take() {
                         let _ = reply.send(PickerResponse::Cancelled);
                     }
-                    app.pending_picker_trace = Some(inline_picker::trace_lines(
-                        &picker.questions,
-                        &PickerResponse::Cancelled,
-                    ));
                 }
             }
             KeyOutcome::Done(answers) => {
                 if let Some(mut picker) = app.inline_picker.take() {
-                    let resp = PickerResponse::Answered(answers);
                     if let Some(reply) = picker.reply.take() {
-                        let _ = reply.send(resp.clone());
+                        let _ = reply.send(PickerResponse::Answered(answers));
                     }
-                    app.pending_picker_trace =
-                        Some(inline_picker::trace_lines(&picker.questions, &resp));
                 }
             }
         }
+        // No live-trace flush: the tool call's UIBlock::Tool will commit through
+        // block_lines → ask_user_resume_trace shortly after this, which renders
+        // the same compact trace. Avoiding the double-emit Codex flagged (P2).
         return;
     }
 
