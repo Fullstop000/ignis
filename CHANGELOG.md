@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-05-26
+
+### Added
+- MCP — connect to user-configured stdio Model Context Protocol servers and expose their tools to the model as `mcp__<server>__<tool>`.
+- `/mcp` — slash command to manage MCP servers (enable/disable).
+- `ignis mcp add | list | get | remove | enable | disable` — CLI to manage MCP servers from outside the TUI.
+
 ## [0.12.0] - 2026-05-26
 
 ### Added
