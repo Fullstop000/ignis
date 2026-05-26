@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::picker::{PickerAnswer, PickerQuestion, PickerRequest, PickerResponse};
+use crate::console::picker::{PickerAnswer, PickerQuestion, PickerRequest, PickerResponse};
 use crate::tools::ask_user::{MAX_OTHER_LEN, OTHER_LABEL};
 
 // The picker reuses the existing app palette. Importing concrete colors
@@ -480,7 +480,7 @@ pub(crate) fn trace_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picker::{PickerOption, PickerQuestion};
+    use crate::console::picker::{PickerOption, PickerQuestion};
 
     fn make_request(
         qs: Vec<PickerQuestion>,

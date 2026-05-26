@@ -66,7 +66,7 @@ pub fn register_native_tools_with_mcp(
     cwd: &Path,
     config: &crate::config::Config,
     mcp: Option<Arc<crate::mcp::McpRegistry>>,
-    picker_tx: Option<tokio::sync::mpsc::Sender<crate::picker::PickerRequest>>,
+    picker_tx: Option<tokio::sync::mpsc::Sender<crate::console::picker::PickerRequest>>,
 ) {
     for tool in native_tools(cwd, config.web_search.clone()) {
         session.register_tool(tool);

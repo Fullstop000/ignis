@@ -114,6 +114,7 @@ pub mod clipboard;
 pub mod highlight;
 pub(crate) mod inline_picker;
 pub mod markdown;
+pub(crate) mod picker;
 pub mod render;
 
 pub(crate) enum AgentRequest {
@@ -323,7 +324,7 @@ pub async fn run_console(
     // Tool → console: the `ask_user` tool sends a PickerRequest when the model
     // wants to ask the user something mid-turn. Capacity 4 — pickers serialize
     // (one open at a time); the buffer just decouples send from console drain.
-    let (picker_tx, mut picker_rx) = mpsc::channel::<crate::picker::PickerRequest>(4);
+    let (picker_tx, mut picker_rx) = mpsc::channel::<crate::console::picker::PickerRequest>(4);
     let picker_tx_runner = picker_tx.clone();
     let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
     let active_inject_runner = active_inject.clone();
@@ -488,7 +489,7 @@ pub async fn run_console(
                 if app.inline_picker.is_some() {
                     // One picker at a time — reject the second so the tool
                     // returns an error instead of stalling.
-                    let _ = req.reply.send(crate::picker::PickerResponse::Cancelled);
+                    let _ = req.reply.send(crate::console::picker::PickerResponse::Cancelled);
                 } else {
                     app.inline_picker = Some(inline_picker::InlinePickerState::new(req));
                 }
@@ -501,7 +502,9 @@ pub async fn run_console(
         }
         while let Ok(req) = picker_rx.try_recv() {
             if app.inline_picker.is_some() {
-                let _ = req.reply.send(crate::picker::PickerResponse::Cancelled);
+                let _ = req
+                    .reply
+                    .send(crate::console::picker::PickerResponse::Cancelled);
             } else {
                 app.inline_picker = Some(inline_picker::InlinePickerState::new(req));
             }
@@ -672,7 +675,7 @@ async fn handle_key(
     // ESC and Ctrl+C — must come before global handlers and the busy-mode
     // gate, because the picker is the only thing the user is interacting with.
     if let Some(state) = app.inline_picker.as_mut() {
-        use crate::picker::PickerResponse;
+        use crate::console::picker::PickerResponse;
         use inline_picker::KeyOutcome;
         let outcome = state.on_key(key);
         match outcome {
