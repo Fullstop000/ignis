@@ -2,6 +2,7 @@ pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod logger;
+pub mod mcp;
 pub mod models;
 pub mod provider;
 pub mod session;
@@ -16,6 +17,7 @@ pub use ignis_macros::tool;
 
 // Crate-root re-exports: the public API surface.
 pub use agent::{Agent, AgentEvent};
+pub use mcp::{McpRegistry, McpServerEntry, McpStatus};
 pub use provider::{Message, ToolCall, ToolCallFunction, Usage};
 pub use session::Session;
 pub use skills::{Skill, SkillRegistry, SkillScope};

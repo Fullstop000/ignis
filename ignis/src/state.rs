@@ -15,6 +15,8 @@ pub struct State {
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_mcp_servers: Vec<String>,
 }
 
 fn state_path() -> Result<std::path::PathBuf, anyhow::Error> {
@@ -61,6 +63,14 @@ pub fn persist_disabled_skills(disabled: &[String]) -> Result<(), anyhow::Error>
     write_state(&state)
 }
 
+/// Persist the disabled-MCP-servers set, preserving every other field
+/// (notably the model selection and disabled-skills set).
+pub fn persist_disabled_mcp_servers(disabled: &[String]) -> Result<(), anyhow::Error> {
+    let mut state = load_state();
+    state.disabled_mcp_servers = disabled.to_vec();
+    write_state(&state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,6 +81,7 @@ mod tests {
             model: Some("deepseek/deepseek-v4-pro".to_string()),
             reasoning_effort: Some("max".to_string()),
             disabled_skills: vec![],
+            disabled_mcp_servers: vec![],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -84,6 +95,7 @@ mod tests {
             model: Some("deepseek/deepseek-v4-pro".to_string()),
             reasoning_effort: None,
             disabled_skills: vec!["a".to_string(), "b".to_string()],
+            disabled_mcp_servers: vec![],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -95,6 +107,23 @@ mod tests {
         let state = State::default();
         let json = serde_json::to_string(&state).unwrap();
         assert!(!json.contains("disabled_skills"));
+        assert!(!json.contains("disabled_mcp_servers"));
+    }
+
+    #[test]
+    fn state_round_trips_disabled_mcp_servers() {
+        let state = State {
+            model: None,
+            reasoning_effort: None,
+            disabled_skills: vec![],
+            disabled_mcp_servers: vec!["github".to_string(), "fs".to_string()],
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.disabled_mcp_servers,
+            vec!["github".to_string(), "fs".to_string()]
+        );
     }
 
     #[test]
@@ -117,6 +146,39 @@ mod tests {
         let s = load_state();
         assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
         assert_eq!(s.disabled_skills.len(), 2);
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn mcp_persist_preserves_model_and_skills() {
+        let _env = crate::util::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = crate::util::unique_temp_dir("ignis-state-mcp-rmw");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        persist_model_selection("deepseek", "deepseek-v4-pro", Some("high")).unwrap();
+        persist_disabled_skills(&["sql-review".to_string()]).unwrap();
+        persist_disabled_mcp_servers(&["github".to_string()]).unwrap();
+        let s = load_state();
+        assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(s.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(s.disabled_skills, vec!["sql-review".to_string()]);
+        assert_eq!(s.disabled_mcp_servers, vec!["github".to_string()]);
+
+        // Re-toggling MCP must not touch model or skills.
+        persist_disabled_mcp_servers(&["github".to_string(), "fs".to_string()]).unwrap();
+        let s = load_state();
+        assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(s.disabled_skills, vec!["sql-review".to_string()]);
+        assert_eq!(s.disabled_mcp_servers.len(), 2);
 
         match prev {
             Some(v) => std::env::set_var("HOME", v),

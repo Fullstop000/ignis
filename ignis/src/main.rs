@@ -10,7 +10,19 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Parse arguments
-    let cli = parse_cli_args(std::env::args().skip(1).collect());
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+
+    // The `mcp` subcommand has its own clap parser; route it before the
+    // hand-rolled session arg parser ever sees it.
+    if raw_args.first().map(|s| s.as_str()) == Some("mcp") {
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+        if let Err(e) = ignis::logger::init(&home.join(".ignis/logs")) {
+            eprintln!("Failed to initialize logger: {}", e);
+        }
+        return ignis::cli::mcp::run(raw_args.into_iter().skip(1).collect()).await;
+    }
+
+    let cli = parse_cli_args(raw_args);
     let is_oneshot = !cli.is_tui && !cli.prompt_args.is_empty();
 
     // 1. Load config
@@ -34,15 +46,20 @@ async fn main() -> Result<(), anyhow::Error> {
     let system_prompt = ignis::agent::build_system_prompt(&cwd);
 
     // Discover skills (global + project roots) and read the disabled set.
-    let disabled_skills: std::collections::HashSet<String> = ignis::state::load_state()
-        .disabled_skills
-        .into_iter()
-        .collect();
+    let state = ignis::state::load_state();
+    let disabled_skills: std::collections::HashSet<String> =
+        state.disabled_skills.iter().cloned().collect();
     let skill_registry = std::sync::Arc::new(ignis::skills::SkillRegistry::load(
         Some(&home),
         &cwd,
         disabled_skills,
     ));
+
+    // Spawn MCP servers (in parallel; each bounded by its `startup_timeout_secs`).
+    // Failures don't block ignis — they surface in `/mcp` and `ignis mcp list`.
+    let disabled_mcp: std::collections::HashSet<String> =
+        state.disabled_mcp_servers.iter().cloned().collect();
+    let mcp_registry = ignis::mcp::McpRegistry::spawn_all(&config.mcp.servers, disabled_mcp).await;
 
     let active_provider = config
         .active_provider()
@@ -62,6 +79,7 @@ async fn main() -> Result<(), anyhow::Error> {
             cwd,
             config,
             skill_registry.clone(),
+            mcp_registry.clone(),
         )
         .await;
     }
@@ -84,12 +102,21 @@ async fn main() -> Result<(), anyhow::Error> {
     session.set_compaction(config.compaction.clone());
 
     // Register tools
-    ignis::tools::register_native_tools(&mut session, &cwd, &config);
+    let mcp_for_subagent = if !mcp_registry.is_empty() {
+        Some(mcp_registry.clone())
+    } else {
+        None
+    };
+    ignis::tools::register_native_tools_with_mcp(&mut session, &cwd, &config, mcp_for_subagent);
     if !skill_registry.is_empty() {
         session.set_skills(skill_registry.clone());
         session.register_tool(std::sync::Arc::new(ignis::tools::SkillTool::new(
             skill_registry.clone(),
         )));
+    }
+    if !mcp_registry.is_empty() {
+        session.set_mcp(mcp_registry.clone());
+        ignis::tools::register_mcp_tools(&mut session, &mcp_registry);
     }
 
     // Run prompt

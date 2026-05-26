@@ -1,9 +1,11 @@
 use crate::agent::Agent;
 use crate::config::Config;
+use crate::mcp::McpRegistry;
 use crate::{AgentTool, Message, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const SUBAGENT_SYSTEM_PROMPT: &str =
     "You are a focused sub-agent spawned to complete one self-contained task. \
@@ -17,6 +19,9 @@ const SUBAGENT_SYSTEM_PROMPT: &str =
 pub struct SubagentTool {
     config: Config,
     cwd: PathBuf,
+    /// Shared with the parent — subagents see the same connected MCP servers
+    /// and their tools (as `mcp__<server>__<tool>`).
+    mcp: Option<Arc<McpRegistry>>,
 }
 
 impl SubagentTool {
@@ -24,7 +29,13 @@ impl SubagentTool {
         Self {
             config,
             cwd: cwd.to_path_buf(),
+            mcp: None,
         }
+    }
+
+    pub fn with_mcp(mut self, mcp: Arc<McpRegistry>) -> Self {
+        self.mcp = Some(mcp);
+        self
     }
 }
 
@@ -64,6 +75,13 @@ impl AgentTool for SubagentTool {
         // Same toolset as the main agent, minus `agent` itself — no recursion.
         for tool in super::native_tools(&self.cwd, self.config.web_search.clone()) {
             agent.register_tool(tool);
+        }
+        // Inherit MCP tools and their server-instructions from the parent.
+        if let Some(mcp) = &self.mcp {
+            for wrapper in mcp.wrappers() {
+                agent.register_tool(wrapper as Arc<dyn AgentTool>);
+            }
+            agent.set_mcp(mcp.clone());
         }
 
         let mut history = vec![Message {

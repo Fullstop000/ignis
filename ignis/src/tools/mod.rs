@@ -52,10 +52,33 @@ pub fn register_native_tools(
     cwd: &Path,
     config: &crate::config::Config,
 ) {
+    register_native_tools_with_mcp(session, cwd, config, None)
+}
+
+/// Same as `register_native_tools` but also threads a shared MCP registry into
+/// the `SubagentTool` so sub-agents inherit MCP tools.
+pub fn register_native_tools_with_mcp(
+    session: &mut crate::Session,
+    cwd: &Path,
+    config: &crate::config::Config,
+    mcp: Option<Arc<crate::mcp::McpRegistry>>,
+) {
     for tool in native_tools(cwd, config.web_search.clone()) {
         session.register_tool(tool);
     }
     // The `agent` tool builds sub-agents from the config; registered only at the
     // top level so sub-agents can't recurse.
-    session.register_tool(Arc::new(SubagentTool::new(config.clone(), cwd)));
+    let mut subagent = SubagentTool::new(config.clone(), cwd);
+    if let Some(mcp) = mcp {
+        subagent = subagent.with_mcp(mcp);
+    }
+    session.register_tool(Arc::new(subagent));
+}
+
+/// Register every tool exposed by a connected MCP server as an `AgentTool`.
+/// Disabled or failed servers contribute nothing — the registry knows.
+pub fn register_mcp_tools(session: &mut crate::Session, registry: &crate::mcp::McpRegistry) {
+    for wrapper in registry.wrappers() {
+        session.register_tool(wrapper as Arc<dyn AgentTool>);
+    }
 }

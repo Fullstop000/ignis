@@ -9,7 +9,8 @@ use std::path::Path;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    App, Mode, ModelPicker, SessionPicker, SkillPicker, ToolCallEntry, ToolStatus, UIBlock,
+    App, McpPicker, Mode, ModelPicker, SessionPicker, SkillPicker, ToolCallEntry, ToolStatus,
+    UIBlock,
 };
 use super::markdown::render_md_block;
 use super::{
@@ -75,6 +76,10 @@ pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
         let rows = app.skills.as_deref().map(|r| r.all().len()).unwrap_or(0) as u16 + 4;
         return rows.clamp(4, cap);
     }
+    if app.mcp_picker.is_some() {
+        let rows = app.mcp.as_deref().map(|r| r.len()).unwrap_or(0) as u16 + 4;
+        return rows.clamp(4, cap);
+    }
     let input_h = input_height(app, cap);
     let sugg = app.slash_suggestions();
     let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
@@ -97,7 +102,11 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
     // Modal pickers own the whole live band.
-    if app.model_picker.is_some() || app.session_picker.is_some() || app.skill_picker.is_some() {
+    if app.model_picker.is_some()
+        || app.session_picker.is_some()
+        || app.skill_picker.is_some()
+        || app.mcp_picker.is_some()
+    {
         let mut lines: Vec<Line> = Vec::new();
         if let Some(picker) = &app.model_picker {
             render_model_picker(&mut lines, picker, &app.model_options);
@@ -107,6 +116,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
             // Rows available for skill items = band minus header (2) + footer (1).
             let max_rows = (size.height as usize).saturating_sub(3).max(1);
             render_skill_picker(&mut lines, picker, app.skills.as_deref(), max_rows);
+        } else if let Some(picker) = &app.mcp_picker {
+            let max_rows = (size.height as usize).saturating_sub(3).max(1);
+            render_mcp_picker(&mut lines, picker, app.mcp.as_deref(), max_rows);
         }
         f.render_widget(
             Paragraph::new(Text::from(lines))
@@ -594,6 +606,63 @@ pub(crate) fn render_skill_picker(
                 style.add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!(" {}  ({scope})", truncate(&desc, 40)), style),
+        ]));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  Up/Down to move, Space/Enter to toggle, Esc to close.",
+        Style::default().fg(TEXT_DIM),
+    )));
+}
+
+pub(crate) fn render_mcp_picker(
+    lines: &mut Vec<Line<'static>>,
+    picker: &McpPicker,
+    registry: Option<&crate::mcp::McpRegistry>,
+    max_rows: usize,
+) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ◆ ", Style::default().fg(MAUVE)),
+        Span::styled(
+            "Manage MCP servers",
+            Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let Some(reg) = registry else { return };
+    let entries = reg.entries();
+    let sel = picker.selected.min(entries.len().saturating_sub(1));
+    let visible = max_rows.max(1);
+    let start = slash_window_start(sel, visible, entries.len());
+    let end = (start + visible).min(entries.len());
+    for (idx, entry) in entries.iter().enumerate().take(end).skip(start) {
+        let selected = idx == sel;
+        let marker = if selected { ">" } else { " " };
+        let check = match entry.status {
+            crate::mcp::McpStatus::Disabled => "[ ]",
+            _ => "[x]",
+        };
+        let style = if selected {
+            Style::default().fg(BG).bg(ACCENT)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        let status_style = match entry.status {
+            crate::mcp::McpStatus::Failed { .. } => style.fg(if selected { BG } else { RED }),
+            crate::mcp::McpStatus::Disabled => style.fg(if selected { BG } else { TEXT_DIM }),
+            _ => style.fg(if selected { BG } else { GREEN }),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {marker} {check} "),
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<14}", truncate(&entry.name, 14)),
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {}", entry.status.label()), status_style),
         ]));
     }
 
