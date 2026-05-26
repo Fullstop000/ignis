@@ -1,0 +1,407 @@
+//! `ask_user` — model-initiated interactive picker. The tool builds a
+//! [`PickerRequest`] from the model's JSON args, sends it to the console over
+//! the shared mpsc channel, and `await`s the user's response on a oneshot.
+//!
+//! Designed to be the *only* primitive in the agent loop that pauses on user
+//! input mid-turn. Without an attached channel the tool is a no-op (returns an
+//! error explaining the situation); this keeps subagents and one-shot CLI runs
+//! safe to construct even when no TUI is wired up.
+use crate::picker::{PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse};
+use crate::{AgentTool, ToolResult};
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot};
+
+/// Hard limits on header chip length and free-text "Other" answers. These are
+/// guard-rails against either the model or the user blowing up the picker.
+pub(crate) const MAX_HEADER_LEN: usize = 12;
+/// Cap on the free-text "Other" answer (bytes). 4 KiB is plenty for the
+/// purpose and prevents paste-bombing the model.
+pub const MAX_OTHER_LEN: usize = 4096;
+/// The auto-appended free-text option's label.
+pub const OTHER_LABEL: &str = "Other (type custom)…";
+
+pub struct AskUserTool {
+    /// `None` when no console is attached (e.g. one-shot CLI, subagent in a
+    /// non-TUI context) — `call` returns is_error explaining that.
+    picker_tx: Option<mpsc::Sender<PickerRequest>>,
+}
+
+impl AskUserTool {
+    pub fn new(picker_tx: Option<mpsc::Sender<PickerRequest>>) -> Self {
+        Self { picker_tx }
+    }
+}
+
+#[async_trait]
+impl AgentTool for AskUserTool {
+    fn name(&self) -> &str {
+        "ask_user"
+    }
+
+    fn description(&self) -> &str {
+        "Ask the user one or more questions and wait for their pick. \
+         Reserve this for decisions whose answer changes your next action \
+         (disambiguating a request, choosing between concrete approaches, \
+         confirming irreversible actions). Do NOT use it for things you can \
+         verify yourself or for casual chit-chat. Each question gets 2–4 \
+         options; an 'Other (type custom)' option is appended automatically \
+         so the user can always free-text. To recommend an option, put it \
+         first and append ' (Recommended)' to its label."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "description": "1-4 questions to ask in sequence.",
+                    "items": {
+                        "type": "object",
+                        "required": ["question", "header", "options"],
+                        "properties": {
+                            "question":    { "type": "string", "description": "The complete question text." },
+                            "header":      { "type": "string", "description": "Short chip label (≤12 chars)." },
+                            "multiSelect": { "type": "boolean", "default": false, "description": "true for space-to-toggle multi-select." },
+                            "options": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 4,
+                                "description": "2-4 distinct options (an 'Other' free-text row is added automatically).",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["label", "description"],
+                                    "properties": {
+                                        "label":       { "type": "string", "description": "1-5 word display text." },
+                                        "description": { "type": "string", "description": "Context explaining the choice." },
+                                        "preview":     { "type": "string", "description": "Optional multi-line code/ASCII shown when this row has focus." }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "required": ["questions"]
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let questions = match parse_questions(&args) {
+            Ok(q) => q,
+            Err(e) => return ToolResult::error(format!("ask_user: {e}")),
+        };
+
+        let Some(tx) = &self.picker_tx else {
+            return ToolResult::error(
+                "ask_user: no interactive console is attached (running headless?). \
+                 Ask the user in prose instead."
+                    .to_string(),
+            );
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let request = PickerRequest {
+            questions: questions.clone(),
+            reply: reply_tx,
+        };
+        if tx.send(request).await.is_err() {
+            return ToolResult::error(
+                "ask_user: console closed before the question opened.".to_string(),
+            );
+        }
+        let response = match reply_rx.await {
+            Ok(r) => r,
+            Err(_) => {
+                return ToolResult::error(
+                    "ask_user: session closed before the user answered.".to_string(),
+                )
+            }
+        };
+
+        match response {
+            PickerResponse::Cancelled => {
+                ToolResult::error("User cancelled the question.".to_string())
+            }
+            PickerResponse::Answered(answers) => format_answers(&questions, &answers),
+        }
+    }
+}
+
+/// Parse + validate the `questions` array. Header length is truncated
+/// silently (it's cosmetic). "Other" is *not* added here — that's the
+/// console's responsibility so changing the label doesn't fork.
+pub(crate) fn parse_questions(args: &Value) -> Result<Vec<PickerQuestion>, String> {
+    let arr = args
+        .get("questions")
+        .and_then(Value::as_array)
+        .ok_or("'questions' must be an array")?;
+    if !(1..=4).contains(&arr.len()) {
+        return Err(format!(
+            "'questions' must have 1-4 items, got {}",
+            arr.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, q) in arr.iter().enumerate() {
+        let question = q
+            .get("question")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("question[{i}].question must be a string"))?
+            .to_string();
+        if question.trim().is_empty() {
+            return Err(format!("question[{i}].question must be non-empty"));
+        }
+        let raw_header = q
+            .get("header")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("question[{i}].header must be a string"))?;
+        // Truncate by char-count, not byte index, so multi-byte chars stay valid.
+        let header: String = raw_header.chars().take(MAX_HEADER_LEN).collect();
+        let multi_select = q
+            .get("multiSelect")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let opts_arr = q
+            .get("options")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("question[{i}].options must be an array"))?;
+        if !(2..=4).contains(&opts_arr.len()) {
+            return Err(format!(
+                "question[{i}].options must have 2-4 items, got {}",
+                opts_arr.len()
+            ));
+        }
+        let mut options = Vec::with_capacity(opts_arr.len());
+        for (j, o) in opts_arr.iter().enumerate() {
+            let label = o
+                .get("label")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("question[{i}].options[{j}].label must be a string"))?
+                .to_string();
+            if label.trim().is_empty() {
+                return Err(format!(
+                    "question[{i}].options[{j}].label must be non-empty"
+                ));
+            }
+            let description = o
+                .get("description")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("question[{i}].options[{j}].description must be a string"))?
+                .to_string();
+            let preview = o.get("preview").and_then(Value::as_str).map(str::to_string);
+            options.push(PickerOption {
+                label,
+                description,
+                preview,
+            });
+        }
+        out.push(PickerQuestion {
+            question,
+            header,
+            multi_select,
+            options,
+        });
+    }
+    Ok(out)
+}
+
+/// Build the JSON result the model sees: `{"answers": [{"question": ..., "answer": ...}, ...]}`.
+/// Single-select → string, multi-select → array. Lengths must already match.
+fn format_answers(questions: &[PickerQuestion], answers: &[PickerAnswer]) -> ToolResult {
+    if questions.len() != answers.len() {
+        return ToolResult::error(format!(
+            "ask_user: internal answer count mismatch ({} questions, {} answers)",
+            questions.len(),
+            answers.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(questions.len());
+    for (q, a) in questions.iter().zip(answers) {
+        let answer_val = match a {
+            PickerAnswer::Single(s) => Value::String(s.clone()),
+            PickerAnswer::Multi(v) => Value::Array(v.iter().cloned().map(Value::String).collect()),
+        };
+        out.push(json!({
+            "question": q.question,
+            "answer": answer_val,
+        }));
+    }
+    ToolResult::ok(json!({ "answers": out }).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn q(question: &str, header: &str, multi: bool, opts: &[(&str, &str)]) -> Value {
+        json!({
+            "question": question,
+            "header": header,
+            "multiSelect": multi,
+            "options": opts.iter().map(|(l, d)| json!({"label": l, "description": d})).collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn parse_rejects_zero_or_five_questions() {
+        assert!(parse_questions(&json!({"questions": []})).is_err());
+        let five = (0..5)
+            .map(|_| q("q", "h", false, &[("a", "A"), ("b", "B")]))
+            .collect::<Vec<_>>();
+        assert!(parse_questions(&json!({ "questions": five })).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_one_or_five_options() {
+        let one = q("Q?", "h", false, &[("a", "A")]);
+        assert!(parse_questions(&json!({"questions": [one]})).is_err());
+        let five = q(
+            "Q?",
+            "h",
+            false,
+            &[("a", "A"), ("b", "B"), ("c", "C"), ("d", "D"), ("e", "E")],
+        );
+        assert!(parse_questions(&json!({"questions": [five]})).is_err());
+    }
+
+    #[test]
+    fn parse_truncates_long_header() {
+        let one = q(
+            "Q?",
+            "this-header-is-way-too-long",
+            false,
+            &[("a", "A"), ("b", "B")],
+        );
+        let qs = parse_questions(&json!({"questions": [one]})).unwrap();
+        assert_eq!(qs[0].header.chars().count(), MAX_HEADER_LEN);
+    }
+
+    #[test]
+    fn parse_accepts_minimal_valid_payload_and_preview() {
+        let payload = json!({
+            "questions": [{
+                "question": "Pick one?",
+                "header": "Choice",
+                "options": [
+                    {"label": "alpha", "description": "first", "preview": "// alpha\nfoo"},
+                    {"label": "beta",  "description": "second"}
+                ]
+            }]
+        });
+        let qs = parse_questions(&payload).unwrap();
+        assert_eq!(qs.len(), 1);
+        assert!(!qs[0].multi_select);
+        assert_eq!(qs[0].options[0].preview.as_deref(), Some("// alpha\nfoo"));
+        assert_eq!(qs[0].options[1].preview, None);
+    }
+
+    #[test]
+    fn parse_rejects_empty_question_or_label() {
+        let bad_q = q("   ", "h", false, &[("a", "A"), ("b", "B")]);
+        assert!(parse_questions(&json!({"questions": [bad_q]})).is_err());
+        let bad_l = json!({
+            "question": "Q?", "header": "h", "options": [
+                {"label": "", "description": "x"}, {"label": "b", "description": "y"}
+            ]
+        });
+        assert!(parse_questions(&json!({"questions": [bad_l]})).is_err());
+    }
+
+    #[test]
+    fn format_single_answer_is_string() {
+        let qs = parse_questions(
+            &json!({"questions": [q("Q?", "h", false, &[("a", "A"), ("b", "B")])]}),
+        )
+        .unwrap();
+        let res = format_answers(&qs, &[PickerAnswer::Single("a".to_string())]);
+        let v: Value = serde_json::from_str(&res.content).unwrap();
+        assert_eq!(v["answers"][0]["answer"], Value::String("a".to_string()));
+        assert!(!res.is_error);
+    }
+
+    #[test]
+    fn format_multi_answer_is_array() {
+        let qs =
+            parse_questions(&json!({"questions": [q("Q?", "h", true, &[("a", "A"), ("b", "B")])]}))
+                .unwrap();
+        let res = format_answers(
+            &qs,
+            &[PickerAnswer::Multi(vec!["a".to_string(), "b".to_string()])],
+        );
+        let v: Value = serde_json::from_str(&res.content).unwrap();
+        assert_eq!(v["answers"][0]["answer"], json!(["a", "b"]));
+    }
+
+    #[tokio::test]
+    async fn no_picker_channel_returns_helpful_error() {
+        let tool = AskUserTool::new(None);
+        let res = tool
+            .call(json!({"questions": [q("Q?", "h", false, &[("a", "A"), ("b", "B")])]}))
+            .await;
+        assert!(res.is_error);
+        assert!(res.content.contains("no interactive console"));
+    }
+
+    #[tokio::test]
+    async fn invalid_args_return_is_error_before_sending() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let tool = AskUserTool::new(Some(tx));
+        let res = tool.call(json!({"questions": []})).await;
+        assert!(res.is_error);
+        assert!(rx.try_recv().is_err(), "no request should have been sent");
+    }
+
+    #[tokio::test]
+    async fn round_trip_single_select() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let tool = AskUserTool::new(Some(tx));
+        let call = tokio::spawn(async move {
+            tool.call(json!({"questions": [q("Pick?", "h", false, &[("yes", "y"), ("no", "n")])]}))
+                .await
+        });
+        let req = rx.recv().await.unwrap();
+        req.reply
+            .send(PickerResponse::Answered(vec![PickerAnswer::Single(
+                "yes".to_string(),
+            )]))
+            .unwrap();
+        let res = call.await.unwrap();
+        assert!(!res.is_error);
+        let v: Value = serde_json::from_str(&res.content).unwrap();
+        assert_eq!(v["answers"][0]["answer"], "yes");
+    }
+
+    #[tokio::test]
+    async fn cancel_returns_is_error() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let tool = AskUserTool::new(Some(tx));
+        let call = tokio::spawn(async move {
+            tool.call(json!({"questions": [q("Pick?", "h", false, &[("a", "A"), ("b", "B")])]}))
+                .await
+        });
+        let req = rx.recv().await.unwrap();
+        req.reply.send(PickerResponse::Cancelled).unwrap();
+        let res = call.await.unwrap();
+        assert!(res.is_error);
+        assert!(res.content.contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn dropped_reply_is_session_closed_error() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let tool = AskUserTool::new(Some(tx));
+        let call = tokio::spawn(async move {
+            tool.call(json!({"questions": [q("Pick?", "h", false, &[("a", "A"), ("b", "B")])]}))
+                .await
+        });
+        let req = rx.recv().await.unwrap();
+        drop(req.reply);
+        let res = call.await.unwrap();
+        assert!(res.is_error);
+        assert!(res.content.contains("session closed"));
+    }
+}

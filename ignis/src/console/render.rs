@@ -64,6 +64,11 @@ pub(crate) fn queued_region_height(app: &App) -> u16 {
 /// suggestions, and the modal pickers, and collapses to a tidy strip at rest.
 pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
     let cap = term_rows.saturating_sub(1).max(3);
+    // `ask_user` runs while busy and owns the whole live band, same as the
+    // slash pickers.
+    if let Some(p) = &app.inline_picker {
+        return super::inline_picker::picker_height(p).clamp(4, cap);
+    }
     if app.model_picker.is_some() {
         let rows = app.model_options.len() as u16 + 4;
         return rows.clamp(4, cap);
@@ -106,9 +111,12 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         || app.session_picker.is_some()
         || app.skill_picker.is_some()
         || app.mcp_picker.is_some()
+        || app.inline_picker.is_some()
     {
         let mut lines: Vec<Line> = Vec::new();
-        if let Some(picker) = &app.model_picker {
+        if let Some(picker) = &app.inline_picker {
+            super::inline_picker::render_inline_picker(&mut lines, picker);
+        } else if let Some(picker) = &app.model_picker {
             render_model_picker(&mut lines, picker, &app.model_options);
         } else if let Some(picker) = &app.session_picker {
             render_session_picker(&mut lines, picker);
@@ -198,6 +206,12 @@ pub(crate) fn block_lines(
             }
         }
         UIBlock::Tool(entry) => {
+            // The `ask_user` tool has its own purpose-built scrollback line
+            // (`inline_picker::trace_lines`); the generic tool block would
+            // dump the raw JSON args+result and double up on the same event.
+            if entry.name == "ask_user" {
+                return lines;
+            }
             let mut raw: Vec<Line<'static>> = Vec::new();
             render_tool_block(&mut raw, entry, tick, cwd, width);
             for line in raw {

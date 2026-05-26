@@ -112,6 +112,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 pub mod app;
 pub mod clipboard;
 pub mod highlight;
+pub mod inline_picker;
 pub mod markdown;
 pub mod render;
 
@@ -319,6 +320,11 @@ pub async fn run_console(
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
     let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
+    // Tool → console: the `ask_user` tool sends a PickerRequest when the model
+    // wants to ask the user something mid-turn. Capacity 4 — pickers serialize
+    // (one open at a time); the buffer just decouples send from console drain.
+    let (picker_tx, mut picker_rx) = mpsc::channel::<crate::picker::PickerRequest>(4);
+    let picker_tx_runner = picker_tx.clone();
     let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
     let active_inject_runner = active_inject.clone();
     let session_manager = SessionManager::new(storage_dir.clone());
@@ -391,6 +397,7 @@ pub async fn run_console(
                 &agent_cwd,
                 &agent_config,
                 mcp_for_subagent,
+                Some(picker_tx_runner.clone()),
             );
             if !runner_skill_registry.is_empty() {
                 session.set_skills(runner_skill_registry.clone());
@@ -472,15 +479,32 @@ pub async fn run_console(
     terminal.draw(|f| draw(f, &mut app))?;
 
     loop {
-        // Wake on either the next frame deadline or an incoming agent event.
+        // Wake on the next frame deadline, an agent event, or an `ask_user`
+        // picker request from a tool.
         tokio::select! {
             _ = tokio::time::sleep(frame) => {}
             Some(ev) = agent_rx.recv() => app.handle_event(ev),
+            Some(req) = picker_rx.recv() => {
+                if app.inline_picker.is_some() {
+                    // One picker at a time — reject the second so the tool
+                    // returns an error instead of stalling.
+                    let _ = req.reply.send(crate::picker::PickerResponse::Cancelled);
+                } else {
+                    app.inline_picker = Some(inline_picker::InlinePickerState::new(req));
+                }
+            }
         }
 
         // Drain any other pending agent events and key input — state only, no draw.
         while let Ok(ev) = agent_rx.try_recv() {
             app.handle_event(ev);
+        }
+        while let Ok(req) = picker_rx.try_recv() {
+            if app.inline_picker.is_some() {
+                let _ = req.reply.send(crate::picker::PickerResponse::Cancelled);
+            } else {
+                app.inline_picker = Some(inline_picker::InlinePickerState::new(req));
+            }
         }
 
         // Edge-triggered: exactly one queued prompt per turn-end (AgentEnd).
@@ -539,6 +563,13 @@ pub async fn run_console(
                 terminal.insert_before(h, |buf| render::render_block_into(buf, &lines))?;
             }
             app.committed += 1;
+        }
+
+        // Flush the `ask_user` trace into scrollback after the picker closes,
+        // so the conversation has a permanent record of the question + answer.
+        if let Some(lines) = app.pending_picker_trace.take() {
+            let h = render::block_height(&lines, width).max(1);
+            terminal.insert_before(h, |buf| render::render_block_into(buf, &lines))?;
         }
 
         // Coalesced redraw of the live band: at most once per frame interval.
@@ -637,6 +668,40 @@ async fn handle_key(
     session_manager: &SessionManager,
     storage_dir: &std::path::Path,
 ) {
+    // Inline (tool-initiated) picker captures ALL keys while open, including
+    // ESC and Ctrl+C — must come before global handlers and the busy-mode
+    // gate, because the picker is the only thing the user is interacting with.
+    if let Some(state) = app.inline_picker.as_mut() {
+        use crate::picker::PickerResponse;
+        use inline_picker::KeyOutcome;
+        let outcome = state.on_key(key);
+        match outcome {
+            KeyOutcome::Continue => {}
+            KeyOutcome::Cancel => {
+                if let Some(mut picker) = app.inline_picker.take() {
+                    if let Some(reply) = picker.reply.take() {
+                        let _ = reply.send(PickerResponse::Cancelled);
+                    }
+                    app.pending_picker_trace = Some(inline_picker::trace_lines(
+                        &picker.questions,
+                        &PickerResponse::Cancelled,
+                    ));
+                }
+            }
+            KeyOutcome::Done(answers) => {
+                if let Some(mut picker) = app.inline_picker.take() {
+                    let resp = PickerResponse::Answered(answers);
+                    if let Some(reply) = picker.reply.take() {
+                        let _ = reply.send(resp.clone());
+                    }
+                    app.pending_picker_trace =
+                        Some(inline_picker::trace_lines(&picker.questions, &resp));
+                }
+            }
+        }
+        return;
+    }
+
     // Global
     match (key.modifiers, key.code) {
         (_, KeyCode::Esc) => {
