@@ -49,7 +49,12 @@ impl AgentTool for AskUserTool {
          verify yourself or for casual chit-chat. Each question gets 2–4 \
          options; an 'Other (type custom)' option is appended automatically \
          so the user can always free-text. To recommend an option, put it \
-         first and append ' (Recommended)' to its label."
+         first and append ' (Recommended)' to its label. \
+         Use 'preview' on an option ONLY for design-style choices where the \
+         user benefits from SEEING the alternative (UI layouts, code \
+         snippets, ASCII diagrams, diffs). The presence of 'preview' on any \
+         option flips the picker into a side-by-side layout — leave it off \
+         for plain text-only choices."
     }
 
     fn execution_mode(&self) -> ExecutionMode {
@@ -87,7 +92,7 @@ impl AgentTool for AskUserTool {
                                     "properties": {
                                         "label":       { "type": "string", "description": "1-5 word display text." },
                                         "description": { "type": "string", "description": "Context explaining the choice." },
-                                        "preview":     { "type": "string", "description": "Optional multi-line code/ASCII shown when this row has focus." }
+                                        "preview":     { "type": "string", "description": "Optional multi-line code/ASCII/mockup. Triggers a side-by-side picker layout (option list left, bordered Preview pane right). Use ONLY for visual/design choices the user benefits from seeing; skip for plain text decisions." }
                                     }
                                 }
                             }

@@ -95,13 +95,14 @@ impl InlinePickerState {
     pub(crate) fn other_focused(&self) -> bool {
         self.cursor == self.current_question().options.len()
     }
-    /// Highlighted option's preview text, if any. Returns None when Other is
-    /// focused (Other has no preview).
-    pub(crate) fn focused_preview(&self) -> Option<&str> {
-        let q = self.current_question();
-        q.options
-            .get(self.cursor)
-            .and_then(|o| o.preview.as_deref())
+    /// True if any option in the current question carries a `preview` field.
+    /// Triggers the split layout — the preview block lives in a bordered pane
+    /// on the right, with the option list on the left.
+    pub(crate) fn has_any_preview(&self) -> bool {
+        self.current_question()
+            .options
+            .iter()
+            .any(|o| o.preview.is_some())
     }
 
     /// Apply a key event; returns what the caller should do.
@@ -208,34 +209,58 @@ impl InlinePickerState {
 
 // ---------- renderer ----------
 
-/// Lines for the picker band (used by render::draw when inline_picker is open).
-pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &InlinePickerState) {
+/// Blank + header strip + question. Used by both layouts (single-column and
+/// split-with-preview) so they share an identical top section.
+pub(crate) fn header_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
     let q = state.current_question();
-    // Header strip
     let progress = if state.total() > 1 {
         format!(" · {}/{}", state.current_index() + 1, state.total())
     } else {
         String::new()
     };
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("◆ ", Style::default().fg(MAUVE)),
-        Span::styled(
-            "ask_user",
-            Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" · ", Style::default().fg(TEXT_DIM)),
-        Span::styled(
-            q.header.clone(),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(progress, Style::default().fg(TEXT_DIM)),
-    ]));
-    // Question text — kept tight against the options it controls.
-    lines.push(Line::from(Span::styled(
-        q.question.clone(),
-        Style::default().fg(TEXT),
-    )));
+    vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("◆ ", Style::default().fg(MAUVE)),
+            Span::styled(
+                "ask_user",
+                Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · ", Style::default().fg(TEXT_DIM)),
+            Span::styled(
+                q.header.clone(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(progress, Style::default().fg(TEXT_DIM)),
+        ]),
+        Line::from(Span::styled(q.question.clone(), Style::default().fg(TEXT))),
+    ]
+}
+
+/// Blank + footer hint. Shared by both layouts.
+pub(crate) fn footer_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
+    let multi = state.is_multi();
+    let footer = if state.other_focused() {
+        if multi {
+            "type text · space toggle · ↵ confirm · esc cancel"
+        } else {
+            "type text · ↵ confirm · esc cancel"
+        }
+    } else if multi {
+        "↑/↓ navigate · space toggle · ↵ confirm · esc cancel"
+    } else {
+        "↑/↓ navigate · ↵ select · esc cancel"
+    };
+    vec![
+        Line::from(""),
+        Line::from(Span::styled(footer, Style::default().fg(TEXT_DIM))),
+    ]
+}
+
+/// Lines for the picker band (used by render::draw when inline_picker is open).
+pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &InlinePickerState) {
+    let q = state.current_question();
+    lines.extend(header_lines(state));
 
     // Options (CC-style stacked: title row + description row indented).
     // Everything sits flush left to match CC's reference layout — no extra
@@ -350,48 +375,152 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
     }
     lines.push(Line::from(other_spans));
 
-    // Preview block when the highlighted option has one — rendered below
-    // (no split pane) so it doesn't fight the option list for width. Open
-    // with a labeled horizontal rule (`── Preview ──`) so it reads as a
-    // distinct sub-section, then dim-color the code body. Leading
-    // whitespace is its own plain span to keep alignment consistent with
-    // the title rows (matching col 2 for the visual gutter).
-    if let Some(preview) = state.focused_preview() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("─── ", Style::default().fg(BORDER_DIM)),
-            Span::styled(
-                "Preview",
-                Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" ", Style::default()),
-            Span::styled("─".repeat(34), Style::default().fg(BORDER_DIM)),
-        ]));
+    // Footer
+    lines.extend(footer_lines(state));
+}
+
+/// Left-pane lines for the SPLIT layout (when at least one option has a
+/// `preview`). Descriptions move to the right pane to keep the option list
+/// compact — the focused option's full detail shows there.
+pub(crate) fn options_pane_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
+    let q = state.current_question();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let opts_n = q.options.len();
+    let cursor = state.cursor();
+    let multi = state.is_multi();
+    let max_number_width = (opts_n + 1).to_string().len();
+    for (idx, opt) in q.options.iter().enumerate() {
+        let selected = idx == cursor;
+        let (clean_label, recommended) = split_recommended(&opt.label);
+        let cursor_glyph = if selected { "> " } else { "  " };
+        let number_str = format!("{:>w$}. ", idx + 1, w = max_number_width);
+        let title_color = if selected { ACCENT } else { TEXT };
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::styled(cursor_glyph, Style::default().fg(ACCENT)),
+            Span::styled(number_str, Style::default().fg(TEXT_DIM)),
+        ];
+        if multi {
+            let cb = if state.is_toggled(idx) {
+                "[x] "
+            } else {
+                "[ ] "
+            };
+            spans.push(Span::styled(cb, Style::default().fg(TEXT_DIM)));
+        }
+        spans.push(Span::styled(
+            clean_label,
+            Style::default()
+                .fg(title_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if recommended {
+            spans.push(Span::styled("  ", Style::default()));
+            spans.extend(recommended_badge());
+        }
+        out.push(Line::from(spans));
+    }
+    // Separator + Other row (single-line, no description in split mode either).
+    out.push(Line::from(Span::styled(
+        "─".repeat(30),
+        Style::default().fg(BORDER_DIM),
+    )));
+    let other_selected = cursor == opts_n;
+    let other_cursor = if other_selected { "> " } else { "  " };
+    let other_number = format!("{:>w$}. ", opts_n + 1, w = max_number_width);
+    let other_color = if other_selected { ACCENT } else { TEXT };
+    let other_buf = state.other_buf();
+    let mut other_spans: Vec<Span<'static>> = vec![
+        Span::styled(other_cursor, Style::default().fg(ACCENT)),
+        Span::styled(other_number, Style::default().fg(TEXT_DIM)),
+    ];
+    if multi {
+        let cb = if state.other_included() {
+            "[x] "
+        } else {
+            "[ ] "
+        };
+        other_spans.push(Span::styled(cb, Style::default().fg(TEXT_DIM)));
+    }
+    if other_selected {
+        other_spans.push(Span::styled(
+            OTHER_LABEL,
+            Style::default()
+                .fg(other_color)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        if !other_buf.is_empty() {
+            other_spans.push(Span::styled("  ", Style::default()));
+            other_spans.push(Span::styled(
+                other_buf.to_string(),
+                Style::default().fg(TEXT),
+            ));
+        }
+        other_spans.push(Span::styled(
+            "_",
+            Style::default()
+                .fg(TEXT_DIM)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ));
+    } else {
+        let suffix = if multi && !other_buf.is_empty() {
+            format!(": {other_buf}")
+        } else {
+            String::new()
+        };
+        other_spans.push(Span::styled(
+            format!("{OTHER_LABEL}{suffix}"),
+            Style::default()
+                .fg(other_color)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    out.push(Line::from(other_spans));
+    out
+}
+
+/// Right-pane lines for the SPLIT layout — focused option's full detail
+/// (title + Recommended badge + description + preview text). When "Other" is
+/// focused, the pane shows a brief hint instead.
+pub(crate) fn preview_pane_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
+    let q = state.current_question();
+    let cursor = state.cursor();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let Some(opt) = q.options.get(cursor) else {
+        // Other focused — no per-option detail to show.
+        out.push(Line::from(Span::styled(
+            "(type custom answer below)",
+            Style::default().fg(TEXT_DIM).add_modifier(Modifier::ITALIC),
+        )));
+        return out;
+    };
+    let (clean_label, recommended) = split_recommended(&opt.label);
+    // Title row (mirrors the cursor styling so the pane reads as "you're
+    // looking at this option").
+    let mut header: Vec<Span<'static>> = vec![Span::styled(
+        clean_label,
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    if recommended {
+        header.push(Span::styled("  ", Style::default()));
+        header.extend(recommended_badge());
+    }
+    out.push(Line::from(header));
+    if !opt.description.is_empty() {
+        out.push(Line::from(Span::styled(
+            opt.description.clone(),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
+    if let Some(preview) = &opt.preview {
+        out.push(Line::from(""));
         for line in preview.lines() {
-            lines.push(Line::from(Span::styled(
+            out.push(Line::from(Span::styled(
                 line.to_string(),
                 Style::default().fg(TEXT_DIM),
             )));
         }
     }
-
-    // Footer
-    lines.push(Line::from(""));
-    let footer = if state.other_focused() {
-        if multi {
-            "type text · space toggle · ↵ confirm · esc cancel"
-        } else {
-            "type text · ↵ confirm · esc cancel"
-        }
-    } else if multi {
-        "↑/↓ navigate · space toggle · ↵ confirm · esc cancel"
-    } else {
-        "↑/↓ navigate · ↵ select · esc cancel"
-    };
-    lines.push(Line::from(Span::styled(
-        footer,
-        Style::default().fg(TEXT_DIM),
-    )));
+    out
 }
 
 /// Strip a trailing " (Recommended)" suffix (case-insensitive, ignoring trailing
@@ -428,21 +557,38 @@ fn recommended_badge() -> Vec<Span<'static>> {
 /// `render::live_height` so the inline viewport recreates at the right size.
 pub(crate) fn picker_height(state: &InlinePickerState) -> u16 {
     let q = state.current_question();
-    // Layout: blank · header · question · options(2 rows each, 1 if no desc) ·
-    // separator · Other · [preview block] · blank · footer.
     let header_rows: u16 = 3; // blank + header + question
-    let option_rows: u16 = q
-        .options
-        .iter()
-        .map(|o| if o.description.is_empty() { 1 } else { 2 })
-        .sum::<usize>() as u16;
-    let separator: u16 = 1;
-    let other_row: u16 = 1;
-    let preview_rows = state.focused_preview().map_or(0, |p| {
-        2 + p.lines().count() as u16 /* blank + "Preview:" + N */
-    });
     let footer_rows: u16 = 2; // blank + footer
-    header_rows + option_rows + separator + other_row + preview_rows + footer_rows
+    if state.has_any_preview() {
+        // Split layout: max(left pane, right pane + border) + header + footer.
+        // Left pane = N options (1 row each) + separator + Other = N + 2.
+        let left = q.options.len() as u16 + 2;
+        // Right pane = title + (desc if any) + blank + preview lines, plus
+        // the bordered Block adds 2 rows (top + bottom border).
+        let max_right_body = q
+            .options
+            .iter()
+            .map(|o| {
+                1 /*title*/
+                    + if o.description.is_empty() { 0 } else { 1 }
+                    + o.preview.as_deref().map_or(0, |p| 1 + p.lines().count() as u16)
+            })
+            .max()
+            .unwrap_or(1);
+        let right = max_right_body + 2 /*border*/;
+        header_rows + left.max(right) + footer_rows
+    } else {
+        // Single-column layout: options (2 rows each if desc, 1 if not) +
+        // separator + Other.
+        let option_rows: u16 = q
+            .options
+            .iter()
+            .map(|o| if o.description.is_empty() { 1 } else { 2 })
+            .sum::<usize>() as u16;
+        let separator: u16 = 1;
+        let other_row: u16 = 1;
+        header_rows + option_rows + separator + other_row + footer_rows
+    }
 }
 
 /// One-line trace committed to scrollback after the picker closes. Single-line

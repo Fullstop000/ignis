@@ -106,6 +106,16 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let size = f.size();
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
+    // Inline (`ask_user`) picker with at least one option carrying a preview
+    // gets its own split layout — option list left, bordered Preview pane
+    // right. The other pickers fall through to the single-paragraph path.
+    if let Some(picker) = &app.inline_picker {
+        if picker.has_any_preview() {
+            render_inline_picker_split(f, size, picker);
+            return;
+        }
+    }
+
     // Modal pickers own the whole live band.
     if app.model_picker.is_some()
         || app.session_picker.is_some()
@@ -167,6 +177,76 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_input(f, layout[3], app);
     draw_footer(f, layout[4], app);
+}
+
+/// Split-layout render for the `ask_user` picker when at least one option
+/// carries a `preview`. The band is divided:
+///   - top: blank + header strip + question (3 rows)
+///   - middle: horizontal split — option list left (~45%), bordered Preview
+///     pane right (~55%) showing the focused option's title + description +
+///     preview text
+///   - bottom: blank + footer (2 rows)
+fn render_inline_picker_split(
+    f: &mut Frame,
+    size: Rect,
+    picker: &super::inline_picker::InlinePickerState,
+) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // header section
+            Constraint::Min(4),    // middle (split)
+            Constraint::Length(2), // footer section
+        ])
+        .split(size);
+
+    // Header section (full width)
+    let header_lines = super::inline_picker::header_lines(picker);
+    f.render_widget(
+        Paragraph::new(Text::from(header_lines))
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        outer[0],
+    );
+
+    // Middle horizontal split: options | preview
+    let middle = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(outer[1]);
+
+    let left_lines = super::inline_picker::options_pane_lines(picker);
+    f.render_widget(
+        Paragraph::new(Text::from(left_lines))
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        middle[0],
+    );
+
+    let right_lines = super::inline_picker::preview_pane_lines(picker);
+    let preview_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .title(Span::styled(
+            " Preview ",
+            Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(
+        Paragraph::new(Text::from(right_lines))
+            .block(preview_block)
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        middle[1],
+    );
+
+    // Footer section (full width)
+    let footer_lines = super::inline_picker::footer_lines(picker);
+    f.render_widget(
+        Paragraph::new(Text::from(footer_lines))
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        outer[2],
+    );
 }
 
 /// Build the rendered lines for one transcript block, for committing to the
