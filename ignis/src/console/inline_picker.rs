@@ -219,7 +219,7 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
     };
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  ◆ ", Style::default().fg(MAUVE)),
+        Span::styled("◆ ", Style::default().fg(MAUVE)),
         Span::styled(
             "ask_user",
             Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
@@ -232,17 +232,19 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
         Span::styled(progress, Style::default().fg(TEXT_DIM)),
     ]));
     // Question text — kept tight against the options it controls.
-    lines.push(Line::from(vec![
-        Span::styled("  ", Style::default()),
-        Span::styled(q.question.clone(), Style::default().fg(TEXT)),
-    ]));
+    lines.push(Line::from(Span::styled(
+        q.question.clone(),
+        Style::default().fg(TEXT),
+    )));
 
     // Options (CC-style stacked: title row + description row indented).
+    // Everything sits flush left to match CC's reference layout — no extra
+    // gutter that ratatui's wrap pipeline sometimes collapses inconsistently.
     let opts_n = q.options.len();
     let cursor = state.cursor();
     let multi = state.is_multi();
     let max_number_width = (opts_n + 1).to_string().len(); // "10" → 2, "9" → 1
-    let desc_indent = 2 /*leading*/ + 2 /*cursor col*/ + max_number_width + 2 /*". "*/;
+    let desc_indent = 2 /*cursor col*/ + max_number_width + 2 /*". "*/;
     let desc_indent_str = " ".repeat(desc_indent);
 
     for (idx, opt) in q.options.iter().enumerate() {
@@ -252,7 +254,6 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
         let number_str = format!("{:>w$}. ", idx + 1, w = max_number_width);
         let title_color = if selected { ACCENT } else { TEXT };
         let mut title_spans: Vec<Span<'static>> = vec![
-            Span::styled("  ", Style::default()),
             Span::styled(cursor_glyph, Style::default().fg(ACCENT)),
             Span::styled(number_str, Style::default().fg(TEXT_DIM)),
         ];
@@ -276,19 +277,21 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
             title_spans.extend(recommended_badge());
         }
         lines.push(Line::from(title_spans));
-        // Description row in dim, indented under the title text.
+        // Description row in dim, indented under the title text (the indent
+        // is baked into the span content because ratatui's wrap pipeline
+        // doesn't reliably preserve a leading plain-style whitespace span).
         if !opt.description.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(desc_indent_str.clone(), Style::default()),
-                Span::styled(opt.description.clone(), Style::default().fg(TEXT_DIM)),
-            ]));
+            lines.push(Line::from(Span::styled(
+                format!("{desc_indent_str}{}", opt.description),
+                Style::default().fg(TEXT_DIM),
+            )));
         }
     }
 
     // Horizontal separator between the regular options and the "Other" row,
     // matching the CC pattern (image 2).
     lines.push(Line::from(Span::styled(
-        format!("  {}", "─".repeat(40)),
+        "─".repeat(42),
         Style::default().fg(BORDER_DIM),
     )));
 
@@ -299,7 +302,6 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
     let other_color = if other_selected { ACCENT } else { TEXT };
     let other_buf = state.other_buf();
     let mut other_spans: Vec<Span<'static>> = vec![
-        Span::styled("  ", Style::default()),
         Span::styled(other_cursor, Style::default().fg(ACCENT)),
         Span::styled(other_number, Style::default().fg(TEXT_DIM)),
     ];
@@ -349,18 +351,27 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
     lines.push(Line::from(other_spans));
 
     // Preview block when the highlighted option has one — rendered below
-    // (no split pane) so it doesn't fight the option list for width.
+    // (no split pane) so it doesn't fight the option list for width. Open
+    // with a labeled horizontal rule (`── Preview ──`) so it reads as a
+    // distinct sub-section, then dim-color the code body. Leading
+    // whitespace is its own plain span to keep alignment consistent with
+    // the title rows (matching col 2 for the visual gutter).
     if let Some(preview) = state.focused_preview() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Preview:",
-            Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD),
-        )));
+        lines.push(Line::from(vec![
+            Span::styled("─── ", Style::default().fg(BORDER_DIM)),
+            Span::styled(
+                "Preview",
+                Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", Style::default()),
+            Span::styled("─".repeat(34), Style::default().fg(BORDER_DIM)),
+        ]));
         for line in preview.lines() {
-            lines.push(Line::from(vec![
-                Span::styled("    ", Style::default()),
-                Span::styled(line.to_string(), Style::default().fg(TEXT_DIM)),
-            ]));
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(TEXT_DIM),
+            )));
         }
     }
 
@@ -368,14 +379,14 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
     lines.push(Line::from(""));
     let footer = if state.other_focused() {
         if multi {
-            "  type text · space toggle · ↵ confirm · esc cancel"
+            "type text · space toggle · ↵ confirm · esc cancel"
         } else {
-            "  type text · ↵ confirm · esc cancel"
+            "type text · ↵ confirm · esc cancel"
         }
     } else if multi {
-        "  ↑/↓ navigate · space toggle · ↵ confirm · esc cancel"
+        "↑/↓ navigate · space toggle · ↵ confirm · esc cancel"
     } else {
-        "  ↑/↓ navigate · ↵ select · esc cancel"
+        "↑/↓ navigate · ↵ select · esc cancel"
     };
     lines.push(Line::from(Span::styled(
         footer,
