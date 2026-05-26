@@ -7,7 +7,7 @@
 //! error explaining the situation); this keeps subagents and one-shot CLI runs
 //! safe to construct even when no TUI is wired up.
 use crate::picker::{PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse};
-use crate::{AgentTool, ToolResult};
+use crate::{AgentTool, ExecutionMode, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -48,6 +48,14 @@ impl AgentTool for AskUserTool {
          options; an 'Other (type custom)' option is appended automatically \
          so the user can always free-text. To recommend an option, put it \
          first and append ' (Recommended)' to its label."
+    }
+
+    fn execution_mode(&self) -> ExecutionMode {
+        // Only one picker can be open at a time; if a batch contained two
+        // `ask_user` calls in parallel, the second would race into the
+        // console's "already-open" guard and come back as a phantom Cancel.
+        // Force serial scheduling so that never happens.
+        ExecutionMode::Sequential
     }
 
     fn parameters(&self) -> Value {
@@ -403,5 +411,184 @@ mod tests {
         let res = call.await.unwrap();
         assert!(res.is_error);
         assert!(res.content.contains("session closed"));
+    }
+}
+
+/// End-to-end tests that drive the same path the console takes
+/// (PickerRequest → InlinePickerState → simulated keystrokes → oneshot
+/// reply). Kept in-crate so the picker types stay `pub(crate)`.
+#[cfg(test)]
+mod end_to_end {
+    use super::*;
+    use crate::console::inline_picker::{InlinePickerState, KeyOutcome};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// Drive the picker by feeding `keys` until it terminates; reply on the
+    /// oneshot the same way the console does. Returns the response.
+    fn drive(mut state: InlinePickerState, keys: &[KeyEvent]) -> PickerResponse {
+        for k in keys {
+            match state.on_key(*k) {
+                KeyOutcome::Continue => {}
+                KeyOutcome::Cancel => {
+                    let reply = state.reply.take().expect("reply present");
+                    let _ = reply.send(PickerResponse::Cancelled);
+                    return PickerResponse::Cancelled;
+                }
+                KeyOutcome::Done(answers) => {
+                    let resp = PickerResponse::Answered(answers);
+                    let reply = state.reply.take().expect("reply present");
+                    let _ = reply.send(resp.clone());
+                    return resp;
+                }
+            }
+        }
+        panic!("ran out of keys before the picker resolved");
+    }
+
+    #[tokio::test]
+    async fn single_select_round_trip() {
+        let (tx, mut rx) = mpsc::channel::<PickerRequest>(1);
+        let tool = AskUserTool::new(Some(tx));
+        let call = tokio::spawn(async move {
+            tool.call(json!({"questions": [{
+                "question": "Which library?",
+                "header": "Library",
+                "options": [
+                    {"label": "serde_json", "description": "stable, std"},
+                    {"label": "simd-json",  "description": "fast"}
+                ]
+            }]}))
+            .await
+        });
+        let state = InlinePickerState::new(rx.recv().await.unwrap());
+        drive(state, &[key(KeyCode::Down), key(KeyCode::Enter)]);
+        let result = call.await.unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        let v: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(v["answers"][0]["answer"], "simd-json");
+    }
+
+    #[tokio::test]
+    async fn multi_select_round_trip() {
+        let (tx, mut rx) = mpsc::channel::<PickerRequest>(1);
+        let tool = AskUserTool::new(Some(tx));
+        let call = tokio::spawn(async move {
+            tool.call(json!({"questions": [{
+                "question": "Which features?",
+                "header": "Features",
+                "multiSelect": true,
+                "options": [
+                    {"label": "auth",    "description": "login"},
+                    {"label": "logging", "description": "structured logs"},
+                    {"label": "metrics", "description": "prometheus"}
+                ]
+            }]}))
+            .await
+        });
+        let state = InlinePickerState::new(rx.recv().await.unwrap());
+        drive(
+            state,
+            &[
+                key(KeyCode::Char(' ')),
+                key(KeyCode::Down),
+                key(KeyCode::Down),
+                key(KeyCode::Char(' ')),
+                key(KeyCode::Enter),
+            ],
+        );
+        let result = call.await.unwrap();
+        let v: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(v["answers"][0]["answer"], json!(["auth", "metrics"]));
+    }
+
+    #[tokio::test]
+    async fn other_typed_text_round_trip() {
+        let (tx, mut rx) = mpsc::channel::<PickerRequest>(1);
+        let tool = AskUserTool::new(Some(tx));
+        let call = tokio::spawn(async move {
+            tool.call(json!({"questions": [{
+                "question": "Name?",
+                "header": "Name",
+                "options": [
+                    {"label": "default", "description": "use default"},
+                    {"label": "skip",    "description": "skip naming"}
+                ]
+            }]}))
+            .await
+        });
+        let state = InlinePickerState::new(rx.recv().await.unwrap());
+        let mut keys = vec![key(KeyCode::Down), key(KeyCode::Down)];
+        for c in "my custom thing".chars() {
+            keys.push(key(KeyCode::Char(c)));
+        }
+        keys.push(key(KeyCode::Enter));
+        drive(state, &keys);
+        let result = call.await.unwrap();
+        let v: Value = serde_json::from_str(&result.content).unwrap();
+        // Spaces must survive — regression guard for the multi-select bug.
+        assert_eq!(v["answers"][0]["answer"], "my custom thing");
+    }
+
+    #[tokio::test]
+    async fn escape_round_trip_is_error() {
+        let (tx, mut rx) = mpsc::channel::<PickerRequest>(1);
+        let tool = AskUserTool::new(Some(tx));
+        let call = tokio::spawn(async move {
+            tool.call(json!({"questions": [{
+                "question": "Confirm?",
+                "header": "Confirm",
+                "options": [
+                    {"label": "yes", "description": "do it"},
+                    {"label": "no",  "description": "abort"}
+                ]
+            }]}))
+            .await
+        });
+        let state = InlinePickerState::new(rx.recv().await.unwrap());
+        drive(state, &[key(KeyCode::Esc)]);
+        let result = call.await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.to_lowercase().contains("cancel"));
+    }
+
+    #[tokio::test]
+    async fn two_question_flow_round_trip() {
+        let (tx, mut rx) = mpsc::channel::<PickerRequest>(1);
+        let tool = AskUserTool::new(Some(tx));
+        let call = tokio::spawn(async move {
+            tool.call(json!({"questions": [
+                {"question": "Lib?",  "header": "Lib", "options": [
+                    {"label": "serde_json", "description": "x"},
+                    {"label": "simd-json",  "description": "y"}
+                ]},
+                {"question": "Mode?", "header": "Mode", "options": [
+                    {"label": "strict", "description": "x"},
+                    {"label": "lax",    "description": "y"}
+                ]}
+            ]}))
+            .await
+        });
+        let state = InlinePickerState::new(rx.recv().await.unwrap());
+        drive(
+            state,
+            &[key(KeyCode::Enter), key(KeyCode::Down), key(KeyCode::Enter)],
+        );
+        let result = call.await.unwrap();
+        let v: Value = serde_json::from_str(&result.content).unwrap();
+        let answers = v["answers"].as_array().unwrap();
+        assert_eq!(answers[0]["answer"], "serde_json");
+        assert_eq!(answers[1]["answer"], "lax");
+    }
+
+    #[tokio::test]
+    async fn execution_mode_is_sequential() {
+        // Guard the P2 fix: parallel ask_user calls would race into the
+        // console's "already-open" guard and surface phantom cancellations.
+        let tool = AskUserTool::new(None);
+        assert!(matches!(tool.execution_mode(), ExecutionMode::Sequential));
     }
 }

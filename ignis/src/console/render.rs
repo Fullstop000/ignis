@@ -207,9 +207,12 @@ pub(crate) fn block_lines(
         }
         UIBlock::Tool(entry) => {
             // The `ask_user` tool has its own purpose-built scrollback line
-            // (`inline_picker::trace_lines`); the generic tool block would
-            // dump the raw JSON args+result and double up on the same event.
+            // (`inline_picker::trace_lines`); rendering the generic tool block
+            // would dump verbose JSON args+result twice. We still want a record
+            // on session resume — the live trace is ephemeral — so build a
+            // compact trace from the persisted entry instead.
             if entry.name == "ask_user" {
+                lines.extend(ask_user_resume_trace(entry));
                 return lines;
             }
             let mut raw: Vec<Line<'static>> = Vec::new();
@@ -325,6 +328,87 @@ fn wrap_line(line: &Line<'static>, width: u16, indent_cols: usize) -> Vec<Line<'
     rows.into_iter()
         .map(|r| Line::from(cells_to_spans(&r)))
         .collect()
+}
+
+/// Compact one-line trace for a persisted `ask_user` tool entry. Parses the
+/// stored result JSON (`{"answers": [{"question": ..., "answer": ...}, ...]}`)
+/// and emits one row per answered question, plus a cancellation marker if the
+/// result was an error. Same look as the live trace from
+/// `inline_picker::trace_lines` so resumed sessions read identically.
+fn ask_user_resume_trace(entry: &ToolCallEntry) -> Vec<Line<'static>> {
+    let (result_text, is_error) = match &entry.status {
+        ToolStatus::Success(s) => (s.clone(), false),
+        ToolStatus::Error(s) => (s.clone(), true),
+        ToolStatus::Pending => return Vec::new(), // nothing to commit yet
+    };
+    let mut out = vec![Line::from("")];
+    if is_error {
+        out.push(Line::from(vec![
+            Span::styled("  ✗ ", Style::default().fg(RED)),
+            Span::styled(
+                "ask_user",
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · cancelled by user", Style::default().fg(TEXT_DIM)),
+        ]));
+        return out;
+    }
+    // Parse the success JSON shape. Fall back to a generic line if it's
+    // anything unexpected — preserves the resume invariant ("never silent").
+    let parsed = serde_json::from_str::<serde_json::Value>(&result_text)
+        .ok()
+        .and_then(|v| {
+            v.get("answers")
+                .and_then(|a| a.as_array())
+                .map(|a| a.to_vec())
+        });
+    match parsed {
+        Some(answers) if !answers.is_empty() => {
+            // Header chips come from the request args; the result JSON only
+            // carries the question text, so reuse that as the label.
+            for a in answers {
+                let question = a
+                    .get("question")
+                    .and_then(|q| q.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let answer_text = match a.get("answer") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Array(items)) => items
+                        .iter()
+                        .filter_map(|i| i.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Some(other) => other.to_string(),
+                    None => String::new(),
+                };
+                out.push(Line::from(vec![
+                    Span::styled("  ✓ ", Style::default().fg(GREEN)),
+                    Span::styled(
+                        "ask_user",
+                        Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" · ", Style::default().fg(BORDER)),
+                    Span::styled(
+                        question,
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(": ", Style::default().fg(TEXT_DIM)),
+                    Span::styled(answer_text, Style::default().fg(TEXT)),
+                ]));
+            }
+        }
+        _ => {
+            out.push(Line::from(vec![
+                Span::styled("  ✓ ", Style::default().fg(GREEN)),
+                Span::styled(
+                    "ask_user",
+                    Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+    }
+    out
 }
 
 /// Wrapped row count of `lines` at `width` — the height to reserve in scrollback.

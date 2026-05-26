@@ -112,7 +112,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 pub mod app;
 pub mod clipboard;
 pub mod highlight;
-pub mod inline_picker;
+pub(crate) mod inline_picker;
 pub mod markdown;
 pub mod render;
 

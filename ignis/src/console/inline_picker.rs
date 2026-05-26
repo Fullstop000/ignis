@@ -22,7 +22,7 @@ use super::{
 
 /// What `on_key` tells the console to do.
 #[derive(Debug)]
-pub enum KeyOutcome {
+pub(crate) enum KeyOutcome {
     /// State changed (or didn't) — re-render and keep going.
     Continue,
     /// User pressed ESC — caller should send `Cancelled` and clear the picker.
@@ -32,7 +32,7 @@ pub enum KeyOutcome {
     Done(Vec<PickerAnswer>),
 }
 
-pub struct InlinePickerState {
+pub(crate) struct InlinePickerState {
     pub(crate) questions: Vec<PickerQuestion>,
     /// One per already-answered question; length == `current` while open.
     answers: Vec<PickerAnswer>,
@@ -43,18 +43,16 @@ pub struct InlinePickerState {
     cursor: usize,
     /// Multi-select only; len == current_question.options.len().
     toggled: Vec<bool>,
-    /// Set when the user toggles Other in multi-select OR when typing in
-    /// single-select with Other focused.
-    other_included: bool,
-    /// Free-text buffer for the Other row.
+    /// Free-text buffer for the Other row. In multi-select, Other is
+    /// considered "included" iff this buffer is non-empty — no separate
+    /// toggle flag, so the user can freely type spaces into it.
     other_buf: String,
-    /// Taken on `Done` / `Cancel` so the caller can `send` on it. Public so
-    /// integration tests can drive the picker the same way the console does.
-    pub reply: Option<tokio::sync::oneshot::Sender<PickerResponse>>,
+    /// Taken on `Done` / `Cancel` so the caller can `send` on it.
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<PickerResponse>>,
 }
 
 impl InlinePickerState {
-    pub fn new(request: PickerRequest) -> Self {
+    pub(crate) fn new(request: PickerRequest) -> Self {
         let first_opts = request.questions[0].options.len();
         Self {
             questions: request.questions,
@@ -62,7 +60,6 @@ impl InlinePickerState {
             current: 0,
             cursor: 0,
             toggled: vec![false; first_opts],
-            other_included: false,
             other_buf: String::new(),
             reply: Some(request.reply),
         }
@@ -89,8 +86,11 @@ impl InlinePickerState {
     pub(crate) fn is_toggled(&self, opt_idx: usize) -> bool {
         self.toggled.get(opt_idx).copied().unwrap_or(false)
     }
+    /// Multi-select: Other is "included" iff its free-text buffer has any
+    /// non-whitespace content. No separate toggle key — keeps space free to
+    /// be typed into the buffer.
     pub(crate) fn other_included(&self) -> bool {
-        self.other_included
+        !self.other_buf.trim().is_empty()
     }
     pub(crate) fn other_focused(&self) -> bool {
         self.cursor == self.current_question().options.len()
@@ -105,7 +105,7 @@ impl InlinePickerState {
     }
 
     /// Apply a key event; returns what the caller should do.
-    pub fn on_key(&mut self, key: KeyEvent) -> KeyOutcome {
+    pub(crate) fn on_key(&mut self, key: KeyEvent) -> KeyOutcome {
         // ESC always cancels regardless of focus.
         if matches!(key.code, KeyCode::Esc) {
             return KeyOutcome::Cancel;
@@ -129,33 +129,23 @@ impl InlinePickerState {
                 }
                 KeyOutcome::Continue
             }
-            KeyCode::Char(' ') if self.is_multi() => {
-                if self.other_focused() {
-                    // Toggle "include Other" only if there's some text to include.
-                    if !self.other_buf.trim().is_empty() {
-                        self.other_included = !self.other_included;
-                    }
-                } else if self.cursor < opts_n {
-                    self.toggled[self.cursor] = !self.toggled[self.cursor];
-                }
-                KeyOutcome::Continue
-            }
             KeyCode::Enter => self.try_advance(),
+            // When Other has focus, typing (incl. space) goes into the buffer.
+            // Must come BEFORE the multi-select space toggle so users can type
+            // multi-word answers like "another approach" into Other.
             KeyCode::Char(c) if self.other_focused() => {
-                // Type into the Other buffer (single-select OR multi-select).
                 // Strip control chars; cap length.
                 if !c.is_control() && self.other_buf.len() + c.len_utf8() <= MAX_OTHER_LEN {
                     self.other_buf.push(c);
                 }
                 KeyOutcome::Continue
             }
+            KeyCode::Char(' ') if self.is_multi() && self.cursor < opts_n => {
+                self.toggled[self.cursor] = !self.toggled[self.cursor];
+                KeyOutcome::Continue
+            }
             KeyCode::Backspace if self.other_focused() => {
                 self.other_buf.pop();
-                // If we just deleted everything and Other was included in multi,
-                // un-include it — empty Other is not a valid answer.
-                if self.other_buf.trim().is_empty() {
-                    self.other_included = false;
-                }
                 KeyOutcome::Continue
             }
             _ => KeyOutcome::Continue,
@@ -176,7 +166,9 @@ impl InlinePickerState {
                 .filter(|(i, _)| self.toggled[*i])
                 .map(|(_, o)| o.label.clone())
                 .collect();
-            if self.other_included && !self.other_buf.trim().is_empty() {
+            // Multi-select: include Other iff buffer has content. No separate
+            // toggle key — space is reserved for typing into Other.
+            if !self.other_buf.trim().is_empty() {
                 picks.push(self.other_buf.trim().to_string());
             }
             if picks.is_empty() {
@@ -209,7 +201,6 @@ impl InlinePickerState {
         let next_opts = self.current_question().options.len();
         self.cursor = 0;
         self.toggled = vec![false; next_opts];
-        self.other_included = false;
         self.other_buf.clear();
         KeyOutcome::Continue
     }
@@ -554,44 +545,41 @@ mod tests {
     }
 
     #[test]
-    fn other_multi_select_requires_toggle_after_typing() {
+    fn other_multi_select_auto_includes_when_buffer_nonempty() {
         let (mut s, _rx) = make_request(vec![q("Q?", "h", true, &["a", "b"])]);
-        // Move to Other
+        // Move to Other and type a multi-word answer (with a space). Space
+        // must reach the buffer — it must NOT toggle a checkbox.
         let _ = s.on_key(key(KeyCode::Down));
         let _ = s.on_key(key(KeyCode::Down));
-        for c in "custom".chars() {
+        for c in "another approach".chars() {
             let _ = s.on_key(key(KeyCode::Char(c)));
         }
-        // No toggle yet → enter no-op (no picks)
-        assert!(matches!(
-            s.on_key(key(KeyCode::Enter)),
-            KeyOutcome::Continue
-        ));
-        // Toggle Other → enter Done with the buffer included
-        let _ = s.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(s.other_buf(), "another approach");
         assert!(s.other_included());
         match s.on_key(key(KeyCode::Enter)) {
             KeyOutcome::Done(ans) => {
-                assert_eq!(ans[0], PickerAnswer::Multi(vec!["custom".to_string()]));
+                assert_eq!(
+                    ans[0],
+                    PickerAnswer::Multi(vec!["another approach".to_string()])
+                );
             }
             other => panic!("expected Done, got {other:?}"),
         }
     }
 
     #[test]
-    fn backspace_emptying_other_unincludes_it() {
+    fn backspace_to_empty_buffer_drops_other_inclusion() {
         let (mut s, _rx) = make_request(vec![q("Q?", "h", true, &["a", "b"])]);
         let _ = s.on_key(key(KeyCode::Down));
         let _ = s.on_key(key(KeyCode::Down));
         for c in "ab".chars() {
             let _ = s.on_key(key(KeyCode::Char(c)));
         }
-        let _ = s.on_key(key(KeyCode::Char(' ')));
-        assert!(s.other_included());
+        assert!(s.other_included(), "non-empty buffer → included");
         let _ = s.on_key(key(KeyCode::Backspace));
         let _ = s.on_key(key(KeyCode::Backspace));
         assert_eq!(s.other_buf(), "");
-        assert!(!s.other_included());
+        assert!(!s.other_included(), "empty buffer → not included");
     }
 
     #[test]
