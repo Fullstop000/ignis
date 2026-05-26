@@ -17,7 +17,7 @@ use crate::tools::ask_user::{MAX_OTHER_LEN, OTHER_LABEL};
 // here keeps the renderer self-contained; the names mirror the ones in
 // console/app.rs (BG/TEXT/ACCENT/MAUVE/TEXT_DIM).
 use super::{
-    ACCENT, BG, BORDER as BORDER_DIM, GREEN as OK_GREEN, MAUVE, RED as ERR_RED, TEXT, TEXT_DIM,
+    ACCENT, BORDER as BORDER_DIM, GREEN as OK_GREEN, MAUVE, RED as ERR_RED, TEXT, TEXT_DIM,
 };
 
 /// What `on_key` tells the console to do.
@@ -237,84 +237,119 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
         Span::styled(q.question.clone(), Style::default().fg(TEXT)),
     ]));
 
-    // Options
+    // Options (CC-style stacked: title row + description row indented).
     let opts_n = q.options.len();
     let cursor = state.cursor();
     let multi = state.is_multi();
+    let max_number_width = (opts_n + 1).to_string().len(); // "10" → 2, "9" → 1
+    let desc_indent = 2 /*leading*/ + 2 /*cursor col*/ + max_number_width + 2 /*". "*/;
+    let desc_indent_str = " ".repeat(desc_indent);
+
     for (idx, opt) in q.options.iter().enumerate() {
         let selected = idx == cursor;
-        let prefix = if multi {
-            if state.is_toggled(idx) {
+        let (clean_label, recommended) = split_recommended(&opt.label);
+        let cursor_glyph = if selected { "> " } else { "  " };
+        let number_str = format!("{:>w$}. ", idx + 1, w = max_number_width);
+        let title_color = if selected { ACCENT } else { TEXT };
+        let mut title_spans: Vec<Span<'static>> = vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(cursor_glyph, Style::default().fg(ACCENT)),
+            Span::styled(number_str, Style::default().fg(TEXT_DIM)),
+        ];
+        if multi {
+            // Multi-select keeps a checkbox between the number and the title.
+            let cb = if state.is_toggled(idx) {
                 "[x] "
             } else {
                 "[ ] "
-            }
-        } else if selected {
-            "▸ "
-        } else {
-            "  "
-        };
-        let row_style = if selected {
-            Style::default().fg(BG).bg(ACCENT)
-        } else {
-            Style::default().fg(TEXT)
-        };
-        let desc_style = if selected {
-            Style::default().fg(BG).bg(ACCENT)
-        } else {
-            Style::default().fg(TEXT_DIM)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {prefix}"), row_style),
-            Span::styled(opt.label.clone(), row_style.add_modifier(Modifier::BOLD)),
-            Span::styled(" — ", desc_style),
-            Span::styled(opt.description.clone(), desc_style),
-        ]));
+            };
+            title_spans.push(Span::styled(cb, Style::default().fg(TEXT_DIM)));
+        }
+        title_spans.push(Span::styled(
+            clean_label,
+            Style::default()
+                .fg(title_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if recommended {
+            title_spans.push(Span::styled("  ", Style::default()));
+            title_spans.extend(recommended_badge());
+        }
+        lines.push(Line::from(title_spans));
+        // Description row in dim, indented under the title text.
+        if !opt.description.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(desc_indent_str.clone(), Style::default()),
+                Span::styled(opt.description.clone(), Style::default().fg(TEXT_DIM)),
+            ]));
+        }
     }
-    // Other row
+
+    // Horizontal separator between the regular options and the "Other" row,
+    // matching the CC pattern (image 2).
+    lines.push(Line::from(Span::styled(
+        format!("  {}", "─".repeat(40)),
+        Style::default().fg(BORDER_DIM),
+    )));
+
+    // Other row — always single-line, no description.
     let other_selected = cursor == opts_n;
-    let other_prefix = if multi {
-        if state.other_included() {
+    let other_cursor = if other_selected { "> " } else { "  " };
+    let other_number = format!("{:>w$}. ", opts_n + 1, w = max_number_width);
+    let other_color = if other_selected { ACCENT } else { TEXT };
+    let other_buf = state.other_buf();
+    let mut other_spans: Vec<Span<'static>> = vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(other_cursor, Style::default().fg(ACCENT)),
+        Span::styled(other_number, Style::default().fg(TEXT_DIM)),
+    ];
+    if multi {
+        let cb = if state.other_included() {
             "[x] "
         } else {
             "[ ] "
-        }
-    } else if other_selected {
-        "▸ "
-    } else {
-        "  "
-    };
-    let other_row_style = if other_selected {
-        Style::default().fg(BG).bg(ACCENT)
-    } else {
-        Style::default().fg(TEXT)
-    };
-    let other_buf = state.other_buf();
+        };
+        other_spans.push(Span::styled(cb, Style::default().fg(TEXT_DIM)));
+    }
     if other_selected {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {other_prefix}"), other_row_style),
-            Span::styled(OTHER_LABEL, other_row_style.add_modifier(Modifier::ITALIC)),
-            Span::styled("  ", other_row_style),
-            Span::styled(other_buf.to_string(), other_row_style),
-            Span::styled("_", other_row_style.add_modifier(Modifier::SLOW_BLINK)),
-        ]));
+        // Focused Other shows label + live buffer + blinking caret.
+        other_spans.push(Span::styled(
+            OTHER_LABEL,
+            Style::default()
+                .fg(other_color)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        if !other_buf.is_empty() {
+            other_spans.push(Span::styled("  ", Style::default()));
+            other_spans.push(Span::styled(
+                other_buf.to_string(),
+                Style::default().fg(TEXT),
+            ));
+        }
+        other_spans.push(Span::styled(
+            "_",
+            Style::default()
+                .fg(TEXT_DIM)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ));
     } else {
-        // Show the buffer too when Other is toggled but not focused (multi).
-        let suffix = if multi && state.other_included() && !other_buf.is_empty() {
+        // Unfocused Other: show "Other: typed text" when multi has a buffer.
+        let suffix = if multi && !other_buf.is_empty() {
             format!(": {other_buf}")
         } else {
             String::new()
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {other_prefix}"), other_row_style),
-            Span::styled(
-                format!("{OTHER_LABEL}{suffix}"),
-                other_row_style.add_modifier(Modifier::ITALIC),
-            ),
-        ]));
+        other_spans.push(Span::styled(
+            format!("{OTHER_LABEL}{suffix}"),
+            Style::default()
+                .fg(other_color)
+                .add_modifier(Modifier::ITALIC),
+        ));
     }
+    lines.push(Line::from(other_spans));
 
-    // Preview block when the highlighted option has one
+    // Preview block when the highlighted option has one — rendered below
+    // (no split pane) so it doesn't fight the option list for width.
     if let Some(preview) = state.focused_preview() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -348,16 +383,55 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
     )));
 }
 
+/// Strip a trailing " (Recommended)" suffix (case-insensitive, ignoring trailing
+/// whitespace) from a label and return whether the original carried it. The
+/// agent encodes recommendation via this label convention; we render the chip.
+fn split_recommended(label: &str) -> (String, bool) {
+    let trimmed = label.trim_end();
+    if let Some(stripped) = trimmed.strip_suffix(')') {
+        // Match "(Recommended)" case-insensitively at the end.
+        if let Some(open) = stripped.rfind('(') {
+            let tag = &stripped[open + 1..];
+            if tag.eq_ignore_ascii_case("Recommended") {
+                return (stripped[..open].trim_end().to_string(), true);
+            }
+        }
+    }
+    (label.to_string(), false)
+}
+
+/// The `┊ Recommended ┊` dim-color chip rendered after the title for the
+/// option the agent marked.
+fn recommended_badge() -> Vec<Span<'static>> {
+    vec![
+        Span::styled("┊ ", Style::default().fg(TEXT_DIM)),
+        Span::styled(
+            "Recommended",
+            Style::default().fg(TEXT_DIM).add_modifier(Modifier::ITALIC),
+        ),
+        Span::styled(" ┊", Style::default().fg(TEXT_DIM)),
+    ]
+}
+
 /// Height (rows) the picker needs given its current state. Used by
 /// `render::live_height` so the inline viewport recreates at the right size.
 pub(crate) fn picker_height(state: &InlinePickerState) -> u16 {
-    // Layout: blank · header · question · options · Other · [preview block] ·
-    // blank · footer.
-    let opts = state.current_question().options.len() as u16;
+    let q = state.current_question();
+    // Layout: blank · header · question · options(2 rows each, 1 if no desc) ·
+    // separator · Other · [preview block] · blank · footer.
+    let header_rows: u16 = 3; // blank + header + question
+    let option_rows: u16 = q
+        .options
+        .iter()
+        .map(|o| if o.description.is_empty() { 1 } else { 2 })
+        .sum::<usize>() as u16;
+    let separator: u16 = 1;
+    let other_row: u16 = 1;
     let preview_rows = state.focused_preview().map_or(0, |p| {
         2 + p.lines().count() as u16 /* blank + "Preview:" + N */
     });
-    3 + opts + 1 + preview_rows + 1 + 1
+    let footer_rows: u16 = 2; // blank + footer
+    header_rows + option_rows + separator + other_row + preview_rows + footer_rows
 }
 
 /// One-line trace committed to scrollback after the picker closes. Single-line
@@ -625,5 +699,30 @@ mod tests {
         let _ = s.on_key(key(KeyCode::Char('\u{007F}')));
         let _ = s.on_key(key(KeyCode::Char('b')));
         assert_eq!(s.other_buf(), "ab");
+    }
+
+    #[test]
+    fn split_recommended_strips_suffix() {
+        assert_eq!(
+            super::split_recommended("serde_json (Recommended)"),
+            ("serde_json".to_string(), true)
+        );
+        // Case-insensitive, tolerant of trailing whitespace.
+        assert_eq!(
+            super::split_recommended("foo (recommended)  "),
+            ("foo".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn split_recommended_leaves_other_parens_alone() {
+        assert_eq!(
+            super::split_recommended("foo (beta)"),
+            ("foo (beta)".to_string(), false)
+        );
+        assert_eq!(
+            super::split_recommended("plain"),
+            ("plain".to_string(), false)
+        );
     }
 }
