@@ -32,6 +32,18 @@ async fn main() -> Result<(), anyhow::Error> {
     let auto_resume = config.auto_resume_last_session.unwrap_or(false);
     let session_request = resolve_session_request(cli, &session_manager, auto_resume, &cwd);
     let system_prompt = ignis::agent::build_system_prompt(&cwd);
+
+    // Discover skills (global + project roots) and read the disabled set.
+    let disabled_skills: std::collections::HashSet<String> = ignis::state::load_state()
+        .disabled_skills
+        .into_iter()
+        .collect();
+    let skill_registry = std::sync::Arc::new(ignis::skills::SkillRegistry::load(
+        Some(&home),
+        &cwd,
+        disabled_skills,
+    ));
+
     let active_provider = config
         .active_provider()
         .unwrap_or_else(|| "default".to_string());
@@ -49,6 +61,7 @@ async fn main() -> Result<(), anyhow::Error> {
             storage_dir,
             cwd,
             config,
+            skill_registry.clone(),
         )
         .await;
     }
@@ -72,6 +85,12 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Register tools
     ignis::tools::register_native_tools(&mut session, &cwd, &config);
+    if !skill_registry.is_empty() {
+        session.set_skills(skill_registry.clone());
+        session.register_tool(std::sync::Arc::new(ignis::tools::SkillTool::new(
+            skill_registry.clone(),
+        )));
+    }
 
     // Run prompt
     let prompt_text = session_request.prompt_args.join(" ");

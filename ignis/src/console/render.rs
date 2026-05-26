@@ -8,7 +8,9 @@ use ratatui::{
 use std::path::Path;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{App, Mode, ModelPicker, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
+use super::app::{
+    App, Mode, ModelPicker, SessionPicker, SkillPicker, ToolCallEntry, ToolStatus, UIBlock,
+};
 use super::markdown::render_md_block;
 use super::{
     format_context, format_duration, format_tokens, highlight, sanitize, truncate, ACCENT, BG,
@@ -18,6 +20,9 @@ use super::{
 
 /// Max queued rows shown before collapsing to a "+N more" row.
 const MAX_QUEUE_ROWS: usize = 5;
+/// Max slash-suggestion rows shown at once; the list scrolls to keep the
+/// selected entry visible when there are more (e.g. many skills + `/skills`).
+const MAX_SLASH_ROWS: u16 = 8;
 
 /// Adaptive hint shown above the input while busy (None = no hint row).
 pub(crate) fn queued_hint(app: &App) -> Option<String> {
@@ -66,10 +71,14 @@ pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
         let rows = p.sessions.len().max(1) as u16 + 4;
         return rows.clamp(4, cap);
     }
+    if let Some(_p) = &app.skill_picker {
+        let rows = app.skills.as_deref().map(|r| r.all().len()).unwrap_or(0) as u16 + 4;
+        return rows.clamp(4, cap);
+    }
     let input_h = input_height(app, cap);
     let sugg = app.slash_suggestions();
     let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
-        (sugg.len() as u16).min(5)
+        (sugg.len() as u16).min(MAX_SLASH_ROWS)
     } else {
         0
     };
@@ -88,12 +97,16 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
     // Modal pickers own the whole live band.
-    if app.model_picker.is_some() || app.session_picker.is_some() {
+    if app.model_picker.is_some() || app.session_picker.is_some() || app.skill_picker.is_some() {
         let mut lines: Vec<Line> = Vec::new();
         if let Some(picker) = &app.model_picker {
             render_model_picker(&mut lines, picker, &app.model_options);
         } else if let Some(picker) = &app.session_picker {
             render_session_picker(&mut lines, picker);
+        } else if let Some(picker) = &app.skill_picker {
+            // Rows available for skill items = band minus header (2) + footer (1).
+            let max_rows = (size.height as usize).saturating_sub(3).max(1);
+            render_skill_picker(&mut lines, picker, app.skills.as_deref(), max_rows);
         }
         f.render_widget(
             Paragraph::new(Text::from(lines))
@@ -109,7 +122,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
         size.height
             .saturating_sub(input_h + 2)
-            .min((sugg.len() as u16).min(5))
+            .min((sugg.len() as u16).min(MAX_SLASH_ROWS))
     } else {
         0
     };
@@ -530,6 +543,66 @@ pub(crate) fn render_session_picker(lines: &mut Vec<Line<'static>>, picker: &Ses
     )));
 }
 
+pub(crate) fn render_skill_picker(
+    lines: &mut Vec<Line<'static>>,
+    picker: &SkillPicker,
+    registry: Option<&crate::skills::SkillRegistry>,
+    max_rows: usize,
+) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ◆ ", Style::default().fg(MAUVE)),
+        Span::styled(
+            "Manage skills",
+            Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let Some(reg) = registry else { return };
+    let skills = reg.all();
+    // Scroll the window so the selected row stays visible when there are more
+    // skills than fit in the band.
+    let sel = picker.selected.min(skills.len().saturating_sub(1));
+    let visible = max_rows.max(1);
+    let start = slash_window_start(sel, visible, skills.len());
+    let end = (start + visible).min(skills.len());
+    for (idx, skill) in skills.iter().enumerate().take(end).skip(start) {
+        let selected = idx == sel;
+        let marker = if selected { ">" } else { " " };
+        let check = if reg.is_enabled(&skill.name) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let scope = match skill.scope {
+            crate::skills::SkillScope::Project => "project",
+            crate::skills::SkillScope::Global => "global",
+        };
+        let style = if selected {
+            Style::default().fg(BG).bg(ACCENT)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        let desc = skill.description.clone().unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {marker} {check} "),
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<18}", truncate(&skill.name, 18)),
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {}  ({scope})", truncate(&desc, 40)), style),
+        ]));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  Up/Down to move, Space/Enter to toggle, Esc to close.",
+        Style::default().fg(TEXT_DIM),
+    )));
+}
+
 pub(crate) fn render_model_picker(
     lines: &mut Vec<Line<'static>>,
     picker: &ModelPicker,
@@ -888,15 +961,32 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 
 /// Render the slash-command suggestions into `area` (the band reserved above the
 /// input). One row per suggestion; the highlighted row is inverted.
+/// First index of the visible slash-suggestion window so that `sel` stays in
+/// view: `[start, start+visible)` always contains `sel`.
+fn slash_window_start(sel: usize, visible: usize, len: usize) -> usize {
+    let visible = visible.max(1);
+    let sel = sel.min(len.saturating_sub(1));
+    if sel >= visible {
+        sel - visible + 1
+    } else {
+        0
+    }
+}
+
 pub(crate) fn draw_slash_suggestions(f: &mut Frame, area: Rect, app: &App) {
     let suggestions = app.slash_suggestions();
     if suggestions.is_empty() || area.height == 0 {
         return;
     }
-    let visible = area.height as usize;
+    let visible = (area.height as usize).max(1);
+    let sel = app.slash_selection.min(suggestions.len() - 1);
+    // Scroll the window so the selected entry is always shown (the list can be
+    // longer than `visible` once skills + `/skills` are present).
+    let start = slash_window_start(sel, visible, suggestions.len());
+    let end = (start + visible).min(suggestions.len());
     let mut lines = Vec::new();
-    for (idx, suggestion) in suggestions.iter().take(visible).enumerate() {
-        let selected = idx == app.slash_selection.min(suggestions.len() - 1);
+    for (idx, suggestion) in suggestions.iter().enumerate().take(end).skip(start) {
+        let selected = idx == sel;
         let style = if selected {
             Style::default().fg(BG).bg(ACCENT)
         } else {
@@ -932,6 +1022,19 @@ mod queue_render_tests {
 
     fn app() -> App {
         App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"))
+    }
+
+    #[test]
+    fn slash_window_keeps_selection_visible() {
+        // Within the first window → no scroll.
+        assert_eq!(slash_window_start(0, 5, 10), 0);
+        assert_eq!(slash_window_start(4, 5, 10), 0);
+        // Past the window → scroll so the selection is the last visible row.
+        assert_eq!(slash_window_start(5, 5, 10), 1);
+        assert_eq!(slash_window_start(9, 5, 10), 5);
+        // Fewer items than the window, or zero height → start at 0.
+        assert_eq!(slash_window_start(2, 8, 3), 0);
+        assert_eq!(slash_window_start(0, 0, 1), 0);
     }
 
     #[test]

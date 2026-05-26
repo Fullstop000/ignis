@@ -103,6 +103,39 @@ In the TUI: `Enter` sends, `↑/↓` history, `Ctrl+D` exit. Output renders inli
 the normal buffer, so scroll with your terminal/tmux as usual. Type `/` for
 slash-command suggestions.
 
+## Skills
+
+Skills are reusable instruction sets the model can load on demand. Each skill is
+a `SKILL.md` file in its own directory:
+
+```
+~/.ignis/skills/<name>/SKILL.md       # global (all projects)
+<repo>/.ignis/skills/<name>/SKILL.md   # project-local
+```
+
+`.agents/skills/` is also scanned at both levels for cross-tool portability. On a
+name clash, project beats global and `.ignis` beats `.agents`.
+
+```markdown
+---
+name: react-patterns
+description: Use when working with React components, hooks, or state.
+---
+# React Patterns
+...your instructions...
+```
+
+- The model sees each skill's name + description and loads one with the `skill`
+  tool when a task matches.
+- Force-load one yourself: `/react-patterns refactor this component`.
+- Enable or disable skills at runtime: `/skills`.
+- A skill can bundle supporting files (scripts, templates) in its directory;
+  when the skill loads, the model is shown the file list and reads them as the
+  instructions reference them.
+
+The `SKILL.md` format matches the cross-tool convention used by Claude Code,
+Codex, OpenCode, and Kimi, so skills in `~/.agents/skills` are shared across them.
+
 ## Development
 
 ```bash

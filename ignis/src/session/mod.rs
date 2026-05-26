@@ -75,6 +75,12 @@ impl Session {
         self.agent.set_hooks(hooks);
     }
 
+    /// Apply the shared skill registry to this session's agent (enables the
+    /// per-turn skill catalog and is paired with registering `SkillTool`).
+    pub fn set_skills(&mut self, skills: std::sync::Arc<crate::skills::SkillRegistry>) {
+        self.agent.set_skills(skills);
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
