@@ -817,13 +817,15 @@ mod tests {
 
     #[test]
     fn sanitize_redacts_api_keys() {
-        let key = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        // Fake keys: underscores keep the secret-scan grep happy while still
+        // matching our redaction regex (which accepts [A-Za-z0-9_-]).
+        let key = "sk-FAKE_NOT_REAL_xxxxxxxxxxxxxxxx";
         let err = format!("auth failed with key {key}");
         let out = Agent::sanitize_and_truncate_error(&err);
         assert!(!out.contains(key), "key leaked: {out}");
         assert!(out.contains("[REDACTED_API_KEY]"));
 
-        let ant_key = "sk-ant-api03-aBc_dEf-12345_xyz-09876_long-suffix";
+        let ant_key = "sk-ant-api03_FAKE_dEf_xyz_long_suffix";
         let out2 = Agent::sanitize_and_truncate_error(ant_key);
         assert!(!out2.contains(ant_key));
         assert_eq!(out2, "[REDACTED_API_KEY]");
