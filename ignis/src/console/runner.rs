@@ -20,6 +20,7 @@ use crate::console::render::{self, draw};
 use crate::session::SessionManager;
 use crate::{AgentEvent, Message, Session};
 
+/// Create an inline-viewport terminal over stdout. Recreated when the live band
 /// needs to grow/shrink (the inline height is fixed per `Terminal`).
 fn make_inline_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     let backend = CrosstermBackend::new(io::stdout());

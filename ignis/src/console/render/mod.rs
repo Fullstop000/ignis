@@ -29,6 +29,9 @@ pub(crate) use widgets::{
     queued_region_height, MAX_SLASH_ROWS,
 };
 
+/// Live-region height (rows) the inline viewport needs for the current state.
+/// Finalized transcript blocks live in the terminal's own scrollback; only this
+/// band is repainted. The band grows for the multi-line input, slash
 /// suggestions, and the modal pickers, and collapses to a tidy strip at rest.
 pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
     let cap = term_rows.saturating_sub(1).max(3);
@@ -146,6 +149,12 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     draw_input(f, layout[3], app);
     draw_footer(f, layout[4], app);
 }
+/// Split-layout render for the `ask_user` picker when at least one option
+/// carries a `preview`. The band is divided:
+///   - top: blank + header strip + question (3 rows)
+///   - middle: horizontal split — option list left (~45%), bordered Preview
+///     pane right (~55%) showing the focused option's title + description +
+///     preview text
 ///   - bottom: blank + footer (2 rows)
 fn render_inline_picker_split(
     f: &mut Frame,

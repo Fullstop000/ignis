@@ -1,8 +1,10 @@
 //! Console layer — TUI runner + per-frame draw + key dispatch + slash
 //! commands. The legacy single-file `console::mod` grew large; the concerns
 //! now split into focused submodules. `pub use` re-exports below preserve
-//! every `crate::console::*` path the rest of the crate already uses, so
-//! the split is a pure organizational change.
+//! every path the rest of the crate (and external callers) actually use;
+//! internal-only items that were previously hoisted as crate-visible
+//! constants live on their submodules and are imported directly via
+//! `crate::console::<submodule>::*`.
 
 pub mod app;
 pub mod clipboard;
