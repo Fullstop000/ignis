@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-05-27
+
+### Changed
+- Internal — unified the top-level CLI on clap; `ignis --help` is now clap-generated and stays in lockstep with the actual flags.
+- Typo'd top-level flags (e.g. `ignis --resme`) now error with a suggested correction instead of being silently sent as one-shot prompt text. A literal `-`-leading prompt now needs `--`, e.g. `ignis -- "--debug fix"`.
+
 ## [0.15.0] - 2026-05-27
 
 ### Added
