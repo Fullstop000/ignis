@@ -138,11 +138,16 @@ async fn fetch_latest_tag() -> Result<String> {
 
 /// Extract the tag from a `…/releases/tag/<tag>` URL. Returns an error rather
 /// than the literal "latest" / an empty string if the redirect didn't land
-/// on a tag page (e.g. the repo has no releases yet).
+/// on a tag page (e.g. the repo has no releases yet). Defensively strips any
+/// trailing query string / fragment — GitHub doesn't add them today, but if
+/// they ever do we don't want `"v1.0.0?ref=foo"` to land in the asset URL.
 fn tag_from_release_url(url: &str) -> Result<String> {
     let last = url
         .trim_end_matches('/')
         .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .split(['?', '#'])
         .next()
         .unwrap_or_default();
     if last.is_empty() || last == "latest" || last == "releases" {
@@ -290,6 +295,20 @@ mod tests {
             tag_from_release_url("https://github.com/Fullstop000/ignis/releases/tag/v0.15.1/")
                 .unwrap(),
             "v0.15.1"
+        );
+    }
+
+    #[test]
+    fn tag_from_release_url_strips_query_and_fragment() {
+        // Defensive: GitHub doesn't add these today, but our extractor
+        // shouldn't slot them into the asset URL if it ever changes.
+        assert_eq!(
+            tag_from_release_url("https://github.com/x/y/releases/tag/v1.2.3?ref=foo").unwrap(),
+            "v1.2.3"
+        );
+        assert_eq!(
+            tag_from_release_url("https://github.com/x/y/releases/tag/v1.2.3#changelog").unwrap(),
+            "v1.2.3"
         );
     }
 

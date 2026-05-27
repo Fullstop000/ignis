@@ -59,7 +59,7 @@ if [ "$VERSION" = "latest" ]; then
     if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
         echo "Failed to resolve the latest release tag." >&2
         echo "Tip: pin a version explicitly, e.g." >&2
-        echo "  curl -fsSL .../install.sh | IGNIS_VERSION=v0.15.1 sh" >&2
+        echo "  curl -fsSL .../install.sh | IGNIS_VERSION=vX.Y.Z sh" >&2
         echo "Browse releases: https://github.com/$REPO/releases" >&2
         exit 1
     fi
