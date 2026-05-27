@@ -765,8 +765,12 @@ impl Agent {
                 }
 
                 // Drain any remaining orphan results (unmatched IDs or missing IDs)
-                // so we never silently lose a tool result.
-                for (_, msg) in results_by_id.drain() {
+                // so we never silently lose a tool result. Sort by tool_call_id so
+                // the appended order is deterministic across runs (HashMap drain
+                // order is not).
+                let mut leftover: Vec<(String, Message)> = results_by_id.drain().collect();
+                leftover.sort_by(|a, b| a.0.cmp(&b.0));
+                for (_, msg) in leftover {
                     push_with_hook(history, hooks.as_deref(), msg).await;
                 }
                 for msg in orphans.drain(..) {

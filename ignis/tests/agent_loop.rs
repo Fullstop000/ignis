@@ -411,13 +411,24 @@ async fn agent_streams_reasoning_then_text_as_two_blocks() {
             )
         })
         .collect();
+    // Exact sequence: Start, 💭, hmm, End, Start, Answer, End (7 events).
+    assert_eq!(msg_events.len(), 7, "events: {msg_events:?}");
     assert!(matches!(msg_events[0], AgentEvent::MessageStart { .. }));
+    assert!(matches!(
+        msg_events[1],
+        AgentEvent::MessageUpdate { delta } if delta == "💭 "
+    ));
+    assert!(matches!(
+        msg_events[2],
+        AgentEvent::MessageUpdate { delta } if delta == "hmm"
+    ));
     assert!(matches!(msg_events[3], AgentEvent::MessageEnd { .. }));
     assert!(matches!(msg_events[4], AgentEvent::MessageStart { .. }));
     assert!(matches!(
-        msg_events.last().unwrap(),
-        AgentEvent::MessageEnd { .. }
+        msg_events[5],
+        AgentEvent::MessageUpdate { delta } if delta == "Answer"
     ));
+    assert!(matches!(msg_events[6], AgentEvent::MessageEnd { .. }));
 }
 
 #[tokio::test]
