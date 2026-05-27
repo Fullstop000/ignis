@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-05-27
+
+### Fixed
+- `install.sh` and `ignis upgrade` no longer fail with HTTP 403 on shared-IP networks (WSL/corp NAT/CI) — both now resolve the latest tag via the `/releases/latest` HTML redirect instead of the rate-limited JSON API.
+
 ## [0.15.1] - 2026-05-27
 
 ### Changed
