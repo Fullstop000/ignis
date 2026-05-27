@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-05-27
+
 ### Added
 - `install.sh` — one-liner installer for Linux/macOS that drops the latest release binary into `~/.ignis/bin` (override with `IGNIS_INSTALL_DIR`).
 - `ignis upgrade` (alias `ignis update`) — self-update to the latest release; supports `--check`, `--force`, and `--version v0.X.Y`.
