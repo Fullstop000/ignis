@@ -61,14 +61,9 @@ impl SessionPicker {
         }
     }
 
-    /// Move the cursor; returns true if any move happened (i.e. the picker has
-    /// at least one row).
-    pub(crate) fn select(&mut self, direction: SelectionDirection) -> bool {
-        if self.sessions.is_empty() {
-            return false;
-        }
+    pub(crate) fn select(&mut self, direction: SelectionDirection) {
+        // `next_selection` no-ops on empty — no extra guard needed.
         self.selected = next_selection(self.selected, self.sessions.len(), direction);
-        true
     }
 
     pub(crate) fn selected_id(&self) -> Option<String> {
@@ -90,9 +85,6 @@ impl SkillPicker {
     }
 
     pub(crate) fn select(&mut self, direction: SelectionDirection, total: usize) {
-        if total == 0 {
-            return;
-        }
         self.selected = next_selection(self.selected, total, direction);
     }
 
@@ -121,9 +113,6 @@ impl McpPicker {
     }
 
     pub(crate) fn select(&mut self, direction: SelectionDirection, total: usize) {
-        if total == 0 {
-            return;
-        }
         self.selected = next_selection(self.selected, total, direction);
     }
 
@@ -655,11 +644,11 @@ impl App {
         self.session_picker = Some(SessionPicker::new(sessions));
     }
 
-    pub(crate) fn select_session_picker(&mut self, direction: SelectionDirection) -> bool {
+    pub(crate) fn select_session_picker(&mut self, direction: SelectionDirection) {
         self.exit_pending = false;
-        self.session_picker
-            .as_mut()
-            .is_some_and(|p| p.select(direction))
+        if let Some(p) = &mut self.session_picker {
+            p.select(direction);
+        }
     }
 
     pub(crate) fn selected_session_id(&self) -> Option<String> {

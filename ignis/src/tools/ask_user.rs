@@ -227,13 +227,9 @@ pub(crate) fn parse_questions(args: &Value) -> Result<Vec<PickerQuestion>, Strin
 /// Build the JSON result the model sees: `{"answers": [{"question": ..., "answer": ...}, ...]}`.
 /// Single-select → string, multi-select → array. Lengths must already match.
 fn format_answers(questions: &[PickerQuestion], answers: &[PickerAnswer]) -> ToolResult {
-    if questions.len() != answers.len() {
-        return ToolResult::error(format!(
-            "ask_user: internal answer count mismatch ({} questions, {} answers)",
-            questions.len(),
-            answers.len()
-        ));
-    }
+    // Picker advances one question at a time, so the lengths are invariant —
+    // any mismatch is a programmer error.
+    debug_assert_eq!(questions.len(), answers.len());
     let mut out = Vec::with_capacity(questions.len());
     for (q, a) in questions.iter().zip(answers) {
         let answer_val = match a {

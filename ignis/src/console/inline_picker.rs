@@ -167,21 +167,14 @@ impl InlinePickerState {
                 .collect();
             // Multi-select: include Other iff buffer has content. No separate
             // toggle key — space is reserved for typing into Other.
-            if !self.other_buf.trim().is_empty() {
-                picks.push(self.other_buf.trim().to_string());
+            let other = self.other_buf.trim();
+            if !other.is_empty() {
+                picks.push(other.to_string());
             }
-            if picks.is_empty() {
-                None
-            } else {
-                Some(PickerAnswer::Multi(picks))
-            }
+            (!picks.is_empty()).then_some(PickerAnswer::Multi(picks))
         } else if self.other_focused() {
             let text = self.other_buf.trim();
-            if text.is_empty() {
-                None
-            } else {
-                Some(PickerAnswer::Single(text.to_string()))
-            }
+            (!text.is_empty()).then(|| PickerAnswer::Single(text.to_string()))
         } else {
             Some(PickerAnswer::Single(q.options[self.cursor].label.clone()))
         };
