@@ -19,9 +19,10 @@ use crate::mcp::{McpRegistry, McpStatus};
 use crate::state;
 use crate::tools::tool::AgentTool;
 
+// The parent `Cli` (in `cli/mod.rs`) owns naming and routes here through the
+// `Command::Mcp(McpCmd)` variant, so we don't set `name`/`about` again.
 #[derive(Debug, Parser)]
-#[command(name = "ignis mcp", about = "Manage MCP servers")]
-pub struct Cli {
+pub struct McpCmd {
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -82,19 +83,9 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
         .ok_or_else(|| format!("expected KEY=VALUE, got `{s}`"))
 }
 
-/// Entry point. `args` is everything *after* `ignis mcp` (so `argv[2..]`).
-///
-/// Uses `Cli::parse_from`, which prints `--help` / `--version` and exits 0
-/// on its own, and prints usage and exits 2 on bad input — matching the rest
-/// of clap's UX (and what `claude mcp` does).
-pub async fn run(args: Vec<String>) -> Result<()> {
-    // clap wants argv[0] in the slice; prepend a label so usage messages read
-    // `ignis mcp …` rather than `mcp …`.
-    let mut full = Vec::with_capacity(args.len() + 1);
-    full.push("ignis mcp".to_string());
-    full.extend(args);
-    let cli = Cli::parse_from(full);
-    match cli.cmd {
+/// Entry point. `cmd` is the already-parsed `McpCmd` from the parent `Cli`.
+pub async fn run(cmd: McpCmd) -> Result<()> {
+    match cmd.cmd {
         Cmd::Add(args) => cmd_add(args),
         Cmd::List(args) => cmd_list(args).await,
         Cmd::Get { name } => cmd_get(name).await,

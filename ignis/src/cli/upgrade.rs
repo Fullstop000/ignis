@@ -31,7 +31,6 @@ pub const TARGET: Option<&str> = if cfg!(all(target_os = "linux", target_arch = 
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "ignis upgrade", about = "Update ignis to the latest release")]
 pub struct UpgradeCmd {
     /// Install a specific tag (e.g. `v0.14.1`) instead of the latest.
     #[arg(long)]
@@ -44,25 +43,7 @@ pub struct UpgradeCmd {
     pub check: bool,
 }
 
-pub async fn run(args: Vec<String>) -> Result<()> {
-    // clap expects argv[0] to be the program name; the dispatcher in main.rs
-    // strips the subcommand word before calling us, so prepend a synthetic one.
-    let mut argv = vec!["ignis upgrade".to_string()];
-    argv.extend(args);
-    // `try_parse_from` returns Err for `--help`/`--version` instead of the
-    // usual exit-0-after-print. Detect those kinds and exit cleanly so
-    // `ignis upgrade --help` reads like every other CLI.
-    let cmd = match UpgradeCmd::try_parse_from(argv) {
-        Ok(c) => c,
-        Err(e) => {
-            e.print().ok();
-            std::process::exit(match e.kind() {
-                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
-                _ => 2,
-            });
-        }
-    };
-
+pub async fn run(cmd: UpgradeCmd) -> Result<()> {
     let target = TARGET.ok_or_else(|| {
         anyhow!(
             "no prebuilt binary for this host; build from source: https://github.com/{}",

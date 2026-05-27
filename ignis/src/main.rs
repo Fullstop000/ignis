@@ -1,5 +1,6 @@
+use clap::Parser;
 use ignis::{
-    cli::{parse_cli_args, resolve_session_request},
+    cli::{resolve_session_request, Cli, Command},
     config::{build_provider, load_config},
     session::{project_sessions_dir, SessionManager},
     storage::FileStorage,
@@ -9,43 +10,25 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Parse arguments
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // clap parses argv, handles --help / --version / errors with proper exits.
+    let cli = Cli::parse();
 
-    // Handle --version / -V and --help / -h only as the very first arg, so
-    // subcommand flags like `ignis upgrade --version v0.14.1` and one-shot
-    // prompts containing those tokens aren't hijacked.
-    match raw_args.first().map(String::as_str) {
-        Some("--version" | "-V") => {
-            println!("ignis {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
-        }
-        Some("--help" | "-h") => {
-            print!("{}", ignis::cli::help_text());
-            return Ok(());
-        }
-        _ => {}
-    }
-
-    // Subcommands with their own clap parsers route here before the
-    // hand-rolled session arg parser ever sees them.
-    match raw_args.first().map(|s| s.as_str()) {
-        Some("mcp") => {
+    // Subcommands short-circuit the session flow.
+    match cli.command {
+        Some(Command::Mcp(cmd)) => {
             let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
             if let Err(e) = ignis::logger::init(&home.join(".ignis/logs")) {
                 eprintln!("Failed to initialize logger: {}", e);
             }
-            return ignis::cli::mcp::run(raw_args.into_iter().skip(1).collect()).await;
+            return ignis::cli::mcp::run(cmd).await;
         }
-        // `update` is an alias for `upgrade` — they target the same self-update
-        // path, so accept whichever word the user reaches for.
-        Some("upgrade") | Some("update") => {
-            return ignis::cli::upgrade::run(raw_args.into_iter().skip(1).collect()).await;
+        Some(Command::Upgrade(cmd)) => {
+            return ignis::cli::upgrade::run(cmd).await;
         }
-        _ => {}
+        None => {}
     }
 
-    let cli = parse_cli_args(raw_args);
+    let cli = cli.to_session_args();
     let is_oneshot = !cli.prompt_args.is_empty();
 
     // 1. Load config

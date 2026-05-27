@@ -1,68 +1,78 @@
-use ignis::cli::{parse_cli_args, resolve_session_request};
+use clap::Parser;
+use ignis::cli::{resolve_session_request, Cli};
 use ignis::session::SessionManager;
 use ignis::util::unique_temp_dir;
 use std::io::Write;
 
+fn parse(argv: &[&str]) -> Cli {
+    let mut full = vec!["ignis"];
+    full.extend_from_slice(argv);
+    Cli::try_parse_from(full).expect("parse")
+}
+
 // ==========================================
-// CLI argument parsing
+// CLI argument parsing (via the unified clap-derived Cli)
 // ==========================================
 
 #[test]
 fn cli_no_args_defaults_to_tui() {
-    let parsed = parse_cli_args(vec![]);
+    let args = parse(&[]).to_session_args();
     // `is_tui` lives on SessionRequest, not CliArgs: an empty prompt_args
     // resolves to the TUI down in resolve_session_request.
-    assert!(!parsed.resume);
-    assert!(parsed.prompt_args.is_empty());
+    assert!(!args.resume);
+    assert!(args.prompt_args.is_empty());
 }
 
 #[test]
 fn cli_oneshot_single_arg() {
-    let parsed = parse_cli_args(vec!["hello".to_string()]);
-    assert_eq!(parsed.prompt_args, vec!["hello"]);
+    let args = parse(&["hello"]).to_session_args();
+    assert_eq!(args.prompt_args, vec!["hello"]);
 }
 
 #[test]
 fn cli_oneshot_multiple_args() {
-    let parsed = parse_cli_args(vec![
-        "write".to_string(),
-        "a".to_string(),
-        "test".to_string(),
-    ]);
-    assert_eq!(parsed.prompt_args, vec!["write", "a", "test"]);
+    let args = parse(&["write", "a", "test"]).to_session_args();
+    assert_eq!(args.prompt_args, vec!["write", "a", "test"]);
 }
 
 #[test]
 fn cli_resume_with_session_id() {
-    let parsed = parse_cli_args(vec!["--resume".to_string(), "work".to_string()]);
-    assert!(parsed.resume);
-    assert_eq!(parsed.resume_session_id.as_deref(), Some("work"));
-    assert!(parsed.prompt_args.is_empty());
+    let args = parse(&["--resume", "work"]).to_session_args();
+    assert!(args.resume);
+    assert_eq!(args.resume_session_id.as_deref(), Some("work"));
+    assert!(args.prompt_args.is_empty());
 }
 
 #[test]
 fn cli_resume_without_session_id() {
-    let parsed = parse_cli_args(vec!["--resume".to_string()]);
-    assert!(parsed.resume);
-    assert!(parsed.resume_session_id.is_none());
+    let args = parse(&["--resume"]).to_session_args();
+    assert!(args.resume);
+    assert!(args.resume_session_id.is_none());
 }
 
 #[test]
 fn cli_resume_with_prompt() {
-    let parsed = parse_cli_args(vec![
-        "--resume".to_string(),
-        "work".to_string(),
-        "hello".to_string(),
-    ]);
-    assert!(parsed.resume);
-    assert_eq!(parsed.resume_session_id.as_deref(), Some("work"));
-    assert_eq!(parsed.prompt_args, vec!["hello"]);
+    let args = parse(&["--resume", "work", "hello"]).to_session_args();
+    assert!(args.resume);
+    assert_eq!(args.resume_session_id.as_deref(), Some("work"));
+    assert_eq!(args.prompt_args, vec!["hello"]);
 }
 
 #[test]
-fn cli_ignores_unknown_flags_as_prompt_args() {
-    let parsed = parse_cli_args(vec!["--unknown".to_string(), "hello".to_string()]);
-    assert_eq!(parsed.prompt_args, vec!["--unknown", "hello"]);
+fn cli_rejects_unknown_top_level_flag() {
+    // Tightened in v0.15.1: clap rejects typos instead of silently sending
+    // them as one-shot prompt text. Use `ignis -- --unknown` for a literal.
+    let err = Cli::try_parse_from(["ignis", "--unknown"]).unwrap_err();
+    assert!(matches!(
+        err.kind(),
+        clap::error::ErrorKind::UnknownArgument | clap::error::ErrorKind::InvalidSubcommand
+    ));
+}
+
+#[test]
+fn cli_hyphen_prompt_works_after_dash_dash() {
+    let args = parse(&["--", "--debug", "fix the bug"]).to_session_args();
+    assert_eq!(args.prompt_args, vec!["--debug", "fix the bug"]);
 }
 
 // ==========================================
@@ -76,7 +86,7 @@ fn resolve_defaults_to_default_session() {
     let manager = SessionManager::new(dir.clone());
 
     let request = resolve_session_request(
-        parse_cli_args(vec!["hello".to_string()]),
+        parse(&["hello"]).to_session_args(),
         &manager,
         false,
         std::path::Path::new("/tmp"),
@@ -97,7 +107,7 @@ fn resolve_empty_prompt_goes_to_tui() {
     let manager = SessionManager::new(dir.clone());
 
     let request = resolve_session_request(
-        parse_cli_args(vec![]),
+        parse(&[]).to_session_args(),
         &manager,
         false,
         std::path::Path::new("/tmp"),
@@ -128,7 +138,7 @@ fn resolve_resume_picks_latest_session() {
 
     let manager = SessionManager::new(dir.clone());
     let request = resolve_session_request(
-        parse_cli_args(vec!["--resume".to_string()]),
+        parse(&["--resume"]).to_session_args(),
         &manager,
         false,
         std::path::Path::new("/tmp"),

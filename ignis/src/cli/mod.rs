@@ -1,9 +1,74 @@
+//! Top-level CLI surface. Owned by clap (derive macros). Subcommand bodies live
+//! in `mcp` and `upgrade` and are embedded as `Command` variants here; that
+//! keeps all parsing — including `--help` and `--version` formatting — in one
+//! place. The legacy hand-rolled parser and hand-typed help string were removed
+//! in v0.15.1 (no behavior change beyond stricter validation of unknown flags).
+
+use clap::{Parser, Subcommand};
+
 use crate::session::SessionManager;
 
 pub mod mcp;
 pub mod upgrade;
 
-#[derive(Debug, PartialEq)]
+#[derive(Parser, Debug)]
+#[command(
+    name = "ignis",
+    version,
+    about = "A multi-provider AI coding agent for your terminal.",
+    long_about = "With no prompt, launches the interactive TUI; with a prompt, runs one-shot to stdout.",
+    after_help = "Repo: https://github.com/Fullstop000/ignis",
+    disable_help_subcommand = true,
+    arg_required_else_help = false
+)]
+pub struct Cli {
+    /// Resume the latest session, or the given session id.
+    #[arg(long, num_args = 0..=1, value_name = "ID")]
+    pub resume: Option<Option<String>>,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    /// The prompt to send (any non-flag args, joined). Prompt tokens that
+    /// start with `-` must be escaped with `--`, e.g. `ignis -- "--debug fix"`.
+    //
+    // The benefit of strict parsing here (no `allow_hyphen_values`): a typo
+    // like `ignis --resme work` surfaces as "unknown argument" with clap's
+    // built-in suggestion instead of being silently sent as a one-shot prompt.
+    #[arg(trailing_var_arg = true)]
+    pub prompt: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Update ignis to the latest release.
+    #[command(alias = "update")]
+    Upgrade(upgrade::UpgradeCmd),
+    /// Manage MCP servers (add, list, get, remove, enable, disable).
+    Mcp(mcp::McpCmd),
+}
+
+impl Cli {
+    /// Map clap's parse result into the small struct that `resolve_session_request`
+    /// already knows how to consume — keeps the resolver and its tests stable.
+    pub fn to_session_args(self) -> CliArgs {
+        let (resume, resume_session_id) = match self.resume {
+            None => (false, None),
+            Some(None) => (true, None),
+            Some(Some(id)) => (true, Some(id)),
+        };
+        CliArgs {
+            resume,
+            resume_session_id,
+            prompt_args: self.prompt,
+        }
+    }
+}
+
+/// Resolver-side view of the CLI: the slice of state that picks a session id
+/// and decides TUI vs. one-shot. Built by `Cli::to_session_args` in the
+/// production path; constructed directly in tests.
+#[derive(Debug, PartialEq, Default)]
 pub struct CliArgs {
     pub resume: bool,
     pub resume_session_id: Option<String>,
@@ -15,72 +80,6 @@ pub struct SessionRequest {
     /// `true` when the resolved request has no prompt — launches the TUI.
     pub is_tui: bool,
     pub prompt_args: Vec<String>,
-}
-
-/// Hand-rolled top-level flag block, kept short on purpose. Subcommands
-/// (`upgrade`, `mcp`) own their own clap parsers and therefore their own
-/// `--help` — this prints the surface a user sees before a subcommand is
-/// chosen. Mirrors the shape of `claude -h` / `kimi -h`.
-pub fn help_text() -> String {
-    format!(
-        "\
-Usage: ignis [options] [command] [prompt]
-
-A multi-provider AI coding agent for your terminal. With no prompt,
-launches the interactive TUI; with a prompt, runs one-shot to stdout.
-
-Arguments:
-  prompt              The prompt to send (any non-flag args, joined).
-
-Options:
-      --resume [id]   Resume the latest session, or the given session id.
-  -V, --version       Print version and exit.
-  -h, --help          Print this help and exit.
-
-Commands:
-  upgrade|update      Update ignis to the latest release.
-  mcp                 Manage MCP servers (add, list, get, remove, enable, disable).
-
-Examples:
-  ignis                                # interactive TUI
-  ignis \"fix the failing test\"         # one-shot prompt
-  ignis --resume                       # resume the latest session
-  ignis --resume <id> \"follow-up\"      # resume + one-shot
-
-Run `ignis <command> --help` for subcommand options.
-Repo: https://github.com/{repo}
-",
-        repo = "Fullstop000/ignis"
-    )
-}
-
-pub fn parse_cli_args(args: Vec<String>) -> CliArgs {
-    let mut resume = false;
-    let mut resume_session_id = None;
-    let mut prompt_args = Vec::new();
-    let mut iter = args.into_iter().peekable();
-
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--resume" => {
-                resume = true;
-                // Consume the next token as the session id only when it looks
-                // like one — not a flag, not the start of a prompt with `--`.
-                if let Some(next) = iter.peek() {
-                    if !next.starts_with("--") {
-                        resume_session_id = iter.next();
-                    }
-                }
-            }
-            _ => prompt_args.push(arg),
-        }
-    }
-
-    CliArgs {
-        resume,
-        resume_session_id,
-        prompt_args,
-    }
 }
 
 pub fn resolve_session_request(
@@ -127,57 +126,95 @@ pub fn resolve_session_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
-    #[test]
-    fn parse_cli_args_treats_resume_value_as_session_id() {
-        let parsed = parse_cli_args(vec!["--resume".to_string(), "hello".to_string()]);
-
-        assert!(parsed.resume);
-        assert_eq!(parsed.resume_session_id.as_deref(), Some("hello"));
-        assert!(parsed.prompt_args.is_empty());
+    fn parse(argv: &[&str]) -> Cli {
+        // clap's argv[0] is the program name.
+        let mut full = vec!["ignis"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(full).expect("parse")
     }
 
     #[test]
-    fn parse_cli_args_oneshot_with_prompt() {
-        let parsed = parse_cli_args(vec!["hello world".to_string()]);
-
-        assert!(!parsed.resume);
-        assert_eq!(parsed.prompt_args, vec!["hello world"]);
+    fn no_args_resolves_to_tui_session_args() {
+        let args = parse(&[]).to_session_args();
+        assert!(!args.resume);
+        assert!(args.resume_session_id.is_none());
+        assert!(args.prompt_args.is_empty());
     }
 
     #[test]
-    fn parse_cli_args_oneshot_with_multiple_words() {
-        let parsed = parse_cli_args(vec![
-            "write".to_string(),
-            "a".to_string(),
-            "test".to_string(),
-        ]);
-
-        assert_eq!(parsed.prompt_args, vec!["write", "a", "test"]);
+    fn bare_resume_means_latest_session() {
+        let args = parse(&["--resume"]).to_session_args();
+        assert!(args.resume);
+        assert!(args.resume_session_id.is_none());
+        assert!(args.prompt_args.is_empty());
     }
 
     #[test]
-    fn parse_cli_args_tui_token_no_longer_recognized() {
-        // `--tui` / `tui` were dropped in v0.15.0 (the no-arg path already
-        // launches the TUI). Tokens with those names now fall through to
-        // prompt_args like any other word.
-        let parsed = parse_cli_args(vec!["--tui".to_string()]);
-        assert_eq!(parsed.prompt_args, vec!["--tui"]);
+    fn resume_with_id_and_prompt() {
+        let args = parse(&["--resume", "work", "follow-up"]).to_session_args();
+        assert!(args.resume);
+        assert_eq!(args.resume_session_id.as_deref(), Some("work"));
+        assert_eq!(args.prompt_args, vec!["follow-up"]);
     }
 
     #[test]
-    fn help_text_lists_top_level_surface() {
-        let h = help_text();
-        assert!(h.starts_with("Usage: ignis"));
-        assert!(h.contains("--resume"));
-        assert!(h.contains("-V, --version"));
-        assert!(h.contains("-h, --help"));
-        assert!(h.contains("upgrade|update"));
-        assert!(h.contains("mcp"));
+    fn oneshot_collects_trailing_args() {
+        let args = parse(&["write", "a", "test"]).to_session_args();
+        assert_eq!(args.prompt_args, vec!["write", "a", "test"]);
+    }
+
+    #[test]
+    fn prompt_can_contain_hyphenated_tokens_after_dash_dash() {
+        // The trailing prompt allows hyphen values; first-token `--something`
+        // still needs `--` to escape clap's flag scan.
+        let args = parse(&["--", "--debug", "fix"]).to_session_args();
+        assert_eq!(args.prompt_args, vec!["--debug", "fix"]);
+    }
+
+    #[test]
+    fn subcommand_takes_precedence_over_prompt() {
+        let cli = Cli::try_parse_from(["ignis", "upgrade", "--check"]).expect("parse");
+        assert!(matches!(cli.command, Some(Command::Upgrade(_))));
+        assert!(cli.prompt.is_empty());
+    }
+
+    #[test]
+    fn update_alias_routes_to_upgrade() {
+        let cli = Cli::try_parse_from(["ignis", "update", "--check"]).expect("parse");
+        assert!(matches!(cli.command, Some(Command::Upgrade(_))));
+    }
+
+    #[test]
+    fn unknown_top_level_flag_is_rejected() {
+        // The hand-rolled parser used to silently push --foo into prompt_args;
+        // clap now surfaces the typo as an error.
+        let err = Cli::try_parse_from(["ignis", "--foo"]).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument | clap::error::ErrorKind::InvalidSubcommand
+            ),
+            "expected UnknownArgument/InvalidSubcommand, got {:?}",
+            err.kind()
+        );
+    }
+
+    #[test]
+    fn help_text_contains_top_level_surface() {
+        // `--help` exits cleanly via clap's DisplayHelp kind; we render the
+        // string into a buffer and inspect it.
+        let err = Cli::try_parse_from(["ignis", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let rendered = err.render().to_string();
+        assert!(rendered.contains("Usage: ignis"));
+        assert!(rendered.contains("--resume"));
+        assert!(rendered.contains("upgrade"));
+        assert!(rendered.contains("mcp"));
         // Things we deliberately don't expose at the top level.
-        assert!(!h.contains("--tui"));
-        assert!(!h.contains("skills"));
-        assert!(!h.contains("config"));
+        assert!(!rendered.contains("--tui"));
+        assert!(!rendered.contains("skills"));
     }
 
     #[test]
@@ -187,7 +224,7 @@ mod tests {
         let manager = SessionManager::new(dir.clone());
 
         let request = resolve_session_request(
-            parse_cli_args(vec!["--resume".to_string(), "default".to_string()]),
+            parse(&["--resume", "default"]).to_session_args(),
             &manager,
             false,
             std::path::Path::new("/tmp"),
@@ -208,7 +245,7 @@ mod tests {
         let manager = SessionManager::new(dir.clone());
 
         let request = resolve_session_request(
-            parse_cli_args(vec!["--resume".to_string()]),
+            parse(&["--resume"]).to_session_args(),
             &manager,
             false,
             std::path::Path::new("/tmp"),
@@ -229,11 +266,7 @@ mod tests {
         let manager = SessionManager::new(dir.clone());
 
         let request = resolve_session_request(
-            parse_cli_args(vec![
-                "--resume".to_string(),
-                "work".to_string(),
-                "hello".to_string(),
-            ]),
+            parse(&["--resume", "work", "hello"]).to_session_args(),
             &manager,
             false,
             std::path::Path::new("/tmp"),
@@ -253,7 +286,7 @@ mod tests {
         let manager = SessionManager::new(dir.clone());
 
         let request = resolve_session_request(
-            parse_cli_args(vec!["hello".to_string()]),
+            parse(&["hello"]).to_session_args(),
             &manager,
             false,
             std::path::Path::new("/tmp"),
@@ -284,7 +317,7 @@ mod tests {
         let manager = SessionManager::new(dir.clone());
 
         let request = resolve_session_request(
-            parse_cli_args(vec![]),
+            parse(&[]).to_session_args(),
             &manager,
             true,
             std::path::Path::new("/tmp"),
@@ -313,7 +346,7 @@ mod tests {
         let manager = SessionManager::new(dir.clone());
 
         let request = resolve_session_request(
-            parse_cli_args(vec![]),
+            parse(&[]).to_session_args(),
             &manager,
             true,
             std::path::Path::new("/tmp"),
@@ -367,7 +400,7 @@ mod tests {
         let manager = SessionManager::new(dir.clone());
 
         let request = resolve_session_request(
-            parse_cli_args(vec![]),
+            parse(&[]).to_session_args(),
             &manager,
             true,
             std::path::Path::new("/tmp"),
