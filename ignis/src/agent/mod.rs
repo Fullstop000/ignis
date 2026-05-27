@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+use regex::Regex;
 
 use crate::mcp::McpRegistry;
 use crate::skills::SkillRegistry;
@@ -234,13 +236,17 @@ impl Agent {
     }
 
     fn sanitize_and_truncate_error(err: &str) -> String {
-        // Redact potential API keys/secrets patterns
-        let redacted = err.replace(r"sk-[a-zA-Z0-9]{32,}", "[REDACTED_API_KEY]");
-        // Truncate to maximum 500 characters
-        if redacted.len() > 500 {
-            format!("{}... [truncated]", &redacted[..500])
+        static API_KEY_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"sk-[A-Za-z0-9_-]{20,}").unwrap());
+        let redacted = API_KEY_RE.replace_all(err, "[REDACTED_API_KEY]");
+        let mut end = 500.min(redacted.len());
+        while end < redacted.len() && !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end < redacted.len() {
+            format!("{}... [truncated]", &redacted[..end])
         } else {
-            redacted
+            redacted.into_owned()
         }
     }
 
@@ -326,6 +332,7 @@ impl Agent {
             let mut reasoning_content = String::new();
             let mut pending_tool_calls: HashMap<usize, AccumulatingToolCall> = HashMap::new();
             let mut message_started = false;
+            let mut reasoning_streaming = false;
             let mut turn_usage = Usage::default();
 
             use futures_util::stream::StreamExt;
@@ -341,6 +348,22 @@ impl Agent {
                     }
                     Ok(delta) => match delta {
                         LlmResponseDelta::Text(content) => {
+                            if reasoning_streaming {
+                                // Close the reasoning block before opening the text block.
+                                let _ = tx
+                                    .send(AgentEvent::MessageEnd {
+                                        message: Message {
+                                            role: "assistant".to_string(),
+                                            content: None,
+                                            reasoning_content: Some(reasoning_content.clone()),
+                                            name: None,
+                                            tool_call_id: None,
+                                            tool_calls: None,
+                                        },
+                                    })
+                                    .await;
+                                reasoning_streaming = false;
+                            }
                             if !message_started {
                                 let _ = tx
                                     .send(AgentEvent::MessageStart {
@@ -360,6 +383,37 @@ impl Agent {
                             let _ = tx.send(AgentEvent::MessageUpdate { delta: content }).await;
                         }
                         LlmResponseDelta::Reasoning(reasoning) => {
+                            // Stream reasoning as a 💭-prefixed assistant block so users
+                            // see the model's thinking incrementally. If text streaming
+                            // has already started, fall back to silent accumulation —
+                            // the final Message still carries reasoning_content.
+                            if !message_started {
+                                if !reasoning_streaming {
+                                    let _ = tx
+                                        .send(AgentEvent::MessageStart {
+                                            message: Message {
+                                                role: "assistant".to_string(),
+                                                content: None,
+                                                reasoning_content: Some(String::new()),
+                                                name: None,
+                                                tool_call_id: None,
+                                                tool_calls: None,
+                                            },
+                                        })
+                                        .await;
+                                    let _ = tx
+                                        .send(AgentEvent::MessageUpdate {
+                                            delta: "💭 ".to_string(),
+                                        })
+                                        .await;
+                                    reasoning_streaming = true;
+                                }
+                                let _ = tx
+                                    .send(AgentEvent::MessageUpdate {
+                                        delta: reasoning.clone(),
+                                    })
+                                    .await;
+                            }
                             reasoning_content.push_str(&reasoning);
                         }
                         LlmResponseDelta::ToolCall {
@@ -441,7 +495,7 @@ impl Agent {
                     },
                 };
 
-                if message_started {
+                if message_started || reasoning_streaming {
                     let _ = tx
                         .send(AgentEvent::MessageEnd {
                             message: msg.clone(),
@@ -655,48 +709,72 @@ impl Agent {
                     parallel_results
                 };
 
-                // Re-align results with original order to maintain history determinism
-                let mut results_by_id: HashMap<String, Message> = results
-                    .into_iter()
-                    .filter_map(|msg| {
-                        if let Some(id) = &msg.tool_call_id {
-                            Some((id.clone(), msg))
-                        } else {
-                            None
+                // Re-align results with original order to maintain history determinism.
+                // Results lacking a tool_call_id, or whose id is not in `tool_calls`,
+                // are appended afterward as orphans so they are never silently dropped.
+                let (mut results_by_id, mut orphans): (HashMap<String, Message>, Vec<Message>) = {
+                    let mut by_id = HashMap::new();
+                    let mut no_id = Vec::new();
+                    for msg in results {
+                        match msg.tool_call_id.clone() {
+                            Some(id) => {
+                                by_id.insert(id, msg);
+                            }
+                            None => no_id.push(msg),
                         }
-                    })
-                    .collect();
+                    }
+                    (by_id, no_id)
+                };
+
+                async fn push_with_hook(
+                    history: &mut Vec<Message>,
+                    hooks: Option<&dyn ToolHooks>,
+                    msg: Message,
+                ) {
+                    if let Some(h) = hooks {
+                        let content_str = msg.content.clone().unwrap_or_default();
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&content_str).unwrap_or_default();
+                        let original_result = ToolResult {
+                            content: parsed["result"]
+                                .as_str()
+                                .unwrap_or(&content_str)
+                                .to_string(),
+                            is_error: parsed["is_error"].as_bool().unwrap_or(false),
+                        };
+                        let transformed = h
+                            .after_tool_call(msg.name.as_deref().unwrap_or(""), original_result)
+                            .await;
+                        let result_json = serde_json::json!({
+                            "result": transformed.content,
+                            "is_error": transformed.is_error
+                        });
+                        history.push(Message {
+                            content: Some(result_json.to_string()),
+                            ..msg
+                        });
+                    } else {
+                        history.push(msg);
+                    }
+                }
 
                 for tc in &tool_calls {
                     if let Some(msg) = results_by_id.remove(&tc.id) {
-                        // Run afterToolCall hook
-                        if let Some(h) = hooks {
-                            let content_str = msg.content.clone().unwrap_or_default();
-                            let parsed: serde_json::Value =
-                                serde_json::from_str(&content_str).unwrap_or_default();
-                            let original_result = ToolResult {
-                                content: parsed["result"]
-                                    .as_str()
-                                    .unwrap_or(&content_str)
-                                    .to_string(),
-                                is_error: parsed["is_error"].as_bool().unwrap_or(false),
-                            };
-                            let transformed = h
-                                .after_tool_call(msg.name.as_deref().unwrap_or(""), original_result)
-                                .await;
-                            let result_json = serde_json::json!({
-                                "result": transformed.content,
-                                "is_error": transformed.is_error
-                            });
-                            let transformed_msg = Message {
-                                content: Some(result_json.to_string()),
-                                ..msg
-                            };
-                            history.push(transformed_msg);
-                        } else {
-                            history.push(msg);
-                        }
+                        push_with_hook(history, hooks.as_deref(), msg).await;
                     }
+                }
+
+                // Drain any remaining orphan results (unmatched IDs or missing IDs)
+                // so we never silently lose a tool result. Sort by tool_call_id so
+                // the appended order is deterministic across runs (HashMap drain
+                // order is not).
+                let mut leftover: Vec<(String, Message)> = results_by_id.drain().collect();
+                leftover.sort_by(|a, b| a.0.cmp(&b.0));
+                for (_, msg) in leftover {
+                    push_with_hook(history, hooks.as_deref(), msg).await;
+                }
+                for msg in orphans.drain(..) {
+                    push_with_hook(history, hooks.as_deref(), msg).await;
                 }
 
                 let _ = tx.send(AgentEvent::TurnEnd).await;
@@ -739,5 +817,35 @@ mod tests {
 
         assert_eq!(with_catalog("BASE", None, None), "BASE");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn sanitize_redacts_api_keys() {
+        // Fake keys: underscores keep the secret-scan grep happy while still
+        // matching our redaction regex (which accepts [A-Za-z0-9_-]).
+        let key = "sk-FAKE_NOT_REAL_xxxxxxxxxxxxxxxx";
+        let err = format!("auth failed with key {key}");
+        let out = Agent::sanitize_and_truncate_error(&err);
+        assert!(!out.contains(key), "key leaked: {out}");
+        assert!(out.contains("[REDACTED_API_KEY]"));
+
+        let ant_key = "sk-ant-api03_FAKE_dEf_xyz_long_suffix";
+        let out2 = Agent::sanitize_and_truncate_error(ant_key);
+        assert!(!out2.contains(ant_key));
+        assert_eq!(out2, "[REDACTED_API_KEY]");
+    }
+
+    #[test]
+    fn sanitize_truncates_long_errors_on_char_boundary() {
+        let s = "中".repeat(400);
+        let out = Agent::sanitize_and_truncate_error(&s);
+        assert!(out.ends_with("... [truncated]"));
+        assert!(out.is_char_boundary(0));
+    }
+
+    #[test]
+    fn sanitize_short_errors_pass_through() {
+        let out = Agent::sanitize_and_truncate_error("plain error");
+        assert_eq!(out, "plain error");
     }
 }

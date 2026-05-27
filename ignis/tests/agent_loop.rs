@@ -336,6 +336,102 @@ async fn agent_reasoning_content_is_preserved() {
 }
 
 #[tokio::test]
+async fn agent_streams_reasoning_deltas_incrementally() {
+    // Reasoning-only turn: the UI must see MessageStart + 💭 + each delta,
+    // not a single bulk dump at the end (issue #16).
+    let provider = MockProvider::new(vec![vec![
+        LlmResponseDelta::Reasoning("step one. ".to_string()),
+        LlmResponseDelta::Reasoning("step two.".to_string()),
+    ]]);
+    let storage = InMemoryStorage::new();
+    let mut session = Session::open(
+        "reasoning-stream".to_string(),
+        "system".to_string(),
+        Box::new(provider),
+        Box::new(storage),
+        "/tmp".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    session.prompt("Think", tx).await.unwrap();
+    let events = collect_events(&mut rx).await;
+
+    let starts = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::MessageStart { .. }))
+        .count();
+    assert_eq!(starts, 1, "reasoning should emit exactly one MessageStart");
+
+    let updates: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageUpdate { delta } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        updates,
+        vec!["💭 ", "step one. ", "step two."],
+        "expected 💭 prefix + each reasoning delta streamed in order"
+    );
+}
+
+#[tokio::test]
+async fn agent_streams_reasoning_then_text_as_two_blocks() {
+    let provider = MockProvider::new(vec![vec![
+        LlmResponseDelta::Reasoning("hmm".to_string()),
+        LlmResponseDelta::Text("Answer".to_string()),
+    ]]);
+    let storage = InMemoryStorage::new();
+    let mut session = Session::open(
+        "reasoning-then-text".to_string(),
+        "system".to_string(),
+        Box::new(provider),
+        Box::new(storage),
+        "/tmp".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    session.prompt("ask", tx).await.unwrap();
+    let events = collect_events(&mut rx).await;
+
+    // Sequence on Message* events: reasoning Start, 💭, hmm, End, text Start, Answer, End.
+    let msg_events: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageStart { .. }
+                    | AgentEvent::MessageUpdate { .. }
+                    | AgentEvent::MessageEnd { .. }
+            )
+        })
+        .collect();
+    // Exact sequence: Start, 💭, hmm, End, Start, Answer, End (7 events).
+    assert_eq!(msg_events.len(), 7, "events: {msg_events:?}");
+    assert!(matches!(msg_events[0], AgentEvent::MessageStart { .. }));
+    assert!(matches!(
+        msg_events[1],
+        AgentEvent::MessageUpdate { delta } if delta == "💭 "
+    ));
+    assert!(matches!(
+        msg_events[2],
+        AgentEvent::MessageUpdate { delta } if delta == "hmm"
+    ));
+    assert!(matches!(msg_events[3], AgentEvent::MessageEnd { .. }));
+    assert!(matches!(msg_events[4], AgentEvent::MessageStart { .. }));
+    assert!(matches!(
+        msg_events[5],
+        AgentEvent::MessageUpdate { delta } if delta == "Answer"
+    ));
+    assert!(matches!(msg_events[6], AgentEvent::MessageEnd { .. }));
+}
+
+#[tokio::test]
 async fn session_compact_summarizes_old_history() {
     // Seed a 10-message conversation with uniform, sizable content so a small
     // keep-budget reliably forces compaction.
