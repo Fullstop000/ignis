@@ -49,7 +49,19 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     // strips the subcommand word before calling us, so prepend a synthetic one.
     let mut argv = vec!["ignis upgrade".to_string()];
     argv.extend(args);
-    let cmd = UpgradeCmd::try_parse_from(argv)?;
+    // `try_parse_from` returns Err for `--help`/`--version` instead of the
+    // usual exit-0-after-print. Detect those kinds and exit cleanly so
+    // `ignis upgrade --help` reads like every other CLI.
+    let cmd = match UpgradeCmd::try_parse_from(argv) {
+        Ok(c) => c,
+        Err(e) => {
+            e.print().ok();
+            std::process::exit(match e.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
+                _ => 2,
+            });
+        }
+    };
 
     let target = TARGET.ok_or_else(|| {
         anyhow!(
@@ -59,10 +71,18 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     })?;
 
     let current = env!("CARGO_PKG_VERSION");
-    let latest_tag = fetch_latest_tag().await?;
-    let latest_ver = strip_v(&latest_tag);
+
+    // Only hit the GitHub releases API when we actually need the latest tag —
+    // `--version vX.Y.Z` should work even when the API is rate-limited or down.
+    let needs_latest = cmd.check || cmd.version.is_none();
+    let latest_tag = if needs_latest {
+        Some(fetch_latest_tag().await?)
+    } else {
+        None
+    };
 
     if cmd.check {
+        let latest_ver = strip_v(latest_tag.as_deref().unwrap());
         if version_lt(current, latest_ver) {
             println!("update available: {} → {}", current, latest_ver);
         } else {
@@ -71,7 +91,10 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let desired_tag = cmd.version.clone().unwrap_or_else(|| latest_tag.clone());
+    let desired_tag = cmd
+        .version
+        .clone()
+        .unwrap_or_else(|| latest_tag.expect("latest_tag fetched when --version is unset"));
     let desired_ver = strip_v(&desired_tag).to_string();
 
     if !cmd.force && desired_ver == current {
@@ -174,7 +197,10 @@ fn atomic_replace(src: &Path, dest: &Path) -> Result<()> {
     let dir = dest
         .parent()
         .ok_or_else(|| anyhow!("destination has no parent: {}", dest.display()))?;
-    let tmp = dir.join(".ignis.upgrade.tmp");
+    // Per-process suffix so two concurrent upgrades don't clobber each other's
+    // staging file. The rename target is still `dest`, so the *result* is
+    // last-writer-wins (fine for self-update).
+    let tmp = dir.join(format!(".ignis.upgrade.{}.tmp", std::process::id()));
     std::fs::copy(src, &tmp).with_context(|| {
         format!(
             "copy new binary into {} (is the directory writable?)",

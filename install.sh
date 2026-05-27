@@ -74,7 +74,14 @@ if [ ! -f "$src" ]; then
 fi
 
 mkdir -p "$INSTALL_DIR"
-install -m 0755 "$src" "$INSTALL_DIR/ignis"
+# Atomic replace: stage in a sibling of the destination, chmod, then mv.
+# `install` copies in place and can leave a half-written binary on signal /
+# ENOSPC. `mv` within the same directory uses rename(2) — all-or-nothing.
+staged="$INSTALL_DIR/.ignis.install.$$"
+trap 'rm -f "$staged"; rm -rf "$tmp"' EXIT INT TERM
+cp "$src" "$staged"
+chmod 0755 "$staged"
+mv -f "$staged" "$INSTALL_DIR/ignis"
 
 echo "ignis ${VERSION} installed to ${INSTALL_DIR}/ignis"
 

@@ -12,8 +12,13 @@ async fn main() -> Result<(), anyhow::Error> {
     // Parse arguments
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Handle --version / -V early, before any subcommand or session parsing.
-    if raw_args.iter().any(|a| a == "--version" || a == "-V") {
+    // Handle --version / -V only as the very first arg, so subcommand flags
+    // like `ignis upgrade --version v0.14.1` and one-shot prompts like
+    // `ignis "fix -V regression"` aren't hijacked.
+    if matches!(
+        raw_args.first().map(String::as_str),
+        Some("--version" | "-V")
+    ) {
         println!("ignis {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
