@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `install.sh` — one-liner installer for Linux/macOS that drops the latest release binary into `~/.ignis/bin` (override with `IGNIS_INSTALL_DIR`).
 - `ignis upgrade` (alias `ignis update`) — self-update to the latest release; supports `--check`, `--force`, and `--version v0.X.Y`.
 - `ignis --version` / `-V` — print the binary's version and exit.
+- `ignis --help` / `-h` — print top-level usage with the available flags and subcommands.
+
+### Removed
+- `ignis --tui` / `ignis tui` — redundant; the no-arg invocation already launches the TUI.
 
 ## [0.14.1] - 2026-05-27
 

@@ -5,7 +5,6 @@ pub mod upgrade;
 
 #[derive(Debug, PartialEq)]
 pub struct CliArgs {
-    pub is_tui: bool,
     pub resume: bool,
     pub resume_session_id: Option<String>,
     pub prompt_args: Vec<String>,
@@ -13,12 +12,49 @@ pub struct CliArgs {
 
 pub struct SessionRequest {
     pub session_id: String,
+    /// `true` when the resolved request has no prompt — launches the TUI.
     pub is_tui: bool,
     pub prompt_args: Vec<String>,
 }
 
+/// Hand-rolled top-level flag block, kept short on purpose. Subcommands
+/// (`upgrade`, `mcp`) own their own clap parsers and therefore their own
+/// `--help` — this prints the surface a user sees before a subcommand is
+/// chosen. Mirrors the shape of `claude -h` / `kimi -h`.
+pub fn help_text() -> String {
+    format!(
+        "\
+Usage: ignis [options] [command] [prompt]
+
+A multi-provider AI coding agent for your terminal. With no prompt,
+launches the interactive TUI; with a prompt, runs one-shot to stdout.
+
+Arguments:
+  prompt              The prompt to send (any non-flag args, joined).
+
+Options:
+      --resume [id]   Resume the latest session, or the given session id.
+  -V, --version       Print version and exit.
+  -h, --help          Print this help and exit.
+
+Commands:
+  upgrade|update      Update ignis to the latest release.
+  mcp                 Manage MCP servers (add, list, get, remove, enable, disable).
+
+Examples:
+  ignis                                # interactive TUI
+  ignis \"fix the failing test\"         # one-shot prompt
+  ignis --resume                       # resume the latest session
+  ignis --resume <id> \"follow-up\"      # resume + one-shot
+
+Run `ignis <command> --help` for subcommand options.
+Repo: https://github.com/{repo}
+",
+        repo = "Fullstop000/ignis"
+    )
+}
+
 pub fn parse_cli_args(args: Vec<String>) -> CliArgs {
-    let mut is_tui = false;
     let mut resume = false;
     let mut resume_session_id = None;
     let mut prompt_args = Vec::new();
@@ -26,11 +62,12 @@ pub fn parse_cli_args(args: Vec<String>) -> CliArgs {
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--tui" | "tui" => is_tui = true,
             "--resume" => {
                 resume = true;
+                // Consume the next token as the session id only when it looks
+                // like one — not a flag, not the start of a prompt with `--`.
                 if let Some(next) = iter.peek() {
-                    if next != "--tui" && next != "tui" && !next.starts_with("--") {
+                    if !next.starts_with("--") {
                         resume_session_id = iter.next();
                     }
                 }
@@ -40,7 +77,6 @@ pub fn parse_cli_args(args: Vec<String>) -> CliArgs {
     }
 
     CliArgs {
-        is_tui,
         resume,
         resume_session_id,
         prompt_args,
@@ -77,7 +113,9 @@ pub fn resolve_session_request(
         SessionManager::create_id()
     };
 
-    let is_tui = cli.is_tui || prompt_args.is_empty();
+    // No prompt → TUI. The dedicated `--tui` flag was removed in v0.15.0;
+    // the no-arg invocation already covered the same intent.
+    let is_tui = prompt_args.is_empty();
 
     SessionRequest {
         session_id,
@@ -100,30 +138,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_cli_args_tui_resume_has_no_prompt() {
-        let parsed = parse_cli_args(vec!["--resume".to_string(), "--tui".to_string()]);
-
-        assert!(parsed.resume);
-        assert!(parsed.is_tui);
-        assert!(parsed.resume_session_id.is_none());
-        assert!(parsed.prompt_args.is_empty());
-    }
-
-    #[test]
     fn parse_cli_args_oneshot_with_prompt() {
         let parsed = parse_cli_args(vec!["hello world".to_string()]);
 
-        assert!(!parsed.is_tui);
         assert!(!parsed.resume);
         assert_eq!(parsed.prompt_args, vec!["hello world"]);
-    }
-
-    #[test]
-    fn parse_cli_args_explicit_tui() {
-        let parsed = parse_cli_args(vec!["--tui".to_string()]);
-
-        assert!(parsed.is_tui);
-        assert!(parsed.prompt_args.is_empty());
     }
 
     #[test]
@@ -134,8 +153,31 @@ mod tests {
             "test".to_string(),
         ]);
 
-        assert!(!parsed.is_tui);
         assert_eq!(parsed.prompt_args, vec!["write", "a", "test"]);
+    }
+
+    #[test]
+    fn parse_cli_args_tui_token_no_longer_recognized() {
+        // `--tui` / `tui` were dropped in v0.15.0 (the no-arg path already
+        // launches the TUI). Tokens with those names now fall through to
+        // prompt_args like any other word.
+        let parsed = parse_cli_args(vec!["--tui".to_string()]);
+        assert_eq!(parsed.prompt_args, vec!["--tui"]);
+    }
+
+    #[test]
+    fn help_text_lists_top_level_surface() {
+        let h = help_text();
+        assert!(h.starts_with("Usage: ignis"));
+        assert!(h.contains("--resume"));
+        assert!(h.contains("-V, --version"));
+        assert!(h.contains("-h, --help"));
+        assert!(h.contains("upgrade|update"));
+        assert!(h.contains("mcp"));
+        // Things we deliberately don't expose at the top level.
+        assert!(!h.contains("--tui"));
+        assert!(!h.contains("skills"));
+        assert!(!h.contains("config"));
     }
 
     #[test]

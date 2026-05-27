@@ -12,15 +12,19 @@ async fn main() -> Result<(), anyhow::Error> {
     // Parse arguments
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Handle --version / -V only as the very first arg, so subcommand flags
-    // like `ignis upgrade --version v0.14.1` and one-shot prompts like
-    // `ignis "fix -V regression"` aren't hijacked.
-    if matches!(
-        raw_args.first().map(String::as_str),
-        Some("--version" | "-V")
-    ) {
-        println!("ignis {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+    // Handle --version / -V and --help / -h only as the very first arg, so
+    // subcommand flags like `ignis upgrade --version v0.14.1` and one-shot
+    // prompts containing those tokens aren't hijacked.
+    match raw_args.first().map(String::as_str) {
+        Some("--version" | "-V") => {
+            println!("ignis {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("--help" | "-h") => {
+            print!("{}", ignis::cli::help_text());
+            return Ok(());
+        }
+        _ => {}
     }
 
     // Subcommands with their own clap parsers route here before the
@@ -42,7 +46,7 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let cli = parse_cli_args(raw_args);
-    let is_oneshot = !cli.is_tui && !cli.prompt_args.is_empty();
+    let is_oneshot = !cli.prompt_args.is_empty();
 
     // 1. Load config
     let config = load_config()?;

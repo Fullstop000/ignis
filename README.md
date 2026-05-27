@@ -112,11 +112,11 @@ models  = [
 ## Usage
 
 ```bash
-cargo run                 # interactive TUI (default)
-cargo run -- --tui        # interactive TUI (explicit)
-cargo run -- "fix the failing test in foo.rs"   # one-shot CLI
-cargo run -- --resume     # resume the latest session (TUI)
-cargo run -- --resume <id> "follow-up prompt"   # resume a session, one-shot
+ignis                                          # interactive TUI (default)
+ignis "fix the failing test in foo.rs"         # one-shot CLI
+ignis --resume                                 # resume the latest session
+ignis --resume <id> "follow-up prompt"         # resume + one-shot
+ignis --help                                   # full flag/subcommand list
 ```
 
 In the TUI: `Enter` sends, `↑/↓` history, `Ctrl+D` exit. Output renders inline in
