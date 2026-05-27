@@ -12,14 +12,28 @@ async fn main() -> Result<(), anyhow::Error> {
     // Parse arguments
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
-    // The `mcp` subcommand has its own clap parser; route it before the
-    // hand-rolled session arg parser ever sees it.
-    if raw_args.first().map(|s| s.as_str()) == Some("mcp") {
-        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-        if let Err(e) = ignis::logger::init(&home.join(".ignis/logs")) {
-            eprintln!("Failed to initialize logger: {}", e);
+    // Handle --version / -V early, before any subcommand or session parsing.
+    if raw_args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("ignis {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    // Subcommands with their own clap parsers route here before the
+    // hand-rolled session arg parser ever sees them.
+    match raw_args.first().map(|s| s.as_str()) {
+        Some("mcp") => {
+            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+            if let Err(e) = ignis::logger::init(&home.join(".ignis/logs")) {
+                eprintln!("Failed to initialize logger: {}", e);
+            }
+            return ignis::cli::mcp::run(raw_args.into_iter().skip(1).collect()).await;
         }
-        return ignis::cli::mcp::run(raw_args.into_iter().skip(1).collect()).await;
+        // `update` is an alias for `upgrade` — they target the same self-update
+        // path, so accept whichever word the user reaches for.
+        Some("upgrade") | Some("update") => {
+            return ignis::cli::upgrade::run(raw_args.into_iter().skip(1).collect()).await;
+        }
+        _ => {}
     }
 
     let cli = parse_cli_args(raw_args);

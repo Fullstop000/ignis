@@ -29,7 +29,27 @@ TUI and a one-shot CLI, with built-in tools.
 
 ## Install
 
-Requires a stable Rust toolchain.
+One-liner (Linux / macOS — drops the binary in `~/.ignis/bin`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Fullstop000/ignis/master/install.sh | sh
+```
+
+Override the version or install dir:
+
+```bash
+curl -fsSL …/install.sh | IGNIS_VERSION=v0.14.1 IGNIS_INSTALL_DIR=/usr/local/bin sh
+```
+
+Already installed? Self-update in place:
+
+```bash
+ignis upgrade              # download + replace the running binary
+ignis upgrade --check      # report whether an update is available
+ignis upgrade --version v0.14.1   # pin to a specific tag
+```
+
+From source (any platform, requires a stable Rust toolchain):
 
 ```bash
 git clone https://github.com/Fullstop000/ignis.git

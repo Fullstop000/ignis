@@ -1,6 +1,7 @@
 use crate::session::SessionManager;
 
 pub mod mcp;
+pub mod upgrade;
 
 #[derive(Debug, PartialEq)]
 pub struct CliArgs {
