@@ -38,7 +38,7 @@ impl TuiProcess {
         // consistent with seed_session.
         let project = std::fs::canonicalize(project).unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_ignis"));
-        command.arg("--tui");
+        // No `--tui` arg — the no-prompt invocation already launches the TUI.
         command.cwd(project.as_os_str());
         command.env("HOME", home.as_os_str());
         command.env("TERM", "xterm-256color");

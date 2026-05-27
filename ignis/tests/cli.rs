@@ -10,9 +10,8 @@ use std::io::Write;
 #[test]
 fn cli_no_args_defaults_to_tui() {
     let parsed = parse_cli_args(vec![]);
-    // parse_cli_args itself does not set is_tui without --tui flag;
-    // the default-to-tui behavior lives in resolve_session_request.
-    assert!(!parsed.is_tui);
+    // `is_tui` lives on SessionRequest, not CliArgs: an empty prompt_args
+    // resolves to the TUI down in resolve_session_request.
     assert!(!parsed.resume);
     assert!(parsed.prompt_args.is_empty());
 }
@@ -20,7 +19,6 @@ fn cli_no_args_defaults_to_tui() {
 #[test]
 fn cli_oneshot_single_arg() {
     let parsed = parse_cli_args(vec!["hello".to_string()]);
-    assert!(!parsed.is_tui);
     assert_eq!(parsed.prompt_args, vec!["hello"]);
 }
 
@@ -31,15 +29,7 @@ fn cli_oneshot_multiple_args() {
         "a".to_string(),
         "test".to_string(),
     ]);
-    assert!(!parsed.is_tui);
     assert_eq!(parsed.prompt_args, vec!["write", "a", "test"]);
-}
-
-#[test]
-fn cli_explicit_tui_flag() {
-    let parsed = parse_cli_args(vec!["--tui".to_string()]);
-    assert!(parsed.is_tui);
-    assert!(parsed.prompt_args.is_empty());
 }
 
 #[test]
@@ -70,17 +60,8 @@ fn cli_resume_with_prompt() {
 }
 
 #[test]
-fn cli_tui_and_resume_together() {
-    let parsed = parse_cli_args(vec!["--resume".to_string(), "--tui".to_string()]);
-    assert!(parsed.is_tui);
-    assert!(parsed.resume);
-    assert!(parsed.resume_session_id.is_none());
-}
-
-#[test]
 fn cli_ignores_unknown_flags_as_prompt_args() {
     let parsed = parse_cli_args(vec!["--unknown".to_string(), "hello".to_string()]);
-    assert!(!parsed.is_tui);
     assert_eq!(parsed.prompt_args, vec!["--unknown", "hello"]);
 }
 
