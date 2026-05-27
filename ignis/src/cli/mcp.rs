@@ -1,6 +1,6 @@
-//! `ignis mcp …` subcommand. Self-contained clap parser; the rest of the CLI
-//! is the hand-rolled `--tui` / `--resume` parser in `cli/mod.rs` and is
-//! untouched.
+//! `ignis mcp …` subcommand. The parent `Cli` in `cli/mod.rs` owns all
+//! top-level clap parsing and dispatches here via `Command::Mcp(McpCmd)`,
+//! so this file only declares the subcommand shape and its handlers.
 //!
 //! Mutations to `~/.ignis/config.toml` go through `toml_edit`, which preserves
 //! the user's comments and surrounding formatting; mutations to

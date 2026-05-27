@@ -186,6 +186,29 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Upgrade(_))));
     }
 
+    /// `ignis --resume <id> upgrade` — `--resume` greedily consumes `<id>`,
+    /// then `upgrade` is in subcommand position and clap routes to it.
+    /// Pins the behavior so it can't drift if we change parser config.
+    #[test]
+    fn resume_id_followed_by_subcommand_routes_to_subcommand() {
+        let cli = Cli::try_parse_from(["ignis", "--resume", "work", "upgrade", "--check"])
+            .expect("parse");
+        assert_eq!(cli.resume, Some(Some("work".to_string())));
+        assert!(matches!(cli.command, Some(Command::Upgrade(_))));
+        assert!(cli.prompt.is_empty());
+    }
+
+    /// `ignis --resume upgrade` (no id) — clap consumes `upgrade` as the
+    /// resume id (greedy `num_args = 0..=1`), so `command` is None and the
+    /// session resumes a session literally called "upgrade". To launch the
+    /// upgrade subcommand without a resume target, just drop `--resume`.
+    #[test]
+    fn bare_resume_then_subcommand_name_consumes_name_as_id() {
+        let cli = Cli::try_parse_from(["ignis", "--resume", "upgrade"]).expect("parse");
+        assert_eq!(cli.resume, Some(Some("upgrade".to_string())));
+        assert!(cli.command.is_none());
+    }
+
     #[test]
     fn unknown_top_level_flag_is_rejected() {
         // The hand-rolled parser used to silently push --foo into prompt_args;
