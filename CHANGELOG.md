@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-05-28
+
+### Fixed
+- Reasoning streams live as a 💭-prefixed block instead of appearing all at once at turn end.
+- API keys (OpenAI `sk-…` / Anthropic `sk-ant-…`) in provider error messages are now actually redacted; the previous code matched a regex literal as plain text and never replaced anything.
+- Parallel tool execution no longer silently drops results whose `tool_call_id` doesn't match an announced tool call.
+
 ## [0.15.2] - 2026-05-27
 
 ### Fixed
