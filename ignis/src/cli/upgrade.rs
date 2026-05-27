@@ -114,10 +114,15 @@ pub async fn run(cmd: UpgradeCmd) -> Result<()> {
     Ok(())
 }
 
-/// `GET /releases/latest` → `tag_name`. GitHub requires a User-Agent.
+/// Resolve the latest release tag via the `/releases/latest` HTML redirect
+/// instead of the JSON API. The API is rate-limited to 60 req/hr per IP for
+/// unauthenticated callers, and shared IPs (WSL, corp NAT, CI) hit that wall
+/// constantly; the redirect endpoint isn't subject to the same limit. reqwest
+/// follows the 302 by default, so we just inspect the final URL's last path
+/// segment — e.g. `…/releases/tag/v0.15.1` → `v0.15.1`.
 async fn fetch_latest_tag() -> Result<String> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
-    let body: serde_json::Value = reqwest::Client::new()
+    let url = format!("https://github.com/{}/releases/latest", REPO);
+    let resp = reqwest::Client::new()
         .get(&url)
         .header(
             reqwest::header::USER_AGENT,
@@ -127,14 +132,23 @@ async fn fetch_latest_tag() -> Result<String> {
         .await
         .context("fetch latest release")?
         .error_for_status()
-        .context("github releases API")?
-        .json()
-        .await
-        .context("parse latest release JSON")?;
-    body.get("tag_name")
-        .and_then(|t| t.as_str())
-        .map(String::from)
-        .ok_or_else(|| anyhow!("releases API: tag_name missing"))
+        .context("github releases page")?;
+    tag_from_release_url(resp.url().as_str())
+}
+
+/// Extract the tag from a `…/releases/tag/<tag>` URL. Returns an error rather
+/// than the literal "latest" / an empty string if the redirect didn't land
+/// on a tag page (e.g. the repo has no releases yet).
+fn tag_from_release_url(url: &str) -> Result<String> {
+    let last = url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if last.is_empty() || last == "latest" || last == "releases" {
+        bail!("could not extract release tag from {url}");
+    }
+    Ok(last.to_string())
 }
 
 async fn download(url: &str, dest: &Path) -> Result<()> {
@@ -262,6 +276,29 @@ mod tests {
     fn strip_v_handles_both_forms() {
         assert_eq!(strip_v("v0.14.1"), "0.14.1");
         assert_eq!(strip_v("0.14.1"), "0.14.1");
+    }
+
+    #[test]
+    fn tag_from_release_url_extracts_tag() {
+        assert_eq!(
+            tag_from_release_url("https://github.com/Fullstop000/ignis/releases/tag/v0.15.1")
+                .unwrap(),
+            "v0.15.1"
+        );
+        // Trailing slash is tolerated.
+        assert_eq!(
+            tag_from_release_url("https://github.com/Fullstop000/ignis/releases/tag/v0.15.1/")
+                .unwrap(),
+            "v0.15.1"
+        );
+    }
+
+    #[test]
+    fn tag_from_release_url_errors_on_unredirected_or_missing_tag() {
+        // The HTML redirect didn't fire (got back `…/releases/latest` itself).
+        assert!(tag_from_release_url("https://github.com/x/y/releases/latest").is_err());
+        // Empty repo with no releases — redirect lands on `…/releases`.
+        assert!(tag_from_release_url("https://github.com/x/y/releases").is_err());
     }
 
     #[test]

@@ -48,11 +48,19 @@ fi
 target="${arch}-${os}"
 
 if [ "$VERSION" = "latest" ]; then
-    VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' \
-        | head -n1)
-    if [ -z "$VERSION" ]; then
+    # Resolve the latest tag via the `/releases/latest` HTML redirect instead
+    # of the JSON API, which is rate-limited to 60 req/hr per IP for
+    # unauthenticated callers — shared IPs (WSL/corp NAT/CI) hit that wall
+    # constantly. The redirect endpoint isn't subject to the same limit and
+    # is the standard installer pattern (rustup/starship/etc).
+    redirect_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+        "https://github.com/$REPO/releases/latest" 2>/dev/null || true)
+    VERSION=${redirect_url##*/}
+    if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
         echo "Failed to resolve the latest release tag." >&2
+        echo "Tip: pin a version explicitly, e.g." >&2
+        echo "  curl -fsSL .../install.sh | IGNIS_VERSION=v0.15.1 sh" >&2
+        echo "Browse releases: https://github.com/$REPO/releases" >&2
         exit 1
     fi
 fi
