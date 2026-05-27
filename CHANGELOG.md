@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-05-27
+
+### Changed
+- Internal — split `console/render.rs` and `console/mod.rs` into focused submodules and gave the slash-picker types their own behavior. No user-visible change.
+
 ## [0.14.0] - 2026-05-26
 
 ### Added

@@ -53,10 +53,48 @@ pub(crate) struct SessionPicker {
     pub(crate) selected: usize,
 }
 
+impl SessionPicker {
+    pub(crate) fn new(sessions: Vec<crate::session::SessionMeta>) -> Self {
+        Self {
+            sessions,
+            selected: 0,
+        }
+    }
+
+    pub(crate) fn select(&mut self, direction: SelectionDirection) {
+        // `next_selection` no-ops on empty — no extra guard needed.
+        self.selected = next_selection(self.selected, self.sessions.len(), direction);
+    }
+
+    pub(crate) fn selected_id(&self) -> Option<String> {
+        self.sessions.get(self.selected).map(|s| s.id.clone())
+    }
+}
+
 /// `/skills` picker state. Rows come from `App.skills` registry `all()`.
 #[derive(Debug, Clone)]
 pub(crate) struct SkillPicker {
     pub(crate) selected: usize,
+}
+
+impl SkillPicker {
+    /// Open over a non-empty registry; returns `None` (so the caller can show
+    /// a notice) when no skills are configured.
+    pub(crate) fn open(registry: &crate::skills::SkillRegistry) -> Option<Self> {
+        (!registry.is_empty()).then_some(Self { selected: 0 })
+    }
+
+    pub(crate) fn select(&mut self, direction: SelectionDirection, total: usize) {
+        self.selected = next_selection(self.selected, total, direction);
+    }
+
+    /// Toggle the highlighted skill on the registry; returns `(name, now_enabled)`
+    /// for the post-toggle notice.
+    pub(crate) fn toggle(&self, registry: &crate::skills::SkillRegistry) -> Option<(String, bool)> {
+        let name = registry.all().get(self.selected)?.name.clone();
+        let now_enabled = registry.toggle(&name);
+        Some((name, now_enabled))
+    }
 }
 
 /// `/mcp` picker state. Rows come from `App.mcp` registry `entries()` —
@@ -66,6 +104,27 @@ pub(crate) struct McpPicker {
     pub(crate) selected: usize,
 }
 
+impl McpPicker {
+    /// Open over a non-empty registry; returns `None` when no servers are
+    /// configured so the caller can show the "add one with `ignis mcp add`"
+    /// notice instead of an empty picker.
+    pub(crate) fn open(registry: &crate::mcp::McpRegistry) -> Option<Self> {
+        (!registry.is_empty()).then_some(Self { selected: 0 })
+    }
+
+    pub(crate) fn select(&mut self, direction: SelectionDirection, total: usize) {
+        self.selected = next_selection(self.selected, total, direction);
+    }
+
+    /// Toggle the highlighted MCP server on the registry; returns
+    /// `(name, now_enabled)`.
+    pub(crate) fn toggle(&self, registry: &crate::mcp::McpRegistry) -> Option<(String, bool)> {
+        let name = registry.entries().get(self.selected)?.name.clone();
+        let now_enabled = registry.toggle(&name);
+        Some((name, now_enabled))
+    }
+}
+
 /// `/model` picker state. Options live on `App.model_options`; this tracks the
 /// highlighted row and, for a reasoning-capable model, the chosen effort level.
 #[derive(Debug, Clone)]
@@ -73,6 +132,82 @@ pub(crate) struct ModelPicker {
     pub(crate) selected: usize,
     /// Index into the selected option's `effort_levels` (ignored if empty).
     pub(crate) effort_idx: usize,
+}
+
+impl ModelPicker {
+    /// Open the picker preselecting the currently active provider/model/effort
+    /// (falls back to row 0 / level 0 when no match). Returns `None` when there
+    /// are no options to show.
+    pub(crate) fn open(
+        options: &[crate::models::ModelOption],
+        provider: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Option<Self> {
+        if options.is_empty() {
+            return None;
+        }
+        let selected = options
+            .iter()
+            .position(|o| o.provider == provider && o.model == model)
+            .unwrap_or(0);
+        let effort_idx = effort
+            .and_then(|e| options[selected].effort_levels.iter().position(|l| l == e))
+            .unwrap_or(0);
+        Some(Self {
+            selected,
+            effort_idx,
+        })
+    }
+
+    /// Move the highlighted model; resets effort to 0 when the new model has
+    /// fewer levels than the current effort_idx points at.
+    pub(crate) fn select(
+        &mut self,
+        direction: SelectionDirection,
+        options: &[crate::models::ModelOption],
+    ) {
+        if options.is_empty() {
+            return;
+        }
+        self.selected = next_selection(self.selected, options.len(), direction);
+        let levels = options[self.selected].effort_levels.len();
+        if self.effort_idx >= levels {
+            self.effort_idx = 0;
+        }
+    }
+
+    /// Cycle the effort level within the currently highlighted model.
+    pub(crate) fn cycle_effort(
+        &mut self,
+        direction: SelectionDirection,
+        options: &[crate::models::ModelOption],
+    ) {
+        let levels = options
+            .get(self.selected)
+            .map(|o| o.effort_levels.len())
+            .unwrap_or(0);
+        if levels == 0 {
+            return;
+        }
+        self.effort_idx = next_selection(self.effort_idx, levels, direction);
+    }
+
+    /// Resolve the picker's selection into `(provider, model, effort, context_window)`
+    /// for the caller to apply. Effort is `None` when the model declares no
+    /// levels; context_window is `None` when the option doesn't declare one.
+    pub(crate) fn resolve(
+        &self,
+        options: &[crate::models::ModelOption],
+    ) -> Option<(String, String, Option<String>, Option<u64>)> {
+        let opt = options.get(self.selected)?;
+        let effort = if opt.effort_levels.is_empty() {
+            None
+        } else {
+            opt.effort_levels.get(self.effort_idx).cloned()
+        };
+        Some((opt.provider.clone(), opt.model.clone(), effort, opt.context))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -506,29 +641,18 @@ impl App {
 
     pub(crate) fn show_session_picker(&mut self, sessions: Vec<crate::session::SessionMeta>) {
         self.exit_pending = false;
-        self.session_picker = Some(SessionPicker {
-            sessions,
-            selected: 0,
-        });
+        self.session_picker = Some(SessionPicker::new(sessions));
     }
 
-    pub(crate) fn select_session_picker(&mut self, direction: SelectionDirection) -> bool {
+    pub(crate) fn select_session_picker(&mut self, direction: SelectionDirection) {
         self.exit_pending = false;
-        let Some(picker) = &mut self.session_picker else {
-            return false;
-        };
-        if picker.sessions.is_empty() {
-            return false;
+        if let Some(p) = &mut self.session_picker {
+            p.select(direction);
         }
-        picker.selected = next_selection(picker.selected, picker.sessions.len(), direction);
-        true
     }
 
     pub(crate) fn selected_session_id(&self) -> Option<String> {
-        self.session_picker
-            .as_ref()
-            .and_then(|picker| picker.sessions.get(picker.selected))
-            .map(|session| session.id.clone())
+        self.session_picker.as_ref().and_then(|p| p.selected_id())
     }
 
     /// Supply the `/model` picker choices and the active effort level.
@@ -543,64 +667,28 @@ impl App {
 
     pub(crate) fn show_model_picker(&mut self) {
         self.exit_pending = false;
-        if self.model_options.is_empty() {
-            self.add_assistant_notice("No models configured.".to_string());
-            return;
+        match ModelPicker::open(
+            &self.model_options,
+            &self.provider,
+            &self.model,
+            self.effort.as_deref(),
+        ) {
+            Some(p) => self.model_picker = Some(p),
+            None => self.add_assistant_notice("No models configured.".to_string()),
         }
-        let selected = self
-            .model_options
-            .iter()
-            .position(|o| o.provider == self.provider && o.model == self.model)
-            .unwrap_or(0);
-        let effort_idx = self
-            .effort
-            .as_deref()
-            .and_then(|e| {
-                self.model_options[selected]
-                    .effort_levels
-                    .iter()
-                    .position(|l| l == e)
-            })
-            .unwrap_or(0);
-        self.model_picker = Some(ModelPicker {
-            selected,
-            effort_idx,
-        });
     }
 
     pub(crate) fn select_model_picker(&mut self, direction: SelectionDirection) {
         self.exit_pending = false;
-        let len = self.model_options.len();
-        if len == 0 {
-            return;
-        }
-        let Some(picker) = &mut self.model_picker else {
-            return;
-        };
-        picker.selected = next_selection(picker.selected, len, direction);
-        let sel = picker.selected;
-        // `picker` borrow ends above; clamp effort to the new model's levels.
-        let levels = self.model_options[sel].effort_levels.len();
-        if let Some(picker) = &mut self.model_picker {
-            if picker.effort_idx >= levels {
-                picker.effort_idx = 0;
-            }
+        if let Some(p) = &mut self.model_picker {
+            p.select(direction, &self.model_options);
         }
     }
 
     pub(crate) fn cycle_effort(&mut self, direction: SelectionDirection) {
         self.exit_pending = false;
-        let Some(picker) = &self.model_picker else {
-            return;
-        };
-        let (sel, cur) = (picker.selected, picker.effort_idx);
-        let levels = self.model_options[sel].effort_levels.len();
-        if levels == 0 {
-            return;
-        }
-        let idx = next_selection(cur, levels, direction);
-        if let Some(picker) = &mut self.model_picker {
-            picker.effort_idx = idx;
+        if let Some(p) = &mut self.model_picker {
+            p.cycle_effort(direction, &self.model_options);
         }
     }
 
@@ -608,62 +696,48 @@ impl App {
     /// close the picker, and return `(provider, model, effort)` to act on.
     pub(crate) fn apply_model_selection(&mut self) -> Option<(String, String, Option<String>)> {
         let picker = self.model_picker.take()?;
-        let opt = self.model_options.get(picker.selected)?.clone();
-        let effort = if opt.effort_levels.is_empty() {
-            None
-        } else {
-            opt.effort_levels.get(picker.effort_idx).cloned()
-        };
-        self.provider = opt.provider.clone();
-        self.model = opt.model.clone();
+        let (provider, model, effort, context) = picker.resolve(&self.model_options)?;
+        self.provider = provider.clone();
+        self.model = model.clone();
         self.effort = effort.clone();
         // Retarget the footer's context gauge to the new model's window, falling
         // back when it's unknown so the % isn't measured against the old model.
-        self.context_window = opt
-            .context
+        self.context_window = context
             .map(|c| c as usize)
             .unwrap_or(self.fallback_context_window);
-        Some((opt.provider, opt.model, effort))
+        Some((provider, model, effort))
     }
 
     pub(crate) fn show_skill_picker(&mut self) {
         self.exit_pending = false;
-        match self.skills.as_deref() {
-            Some(reg) if !reg.is_empty() => {
-                self.skill_picker = Some(SkillPicker { selected: 0 });
-            }
-            _ => self.add_assistant_notice(
+        match self.skills.as_deref().and_then(SkillPicker::open) {
+            Some(p) => self.skill_picker = Some(p),
+            None => self.add_assistant_notice(
                 "No skills found. Add one at ~/.ignis/skills/<name>/SKILL.md".to_string(),
             ),
         }
     }
 
     pub(crate) fn select_skill_picker(&mut self, direction: SelectionDirection) {
-        let len = self.skills.as_deref().map(|r| r.all().len()).unwrap_or(0);
-        if len == 0 {
-            return;
-        }
-        if let Some(picker) = &mut self.skill_picker {
-            picker.selected = next_selection(picker.selected, len, direction);
+        let total = self.skills.as_deref().map(|r| r.all().len()).unwrap_or(0);
+        if let Some(p) = &mut self.skill_picker {
+            p.select(direction, total);
         }
     }
 
     /// Toggle the highlighted skill. Returns `(name, now_enabled)` for a notice.
     pub(crate) fn toggle_selected_skill(&mut self) -> Option<(String, bool)> {
-        let picker = self.skill_picker.as_ref()?;
-        let reg = self.skills.as_deref()?;
-        let name = reg.all().get(picker.selected)?.name.clone();
-        let now_enabled = reg.toggle(&name);
-        Some((name, now_enabled))
+        self.skill_picker
+            .as_ref()
+            .zip(self.skills.as_deref())
+            .and_then(|(p, reg)| p.toggle(reg))
     }
 
     pub(crate) fn show_mcp_picker(&mut self) {
         self.exit_pending = false;
-        match self.mcp.as_deref() {
-            Some(reg) if !reg.is_empty() => {
-                self.mcp_picker = Some(McpPicker { selected: 0 });
-            }
-            _ => self.add_assistant_notice(
+        match self.mcp.as_deref().and_then(McpPicker::open) {
+            Some(p) => self.mcp_picker = Some(p),
+            None => self.add_assistant_notice(
                 "No MCP servers configured. Add one with `ignis mcp add <name> -- <cmd> [args]`."
                     .to_string(),
             ),
@@ -671,22 +745,18 @@ impl App {
     }
 
     pub(crate) fn select_mcp_picker(&mut self, direction: SelectionDirection) {
-        let len = self.mcp.as_deref().map(|r| r.len()).unwrap_or(0);
-        if len == 0 {
-            return;
-        }
-        if let Some(picker) = &mut self.mcp_picker {
-            picker.selected = next_selection(picker.selected, len, direction);
+        let total = self.mcp.as_deref().map(|r| r.len()).unwrap_or(0);
+        if let Some(p) = &mut self.mcp_picker {
+            p.select(direction, total);
         }
     }
 
     /// Toggle the highlighted MCP server. Returns `(name, now_enabled)`.
     pub(crate) fn toggle_selected_mcp_server(&mut self) -> Option<(String, bool)> {
-        let picker = self.mcp_picker.as_ref()?;
-        let reg = self.mcp.as_deref()?;
-        let name = reg.entries().get(picker.selected)?.name.clone();
-        let now_enabled = reg.toggle(&name);
-        Some((name, now_enabled))
+        self.mcp_picker
+            .as_ref()
+            .zip(self.mcp.as_deref())
+            .and_then(|(p, reg)| p.toggle(reg))
     }
 
     pub(crate) fn render_session_history(
