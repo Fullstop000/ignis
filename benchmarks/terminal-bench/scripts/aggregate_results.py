@@ -62,7 +62,11 @@ def _wall_seconds(started: str | None, finished: str | None) -> float | None:
 
 
 def _sum_usage(usage_dir: Path) -> tuple[int, int, int]:
-    """Sum input/output/cache_read across every ignis *.usage.json in the tree."""
+    """Sum input/output/cache_read across every ignis *.usage.json in the tree.
+
+    cache_write_tokens is intentionally not aggregated — only cache_read drives
+    the cache_hit_rate metric the report cares about.
+    """
     in_t = out_t = cache_t = 0
     if not usage_dir.exists():
         return in_t, out_t, cache_t

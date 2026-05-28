@@ -11,5 +11,7 @@ terminal-bench-2/
 terminal-bench-sample/
 terminal-bench-pro/
 # Generated reports — keep the scripts under version control, not their output.
+results.csv
 results-*.csv
+report.html
 report-*.html
