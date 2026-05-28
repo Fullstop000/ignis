@@ -27,6 +27,16 @@ pub trait LlmProvider: Send + Sync + 'static {
         messages: &[Message],
         tools: &[serde_json::Value],
     ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error>;
+
+    /// Return the model identifier this provider is configured for. Used for
+    /// telemetry attributes and any caller that needs to know the active model
+    /// without inspecting config.
+    fn model_id(&self) -> &str;
+
+    /// Return the provider name (e.g. "openai", "anthropic", "kimi-code"). Used
+    /// for telemetry attributes. Stored on the struct rather than the trait so
+    /// OpenAiProvider can distinguish openai vs. kimi vs. moonshot.
+    fn provider_name(&self) -> &str;
 }
 
 mod anthropic;
@@ -81,7 +91,8 @@ pub struct Chunk {
 /// OpenAI-compatible usage object from the final stream chunk. `prompt_tokens`
 /// is the full input (cache hits included); cache reads appear either as
 /// OpenAI's `prompt_tokens_details.cached_tokens` or DeepSeek's
-/// `prompt_cache_hit_tokens`.
+/// `prompt_cache_hit_tokens`. `completion_tokens_details.reasoning_tokens` is
+/// the invisible-thinking subset of `completion_tokens` for o-series models.
 #[derive(Deserialize, Debug)]
 pub struct ChunkUsage {
     #[serde(default)]
@@ -90,6 +101,8 @@ pub struct ChunkUsage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
     #[serde(default)]
     pub prompt_cache_hit_tokens: Option<u64>,
 }
@@ -100,6 +113,12 @@ pub struct PromptTokensDetails {
     pub cached_tokens: u64,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct CompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
 impl ChunkUsage {
     pub fn to_usage(&self) -> Usage {
         let cache_read = self
@@ -108,10 +127,16 @@ impl ChunkUsage {
             .map(|d| d.cached_tokens)
             .or(self.prompt_cache_hit_tokens)
             .unwrap_or(0);
+        let reasoning = self
+            .completion_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
         Usage {
             // prompt_tokens already includes cached tokens.
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,
+            reasoning_tokens: reasoning,
             cache_read_tokens: cache_read,
             cache_write_tokens: 0,
         }

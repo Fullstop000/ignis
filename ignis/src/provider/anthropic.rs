@@ -71,6 +71,14 @@ enum AnthropicDelta {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
+    fn provider_name(&self) -> &str {
+        "anthropic"
+    }
+
     async fn chat_stream(
         &self,
         system_prompt: &str,

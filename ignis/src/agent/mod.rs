@@ -286,6 +286,19 @@ impl Agent {
             drain_injected(inject_rx.as_deref_mut(), history, &tx).await;
             let _ = tx.send(AgentEvent::TurnStart).await;
 
+            // LLM request span. Captures wall-clock via construct→drop; final
+            // attrs recorded after stream consumption (tokens, success).
+            let llm_span = tracing::info_span!(
+                "ignis.llm_request",
+                provider = %self.provider.provider_name(),
+                model = %self.provider.model_id(),
+                input_tokens = tracing::field::Empty,
+                output_tokens = tracing::field::Empty,
+                reasoning_tokens = tracing::field::Empty,
+                success = tracing::field::Empty,
+            );
+            let llm_start = std::time::Instant::now();
+
             let mut stream = match self
                 .provider
                 .chat_stream(&effective_prompt, &*history, &tool_schemas)
@@ -294,6 +307,14 @@ impl Agent {
                 Ok(s) => s,
                 Err(err) => {
                     let err_msg = Self::sanitize_and_truncate_error(&err.to_string());
+                    llm_span.record("success", false);
+                    crate::telemetry::record_llm_request(
+                        self.provider.provider_name(),
+                        self.provider.model_id(),
+                        llm_start.elapsed(),
+                        false,
+                    );
+                    drop(llm_span);
                     let error_content = format!("Error: {}", err_msg);
                     let _ = tx
                         .send(AgentEvent::MessageStart {
@@ -444,8 +465,26 @@ impl Agent {
                 }
             }
 
+            // Record final LLM-request span attrs + duration metric. Span drops
+            // at the end of this loop iteration; record before drop.
+            llm_span.record("success", true);
+            llm_span.record("input_tokens", turn_usage.input_tokens);
+            llm_span.record("output_tokens", turn_usage.output_tokens);
+            llm_span.record("reasoning_tokens", turn_usage.reasoning_tokens);
+            crate::telemetry::record_llm_request(
+                self.provider.provider_name(),
+                self.provider.model_id(),
+                llm_start.elapsed(),
+                true,
+            );
+
             // Report this turn's real token usage (if the provider supplied it).
             if !turn_usage.is_zero() {
+                crate::telemetry::record_tokens(
+                    &turn_usage,
+                    self.provider.provider_name(),
+                    self.provider.model_id(),
+                );
                 total_usage.add(&turn_usage);
                 let _ = tx.send(AgentEvent::Usage(turn_usage)).await;
             }
@@ -546,6 +585,22 @@ impl Agent {
                             let arguments_str = tc.function.arguments;
                             let maybe_tool = tools_map.get(&tool_name).cloned();
 
+                            // ignis.tool.execution span. Captures wall-clock via
+                            // construct→drop; tool.arguments included only when
+                            // IGNIS_LOG_TOOL_DETAILS=1.
+                            let tool_span = tracing::info_span!(
+                                "ignis.tool.execution",
+                                tool.name = %tool_name,
+                                tool.call_id = %tc_id,
+                                success = tracing::field::Empty,
+                                is_error = tracing::field::Empty,
+                                tool.arguments = tracing::field::Empty,
+                            );
+                            if crate::telemetry::log_tool_details() {
+                                tool_span.record("tool.arguments", arguments_str.as_str());
+                            }
+                            let tool_start = std::time::Instant::now();
+
                             let _ = tx_inner
                                 .send(AgentEvent::ToolExecutionStart {
                                     tool_call_id: tc_id.clone(),
@@ -573,6 +628,15 @@ impl Agent {
                                     Some(tool) => tool.call(args).await,
                                 },
                             };
+
+                            tool_span.record("success", !result.is_error);
+                            tool_span.record("is_error", result.is_error);
+                            crate::telemetry::record_tool_call(
+                                &tool_name,
+                                tool_start.elapsed(),
+                                !result.is_error,
+                            );
+                            drop(tool_span);
 
                             let _ = tx_inner
                                 .send(AgentEvent::ToolExecutionEnd {

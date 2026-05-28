@@ -406,6 +406,8 @@ pub(crate) async fn handle_key(
                     app.show_skill_picker();
                 } else if command == "/mcp" && arg_count == 1 {
                     app.show_mcp_picker();
+                } else if command == "/telemetry" && arg_count == 1 {
+                    app.show_telemetry_status();
                 } else if command.starts_with('/')
                     && app
                         .skills
