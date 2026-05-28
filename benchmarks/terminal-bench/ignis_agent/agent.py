@@ -28,6 +28,9 @@ _PROVIDERS: dict[str, tuple[str, str | None]] = {
     "openai": ("OPENAI_API_KEY", "https://api.openai.com/v1"),
     "gemini": ("GEMINI_API_KEY", None),
     "deepseek": ("DEEPSEEK_API_KEY", None),
+    # ignis hardcodes https://api.kimi.com/coding/v1 and the KimiCLI User-Agent
+    # the Kimi Coding Plan requires; we only need to forward the key.
+    "kimi-code": ("KIMI_CODE_API_KEY", None),
 }
 
 
