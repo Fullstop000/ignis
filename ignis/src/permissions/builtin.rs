@@ -112,11 +112,11 @@ pub fn is_read_only_bash(command: &str) -> bool {
 }
 
 /// Circuit-breaker patterns — destructive commands that ALWAYS ask, even
-/// under `BypassPermissions`. Under AFK, these auto-deny (no user available
-/// to authorize). The set is intentionally tiny: `rm -rf /`, `rm -rf ~`,
-/// `rm -rf $HOME`, all variants. Bigger patterns belong in user-supplied
-/// deny rules (v0.17.0); this is the "even if you said yes to everything,
-/// this one still asks" floor.
+/// under `HandsFree`. Under `FullyUnattended`, these hard-deny (no user
+/// available to authorize). The set is intentionally tiny: `rm -rf /`,
+/// `rm -rf ~`, `rm -rf $HOME`, all variants. Bigger patterns belong in
+/// user-supplied deny rules (v0.18.0); this is the "even if you said yes
+/// to everything, this one still asks" floor.
 pub fn is_circuit_breaker(command: &str) -> bool {
     circuit_breaker_label(command).is_some()
 }
@@ -289,12 +289,12 @@ fn match_breaker_in_segment(segment: &str) -> Option<&'static str> {
 }
 
 /// Protected path patterns — files/dirs the model should never silently edit
-/// even under `BypassPermissions`. The patterns are absolute or basename-based;
+/// even under `HandsFree`. The patterns are absolute or basename-based;
 /// matched against the path the model gave to `edit_file`/`create_file`.
 ///
 /// The intent is "the model can't accidentally rewrite your shell init or
-/// ignis's own config." Under `BypassPermissions` these still raise a picker;
-/// under AFK they auto-deny.
+/// ignis's own config." Under `HandsFree` these still raise a picker;
+/// under `FullyUnattended` they hard-deny.
 pub fn is_protected_path(path: &str) -> bool {
     let path = path.trim();
     if path.is_empty() {
