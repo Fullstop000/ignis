@@ -8,6 +8,7 @@ use crate::session::project_slug;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -440,8 +441,60 @@ pub fn render_html(records: &[SessionRecord], scope: Scope, generated_at: u64) -
     format!("{}{}{}", header, body, footer)
 }
 
-pub async fn run(_cmd: SessionsCmd) -> Result<()> {
-    anyhow::bail!("not yet implemented");
+/// Inner, IO-mockable variant for tests. `is_tty` is the caller's view of
+/// whether stdin is interactive.
+fn resolve_scope_inner(flag: Option<Scope>, is_tty: bool) -> Result<Scope> {
+    if let Some(s) = flag {
+        return Ok(s);
+    }
+    if !is_tty {
+        anyhow::bail!(
+            "--scope required when stdin is not a TTY (try --scope current or --scope all)"
+        );
+    }
+    let mut stderr = std::io::stderr().lock();
+    write!(stderr, "Scope: 1) Current project  2) All projects [1/2]: ")?;
+    stderr.flush()?;
+    let mut buf = [0u8; 1];
+    std::io::stdin().lock().read_exact(&mut buf)?;
+    match buf[0] {
+        b'1' => Ok(Scope::Current),
+        b'2' => Ok(Scope::All),
+        _ => anyhow::bail!("expected '1' or '2'"),
+    }
+}
+
+fn resolve_scope(flag: Option<Scope>) -> Result<Scope> {
+    resolve_scope_inner(flag, std::io::stdin().is_terminal())
+}
+
+pub async fn run(cmd: SessionsCmd) -> Result<()> {
+    let Cmd::Export(args) = cmd.cmd;
+    if !args.html {
+        anyhow::bail!("--html is required (no other formats in v1)");
+    }
+    let scope = resolve_scope(args.scope)?;
+
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not locate home directory"))?;
+    let projects_dir = home.join(".ignis/projects");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    let records = walk_sessions(&projects_dir, scope, &cwd)?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let html = render_html(&records, scope, now);
+
+    let out_path = args
+        .output
+        .unwrap_or_else(|| default_output_path(&cwd, now));
+    std::fs::write(&out_path, html)?;
+    let abs = std::fs::canonicalize(&out_path).unwrap_or(out_path);
+    println!("{}", abs.display());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -515,6 +568,20 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["s1", "s2"]);
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn resolve_scope_explicit_flag_wins() {
+        let s = resolve_scope_inner(Some(Scope::All), false).unwrap();
+        assert!(matches!(s, Scope::All));
+        let s = resolve_scope_inner(Some(Scope::Current), true).unwrap();
+        assert!(matches!(s, Scope::Current));
+    }
+
+    #[test]
+    fn resolve_scope_non_tty_without_flag_errors() {
+        let err = resolve_scope_inner(None, false).unwrap_err();
+        assert!(err.to_string().contains("--scope"));
     }
 
     fn sample_record() -> SessionRecord {
