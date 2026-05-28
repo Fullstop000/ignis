@@ -13,6 +13,7 @@ inside the sandbox and invoke `ignis "<instruction>"` — a non-empty prompt arg
 switches ignis off TUI mode into one-shot streaming.
 """
 
+import json
 import shlex
 
 from harbor.agents.installed.base import BaseInstalledAgent, with_prompt_template
@@ -137,10 +138,59 @@ class IgnisAgent(BaseInstalledAgent):
         )
 
         log_path = (EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME).as_posix()
-        await self.exec_as_agent(
-            environment,
-            command=(
-                f"ignis {shlex.quote(instruction)} "
-                f"2>&1 | stdbuf -oL tee {shlex.quote(log_path)}"
-            ),
-        )
+        sessions_dst = (EnvironmentPaths.agent_dir / "ignis-projects").as_posix()
+        try:
+            await self.exec_as_agent(
+                environment,
+                command=(
+                    f"ignis {shlex.quote(instruction)} "
+                    f"2>&1 | stdbuf -oL tee {shlex.quote(log_path)}"
+                ),
+            )
+        finally:
+            # ignis persists per-session token usage to
+            # $HOME/.ignis/projects/<cwd-hash>/<session>.usage.json. Copy it
+            # into the harbor-synced agent dir so populate_context_post_run
+            # can read it once the sandbox is torn down. Best-effort — never
+            # let trajectory bookkeeping mask the real run outcome.
+            try:
+                await self.exec_as_agent(
+                    environment,
+                    command=(
+                        f"mkdir -p {shlex.quote(sessions_dst)} && "
+                        'if [ -d "$HOME/.ignis/projects" ]; then '
+                        f'  cp -R "$HOME/.ignis/projects/." {shlex.quote(sessions_dst)}/; '
+                        "fi"
+                    ),
+                )
+            except Exception:
+                pass
+
+    def populate_context_post_run(self, context: AgentContext) -> None:
+        """Aggregate every synced ignis usage.json into the trial's token counts.
+
+        ignis writes one `<session>.usage.json` per session in v0.4+ — schema
+        is `{"input_tokens", "output_tokens", "cache_read_tokens",
+        "cache_write_tokens"}`. We sum them up so harbor's per-trial report
+        shows real numbers instead of `null`. Cost is left None: ignis doesn't
+        compute it and we don't ship a pricing table.
+        """
+        synced = self.logs_dir / "ignis-projects"
+        if not synced.exists():
+            return
+
+        in_tot = out_tot = cache_tot = 0
+        for usage_file in synced.rglob("*.usage.json"):
+            try:
+                with open(usage_file) as handle:
+                    data = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                continue
+            in_tot += int(data.get("input_tokens", 0) or 0)
+            out_tot += int(data.get("output_tokens", 0) or 0)
+            cache_tot += int(data.get("cache_read_tokens", 0) or 0)
+
+        if in_tot or out_tot:
+            context.n_input_tokens = in_tot
+            context.n_output_tokens = out_tot
+            context.n_cache_tokens = cache_tot
