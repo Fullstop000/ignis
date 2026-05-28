@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.egg-info/
+dist/
+build/
+.harbor/
+logs/
+runs/
+# Datasets harbor pulls down at run time live next to the adapter — never commit.
+terminal-bench-2/
+terminal-bench-sample/
+terminal-bench-pro/
