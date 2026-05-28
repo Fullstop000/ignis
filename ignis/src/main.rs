@@ -34,29 +34,21 @@ async fn main() -> Result<(), anyhow::Error> {
     // 1. Load config
     let config = load_config()?;
 
-    // Resolve permission state: CLI flag > state.json > default. AFK is the
-    // logical OR of the CLI flag, the persisted state, and the one-shot
-    // implicit-AFK rule (no TTY to prompt on, so we must auto-handle).
-    // A typo'd `--permission-mode foo` errors out — silently demoting it to
-    // Default would be the worst kind of foot-gun (user thinks they got bypass,
-    // gets safe-mode instead, or vice versa).
+    // Resolve permission mode. Precedence: `--afk` flag > one-shot implicit
+    // > persisted `state.json` > built-in `Off`. The `--afk` flag and the
+    // one-shot implicit both pin `FullyUnattended` — they signal "no TTY,
+    // don't pause for input" and that's what FullyUnattended encodes.
     let persisted_state = ignis::state::load_state();
-    let resolved_mode = if let Some(raw) = cli.permission_mode.as_deref() {
-        ignis::permissions::Mode::parse(raw).ok_or_else(|| {
-            anyhow::anyhow!(
-                "--permission-mode: unknown value {raw:?}. Valid: default, bypassPermissions."
-            )
-        })?
+    let resolved_mode = if cli.afk || is_oneshot {
+        ignis::permissions::Mode::FullyUnattended
     } else {
         persisted_state
-            .permission_mode
+            .mode
             .as_deref()
             .and_then(ignis::permissions::Mode::parse)
             .unwrap_or_default()
     };
-    let resolved_afk = cli.afk || persisted_state.afk || is_oneshot;
-    let permissions =
-        ignis::permissions::runtime::PermissionState::new(resolved_mode, resolved_afk);
+    let permissions = ignis::permissions::runtime::PermissionState::new(resolved_mode);
 
     // 2. Resolve paths
     let home =

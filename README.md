@@ -21,12 +21,13 @@ TUI and a one-shot CLI, with built-in tools.
   slash commands (`/resume`, `/clear`, `/compact`, `/copy`, `/model`).
 - **Runtime model switching** — `/model` picks the provider/model and (for
   reasoning models) the effort level, and saves it back to your config.
-- **Permissions** — every tool call passes a gate; sensitive tools prompt with
-  approve-once / approve-session / deny. `--permission-mode bypassPermissions`
-  auto-allows except for a built-in safety floor (`rm -rf /` family, `.git/**`,
-  `.ignis/**`, shell init files). See [`docs/permissions.md`](docs/permissions.md).
-- **AFK mode** — `--afk` / `/afk` auto-approves tool calls and dismisses
-  `ask_user`, for unattended or one-shot runs.
+- **Permission modes** — every tool call passes a gate; sensitive tools prompt
+  with approve-once / approve-session / deny. `/afk` opens a picker to enter
+  either *Hands-free* (auto-approve tools, still answer `ask_user`) or *Fully
+  unattended* (auto-approve everything, dismiss `ask_user`). Built-in safety
+  floor (`rm -rf /` family, `.git/**`, `.ignis/**`, shell init files) always
+  asks under Off/Hands-free and hard-denies under Fully unattended. See
+  [`docs/permissions.md`](docs/permissions.md).
 - **Single binary** — no external runtime dependencies.
 
 > `/copy` (copy the last reply to the clipboard) uses a platform clipboard tool:
@@ -122,8 +123,7 @@ ignis                                          # interactive TUI (default)
 ignis "fix the failing test in foo.rs"         # one-shot CLI
 ignis --resume                                 # resume the latest session
 ignis --resume <id> "follow-up prompt"         # resume + one-shot
-ignis --permission-mode bypassPermissions      # auto-allow (see docs/permissions.md)
-ignis --afk                                    # AFK mode (auto-approve + auto-dismiss ask_user)
+ignis --afk                                    # fully unattended (auto-approve + dismiss ask_user)
 ignis --help                                   # full flag/subcommand list
 ```
 

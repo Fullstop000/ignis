@@ -127,12 +127,12 @@ impl AgentTool for AskUserTool {
             Err(e) => return ToolResult::error(format!("ask_user: {e}")),
         };
 
-        // AFK auto-dismiss: when AFK is on, no user is present to answer.
+        // Fully-unattended mode auto-dismisses: no user is present to answer.
         // Reply with empty answers + a clear `dismissed`/`reason` so the model
-        // can adapt (the system prompt and ask_user description both surface
-        // this contract).
+        // can adapt. The lighter HandsFree mode leaves `ask_user` alone — at
+        // the keyboard, model can still consult the user.
         if let Some(p) = &self.permissions {
-            if p.afk() {
+            if p.mode().is_fully_unattended() {
                 let body = serde_json::json!({
                     "answers": questions
                         .iter()
@@ -143,7 +143,7 @@ impl AgentTool for AskUserTool {
                         }))
                         .collect::<Vec<_>>(),
                     "dismissed": true,
-                    "reason": "Running in afk mode. No user is present. Make your best judgment and proceed.",
+                    "reason": "Running fully unattended. No user is present. Make your best judgment and proceed.",
                 });
                 return ToolResult::ok(body.to_string());
             }
@@ -398,11 +398,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn afk_auto_dismisses_without_touching_picker_channel() {
+    async fn fully_unattended_auto_dismisses_without_touching_picker_channel() {
         use crate::permissions::runtime::PermissionState;
         use crate::permissions::Mode;
         let (tx, mut rx) = mpsc::channel::<PickerRequest>(1);
-        let state = PermissionState::new(Mode::Default, true);
+        let state = PermissionState::new(Mode::FullyUnattended);
         let tool = AskUserTool::new(Some(tx)).with_permissions(state);
         let res = tool
             .call(json!({"questions": [q("What now?", "h", false, &[("a", "A"), ("b", "B")])]}))
@@ -410,20 +410,23 @@ mod tests {
         // Tool should NOT have sent a request to the picker — channel stays empty.
         assert!(
             rx.try_recv().is_err(),
-            "AFK should not touch the picker channel"
+            "fully-unattended should not touch the picker channel"
         );
         // The reply must be a successful dismissal (NOT is_error), so the
         // model sees structured "make your best judgment" guidance.
         assert!(
             !res.is_error,
-            "AFK dismiss should be success, got error: {}",
+            "fully-unattended dismiss should be success, got error: {}",
             res.content
         );
         let body: serde_json::Value = serde_json::from_str(&res.content).unwrap();
         assert_eq!(body["dismissed"], serde_json::Value::Bool(true));
         assert!(
-            body["reason"].as_str().unwrap_or("").contains("afk"),
-            "expected 'afk' in reason, got: {body}"
+            body["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("fully unattended"),
+            "expected 'fully unattended' in reason, got: {body}"
         );
     }
 

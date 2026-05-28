@@ -537,10 +537,10 @@ pub(crate) async fn handle_key(
 }
 
 /// `/afk` toggle handler. When AFK is currently on, flips it off immediately
-/// (disabling AFK strictly increases safety, no confirmation needed). When off,
-/// opens a 2-option confirmation picker (Enable AFK / Cancel) — the only
-/// feature in v0.16.0 with an asymmetric gate, because enabling AFK is the
-/// only single-keystroke action with session-wide auto-approval consequences.
+/// (disabling strictly increases safety, no confirmation needed). When off,
+/// opens a 2-option picker asking *which level* of AFK to enable: fully
+/// unattended (dismiss `ask_user`, hard-deny safety floor) or hands-free
+/// (auto-approve tools, but still answer `ask_user` and floor still prompts).
 async fn handle_afk_toggle(
     app: &mut App,
     picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
@@ -548,14 +548,20 @@ async fn handle_afk_toggle(
     use crate::console::picker::{
         PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse,
     };
+    use crate::permissions::Mode;
     use tokio::sync::oneshot;
+
+    const FULLY_UNATTENDED: &str = "Fully unattended (dismiss questions)";
+    const HANDS_FREE: &str = "Hands-free, keep questions";
 
     let Some(perms) = app.permissions.clone() else {
         app.add_assistant_notice("AFK: permission state not attached".to_string());
         return;
     };
-    if perms.afk() {
-        perms.set_afk(false);
+    // Asymmetric gate: any AFK level → off fires immediately.
+    if perms.mode() != Mode::Off {
+        perms.set_mode(Mode::Off);
+        let _ = crate::state::persist_permission_mode(None);
         app.add_assistant_notice("AFK disabled.".to_string());
         return;
     }
@@ -567,22 +573,28 @@ async fn handle_afk_toggle(
     let (reply_tx, reply_rx) = oneshot::channel();
     let request = PickerRequest {
         questions: vec![PickerQuestion {
-            question: "Enable AFK mode? Every tool call will auto-approve (except circuit \
-                       breakers like `rm -rf /` and protected paths like .git/**). `ask_user` \
-                       requests will auto-dismiss. AFK persists until you toggle off with /afk."
-                .to_string(),
+            question: "Enable AFK — how should the agent run while you're away?".to_string(),
             header: "AFK".to_string(),
             multi_select: false,
             allow_other: false,
             options: vec![
                 PickerOption {
-                    label: "Enable AFK".to_string(),
-                    description: "I'm stepping away — proceed without me.".to_string(),
+                    label: FULLY_UNATTENDED.to_string(),
+                    description: "Auto-approve every tool call. `ask_user` is auto-dismissed so \
+                                  the model proceeds on its best judgment. `rm -rf /` and \
+                                  protected-path edits hard-deny — there's no one here to \
+                                  confirm them. For CI, overnight, or one-shot runs."
+                        .to_string(),
                     preview: None,
                 },
                 PickerOption {
-                    label: "Cancel".to_string(),
-                    description: "Keep current mode.".to_string(),
+                    label: HANDS_FREE.to_string(),
+                    description: "Auto-approve tool calls so the picker stops interrupting you, \
+                                  but the model can still consult you via `ask_user`, and \
+                                  dangerous patterns (`rm -rf /`, edits to `.git`/`.ignis`/\
+                                  shell init) still prompt for confirmation. For when you're \
+                                  at the keyboard and want flow."
+                        .to_string(),
                     preview: None,
                 },
             ],
@@ -593,13 +605,19 @@ async fn handle_afk_toggle(
         app.add_assistant_notice("/afk: picker channel closed".to_string());
         return;
     }
-    // Spawn so the key handler returns immediately; toggle AFK on the reply.
+    // Spawn so the key handler returns immediately; set the chosen mode on reply.
     let perms_for_reply = perms.clone();
     tokio::spawn(async move {
         if let Ok(PickerResponse::Answered(answers)) = reply_rx.await {
             if let Some(PickerAnswer::Single(label)) = answers.first() {
-                if label == "Enable AFK" {
-                    perms_for_reply.set_afk(true);
+                let chosen = match label.as_str() {
+                    FULLY_UNATTENDED => Some(Mode::FullyUnattended),
+                    HANDS_FREE => Some(Mode::HandsFree),
+                    _ => None,
+                };
+                if let Some(mode) = chosen {
+                    perms_for_reply.set_mode(mode);
+                    let _ = crate::state::persist_permission_mode(Some(mode.as_str()));
                 }
             }
         }

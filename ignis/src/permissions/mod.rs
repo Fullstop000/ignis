@@ -1,10 +1,11 @@
 //! Agent permission control — gate every tool call through a small, predictable
-//! decision pipeline before dispatch. Designed against the v0.16.0 cut of
-//! `docs/superpowers/specs/2026-05-28-agent-permissions-design.md`:
-//! safe-first defaults, no sandbox (advisory only), no allowlist grammar yet
-//! (v0.17.0). The grammar-less v1 still delivers the safety floor: per-tool
-//! defaults, read-only auto-allow set, circuit breaker, protected paths,
-//! bypass mode, AFK, and the picker.
+//! decision pipeline before dispatch.
+//!
+//! v0.17.0 collapses what used to be a 2D space (permission mode + AFK toggle)
+//! into a single 3-state `Mode` enum. The middle "auto-approve but `ask_user`
+//! still works" state lives on as `HandsFree`; the heavy headless state is
+//! `FullyUnattended`. Permission-mode CLI flag and the `bypassPermissions` name
+//! are gone.
 //!
 //! Integration: a `PermissionChecker` impls `tools::tool::ToolHooks`; the
 //! agent loop already invokes `before_tool_call` on every dispatch (see
@@ -17,36 +18,54 @@ pub mod runtime;
 
 use serde::{Deserialize, Serialize};
 
-/// Top-level permission mode. AFK is a separate independent toggle on
-/// `PermissionState`, NOT a mode — they compose. Modes are deliberately few
-/// (v1 ships `Default` + `BypassPermissions`; `AcceptEdits` and `Plan` ship
-/// in v0.17.0+ once the allowlist grammar is in).
+/// The single axis for "how much should ignis prompt me?" There are exactly
+/// three real points on it: full prompts (Off), keyboard-present but flow
+/// (HandsFree), and headless/unattended (FullyUnattended). The two AFK levels
+/// share auto-approve of sensitive tools but differ on (a) safety-floor
+/// behavior and (b) whether `ask_user` is dismissed.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum Mode {
-    /// Ask for tools whose default policy is Ask; auto-allow the rest.
+    /// Prompt for sensitive tools; safety floor asks; `ask_user` prompts.
     #[default]
-    Default,
-    /// Auto-allow every tool call (subject to circuit breakers + protected
-    /// paths). The escape hatch for trusted contexts (containers, scripted
-    /// runs). Refused under sudo/root unless a sandbox env-var is detected.
-    BypassPermissions,
+    Off,
+    /// Auto-approve sensitive tools, but safety floor still asks and
+    /// `ask_user` still prompts. For interactive sessions where you want
+    /// flow without losing oversight on judgment calls.
+    HandsFree,
+    /// Auto-approve sensitive tools; safety floor hard-denies (no one to
+    /// confirm); `ask_user` is auto-dismissed. For CI, overnight, one-shot.
+    FullyUnattended,
 }
 
 impl Mode {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Mode::Default => "default",
-            Mode::BypassPermissions => "bypassPermissions",
+            Mode::Off => "off",
+            Mode::HandsFree => "hands_free",
+            Mode::FullyUnattended => "fully_unattended",
         }
     }
 
     pub fn parse(s: &str) -> Option<Mode> {
         match s {
-            "default" => Some(Mode::Default),
-            "bypassPermissions" | "bypass" => Some(Mode::BypassPermissions),
+            "off" => Some(Mode::Off),
+            "hands_free" => Some(Mode::HandsFree),
+            "fully_unattended" => Some(Mode::FullyUnattended),
             _ => None,
         }
+    }
+
+    /// True for HandsFree and FullyUnattended — the two states where the
+    /// per-tool default `Ask` is auto-promoted to `Allow`.
+    pub fn auto_approves_sensitive(&self) -> bool {
+        matches!(self, Mode::HandsFree | Mode::FullyUnattended)
+    }
+
+    /// True only for FullyUnattended — the state where safety-floor `Ask`
+    /// becomes hard `Deny` (no human to confirm) and `ask_user` auto-dismisses.
+    pub fn is_fully_unattended(&self) -> bool {
+        matches!(self, Mode::FullyUnattended)
     }
 }
 
@@ -76,37 +95,28 @@ impl Decision {
 /// Resolve the decision for one tool call, applying (in order):
 ///
 /// 1. **Circuit breakers** on raw bash args (`rm -rf /`, `rm -rf ~`,
-///    `rm -rf $HOME`) — always `Ask`, regardless of mode. If AFK then
-///    promote to `Deny` (no user available to authorize).
+///    `rm -rf $HOME`) — `Ask` under Off/HandsFree, **hard `Deny`** under
+///    FullyUnattended (no user to authorize). Always runs first.
 /// 2. **Protected-path edits** (`edit_file`/`create_file` targeting
-///    `.git/**`, `.ignis/**`, shell init, etc.) — `Ask` under any mode
-///    except `BypassPermissions`, where it stays `Ask` (intentional carve-out
-///    so even bypass doesn't silently rewrite your `.bashrc`).
-/// 3. **Read-only bash auto-allow** for ~30 curated commands (`ls`,
-///    `cat`, `git status`, …) — `Allow`.
-/// 4. **`BypassPermissions` mode** — `Allow` (after step 1+2 short-circuit).
-/// 5. **Per-tool default** policy (the tool registry says what each tool's
-///    baseline is: `read_file` → Allow, `bash` → Ask, etc.).
-///
-/// Then a post-pass:
-/// - If final is `Ask` and AFK is on → promote to `Allow` (matches Kimi
-///   semantic; matches `BypassPermissions` once step 1+2 have already had
-///   their say).
-/// - If final is `Ask` and console-closed (no picker channel) → `Deny`
-///   with a "no interactive console" reason.
+///    `.git/**`, `.ignis/**`, shell init, etc.) — same `Ask`/`Deny` split as
+///    step 1. Same precedence rule: floor first.
+/// 3. **Session-allow** shortcut (only after the floor has had its say).
+/// 4. **Read-only bash auto-allow** for ~30 curated commands.
+/// 5. **HandsFree / FullyUnattended** auto-approve the sensitive tools whose
+///    per-tool default would otherwise be `Ask`.
+/// 6. **Per-tool default** policy.
 pub fn check(
     tool_name: &str,
     arguments_json: &str,
     default_for_tool: Decision,
     mode: Mode,
-    afk: bool,
     session_allowed: bool,
 ) -> Decision {
     let args: serde_json::Value = serde_json::from_str(arguments_json).unwrap_or_default();
 
     // Step 1: circuit breakers (raw bash arg scan). These ALWAYS take
-    // precedence over session-allow shortcuts and bypass mode — that's the
-    // whole point of the floor.
+    // precedence over session-allow shortcuts and any auto-approve mode —
+    // that's the whole point of the floor.
     if tool_name == "bash" {
         if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
             if builtin::is_circuit_breaker(cmd) {
@@ -114,8 +124,10 @@ pub fn check(
                     "destructive command pattern matched ({}); requires explicit confirmation",
                     builtin::circuit_breaker_label(cmd).unwrap_or("circuit breaker")
                 );
-                return if afk {
-                    Decision::deny(format!("AFK: {reason}. Toggle off and authorize manually."))
+                return if mode.is_fully_unattended() {
+                    Decision::deny(format!(
+                        "fully-unattended mode: {reason}. Toggle off and authorize manually."
+                    ))
                 } else {
                     Decision::ask(reason)
                 };
@@ -123,14 +135,15 @@ pub fn check(
         }
     }
 
-    // Step 2: protected-path edits (Ask under any mode — bypass included).
-    // Same precedence rule as step 1: floor first.
+    // Step 2: protected-path edits. Same precedence rule as step 1: floor first.
     if matches!(tool_name, "edit_file" | "create_file") {
         if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
             if builtin::is_protected_path(path) {
                 let reason = format!("edit targets a protected path: {path}");
-                return if afk {
-                    Decision::deny(format!("AFK: {reason}. Toggle off and authorize manually."))
+                return if mode.is_fully_unattended() {
+                    Decision::deny(format!(
+                        "fully-unattended mode: {reason}. Toggle off and authorize manually."
+                    ))
                 } else {
                     Decision::ask(reason)
                 };
@@ -154,18 +167,9 @@ pub fn check(
         }
     }
 
-    // Step 5: bypass mode (after the safety floor has had its say).
-    if mode == Mode::BypassPermissions {
-        return Decision::Allow;
-    }
-
-    // Step 6: per-tool default policy applies.
-    let raw = default_for_tool;
-
-    // AFK post-pass: an Ask becomes Allow under AFK (the picker would just
-    // confirm, and no one is there to confirm). Deny stays Deny; Allow stays.
-    match raw {
-        Decision::Ask { .. } if afk => Decision::Allow,
+    // Step 5: per-tool default. Auto-approve modes promote an `Ask` to `Allow`.
+    match default_for_tool {
+        Decision::Ask { .. } if mode.auto_approves_sensitive() => Decision::Allow,
         other => other,
     }
 }
@@ -176,7 +180,8 @@ pub fn default_policy_for_tool(tool_name: &str) -> Decision {
     match tool_name {
         // Pure reads.
         "read_file" | "list_dir" | "grep" | "glob" | "web_search" | "skill" => Decision::Allow,
-        // ask_user is gated separately (AFK auto-dismisses inside the tool).
+        // ask_user is gated separately (FullyUnattended auto-dismisses inside
+        // the tool, before the gate sees it).
         "ask_user" => Decision::Allow,
         // Network + writes + execution + agent spawn → ask by default.
         "web_fetch" => Decision::ask("network fetch"),
@@ -201,15 +206,23 @@ mod tests {
 
     #[test]
     fn mode_parse_roundtrip() {
-        assert_eq!(Mode::parse("default"), Some(Mode::Default));
-        assert_eq!(
-            Mode::parse("bypassPermissions"),
-            Some(Mode::BypassPermissions)
-        );
-        assert_eq!(Mode::parse("bypass"), Some(Mode::BypassPermissions));
+        assert_eq!(Mode::parse("off"), Some(Mode::Off));
+        assert_eq!(Mode::parse("hands_free"), Some(Mode::HandsFree));
+        assert_eq!(Mode::parse("fully_unattended"), Some(Mode::FullyUnattended));
         assert_eq!(Mode::parse("nonsense"), None);
-        assert_eq!(Mode::Default.as_str(), "default");
-        assert_eq!(Mode::BypassPermissions.as_str(), "bypassPermissions");
+        assert_eq!(Mode::Off.as_str(), "off");
+        assert_eq!(Mode::HandsFree.as_str(), "hands_free");
+        assert_eq!(Mode::FullyUnattended.as_str(), "fully_unattended");
+    }
+
+    #[test]
+    fn mode_classification_predicates() {
+        assert!(!Mode::Off.auto_approves_sensitive());
+        assert!(Mode::HandsFree.auto_approves_sensitive());
+        assert!(Mode::FullyUnattended.auto_approves_sensitive());
+        assert!(!Mode::Off.is_fully_unattended());
+        assert!(!Mode::HandsFree.is_fully_unattended());
+        assert!(Mode::FullyUnattended.is_fully_unattended());
     }
 
     #[test]
@@ -246,61 +259,68 @@ mod tests {
     }
 
     #[test]
-    fn read_tool_in_default_mode_allows() {
+    fn read_tool_in_off_mode_allows() {
         let d = check(
             "read_file",
             json(r#"{"path":"src/main.rs"}"#),
             default_policy_for_tool("read_file"),
-            Mode::Default,
+            Mode::Off,
             false,
-            false, // session_allowed
         );
         assert_eq!(d, Decision::Allow);
     }
 
     #[test]
-    fn bash_in_default_mode_asks() {
+    fn bash_in_off_mode_asks() {
         let d = check(
             "bash",
             json(r#"{"command":"cargo build"}"#),
             default_policy_for_tool("bash"),
-            Mode::Default,
+            Mode::Off,
             false,
-            false, // session_allowed
         );
         assert!(matches!(d, Decision::Ask { .. }));
     }
 
     #[test]
-    fn bash_read_only_auto_allows_even_in_default() {
-        // `git status` is on the auto-allow list.
+    fn bash_read_only_auto_allows_even_in_off() {
         let d = check(
             "bash",
             json(r#"{"command":"git status"}"#),
             default_policy_for_tool("bash"),
-            Mode::Default,
+            Mode::Off,
             false,
-            false, // session_allowed
         );
         assert_eq!(d, Decision::Allow);
     }
 
     #[test]
-    fn bypass_mode_allows_normal_tools() {
+    fn hands_free_allows_normal_tools() {
         let d = check(
             "bash",
             json(r#"{"command":"cargo build && cargo test"}"#),
             default_policy_for_tool("bash"),
-            Mode::BypassPermissions,
+            Mode::HandsFree,
             false,
-            false, // session_allowed
         );
         assert_eq!(d, Decision::Allow);
     }
 
     #[test]
-    fn bypass_mode_still_asks_circuit_breaker() {
-        // `rm -rf /` always asks even under bypass (the floor of safety).
+    fn fully_unattended_allows_normal_tools() {
+        let d = check(
+            "bash",
+            json(r#"{"command":"cargo build"}"#),
+            default_policy_for_tool("bash"),
+            Mode::FullyUnattended,
+            false,
+        );
+        assert_eq!(d, Decision::Allow);
+    }
+
+    #[test]
+    fn hands_free_still_asks_circuit_breaker() {
+        // The floor is non-negotiable under hands-free.
         for cmd in [
             r#"{"command":"rm -rf /"}"#,
             r#"{"command":"rm -rf ~"}"#,
@@ -311,13 +331,12 @@ mod tests {
                 "bash",
                 cmd,
                 default_policy_for_tool("bash"),
-                Mode::BypassPermissions,
+                Mode::HandsFree,
                 false,
-                false, // session_allowed
             );
             assert!(
                 matches!(d, Decision::Ask { .. }),
-                "expected Ask for circuit breaker, got {:?} on {}",
+                "expected Ask under HandsFree for circuit breaker, got {:?} on {}",
                 d,
                 cmd
             );
@@ -325,79 +344,60 @@ mod tests {
     }
 
     #[test]
-    fn bypass_mode_still_asks_protected_path_edit() {
+    fn hands_free_still_asks_protected_path_edit() {
         let d = check(
             "edit_file",
             json(r#"{"path":".git/config"}"#),
             default_policy_for_tool("edit_file"),
-            Mode::BypassPermissions,
+            Mode::HandsFree,
             false,
-            false, // session_allowed
         );
         assert!(matches!(d, Decision::Ask { .. }));
     }
 
     #[test]
-    fn afk_promotes_ask_to_allow_for_normal_tools() {
-        let d = check(
-            "bash",
-            json(r#"{"command":"cargo build"}"#),
-            default_policy_for_tool("bash"),
-            Mode::Default,
-            true,  // afk
-            false, // session_allowed
-        );
-        assert_eq!(d, Decision::Allow);
-    }
-
-    #[test]
-    fn afk_denies_circuit_breakers() {
-        // AFK doesn't auto-approve `rm -rf /`; with no user to authorize
-        // a circuit-breaker match, the safest action is to refuse.
+    fn fully_unattended_denies_circuit_breakers() {
         let d = check(
             "bash",
             json(r#"{"command":"rm -rf /"}"#),
             default_policy_for_tool("bash"),
-            Mode::Default,
-            true,  // afk
-            false, // session_allowed
+            Mode::FullyUnattended,
+            false,
         );
         assert!(
-            matches!(d, Decision::Deny { ref reason } if reason.contains("AFK")),
-            "expected AFK-Deny, got {:?}",
+            matches!(d, Decision::Deny { ref reason } if reason.contains("fully-unattended")),
+            "expected FullyUnattended-Deny, got {:?}",
             d
         );
     }
 
     #[test]
-    fn afk_denies_protected_path_edits() {
+    fn fully_unattended_denies_protected_path_edits() {
         let d = check(
             "edit_file",
             json(r#"{"path":".bashrc"}"#),
             default_policy_for_tool("edit_file"),
-            Mode::Default,
-            true,  // afk
-            false, // session_allowed
+            Mode::FullyUnattended,
+            false,
         );
         assert!(
-            matches!(d, Decision::Deny { ref reason } if reason.contains("AFK")),
-            "expected AFK-Deny, got {:?}",
+            matches!(d, Decision::Deny { ref reason } if reason.contains("fully-unattended")),
+            "expected FullyUnattended-Deny, got {:?}",
             d
         );
     }
 
     #[test]
     fn session_allow_does_not_bypass_circuit_breaker() {
-        // Regression test for P1: a previous "Approve session" must NOT
-        // green-light a subsequent destructive command. The safety floor
-        // runs before the session-allow shortcut by design.
+        // Regression: a previous "Approve session" must NOT green-light a
+        // subsequent destructive command. Safety floor runs before the
+        // session-allow shortcut by design.
         let d = check(
             "bash",
             json(r#"{"command":"rm -rf /"}"#),
             default_policy_for_tool("bash"),
-            Mode::Default,
-            false, // afk
-            true,  // session_allowed — must NOT win against the safety floor
+            Mode::Off,
+            true, // session_allowed — must NOT win against the safety floor
         );
         assert!(
             matches!(d, Decision::Ask { .. }),
@@ -408,15 +408,12 @@ mod tests {
 
     #[test]
     fn session_allow_does_not_bypass_protected_path() {
-        // Symmetric to the bash case: even with prior "Approve session" for
-        // edit_file, .bashrc is still protected.
         let d = check(
             "edit_file",
             json(r#"{"path":".bashrc"}"#),
             default_policy_for_tool("edit_file"),
-            Mode::Default,
-            false, // afk
-            true,  // session_allowed
+            Mode::Off,
+            true,
         );
         assert!(
             matches!(d, Decision::Ask { .. }),
@@ -427,30 +424,24 @@ mod tests {
 
     #[test]
     fn session_allow_does_speed_up_normal_tool_calls() {
-        // Positive case: session-allow DOES short-circuit a normal bash
-        // call (no safety-floor match), without touching the picker.
         let d = check(
             "bash",
             json(r#"{"command":"cargo build"}"#),
             default_policy_for_tool("bash"),
-            Mode::Default,
-            false,
-            true, // session_allowed
+            Mode::Off,
+            true,
         );
         assert_eq!(d, Decision::Allow);
     }
 
     #[test]
     fn malformed_args_does_not_panic() {
-        // Missing 'command' field — defaults to no-circuit-breaker, no-read-only.
-        // Bash still asks under default mode.
         let d = check(
             "bash",
             "not even json",
             default_policy_for_tool("bash"),
-            Mode::Default,
+            Mode::Off,
             false,
-            false, // session_allowed
         );
         assert!(matches!(d, Decision::Ask { .. }));
     }

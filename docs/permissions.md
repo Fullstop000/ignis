@@ -1,12 +1,12 @@
 # Permissions
 
-Ignis gates every tool call the model wants to run. This page documents what's
-shipped today (v0.17.0), what each control actually does, and where the safety
-floor is — the things that always ask, regardless of mode.
+Ignis gates every tool call the model wants to run. The gate decides
+`Allow`, `Ask` (open a picker), or `Deny`. Sensitive tools (`bash`,
+`edit_file`, `create_file`, `web_fetch`, `agent`, MCP) never run without
+going through it.
 
-The model never edits files, runs shell commands, or fetches the web without
-going through the gate. The gate's decision is `Allow`, `Ask` (open a picker),
-or `Deny`.
+This page covers what's shipped in v0.17.0: the three modes, the safety
+floor, and how to turn modes on and off.
 
 ## Permission system
 
@@ -24,52 +24,54 @@ The read-only bash set is built in and not configurable.
 
 ## Permission modes
 
-Set with `--permission-mode <mode>` on launch, persisted into `~/.ignis/state.json`.
+There is one axis — *"how much should ignis prompt me?"* — with three
+points on it.
 
-| Mode                | Behavior                                                                              |
-| ------------------- | ------------------------------------------------------------------------------------- |
-| `default`           | Prompts on first use of each sensitive tool. This is the default.                     |
-| `bypassPermissions` | Auto-allows everything *except* the [safety floor](#safety-floor) below.              |
+| Mode                 | Sensitive tools | Safety floor | `ask_user` | Mental model                                                  |
+| -------------------- | --------------- | ------------ | ---------- | ------------------------------------------------------------- |
+| **Off** (default)    | prompt          | ask          | prompt     | "Check each call with me."                                    |
+| **Hands-free**       | auto-approve    | ask          | prompt     | "I'm at the keyboard, want flow, still consult me on design." |
+| **Fully unattended** | auto-approve    | **deny**     | dismiss    | "Nobody's home — make your best judgment."                    |
 
-> `bypassPermissions` is not "anything goes." Circuit breakers (`rm -rf /` family)
-> and protected-path edits (`.git/**`, `.ignis/**`, shell init files) still ask.
-> Use this mode only when you understand that contract.
+The two AFK levels share auto-approve of sensitive tools but differ on
+(a) the safety floor (Ask under Hands-free, hard Deny under Fully
+unattended — there's no one to confirm), and (b) whether `ask_user`
+prompts or auto-dismisses.
 
-A typo'd mode value errors at startup with the list of valid options — it does
-not silently fall back to `default`.
+## Choosing a mode
 
-`acceptEdits` and `plan` modes are planned; see [roadmap](#roadmap).
+### `/afk` (slash command)
 
-## AFK mode
+`/afk` in the TUI opens a picker with the two AFK levels (when current
+mode is Off), or turns AFK off immediately (when in any AFK level).
+This *asymmetric gate* is on purpose — enabling AFK changes what the
+model can do without your sign-off, so we confirm; disabling strictly
+increases safety, so it fires immediately.
 
-AFK ("away from keyboard") is a separate toggle that automates user interaction
-for headless or unattended runs. It is independent of permission mode.
+To switch *between* Hands-free and Fully unattended, `/afk` → off, then
+`/afk` again and pick. The two-step matches the gate principle (any
+escalation gets friction).
 
-When AFK is on:
-- Tool calls that would `Ask` are auto-approved.
-- `ask_user` returns a structured dismissal (`{dismissed: true, reason: …}`)
-  instead of opening a picker. The model is told no user is present and to
-  proceed with its best judgment.
-- The safety floor still applies. Circuit breakers and protected-path edits
-  become hard `Deny` under AFK (no human is there to confirm).
+The chosen mode persists in `~/.ignis/state.json` (`mode` field) and is
+restored at next launch.
 
-Enable with `--afk` on launch, or `/afk` in-session. One-shot CLI invocations
-(`ignis "do X"`) enable AFK implicitly — there is no TTY to prompt on.
+### `--afk` (CLI flag)
 
-### The asymmetric `/afk` gate
+`--afk` at launch pins **Fully unattended** for the session, bypassing
+the picker. It's the right flag for CI, overnight, headless runs.
 
-- `/afk` to **enable** AFK in an interactive session opens a confirmation picker.
-  Enabling AFK strictly increases what the model can do without your sign-off,
-  so we ask first.
-- `/afk` to **disable** AFK fires immediately. Disabling strictly increases
-  safety, so no confirmation is needed.
-- The `--afk` CLI flag bypasses the confirmation (you explicitly asked for AFK
-  when launching).
+There is no CLI flag for Hands-free — at the keyboard, `/afk` is the
+way in.
+
+### One-shot CLI
+
+`ignis "<prompt>"` implies **Fully unattended** automatically — there's
+no TTY to open a picker on, and waiting on a missing user would hang.
 
 ## Permission picker
 
-When the gate decides `Ask`, ignis pauses the agent and opens a picker with
-three options:
+When the gate decides `Ask`, ignis pauses the agent and opens a picker
+with three options:
 
 | Option            | Effect                                                                                 |
 | ----------------- | -------------------------------------------------------------------------------------- |
@@ -77,21 +79,22 @@ three options:
 | `Approve session` | Allow **any** call to this tool for the rest of this process. Not persisted to disk.   |
 | `Deny`            | Reject this call. The model receives the rejection and chooses what to do next.        |
 
-> `Approve session` is tool-scoped, not command-scoped. Approving `bash` for the
-> session allows every subsequent `bash` call this session, not just the one you
-> saw. Per-command allowlist grammar (e.g. `Bash(git *)`) is on the roadmap.
+> `Approve session` is tool-scoped, not command-scoped. Approving `bash`
+> for the session allows every subsequent `bash` call this session, not
+> just the one you saw. Per-command allowlist grammar (e.g.
+> `Bash(git *)`) is on the roadmap.
 
-The picker reuses the same channel as `/model`, `/skills`, etc. — `Esc` or
-`Ctrl+C` cancels the call and returns the user-cancelled error to the model.
+`Esc` or `Ctrl+C` cancels the call and returns the user-cancelled error
+to the model.
 
 ## Safety floor
 
-Two patterns always trigger the gate, even under `bypassPermissions` or a prior
+Two patterns always trigger the gate, even under Hands-free or a prior
 `Approve session`:
 
-**Circuit breakers** — the `rm -rf /` family. Stripped of leading `sudo` and
-`VAR=value` prefixes, and checked against each segment of a compound command
-(`ls; rm -rf /`, `true && rm -rf $HOME`, etc.):
+**Circuit breakers** — the `rm -rf /` family. Stripped of leading `sudo`
+and `VAR=value` prefixes, and checked against each segment of a compound
+command (`ls; rm -rf /`, `true && rm -rf $HOME`, etc.):
 
 - `rm -rf /` (and `rm -fr /`)
 - `rm -rf ~` (and `rm -fr ~`)
@@ -103,50 +106,30 @@ Two patterns always trigger the gate, even under `bypassPermissions` or a prior
 - `.ignis/**` — ignis's own state and config
 - `.bashrc`, `.zshrc`, `.profile`, `.gitconfig` — shell init files
 
-Under `default` mode these prompt for explicit approval. Under AFK they hard
-`Deny`.
+Under Off or Hands-free these prompt for explicit approval. Under Fully
+unattended they hard `Deny`.
 
-The breaker is a floor, not a ceiling: it's deliberately small, covers the
-catastrophic-and-easily-recognized cases, and doesn't try to reason about every
-destructive command. Sandbox-level enforcement (Linux Landlock) is on the
-roadmap.
-
-## CLI flags
-
-```bash
-ignis --permission-mode default            # explicit
-ignis --permission-mode bypassPermissions  # auto-allow except safety floor
-ignis --afk                                # enable AFK at launch
-```
-
-Resolution order: `--permission-mode` CLI flag → `permission_mode` in
-`~/.ignis/state.json` → `default`. The CLI flag also writes through to
-`state.json`, so it sticks across restarts until changed.
-
-`--afk` is per-invocation. AFK is also implicitly enabled for one-shot
-`ignis "<prompt>"` runs.
-
-## Slash commands
-
-| Command | Effect                                                                                              |
-| ------- | --------------------------------------------------------------------------------------------------- |
-| `/afk`  | Toggle AFK mode. Enabling prompts confirmation; disabling fires immediately.                        |
-
-`/permissions` (in-session inspection + ad-hoc rule edits) is on the roadmap.
+The floor is intentionally small, covers catastrophic-and-easily-
+recognized cases, and doesn't try to reason about every destructive
+command. Sandbox-level enforcement (Linux Landlock) is on the roadmap.
 
 ## Roadmap
 
 Planned for v0.18.0 and later (not shipped in v0.17.0):
 
-- **Allowlist grammar** — settings.json `allow` / `ask` / `deny` arrays with
-  patterns like `Bash(git *)`, `Edit(/src/**)`, `WebFetch(domain:example.com)`,
-  `mcp__<server>` — the main vocabulary for fine-grained policy.
+- **Allowlist grammar** — settings.json `allow` / `ask` / `deny` arrays
+  with patterns like `Bash(git *)`, `Edit(/src/**)`,
+  `WebFetch(domain:example.com)`, `mcp__<server>` — the main vocabulary
+  for fine-grained policy.
 - `/permissions` — in-TUI inspection and ad-hoc rule edits.
-- `acceptEdits` mode — auto-approve file edits inside the working directory.
+- `acceptEdits` mode — auto-approve file edits inside the working
+  directory, prompt for everything else.
 - `plan` mode — read-only exploration with no edits.
-- **Three-tier settings layering** — managed > project > user precedence for
-  the allowlist grammar above.
-- **OS-level sandboxing** — Linux Landlock filesystem restrictions for bash
-  calls, as a defense-in-depth layer below the permission gate.
+- **Three-tier settings layering** — managed > project > user
+  precedence for the allowlist grammar above.
+- **OS-level sandboxing** — Linux Landlock filesystem restrictions for
+  bash calls, as a defense-in-depth layer below the permission gate.
+- **TUI mode badges** — colored footer indicator when in Hands-free or
+  Fully unattended.
 
 Anything not listed above is not on the near-term roadmap.

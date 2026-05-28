@@ -136,7 +136,6 @@ impl ToolHooks for PermissionChecker {
             &args.to_string(),
             default_policy_for_tool(tool_name),
             self.state.mode(),
-            self.state.afk(),
             session_allowed,
         );
 
@@ -147,7 +146,7 @@ impl ToolHooks for PermissionChecker {
                 let Some(tx) = &self.picker_tx else {
                     return Err(format!(
                         "no interactive console available to approve ({reason}). \
-                         Re-run with --permission-mode bypassPermissions or --afk."
+                         Re-run with --afk for unattended runs."
                     ));
                 };
 
@@ -213,7 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn allows_read_tool_in_default_mode() {
-        let state = PermissionState::new(Mode::Default, false);
+        let state = PermissionState::new(Mode::Off);
         let checker = PermissionChecker::new(state);
         let result = checker
             .before_tool_call("read_file", &json!({"path": "src/main.rs"}))
@@ -223,7 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn denies_bash_in_default_mode_without_picker() {
-        let state = PermissionState::new(Mode::Default, false);
+        let state = PermissionState::new(Mode::Off);
         let checker = PermissionChecker::new(state);
         let result = checker
             .before_tool_call("bash", &json!({"command": "cargo build"}))
@@ -234,8 +233,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bypass_allows_bash() {
-        let state = PermissionState::new(Mode::BypassPermissions, false);
+    async fn hands_free_allows_bash() {
+        let state = PermissionState::new(Mode::HandsFree);
         let checker = PermissionChecker::new(state);
         let result = checker
             .before_tool_call("bash", &json!({"command": "cargo build && cargo test"}))
@@ -244,8 +243,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn afk_allows_bash() {
-        let state = PermissionState::new(Mode::Default, true);
+    async fn fully_unattended_allows_bash() {
+        let state = PermissionState::new(Mode::FullyUnattended);
         let checker = PermissionChecker::new(state);
         let result = checker
             .before_tool_call("bash", &json!({"command": "cargo build"}))
@@ -254,20 +253,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn afk_denies_circuit_breaker() {
-        let state = PermissionState::new(Mode::Default, true);
+    async fn fully_unattended_denies_circuit_breaker() {
+        let state = PermissionState::new(Mode::FullyUnattended);
         let checker = PermissionChecker::new(state);
         let result = checker
             .before_tool_call("bash", &json!({"command": "rm -rf /"}))
             .await;
         assert!(result.is_err());
         let msg = result.unwrap_err();
-        assert!(msg.contains("AFK"), "msg: {msg}");
+        assert!(msg.contains("fully-unattended"), "msg: {msg}");
     }
 
     #[tokio::test]
     async fn session_allow_bypasses_picker() {
-        let state = PermissionState::new(Mode::Default, false);
+        let state = PermissionState::new(Mode::Off);
         state.add_session_allow("bash");
         let checker = PermissionChecker::new(state);
         let result = checker
@@ -278,7 +277,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_bash_auto_allows_without_session_approval() {
-        let state = PermissionState::new(Mode::Default, false);
+        let state = PermissionState::new(Mode::Off);
         let checker = PermissionChecker::new(state);
         let result = checker
             .before_tool_call("bash", &json!({"command": "git status"}))
@@ -287,9 +286,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bypass_still_blocks_circuit_breaker_in_headless() {
-        // Bypass mode + rm -rf / + no picker → Deny because Ask + no console.
-        let state = PermissionState::new(Mode::BypassPermissions, false);
+    async fn hands_free_still_blocks_circuit_breaker_in_headless() {
+        // HandsFree + rm -rf / + no picker → Deny because Ask + no console.
+        let state = PermissionState::new(Mode::HandsFree);
         let checker = PermissionChecker::new(state);
         let result = checker
             .before_tool_call("bash", &json!({"command": "rm -rf /"}))
@@ -322,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn picker_approve_once_allows_call_but_does_not_persist() {
-        let state = PermissionState::new(Mode::Default, false);
+        let state = PermissionState::new(Mode::Off);
         let (result, q) = run_with_picker_reply(
             state.clone(),
             "bash",
@@ -342,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn picker_approve_session_persists_into_state() {
-        let state = PermissionState::new(Mode::Default, false);
+        let state = PermissionState::new(Mode::Off);
         let (result, _) = run_with_picker_reply(
             state.clone(),
             "bash",
@@ -356,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn picker_deny_returns_user_denied_error() {
-        let state = PermissionState::new(Mode::Default, false);
+        let state = PermissionState::new(Mode::Off);
         let (result, _) = run_with_picker_reply(
             state,
             "bash",
@@ -370,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn picker_cancelled_treated_as_deny() {
-        let state = PermissionState::new(Mode::Default, false);
+        let state = PermissionState::new(Mode::Off);
         let (result, _) = run_with_picker_reply(
             state,
             "bash",
@@ -384,7 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn picker_question_includes_bash_command_in_body() {
-        let state = PermissionState::new(Mode::Default, false);
+        let state = PermissionState::new(Mode::Off);
         let (_, q) = run_with_picker_reply(
             state,
             "bash",
@@ -402,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn picker_question_includes_edit_path() {
-        let state = PermissionState::new(Mode::Default, false);
+        let state = PermissionState::new(Mode::Off);
         let (_, q) = run_with_picker_reply(
             state,
             "edit_file",

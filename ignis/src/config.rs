@@ -487,8 +487,7 @@ models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", 
             reasoning_effort: Some("high".to_string()),
             disabled_skills: vec![],
             disabled_mcp_servers: vec![],
-            permission_mode: None,
-            afk: false,
+            mode: None,
         });
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(cfg.active_effort().as_deref(), Some("high"));
@@ -618,8 +617,7 @@ models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", 
             reasoning_effort: None,
             disabled_skills: vec![],
             disabled_mcp_servers: vec![],
-            permission_mode: None,
-            afk: false,
+            mode: None,
         });
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(cfg.active_effort(), None);
