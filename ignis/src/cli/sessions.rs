@@ -2,9 +2,9 @@
 //! `~/.ignis/projects/` and writes an HTML report. See
 //! `docs/superpowers/specs/2026-05-28-sessions-html-export-design.md`.
 
+use crate::session::project_slug;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use crate::session::project_slug;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -160,11 +160,7 @@ pub fn parse_session(
     Ok(rec)
 }
 
-pub fn walk_sessions(
-    projects_dir: &Path,
-    scope: Scope,
-    cwd: &Path,
-) -> Result<Vec<SessionRecord>> {
+pub fn walk_sessions(projects_dir: &Path, scope: Scope, cwd: &Path) -> Result<Vec<SessionRecord>> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(projects_dir) {
         Ok(e) => e,
@@ -394,7 +390,10 @@ pub fn render_html(records: &[SessionRecord], scope: Scope, generated_at: u64) -
         let mut rows = String::new();
         for r in records {
             let started = r.started_at.map(format_timestamp_utc).unwrap_or_default();
-            let modified = r.last_modified.map(format_timestamp_utc).unwrap_or_default();
+            let modified = r
+                .last_modified
+                .map(format_timestamp_utc)
+                .unwrap_or_default();
             rows.push_str(&format!(
                 r#"<tr class="row"><td class="mono">{slug}</td><td class="mono">{id}</td><td data-sort="{ts_s}">{started}</td><td data-sort="{ts_m}">{modified}</td><td>{msgs}</td><td>{tok}</td><td>{tcc}</td><td>{tec}</td><td>{chips}</td></tr>"#,
                 slug = escape_html(&r.project_slug),
@@ -553,7 +552,11 @@ mod tests {
         let dir = projects_dir.join(slug);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{session_id}.jsonl")), fixture_jsonl()).unwrap();
-        std::fs::write(dir.join(format!("{session_id}.usage.json")), fixture_usage()).unwrap();
+        std::fs::write(
+            dir.join(format!("{session_id}.usage.json")),
+            fixture_usage(),
+        )
+        .unwrap();
     }
 
     #[test]
