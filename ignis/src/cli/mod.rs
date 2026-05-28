@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use crate::session::SessionManager;
 
 pub mod mcp;
+pub mod sessions;
 pub mod upgrade;
 
 #[derive(Parser, Debug)]
@@ -54,6 +55,8 @@ pub enum Command {
     Upgrade(upgrade::UpgradeCmd),
     /// Manage MCP servers (add, list, get, remove, enable, disable).
     Mcp(mcp::McpCmd),
+    /// Inspect or export session history.
+    Sessions(sessions::SessionsCmd),
 }
 
 impl Cli {

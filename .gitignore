@@ -50,3 +50,4 @@ raw_run.log
 
 # MCP / tooling caches
 .code-review-graph/
+.gstack/

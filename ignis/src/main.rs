@@ -25,6 +25,13 @@ async fn main() -> Result<(), anyhow::Error> {
         Some(Command::Upgrade(cmd)) => {
             return ignis::cli::upgrade::run(cmd).await;
         }
+        Some(Command::Sessions(cmd)) => {
+            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+            if let Err(e) = ignis::logger::init(&home.join(".ignis/logs")) {
+                eprintln!("Failed to initialize logger: {}", e);
+            }
+            return ignis::cli::sessions::run(cmd).await;
+        }
         None => {}
     }
 
