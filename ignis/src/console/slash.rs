@@ -39,6 +39,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: Cow::Borrowed("/mcp"),
         description: Cow::Borrowed("Manage MCP servers (enable/disable)"),
     },
+    SlashCommand {
+        name: Cow::Borrowed("/afk"),
+        description: Cow::Borrowed("Toggle AFK mode (auto-approve tools + dismiss ask_user)"),
+    },
 ];
 
 pub(crate) fn slash_suggestions(

@@ -90,6 +90,7 @@ fn apply_edit_key(app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_key(
     app: &mut App,
     key: KeyEvent,
@@ -98,6 +99,7 @@ pub(crate) async fn handle_key(
     active_inject: &ActiveInject,
     session_manager: &SessionManager,
     storage_dir: &std::path::Path,
+    picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
 ) {
     // Inline (tool-initiated) picker captures ALL keys while open, including
     // ESC and Ctrl+C — must come before global handlers and the busy-mode
@@ -406,6 +408,8 @@ pub(crate) async fn handle_key(
                     app.show_skill_picker();
                 } else if command == "/mcp" && arg_count == 1 {
                     app.show_mcp_picker();
+                } else if command == "/afk" && arg_count == 1 {
+                    handle_afk_toggle(app, picker_tx).await;
                 } else if command.starts_with('/')
                     && app
                         .skills
@@ -528,4 +532,74 @@ pub(crate) async fn handle_key(
         }
         _ => {}
     }
+}
+
+/// `/afk` toggle handler. When AFK is currently on, flips it off immediately
+/// (disabling AFK strictly increases safety, no confirmation needed). When off,
+/// opens a 2-option confirmation picker (Enable AFK / Cancel) — the only
+/// feature in v0.16.0 with an asymmetric gate, because enabling AFK is the
+/// only single-keystroke action with session-wide auto-approval consequences.
+async fn handle_afk_toggle(
+    app: &mut App,
+    picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
+) {
+    use crate::console::picker::{
+        PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse,
+    };
+    use tokio::sync::oneshot;
+
+    let Some(perms) = app.permissions.clone() else {
+        app.add_assistant_notice("AFK: permission state not attached".to_string());
+        return;
+    };
+    if perms.afk() {
+        perms.set_afk(false);
+        app.add_assistant_notice("AFK disabled.".to_string());
+        return;
+    }
+    if app.inline_picker.is_some() {
+        // A picker is already up — don't race over it.
+        app.add_assistant_notice("/afk: another picker is open; close it first.".to_string());
+        return;
+    }
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let request = PickerRequest {
+        questions: vec![PickerQuestion {
+            question: "Enable AFK mode? Every tool call will auto-approve (except circuit \
+                       breakers like `rm -rf /` and protected paths like .git/**). `ask_user` \
+                       requests will auto-dismiss. AFK persists until you toggle off with /afk."
+                .to_string(),
+            header: "AFK".to_string(),
+            multi_select: false,
+            allow_other: false,
+            options: vec![
+                PickerOption {
+                    label: "Enable AFK".to_string(),
+                    description: "I'm stepping away — proceed without me.".to_string(),
+                    preview: None,
+                },
+                PickerOption {
+                    label: "Cancel".to_string(),
+                    description: "Keep current mode.".to_string(),
+                    preview: None,
+                },
+            ],
+        }],
+        reply: reply_tx,
+    };
+    if picker_tx.send(request).await.is_err() {
+        app.add_assistant_notice("/afk: picker channel closed".to_string());
+        return;
+    }
+    // Spawn so the key handler returns immediately; toggle AFK on the reply.
+    let perms_for_reply = perms.clone();
+    tokio::spawn(async move {
+        if let Ok(PickerResponse::Answered(answers)) = reply_rx.await {
+            if let Some(PickerAnswer::Single(label)) = answers.first() {
+                if label == "Enable AFK" {
+                    perms_for_reply.set_afk(true);
+                }
+            }
+        }
+    });
 }

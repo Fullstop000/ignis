@@ -305,6 +305,7 @@ pub async fn run_console(
                     &active_inject,
                     &session_manager,
                     &ui_storage_dir,
+                    &picker_tx,
                 )
                 .await;
             }

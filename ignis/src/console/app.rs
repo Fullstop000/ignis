@@ -1054,7 +1054,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name.as_ref())
                 .collect::<Vec<_>>(),
-            vec!["/resume", "/clear", "/compact", "/copy", "/model", "/skills", "/mcp"]
+            vec!["/resume", "/clear", "/compact", "/copy", "/model", "/skills", "/mcp", "/afk",]
         );
     }
 
