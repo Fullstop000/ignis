@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-05-29
+
+### Added
+- `benchmarks/terminal-bench/scripts/` — stdlib-only TB2 result aggregator and single-file HTML report generator.
+
 ## [0.21.0] - 2026-05-29
 
 ### Added
