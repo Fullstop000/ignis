@@ -20,7 +20,10 @@ uname_s="$(uname -s)"
 uname_m="$(uname -m)"
 
 case "$uname_s" in
-    Linux)  os="unknown-linux-gnu" ;;
+    # musl-static on Linux so the binary runs anywhere — including older glibc
+    # base images (TB2 sandboxes, slim CI runners, etc.) where the previous
+    # `unknown-linux-gnu` build refused to load.
+    Linux)  os="unknown-linux-musl" ;;
     Darwin) os="apple-darwin" ;;
     *)
         echo "Unsupported OS: $uname_s." >&2
@@ -39,7 +42,7 @@ case "$uname_m" in
 esac
 
 # Releases only ship linux/x86_64 today; refuse other linux arches up front.
-if [ "$os" = "unknown-linux-gnu" ] && [ "$arch" != "x86_64" ]; then
+if [ "$os" = "unknown-linux-musl" ] && [ "$arch" != "x86_64" ]; then
     echo "No prebuilt binary for linux/$arch." >&2
     echo "Build from source: https://github.com/$REPO" >&2
     exit 1

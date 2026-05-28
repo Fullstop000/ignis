@@ -1,6 +1,6 @@
 [package]
 name = "ignis"
-version = "0.15.3"
+version = "0.16.0"
 edition = "2021"
 description = "A single-binary, multi-provider AI coding agent for your terminal."
 license = "Apache-2.0"
@@ -8,7 +8,7 @@ repository = "https://github.com/Fullstop000/ignis"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "stream"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures-util = "0.3"
