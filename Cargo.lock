@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "ignis"
-version = "0.15.3"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "async-trait",

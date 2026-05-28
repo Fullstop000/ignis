@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-05-28
+
+### Added
+- `benchmarks/terminal-bench/` — Harbor adapter that runs ignis as a Terminal-Bench 2 agent.
+
+### Changed
+- Linux release binary is now statically linked against musl — runs on any modern x86_64 Linux without distro-glibc coupling.
+
 ## [0.15.3] - 2026-05-28
 
 ### Fixed
