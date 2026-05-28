@@ -172,6 +172,16 @@ pub async fn run_console(
                 crate::tools::register_mcp_tools(&mut session, &runner_mcp_registry);
             }
 
+            // Permission gate. The TUI's picker channel is wired in so an
+            // `Ask` decision opens the 3-option permission picker (Approve
+            // once / Approve session / Deny) over the same plumbing
+            // `ask_user` uses; on `Approve session` the checker writes back
+            // into the shared `PermissionState`.
+            session.set_hooks(Box::new(
+                crate::permissions::checker::PermissionChecker::new(runner_permissions.clone())
+                    .with_picker(picker_tx_runner.clone()),
+            ));
+
             let notice_msg = |content: &str| Message {
                 role: "assistant".to_string(),
                 content: Some(content.to_string()),

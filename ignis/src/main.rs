@@ -143,6 +143,13 @@ async fn main() -> Result<(), anyhow::Error> {
         None,
         Some(permissions.clone()),
     );
+
+    // Permission gate. AFK is on for one-shot CLI so most Ask decisions
+    // become Allow inside the checker; circuit breakers + protected paths
+    // still Deny, surfacing the refusal to the model so it can adapt.
+    session.set_hooks(Box::new(
+        ignis::permissions::checker::PermissionChecker::new(permissions.clone()),
+    ));
     if !skill_registry.is_empty() {
         session.set_skills(skill_registry.clone());
         session.register_tool(std::sync::Arc::new(ignis::tools::SkillTool::new(

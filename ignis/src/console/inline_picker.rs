@@ -113,8 +113,12 @@ impl InlinePickerState {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return KeyOutcome::Cancel;
         }
-        let opts_n = self.current_question().options.len();
-        let last = opts_n; // Other row index
+        let q = self.current_question();
+        let opts_n = q.options.len();
+        // Last selectable index. When `allow_other` is false the picker has no
+        // free-text row (permission/AFK pickers use this) so the cursor can
+        // never reach what would have been the Other position.
+        let last = if q.allow_other { opts_n } else { opts_n - 1 };
         match key.code {
             KeyCode::Up => {
                 if self.cursor > 0 {
@@ -301,6 +305,15 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
                 Style::default().fg(TEXT_DIM),
             )));
         }
+    }
+
+    // The separator + Other row only render when the question opts in. The
+    // permission and AFK pickers set `allow_other = false` — the option set
+    // is closed by design (Approve once / Approve session / Deny etc.).
+    if !q.allow_other {
+        // Footer still needs to render even when we skip the Other block.
+        lines.extend(footer_lines(state));
+        return;
     }
 
     // Horizontal separator between the regular options and the "Other" row,
@@ -624,6 +637,7 @@ mod tests {
             question: question.to_string(),
             header: header.to_string(),
             multi_select: multi,
+            allow_other: true,
             options: labels
                 .iter()
                 .map(|l| PickerOption {

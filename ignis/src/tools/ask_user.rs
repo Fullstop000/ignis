@@ -258,6 +258,7 @@ pub(crate) fn parse_questions(args: &Value) -> Result<Vec<PickerQuestion>, Strin
             header,
             multi_select,
             options,
+            allow_other: true,
         });
     }
     Ok(out)

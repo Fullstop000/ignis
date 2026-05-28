@@ -30,8 +30,12 @@ pub struct PickerQuestion {
     /// `true` enables space-to-toggle multi-select; `false` is single-select.
     pub multi_select: bool,
     /// 2-4 options. The console appends an `"Other (type custom)…"` row on
-    /// top of these for free-text answers.
+    /// top of these for free-text answers when `allow_other` is true.
     pub options: Vec<PickerOption>,
+    /// Show the `"Other (type custom)…"` free-text row? `true` for `ask_user`
+    /// (the model invites the user to free-text anything). `false` for
+    /// permission/AFK prompts where the option set is closed by design.
+    pub allow_other: bool,
 }
 
 /// A request from a tool to the console asking the user to pick. The `reply`
