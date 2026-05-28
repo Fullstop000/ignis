@@ -28,10 +28,14 @@ fn export_writes_html_with_session_row() {
     let home = tmp.path().join("home");
     let cwd = tmp.path().join("workdir");
     let projects = home.join(".ignis/projects");
-    let slug = ignis::session::project_slug(&cwd);
+    std::fs::create_dir_all(&cwd).unwrap();
+    // macOS canonicalizes `/var/folders/...` (the tempfile path) to
+    // `/private/var/folders/...` inside spawned processes via `current_dir()`,
+    // so slug the canonical path the binary will see — not the symlink one.
+    let cwd_canonical = std::fs::canonicalize(&cwd).unwrap();
+    let slug = ignis::session::project_slug(&cwd_canonical);
     let proj = projects.join(&slug);
     std::fs::create_dir_all(&proj).unwrap();
-    std::fs::create_dir_all(&cwd).unwrap();
 
     let jsonl = format!(
         "{}\n{}\n",
