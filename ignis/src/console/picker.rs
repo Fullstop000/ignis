@@ -25,6 +25,10 @@ pub struct PickerOption {
 pub struct PickerQuestion {
     /// The complete question text.
     pub question: String,
+    /// Picker-kind label rendered before the header chip (e.g. "ask_user",
+    /// "permission", "afk"). Tells the user *which* subsystem opened the
+    /// picker. The channel is shared so this can't be inferred otherwise.
+    pub kind: String,
     /// Short chip label (≤12 chars) shown in the header strip.
     pub header: String,
     /// `true` enables space-to-toggle multi-select; `false` is single-select.

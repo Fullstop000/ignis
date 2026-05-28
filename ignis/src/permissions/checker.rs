@@ -92,6 +92,7 @@ impl PermissionChecker {
         };
         PickerQuestion {
             question,
+            kind: "permission".to_string(),
             header,
             multi_select: false,
             allow_other: false,

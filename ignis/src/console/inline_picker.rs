@@ -218,7 +218,7 @@ pub(crate) fn header_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("◆ ", Style::default().fg(MAUVE)),
             Span::styled(
-                "ask_user",
+                q.kind.clone(),
                 Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" · ", Style::default().fg(TEXT_DIM)),
@@ -635,6 +635,7 @@ mod tests {
     fn q(question: &str, header: &str, multi: bool, labels: &[&str]) -> PickerQuestion {
         PickerQuestion {
             question: question.to_string(),
+            kind: "ask_user".to_string(),
             header: header.to_string(),
             multi_select: multi,
             allow_other: true,

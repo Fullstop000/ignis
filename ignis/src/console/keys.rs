@@ -574,6 +574,7 @@ async fn handle_afk_toggle(
     let request = PickerRequest {
         questions: vec![PickerQuestion {
             question: "Enable AFK — how should the agent run while you're away?".to_string(),
+            kind: "afk".to_string(),
             header: "AFK".to_string(),
             multi_select: false,
             allow_other: false,

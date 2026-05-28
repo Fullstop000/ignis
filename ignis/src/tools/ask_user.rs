@@ -255,6 +255,7 @@ pub(crate) fn parse_questions(args: &Value) -> Result<Vec<PickerQuestion>, Strin
         }
         out.push(PickerQuestion {
             question,
+            kind: "ask_user".to_string(),
             header,
             multi_select,
             options,
