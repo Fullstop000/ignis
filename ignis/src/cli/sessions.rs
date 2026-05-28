@@ -221,6 +221,39 @@ pub fn walk_sessions(
     Ok(out)
 }
 
+/// Format a Unix-epoch second count as `YYYY-MM-DD-HHMMSS` in UTC. Pure
+/// `std` — avoids pulling chrono/time as a dep just for one filename.
+pub fn format_timestamp_utc(epoch_secs: u64) -> String {
+    const SECS_PER_DAY: u64 = 86_400;
+    let days = epoch_secs / SECS_PER_DAY;
+    let rem = epoch_secs % SECS_PER_DAY;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+
+    // Civil-from-days: derive (year, month, day) from days since 1970-01-01.
+    // Howard Hinnant's algorithm — shift the epoch so we count from 0000-03-01.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{d:02}-{h:02}{m:02}{s:02}")
+}
+
+pub fn default_output_path(cwd: &Path, epoch_secs: u64) -> PathBuf {
+    cwd.join(format!(
+        "ignis-sessions-{}.html",
+        format_timestamp_utc(epoch_secs)
+    ))
+}
+
 pub async fn run(_cmd: SessionsCmd) -> Result<()> {
     anyhow::bail!("not yet implemented");
 }
@@ -296,6 +329,26 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["s1", "s2"]);
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn format_timestamp_utc_matches_y_m_d_hms() {
+        assert_eq!(format_timestamp_utc(1735787045), "2025-01-02-030405");
+    }
+
+    #[test]
+    fn format_timestamp_utc_handles_leap_year_feb_29() {
+        assert_eq!(format_timestamp_utc(1709164800), "2024-02-29-000000");
+    }
+
+    #[test]
+    fn default_output_path_uses_cwd_and_timestamp() {
+        let cwd = std::path::PathBuf::from("/tmp/work");
+        let p = default_output_path(&cwd, 1735787045);
+        assert_eq!(
+            p.to_string_lossy(),
+            "/tmp/work/ignis-sessions-2025-01-02-030405.html"
+        );
     }
 
     #[test]
