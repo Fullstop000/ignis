@@ -26,6 +26,20 @@ pub struct Cli {
     #[arg(long, num_args = 0..=1, value_name = "ID")]
     pub resume: Option<Option<String>>,
 
+    /// Permission mode for this session: `default` (ask for sensitive tools)
+    /// or `bypassPermissions` (auto-allow everything except circuit breakers
+    /// + protected paths). Overrides the persisted setting in state.json.
+    #[arg(long = "permission-mode", value_name = "MODE")]
+    pub permission_mode: Option<String>,
+
+    /// Enable AFK mode for this session — auto-approves tool calls and
+    /// auto-dismisses `ask_user` with "Make your best judgment and proceed."
+    /// Bypasses the `/afk` mid-session confirmation gate (typing the flag at
+    /// launch is explicit intent). One-shot invocations (with a prompt arg)
+    /// imply `--afk` automatically.
+    #[arg(long)]
+    pub afk: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -61,6 +75,8 @@ impl Cli {
             resume,
             resume_session_id,
             prompt_args: self.prompt,
+            permission_mode: self.permission_mode,
+            afk: self.afk,
         }
     }
 }
@@ -73,6 +89,11 @@ pub struct CliArgs {
     pub resume: bool,
     pub resume_session_id: Option<String>,
     pub prompt_args: Vec<String>,
+    /// `--permission-mode` value from CLI. Falls through to state.json default
+    /// when None; rejected with a clear error if non-empty and unparseable.
+    pub permission_mode: Option<String>,
+    /// `--afk` from CLI. One-shot invocations also force this to `true`.
+    pub afk: bool,
 }
 
 pub struct SessionRequest {

@@ -42,6 +42,7 @@ pub async fn run_console(
     config: crate::config::Config,
     skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
     mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
+    permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
 ) -> Result<(), anyhow::Error> {
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
     // Context windows: config override → cached models.dev → compaction threshold.
@@ -99,6 +100,9 @@ pub async fn run_console(
     let runner_mcp_registry = mcp_registry.clone();
     app.mcp = Some(mcp_registry);
 
+    let runner_permissions = permissions.clone();
+    app.permissions = Some(permissions);
+
     // Background agent runner
     tokio::spawn(async move {
         while let Some(request) = prompt_rx.recv().await {
@@ -155,6 +159,7 @@ pub async fn run_console(
                 &agent_config,
                 mcp_for_subagent,
                 Some(picker_tx_runner.clone()),
+                Some(runner_permissions.clone()),
             );
             if !runner_skill_registry.is_empty() {
                 session.set_skills(runner_skill_registry.clone());

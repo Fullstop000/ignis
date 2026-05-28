@@ -293,6 +293,10 @@ pub(crate) struct App {
     pub(crate) skills: Option<std::sync::Arc<crate::skills::SkillRegistry>>,
     /// MCP registry for `/mcp` picker; `None` when no MCP servers are configured.
     pub(crate) mcp: Option<std::sync::Arc<crate::mcp::McpRegistry>>,
+    /// Shared permission state — read by `/permissions` and `/afk` pickers
+    /// (chunk 3) and by the TUI status-badge renderer. `None` only in legacy
+    /// tests that construct `App` directly.
+    pub(crate) permissions: Option<std::sync::Arc<crate::permissions::runtime::PermissionState>>,
 }
 
 impl App {
@@ -335,6 +339,7 @@ impl App {
             clipboard_fn: super::clipboard::set_clipboard,
             skills: None,
             mcp: None,
+            permissions: None,
         }
     }
 

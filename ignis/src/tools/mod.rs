@@ -54,19 +54,23 @@ pub fn register_native_tools(
     cwd: &Path,
     config: &crate::config::Config,
 ) {
-    register_native_tools_with_mcp(session, cwd, config, None, None)
+    register_native_tools_with_mcp(session, cwd, config, None, None, None)
 }
 
 /// Same as `register_native_tools` but threads a shared MCP registry into the
-/// `SubagentTool` (so sub-agents inherit MCP tools) and an optional picker
-/// channel into `AskUserTool` (so the model can interactively ask the user).
-/// `picker_tx = None` in headless contexts disables `ask_user` cleanly.
+/// `SubagentTool` (so sub-agents inherit MCP tools), an optional picker
+/// channel into `AskUserTool` (so the model can interactively ask the user),
+/// and an optional shared `PermissionState` so `ask_user` honors AFK mode.
+/// `picker_tx = None` in headless contexts disables `ask_user` cleanly;
+/// `permissions = None` skips the AFK guard (e.g. tests with no permission
+/// system attached).
 pub fn register_native_tools_with_mcp(
     session: &mut crate::Session,
     cwd: &Path,
     config: &crate::config::Config,
     mcp: Option<Arc<crate::mcp::McpRegistry>>,
     picker_tx: Option<tokio::sync::mpsc::Sender<crate::console::picker::PickerRequest>>,
+    permissions: Option<Arc<crate::permissions::runtime::PermissionState>>,
 ) {
     for tool in native_tools(cwd, config.web_search.clone()) {
         session.register_tool(tool);
@@ -80,7 +84,11 @@ pub fn register_native_tools_with_mcp(
     session.register_tool(Arc::new(subagent));
     // The `ask_user` tool — registered only at the top level. Sub-agents are
     // for self-contained work and shouldn't pause to interrogate the user.
-    session.register_tool(Arc::new(AskUserTool::new(picker_tx)));
+    let mut ask_user = AskUserTool::new(picker_tx);
+    if let Some(p) = permissions {
+        ask_user = ask_user.with_permissions(p);
+    }
+    session.register_tool(Arc::new(ask_user));
 }
 
 /// Register every tool exposed by a connected MCP server as an `AgentTool`.

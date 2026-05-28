@@ -34,6 +34,20 @@ async fn main() -> Result<(), anyhow::Error> {
     // 1. Load config
     let config = load_config()?;
 
+    // Resolve permission state: CLI flag > state.json > default. AFK is the
+    // logical OR of the CLI flag, the persisted state, and the one-shot
+    // implicit-AFK rule (no TTY to prompt on, so we must auto-handle).
+    let persisted_state = ignis::state::load_state();
+    let resolved_mode = cli
+        .permission_mode
+        .as_deref()
+        .or(persisted_state.permission_mode.as_deref())
+        .and_then(ignis::permissions::Mode::parse)
+        .unwrap_or_default();
+    let resolved_afk = cli.afk || persisted_state.afk || is_oneshot;
+    let permissions =
+        ignis::permissions::runtime::PermissionState::new(resolved_mode, resolved_afk);
+
     // 2. Resolve paths
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not locate home directory"))?;
@@ -86,6 +100,7 @@ async fn main() -> Result<(), anyhow::Error> {
             config,
             skill_registry.clone(),
             mcp_registry.clone(),
+            permissions.clone(),
         )
         .await;
         // Bring down MCP servers explicitly before tokio runtime tears down —
@@ -117,13 +132,16 @@ async fn main() -> Result<(), anyhow::Error> {
     } else {
         None
     };
-    // One-shot CLI is headless — no interactive picker.
+    // One-shot CLI is headless — no interactive picker. AFK was force-set
+    // above, so ask_user auto-dismisses with structured guidance instead of
+    // hanging on the missing TTY.
     ignis::tools::register_native_tools_with_mcp(
         &mut session,
         &cwd,
         &config,
         mcp_for_subagent,
         None,
+        Some(permissions.clone()),
     );
     if !skill_registry.is_empty() {
         session.set_skills(skill_registry.clone());
