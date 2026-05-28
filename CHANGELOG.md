@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-05-28
+
+### Added
+- TB2 adapter — `kimi-code/kimi-for-coding` is now a supported `-m` provider.
+- TB2 adapter — per-trial `n_input_tokens` / `n_output_tokens` / `n_cache_tokens` now populate harbor's result.json instead of staying null.
+
 ## [0.17.0] - 2026-05-28
 
 ### Added
