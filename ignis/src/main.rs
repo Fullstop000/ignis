@@ -37,13 +37,23 @@ async fn main() -> Result<(), anyhow::Error> {
     // Resolve permission state: CLI flag > state.json > default. AFK is the
     // logical OR of the CLI flag, the persisted state, and the one-shot
     // implicit-AFK rule (no TTY to prompt on, so we must auto-handle).
+    // A typo'd `--permission-mode foo` errors out — silently demoting it to
+    // Default would be the worst kind of foot-gun (user thinks they got bypass,
+    // gets safe-mode instead, or vice versa).
     let persisted_state = ignis::state::load_state();
-    let resolved_mode = cli
-        .permission_mode
-        .as_deref()
-        .or(persisted_state.permission_mode.as_deref())
-        .and_then(ignis::permissions::Mode::parse)
-        .unwrap_or_default();
+    let resolved_mode = if let Some(raw) = cli.permission_mode.as_deref() {
+        ignis::permissions::Mode::parse(raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--permission-mode: unknown value {raw:?}. Valid: default, bypassPermissions."
+            )
+        })?
+    } else {
+        persisted_state
+            .permission_mode
+            .as_deref()
+            .and_then(ignis::permissions::Mode::parse)
+            .unwrap_or_default()
+    };
     let resolved_afk = cli.afk || persisted_state.afk || is_oneshot;
     let permissions =
         ignis::permissions::runtime::PermissionState::new(resolved_mode, resolved_afk);

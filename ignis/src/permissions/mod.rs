@@ -100,10 +100,13 @@ pub fn check(
     default_for_tool: Decision,
     mode: Mode,
     afk: bool,
+    session_allowed: bool,
 ) -> Decision {
     let args: serde_json::Value = serde_json::from_str(arguments_json).unwrap_or_default();
 
-    // Step 1: circuit breakers (raw bash arg scan).
+    // Step 1: circuit breakers (raw bash arg scan). These ALWAYS take
+    // precedence over session-allow shortcuts and bypass mode — that's the
+    // whole point of the floor.
     if tool_name == "bash" {
         if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
             if builtin::is_circuit_breaker(cmd) {
@@ -121,6 +124,7 @@ pub fn check(
     }
 
     // Step 2: protected-path edits (Ask under any mode — bypass included).
+    // Same precedence rule as step 1: floor first.
     if matches!(tool_name, "edit_file" | "create_file") {
         if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
             if builtin::is_protected_path(path) {
@@ -134,7 +138,14 @@ pub fn check(
         }
     }
 
-    // Step 3: read-only bash auto-allow.
+    // Step 3: session-allow shortcut. Only reaches here once we've cleared
+    // the safety floor (steps 1+2 return above). "Approve session" was
+    // explicit consent for the tool — honor it, but never against the floor.
+    if session_allowed {
+        return Decision::Allow;
+    }
+
+    // Step 4: read-only bash auto-allow.
     if tool_name == "bash" {
         if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
             if builtin::is_read_only_bash(cmd) {
@@ -143,12 +154,12 @@ pub fn check(
         }
     }
 
-    // Step 4: bypass mode (after steps 1+2 short-circuit, this is just allow).
+    // Step 5: bypass mode (after the safety floor has had its say).
     if mode == Mode::BypassPermissions {
         return Decision::Allow;
     }
 
-    // Step 5: per-tool default policy applies.
+    // Step 6: per-tool default policy applies.
     let raw = default_for_tool;
 
     // AFK post-pass: an Ask becomes Allow under AFK (the picker would just
@@ -242,6 +253,7 @@ mod tests {
             default_policy_for_tool("read_file"),
             Mode::Default,
             false,
+            false, // session_allowed
         );
         assert_eq!(d, Decision::Allow);
     }
@@ -254,6 +266,7 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::Default,
             false,
+            false, // session_allowed
         );
         assert!(matches!(d, Decision::Ask { .. }));
     }
@@ -267,6 +280,7 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::Default,
             false,
+            false, // session_allowed
         );
         assert_eq!(d, Decision::Allow);
     }
@@ -279,6 +293,7 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::BypassPermissions,
             false,
+            false, // session_allowed
         );
         assert_eq!(d, Decision::Allow);
     }
@@ -298,6 +313,7 @@ mod tests {
                 default_policy_for_tool("bash"),
                 Mode::BypassPermissions,
                 false,
+                false, // session_allowed
             );
             assert!(
                 matches!(d, Decision::Ask { .. }),
@@ -316,6 +332,7 @@ mod tests {
             default_policy_for_tool("edit_file"),
             Mode::BypassPermissions,
             false,
+            false, // session_allowed
         );
         assert!(matches!(d, Decision::Ask { .. }));
     }
@@ -327,7 +344,8 @@ mod tests {
             json(r#"{"command":"cargo build"}"#),
             default_policy_for_tool("bash"),
             Mode::Default,
-            true, // afk
+            true,  // afk
+            false, // session_allowed
         );
         assert_eq!(d, Decision::Allow);
     }
@@ -341,7 +359,8 @@ mod tests {
             json(r#"{"command":"rm -rf /"}"#),
             default_policy_for_tool("bash"),
             Mode::Default,
-            true, // afk
+            true,  // afk
+            false, // session_allowed
         );
         assert!(
             matches!(d, Decision::Deny { ref reason } if reason.contains("AFK")),
@@ -357,13 +376,68 @@ mod tests {
             json(r#"{"path":".bashrc"}"#),
             default_policy_for_tool("edit_file"),
             Mode::Default,
-            true, // afk
+            true,  // afk
+            false, // session_allowed
         );
         assert!(
             matches!(d, Decision::Deny { ref reason } if reason.contains("AFK")),
             "expected AFK-Deny, got {:?}",
             d
         );
+    }
+
+    #[test]
+    fn session_allow_does_not_bypass_circuit_breaker() {
+        // Regression test for P1: a previous "Approve session" must NOT
+        // green-light a subsequent destructive command. The safety floor
+        // runs before the session-allow shortcut by design.
+        let d = check(
+            "bash",
+            json(r#"{"command":"rm -rf /"}"#),
+            default_policy_for_tool("bash"),
+            Mode::Default,
+            false, // afk
+            true,  // session_allowed — must NOT win against the safety floor
+        );
+        assert!(
+            matches!(d, Decision::Ask { .. }),
+            "session-allow must NOT bypass circuit breaker, got {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn session_allow_does_not_bypass_protected_path() {
+        // Symmetric to the bash case: even with prior "Approve session" for
+        // edit_file, .bashrc is still protected.
+        let d = check(
+            "edit_file",
+            json(r#"{"path":".bashrc"}"#),
+            default_policy_for_tool("edit_file"),
+            Mode::Default,
+            false, // afk
+            true,  // session_allowed
+        );
+        assert!(
+            matches!(d, Decision::Ask { .. }),
+            "session-allow must NOT bypass protected path, got {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn session_allow_does_speed_up_normal_tool_calls() {
+        // Positive case: session-allow DOES short-circuit a normal bash
+        // call (no safety-floor match), without touching the picker.
+        let d = check(
+            "bash",
+            json(r#"{"command":"cargo build"}"#),
+            default_policy_for_tool("bash"),
+            Mode::Default,
+            false,
+            true, // session_allowed
+        );
+        assert_eq!(d, Decision::Allow);
     }
 
     #[test]
@@ -376,6 +450,7 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::Default,
             false,
+            false, // session_allowed
         );
         assert!(matches!(d, Decision::Ask { .. }));
     }

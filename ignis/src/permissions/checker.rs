@@ -125,12 +125,11 @@ impl ToolHooks for PermissionChecker {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Result<(), String> {
-        // Fast path: session-level "Approve session" overrides everything
-        // short of circuit breakers + protected paths. The safety floor is
-        // checked inside `check()` and returns Ask before any user-supplied
-        // allow rule runs; the session-allow shortcut below only applies once
-        // we've cleared that floor.
-        let session_pre_approved = self.state.is_session_allowed(tool_name);
+        // Session-level "Approve session" is honored inside `check()` AFTER
+        // the safety floor (circuit breakers, protected paths) has had its
+        // say. The floor is non-negotiable — even an explicit prior
+        // "Approve session" can't allow `rm -rf /`.
+        let session_allowed = self.state.is_session_allowed(tool_name);
 
         let decision = check(
             tool_name,
@@ -138,15 +137,13 @@ impl ToolHooks for PermissionChecker {
             default_policy_for_tool(tool_name),
             self.state.mode(),
             self.state.afk(),
+            session_allowed,
         );
 
         match decision {
             Decision::Allow => Ok(()),
             Decision::Deny { reason } => Err(reason),
             Decision::Ask { reason } => {
-                if session_pre_approved {
-                    return Ok(());
-                }
                 let Some(tx) = &self.picker_tx else {
                     return Err(format!(
                         "no interactive console available to approve ({reason}). \

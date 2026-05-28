@@ -123,8 +123,99 @@ pub fn is_circuit_breaker(command: &str) -> bool {
 
 /// Return the human-readable label of the matching circuit-breaker pattern,
 /// or `None` if none matched. Used in the UI to explain why the picker fired.
+///
+/// Splits the input on shell metacharacters (`&&`, `||`, `;`, `|`, `$(…)`,
+/// backticks) and checks **each segment** independently — so compounds like
+/// `ls; rm -rf /` or `true && rm -rf $HOME` still trip the breaker. Anything
+/// inside `$(…)` or backticks is also extracted and checked. This pairs
+/// with `is_read_only_bash`'s symmetric refusal to auto-allow compounds:
+/// auto-allow stays conservative on shape, and the breaker stays conservative
+/// on content.
 pub fn circuit_breaker_label(command: &str) -> Option<&'static str> {
-    let normalized = command.trim().replace('\t', " ");
+    for segment in split_command_segments(command) {
+        if let Some(label) = match_breaker_in_segment(&segment) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// Walk a bash command and emit every potential simple-command segment to
+/// check independently. Splits on `;`, `&&`, `||`, `|`, and pulls out the
+/// inside of any `$(…)` or `\`…\`` substitutions. Cheap and intentionally
+/// over-eager — false positives only cost an extra `Ask`, not a real run.
+fn split_command_segments(command: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // Backtick substitution: pull the inside out as its own segment.
+            '`' => {
+                let mut inner = String::new();
+                for cc in chars.by_ref() {
+                    if cc == '`' {
+                        break;
+                    }
+                    inner.push(cc);
+                }
+                if !inner.is_empty() {
+                    out.extend(split_command_segments(&inner));
+                }
+            }
+            // `$(…)` substitution: peek and pull the inside out.
+            '$' if chars.peek() == Some(&'(') => {
+                chars.next(); // consume '('
+                let mut depth = 1usize;
+                let mut inner = String::new();
+                for cc in chars.by_ref() {
+                    if cc == '(' {
+                        depth += 1;
+                    } else if cc == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    inner.push(cc);
+                }
+                if !inner.is_empty() {
+                    out.extend(split_command_segments(&inner));
+                }
+            }
+            // Segment separators.
+            ';' => {
+                push_nonempty(&mut out, std::mem::take(&mut current));
+            }
+            '&' if chars.peek() == Some(&'&') => {
+                chars.next();
+                push_nonempty(&mut out, std::mem::take(&mut current));
+            }
+            '|' if chars.peek() == Some(&'|') => {
+                chars.next();
+                push_nonempty(&mut out, std::mem::take(&mut current));
+            }
+            '|' => {
+                push_nonempty(&mut out, std::mem::take(&mut current));
+            }
+            other => current.push(other),
+        }
+    }
+    push_nonempty(&mut out, current);
+    out
+}
+
+fn push_nonempty(out: &mut Vec<String>, s: String) {
+    let trimmed = s.trim();
+    if !trimmed.is_empty() {
+        out.push(trimmed.to_string());
+    }
+}
+
+/// Match the `rm -rf /` family inside ONE shell segment (no metacharacters
+/// to split on at this level). Returns the canonical label or `None`.
+fn match_breaker_in_segment(segment: &str) -> Option<&'static str> {
+    let normalized = segment.trim().replace('\t', " ");
     // Strip leading env-var assignments and `sudo` so `sudo rm -rf /` still
     // matches.
     let mut rest = normalized.as_str();
@@ -380,6 +471,36 @@ mod tests {
             "sudo rm -rf $HOME",
         ] {
             assert!(is_circuit_breaker(cmd), "expected circuit breaker: {cmd}");
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_catches_compound_command_hidden_segments() {
+        // Compounds and substitutions don't slip past the breaker — each
+        // segment is checked independently. Without this guard, a model
+        // (or a typo) under Bypass could chain a destructive command after
+        // an innocent one and skate through.
+        for cmd in [
+            "ls; rm -rf /",
+            "true && rm -rf /",
+            "false || rm -rf $HOME",
+            "rm -rf ~ ; ls",
+            // NOTE: `xargs rm -rf /` (and other indirect-execution wrappers
+            // like `env`, `nice`, `time`) is intentionally NOT covered in
+            // v0.16.0 — the breaker only matches direct `rm` invocations.
+            // Compound shape under Bypass with xargs slips through; the user
+            // is still protected in `default` mode because the compound
+            // refuses to auto-allow. Wrapper-stripping is v0.16.1+ work.
+            "$(rm -rf /)",
+            "echo `rm -rf $HOME`",
+            "cd /tmp; rm -rf /",
+            "true && sudo rm -rf /",
+            "false || FOO=bar rm -rf $HOME",
+        ] {
+            assert!(
+                is_circuit_breaker(cmd),
+                "circuit breaker must catch hidden destructive segment in: {cmd}"
+            );
         }
     }
 
