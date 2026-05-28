@@ -27,11 +27,28 @@ pub struct AskUserTool {
     /// `None` when no console is attached (e.g. one-shot CLI, subagent in a
     /// non-TUI context) — `call` returns is_error explaining that.
     picker_tx: Option<mpsc::Sender<PickerRequest>>,
+    /// Permission state shared with the agent loop. When `afk` is on we
+    /// auto-dismiss the question with a fixed reply so the model can finish
+    /// end-to-end without waiting for a user who isn't there.
+    permissions: Option<std::sync::Arc<crate::permissions::runtime::PermissionState>>,
 }
 
 impl AskUserTool {
     pub fn new(picker_tx: Option<mpsc::Sender<PickerRequest>>) -> Self {
-        Self { picker_tx }
+        Self {
+            picker_tx,
+            permissions: None,
+        }
+    }
+
+    /// Attach the shared permission state. Constructed at session-build time
+    /// in `main.rs`; tests typically leave it `None`.
+    pub fn with_permissions(
+        mut self,
+        permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
+    ) -> Self {
+        self.permissions = Some(permissions);
+        self
     }
 }
 
@@ -109,6 +126,28 @@ impl AgentTool for AskUserTool {
             Ok(q) => q,
             Err(e) => return ToolResult::error(format!("ask_user: {e}")),
         };
+
+        // Fully-unattended mode auto-dismisses: no user is present to answer.
+        // Reply with empty answers + a clear `dismissed`/`reason` so the model
+        // can adapt. The lighter HandsFree mode leaves `ask_user` alone — at
+        // the keyboard, model can still consult the user.
+        if let Some(p) = &self.permissions {
+            if p.mode().is_fully_unattended() {
+                let body = serde_json::json!({
+                    "answers": questions
+                        .iter()
+                        .map(|q| serde_json::json!({
+                            "question": q.question,
+                            "answer": null,
+                            "dismissed": true,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "dismissed": true,
+                    "reason": "Running fully unattended. No user is present. Make your best judgment and proceed.",
+                });
+                return ToolResult::ok(body.to_string());
+            }
+        }
 
         let Some(tx) = &self.picker_tx else {
             return ToolResult::error(
@@ -219,6 +258,7 @@ pub(crate) fn parse_questions(args: &Value) -> Result<Vec<PickerQuestion>, Strin
             header,
             multi_select,
             options,
+            allow_other: true,
         });
     }
     Ok(out)
@@ -355,6 +395,39 @@ mod tests {
             .await;
         assert!(res.is_error);
         assert!(res.content.contains("no interactive console"));
+    }
+
+    #[tokio::test]
+    async fn fully_unattended_auto_dismisses_without_touching_picker_channel() {
+        use crate::permissions::runtime::PermissionState;
+        use crate::permissions::Mode;
+        let (tx, mut rx) = mpsc::channel::<PickerRequest>(1);
+        let state = PermissionState::new(Mode::FullyUnattended);
+        let tool = AskUserTool::new(Some(tx)).with_permissions(state);
+        let res = tool
+            .call(json!({"questions": [q("What now?", "h", false, &[("a", "A"), ("b", "B")])]}))
+            .await;
+        // Tool should NOT have sent a request to the picker — channel stays empty.
+        assert!(
+            rx.try_recv().is_err(),
+            "fully-unattended should not touch the picker channel"
+        );
+        // The reply must be a successful dismissal (NOT is_error), so the
+        // model sees structured "make your best judgment" guidance.
+        assert!(
+            !res.is_error,
+            "fully-unattended dismiss should be success, got error: {}",
+            res.content
+        );
+        let body: serde_json::Value = serde_json::from_str(&res.content).unwrap();
+        assert_eq!(body["dismissed"], serde_json::Value::Bool(true));
+        assert!(
+            body["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("fully unattended"),
+            "expected 'fully unattended' in reason, got: {body}"
+        );
     }
 
     #[tokio::test]

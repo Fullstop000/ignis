@@ -17,6 +17,11 @@ pub struct State {
     pub disabled_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_mcp_servers: Vec<String>,
+    /// Persisted permission mode: `"off"`, `"hands_free"`, or
+    /// `"fully_unattended"`. Omitted from JSON when None (= use the built-in
+    /// `Off` default at next launch). Set by `/afk` (via the picker).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 fn state_path() -> Result<std::path::PathBuf, anyhow::Error> {
@@ -71,6 +76,15 @@ pub fn persist_disabled_mcp_servers(disabled: &[String]) -> Result<(), anyhow::E
     write_state(&state)
 }
 
+/// Persist the permission `mode`, preserving every other field. Called by
+/// `/afk` (which sets `Some("hands_free")` or `Some("fully_unattended")`) and
+/// by toggling off (which sets `None`, omitted from JSON).
+pub fn persist_permission_mode(mode: Option<&str>) -> Result<(), anyhow::Error> {
+    let mut state = load_state();
+    state.mode = mode.map(String::from);
+    write_state(&state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +96,7 @@ mod tests {
             reasoning_effort: Some("max".to_string()),
             disabled_skills: vec![],
             disabled_mcp_servers: vec![],
+            mode: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -96,6 +111,7 @@ mod tests {
             reasoning_effort: None,
             disabled_skills: vec!["a".to_string(), "b".to_string()],
             disabled_mcp_servers: vec![],
+            mode: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -117,6 +133,7 @@ mod tests {
             reasoning_effort: None,
             disabled_skills: vec![],
             disabled_mcp_servers: vec!["github".to_string(), "fs".to_string()],
+            mode: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -146,6 +163,68 @@ mod tests {
         let s = load_state();
         assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
         assert_eq!(s.disabled_skills.len(), 2);
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn permission_mode_round_trip_through_state() {
+        for value in ["off", "hands_free", "fully_unattended"] {
+            let state = State {
+                model: None,
+                reasoning_effort: None,
+                disabled_skills: vec![],
+                disabled_mcp_servers: vec![],
+                mode: Some(value.to_string()),
+            };
+            let json = serde_json::to_string(&state).unwrap();
+            let back: State = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                back.mode.as_deref(),
+                Some(value),
+                "round-trip failed for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_mode_default_omits_from_json() {
+        let state = State::default();
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            !json.contains("\"mode\""),
+            "default state should omit mode, got: {json}"
+        );
+    }
+
+    #[test]
+    fn permission_mode_persist_preserves_siblings() {
+        let _env = crate::util::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = crate::util::unique_temp_dir("ignis-state-mode-rmw");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        persist_model_selection("deepseek", "deepseek-v4-pro", Some("high")).unwrap();
+        persist_disabled_skills(&["sql-review".to_string()]).unwrap();
+        persist_permission_mode(Some("hands_free")).unwrap();
+        let s = load_state();
+        assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(s.disabled_skills, vec!["sql-review".to_string()]);
+        assert_eq!(s.mode.as_deref(), Some("hands_free"));
+
+        // Clearing the mode must not touch model or skills.
+        persist_permission_mode(None).unwrap();
+        let s = load_state();
+        assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(s.disabled_skills, vec!["sql-review".to_string()]);
+        assert!(s.mode.is_none());
 
         match prev {
             Some(v) => std::env::set_var("HOME", v),

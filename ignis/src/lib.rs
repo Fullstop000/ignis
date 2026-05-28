@@ -4,6 +4,7 @@ pub mod config;
 pub mod logger;
 pub mod mcp;
 pub mod models;
+pub mod permissions;
 pub mod provider;
 pub mod session;
 pub mod skills;

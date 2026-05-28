@@ -34,6 +34,22 @@ async fn main() -> Result<(), anyhow::Error> {
     // 1. Load config
     let config = load_config()?;
 
+    // Resolve permission mode. Precedence: `--afk` flag > one-shot implicit
+    // > persisted `state.json` > built-in `Off`. The `--afk` flag and the
+    // one-shot implicit both pin `FullyUnattended` — they signal "no TTY,
+    // don't pause for input" and that's what FullyUnattended encodes.
+    let persisted_state = ignis::state::load_state();
+    let resolved_mode = if cli.afk || is_oneshot {
+        ignis::permissions::Mode::FullyUnattended
+    } else {
+        persisted_state
+            .mode
+            .as_deref()
+            .and_then(ignis::permissions::Mode::parse)
+            .unwrap_or_default()
+    };
+    let permissions = ignis::permissions::runtime::PermissionState::new(resolved_mode);
+
     // 2. Resolve paths
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not locate home directory"))?;
@@ -93,6 +109,7 @@ async fn main() -> Result<(), anyhow::Error> {
             config,
             skill_registry.clone(),
             mcp_registry.clone(),
+            permissions.clone(),
         )
         .await;
         // Bring down MCP servers explicitly before tokio runtime tears down —
@@ -124,14 +141,24 @@ async fn main() -> Result<(), anyhow::Error> {
     } else {
         None
     };
-    // One-shot CLI is headless — no interactive picker.
+    // One-shot CLI is headless — no interactive picker. AFK was force-set
+    // above, so ask_user auto-dismisses with structured guidance instead of
+    // hanging on the missing TTY.
     ignis::tools::register_native_tools_with_mcp(
         &mut session,
         &cwd,
         &config,
         mcp_for_subagent,
         None,
+        Some(permissions.clone()),
     );
+
+    // Permission gate. AFK is on for one-shot CLI so most Ask decisions
+    // become Allow inside the checker; circuit breakers + protected paths
+    // still Deny, surfacing the refusal to the model so it can adapt.
+    session.set_hooks(Box::new(
+        ignis::permissions::checker::PermissionChecker::new(permissions.clone()),
+    ));
     if !skill_registry.is_empty() {
         session.set_skills(skill_registry.clone());
         session.register_tool(std::sync::Arc::new(ignis::tools::SkillTool::new(

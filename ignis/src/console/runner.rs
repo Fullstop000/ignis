@@ -42,6 +42,7 @@ pub async fn run_console(
     config: crate::config::Config,
     skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
     mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
+    permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
 ) -> Result<(), anyhow::Error> {
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
     // Context windows: config override → cached models.dev → compaction threshold.
@@ -99,6 +100,9 @@ pub async fn run_console(
     let runner_mcp_registry = mcp_registry.clone();
     app.mcp = Some(mcp_registry);
 
+    let runner_permissions = permissions.clone();
+    app.permissions = Some(permissions);
+
     // Background agent runner
     tokio::spawn(async move {
         while let Some(request) = prompt_rx.recv().await {
@@ -155,6 +159,7 @@ pub async fn run_console(
                 &agent_config,
                 mcp_for_subagent,
                 Some(picker_tx_runner.clone()),
+                Some(runner_permissions.clone()),
             );
             if !runner_skill_registry.is_empty() {
                 session.set_skills(runner_skill_registry.clone());
@@ -166,6 +171,16 @@ pub async fn run_console(
                 session.set_mcp(runner_mcp_registry.clone());
                 crate::tools::register_mcp_tools(&mut session, &runner_mcp_registry);
             }
+
+            // Permission gate. The TUI's picker channel is wired in so an
+            // `Ask` decision opens the 3-option permission picker (Approve
+            // once / Approve session / Deny) over the same plumbing
+            // `ask_user` uses; on `Approve session` the checker writes back
+            // into the shared `PermissionState`.
+            session.set_hooks(Box::new(
+                crate::permissions::checker::PermissionChecker::new(runner_permissions.clone())
+                    .with_picker(picker_tx_runner.clone()),
+            ));
 
             let notice_msg = |content: &str| Message {
                 role: "assistant".to_string(),
@@ -290,6 +305,7 @@ pub async fn run_console(
                     &active_inject,
                     &session_manager,
                     &ui_storage_dir,
+                    &picker_tx,
                 )
                 .await;
             }

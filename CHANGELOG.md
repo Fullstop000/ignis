@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.17.0] - 2026-05-28
 
 ### Added
+- Agent permission control — every tool call now passes through a permission gate; sensitive tools (`bash`, `edit_file`, `create_file`, `web_fetch`, `agent`, MCP) prompt with a 3-option picker (Approve once / Approve session / Deny). Built-in safety floor (`rm -rf /` family, edits to `.git/**` / `.ignis/**` / shell init) always prompts and is never bypassed.
+- `/afk` slash command — opens a picker to enter *Hands-free* (auto-approve tools, still answer `ask_user`) or *Fully unattended* (auto-approve everything, dismiss `ask_user`, hard-deny safety floor). Disabling fires immediately; enabling confirms. Mode persists in `state.json`.
+- `--afk` CLI flag and implicit one-shot AFK — both pin Fully unattended so headless runs never hang on a missing TTY.
 - Opt-in OpenTelemetry export of session traces and token-usage metrics over OTLP — enable with `IGNIS_ENABLE_TELEMETRY=1`.
 - `/telemetry` — show OpenTelemetry export status.
 

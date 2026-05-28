@@ -26,6 +26,14 @@ pub struct Cli {
     #[arg(long, num_args = 0..=1, value_name = "ID")]
     pub resume: Option<Option<String>>,
 
+    /// Enable AFK mode (fully unattended) for this session — auto-approves
+    /// every tool call, auto-dismisses `ask_user`, and hard-denies the safety
+    /// floor (`rm -rf /` family, `.git`/`.ignis`/shell-init edits). Bypasses
+    /// the `/afk` confirmation picker (typing the flag at launch is explicit
+    /// intent). One-shot invocations imply `--afk` automatically.
+    #[arg(long)]
+    pub afk: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -61,6 +69,7 @@ impl Cli {
             resume,
             resume_session_id,
             prompt_args: self.prompt,
+            afk: self.afk,
         }
     }
 }
@@ -73,6 +82,8 @@ pub struct CliArgs {
     pub resume: bool,
     pub resume_session_id: Option<String>,
     pub prompt_args: Vec<String>,
+    /// `--afk` from CLI. One-shot invocations also force this to `true`.
+    pub afk: bool,
 }
 
 pub struct SessionRequest {

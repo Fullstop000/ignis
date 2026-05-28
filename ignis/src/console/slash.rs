@@ -40,6 +40,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: Cow::Borrowed("Manage MCP servers (enable/disable)"),
     },
     SlashCommand {
+        name: Cow::Borrowed("/afk"),
+        description: Cow::Borrowed("Toggle AFK mode (auto-approve tools + dismiss ask_user)"),
+    },
+    SlashCommand {
         name: Cow::Borrowed("/telemetry"),
         description: Cow::Borrowed("Show OpenTelemetry export status"),
     },
