@@ -4,10 +4,11 @@
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use crate::session::project_slug;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 pub struct SessionsCmd {
@@ -158,6 +159,68 @@ pub fn parse_session(
     Ok(rec)
 }
 
+pub fn walk_sessions(
+    projects_dir: &Path,
+    scope: Scope,
+    cwd: &Path,
+) -> Result<Vec<SessionRecord>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(projects_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(out),
+    };
+
+    let want_slug = match scope {
+        Scope::Current => Some(project_slug(cwd)),
+        Scope::All => None,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let slug = match path.file_name().and_then(|n| n.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if let Some(want) = &want_slug {
+            if &slug != want {
+                continue;
+            }
+        }
+        for file in std::fs::read_dir(&path)?.flatten() {
+            let fp = file.path();
+            if fp.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let stem = match fp.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let jsonl = match std::fs::read_to_string(&fp) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if jsonl.trim().is_empty() {
+                continue;
+            }
+            let usage_path = path.join(format!("{stem}.usage.json"));
+            let usage_raw = std::fs::read_to_string(&usage_path).ok();
+            let mut rec = parse_session(&stem, &slug, &jsonl, usage_raw.as_deref())?;
+            if let Ok(meta) = std::fs::metadata(&fp) {
+                if let Ok(mtime) = meta.modified() {
+                    if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                        rec.last_modified = Some(d.as_secs());
+                    }
+                }
+            }
+            out.push(rec);
+        }
+    }
+    Ok(out)
+}
+
 pub async fn run(_cmd: SessionsCmd) -> Result<()> {
     anyhow::bail!("not yet implemented");
 }
@@ -212,5 +275,41 @@ mod tests {
         assert_eq!(rec.reasoning_tokens, 0);
         assert_eq!(rec.cache_read_tokens, 0);
         assert_eq!(rec.cache_write_tokens, 0);
+    }
+
+    fn write_fixture_session(projects_dir: &std::path::Path, slug: &str, session_id: &str) {
+        let dir = projects_dir.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{session_id}.jsonl")), fixture_jsonl()).unwrap();
+        std::fs::write(dir.join(format!("{session_id}.usage.json")), fixture_usage()).unwrap();
+    }
+
+    #[test]
+    fn walk_sessions_all_scope_returns_every_project() {
+        let tmp = crate::util::unique_temp_dir("ignis-walk-all");
+        let projects = tmp.join("projects");
+        write_fixture_session(&projects, "proj-a", "s1");
+        write_fixture_session(&projects, "proj-b", "s2");
+
+        let recs = walk_sessions(&projects, Scope::All, &PathBuf::from("/anywhere")).unwrap();
+        let mut ids: Vec<&str> = recs.iter().map(|r| r.session_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["s1", "s2"]);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn walk_sessions_current_scope_filters_by_cwd_slug() {
+        let tmp = crate::util::unique_temp_dir("ignis-walk-current");
+        let projects = tmp.join("projects");
+        let cwd = PathBuf::from("/home/u/proj-a");
+        let slug = project_slug(&cwd);
+        write_fixture_session(&projects, &slug, "s1");
+        write_fixture_session(&projects, "proj-b", "s2");
+
+        let recs = walk_sessions(&projects, Scope::Current, &cwd).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].session_id, "s1");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
