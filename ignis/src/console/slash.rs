@@ -39,6 +39,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: Cow::Borrowed("/mcp"),
         description: Cow::Borrowed("Manage MCP servers (enable/disable)"),
     },
+    SlashCommand {
+        name: Cow::Borrowed("/telemetry"),
+        description: Cow::Borrowed("Show OpenTelemetry export status"),
+    },
 ];
 
 pub(crate) fn slash_suggestions(
@@ -125,6 +129,7 @@ mod slash_skill_tests {
         assert!(!names.iter().any(|n| n == "/beta")); // disabled
         assert!(names.iter().any(|n| n == "/skills"));
         assert!(names.iter().any(|n| n == "/mcp"));
+        assert!(names.iter().any(|n| n == "/telemetry"));
         std::fs::remove_dir_all(&tmp).ok();
     }
 

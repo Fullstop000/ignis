@@ -41,6 +41,14 @@ impl DeepSeekProvider {
 
 #[async_trait]
 impl LlmProvider for DeepSeekProvider {
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
+    fn provider_name(&self) -> &str {
+        "deepseek"
+    }
+
     async fn chat_stream(
         &self,
         system_prompt: &str,

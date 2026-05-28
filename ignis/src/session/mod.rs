@@ -31,6 +31,15 @@ pub struct Session {
 
 impl Session {
     /// Open a session, loading any persisted history for `id`.
+    #[tracing::instrument(
+        name = "ignis.session",
+        skip_all,
+        fields(
+            session.id = %id,
+            provider = %provider.provider_name(),
+            cwd = %start_dir,
+        ),
+    )]
     pub async fn open(
         id: String,
         system_prompt: String,
@@ -97,11 +106,26 @@ impl Session {
 
     /// Append the user's message, run the agent loop over the history, and
     /// persist the result.
+    #[tracing::instrument(
+        name = "ignis.turn",
+        skip_all,
+        fields(
+            session.id = %self.id,
+            prompt.length = text.len(),
+            prompt.text = tracing::field::Empty,
+        ),
+    )]
     pub async fn prompt(
         &mut self,
         text: &str,
         tx: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> Result<(), anyhow::Error> {
+        // Prompt body is recorded only when IGNIS_LOG_USER_PROMPTS=1 — redacted
+        // by default per the privacy gate.
+        if crate::telemetry::log_user_prompts() {
+            tracing::Span::current().record("prompt.text", text);
+        }
+
         // Auto-compact when the estimated context grows past the threshold.
         // Best-effort: a compaction failure must not block the user's prompt.
         if self.compaction.auto && estimate_tokens(&self.history) > self.compaction.threshold_tokens
@@ -596,6 +620,7 @@ mod tests {
         let usage = crate::Usage {
             input_tokens: 1234,
             output_tokens: 56,
+            reasoning_tokens: 0,
             cache_read_tokens: 789,
             cache_write_tokens: 0,
         };

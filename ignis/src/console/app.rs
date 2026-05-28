@@ -627,6 +627,44 @@ impl App {
         self.blocks.push(UIBlock::Assistant(text));
     }
 
+    /// `/telemetry` — render a multi-line system notice with the current OTel
+    /// export state (enabled, endpoint, protocol, privacy flags). Read-only.
+    pub(crate) fn show_telemetry_status(&mut self) {
+        let s = crate::telemetry::state_snapshot();
+        let mut lines = vec!["Telemetry status".to_string()];
+
+        if !s.feature_compiled {
+            lines.push(String::from(
+                "  • compiled without the `telemetry` feature — rebuild with --features telemetry to enable",
+            ));
+        } else if !s.enabled {
+            lines.push(String::from(
+                "  • disabled (set IGNIS_ENABLE_TELEMETRY=1 or [telemetry] enabled=true in ~/.ignis/config.toml)",
+            ));
+        } else {
+            lines.push(String::from("  • enabled ✓"));
+            if let Some(ep) = &s.endpoint {
+                lines.push(format!("  • OTLP endpoint: {}", ep));
+            }
+            if let Some(proto) = &s.protocol {
+                lines.push(format!("  • protocol: {}", proto));
+            }
+            lines.push(
+                "  • signals: ignis.{session, turn, llm_request, tool.execution} spans + ignis.*/gen_ai.* metrics".to_string()
+            );
+        }
+        lines.push(format!(
+            "  • IGNIS_LOG_USER_PROMPTS: {}",
+            if s.log_user_prompts { "on" } else { "off" }
+        ));
+        lines.push(format!(
+            "  • IGNIS_LOG_TOOL_DETAILS: {}",
+            if s.log_tool_details { "on" } else { "off" }
+        ));
+
+        self.add_assistant_notice(lines.join("\n"));
+    }
+
     pub(crate) fn start_new_session(&mut self, session_id: String) {
         self.exit_pending = false;
         self.session_id = session_id;
@@ -1049,7 +1087,16 @@ mod tests {
                 .iter()
                 .map(|command| command.name.as_ref())
                 .collect::<Vec<_>>(),
-            vec!["/resume", "/clear", "/compact", "/copy", "/model", "/skills", "/mcp"]
+            vec![
+                "/resume",
+                "/clear",
+                "/compact",
+                "/copy",
+                "/model",
+                "/skills",
+                "/mcp",
+                "/telemetry",
+            ]
         );
     }
 

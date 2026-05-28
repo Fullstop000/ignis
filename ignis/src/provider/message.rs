@@ -33,13 +33,17 @@ pub struct Message {
 
 /// Real token usage for a turn or session, mirroring how Claude/Kimi/Codex
 /// record it. `input_tokens` is the full prompt (cache reads/writes included);
-/// `cache_read_tokens` is the cached subset.
+/// `cache_read_tokens` is the cached subset. `reasoning_tokens` is the
+/// invisible-thinking subset of `output_tokens` (OpenAI o-series, Anthropic
+/// extended thinking) — operators care about it for cost attribution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
     #[serde(default)]
     pub cache_read_tokens: u64,
     #[serde(default)]
@@ -50,6 +54,7 @@ impl Usage {
     pub fn add(&mut self, other: &Usage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_write_tokens += other.cache_write_tokens;
     }
