@@ -650,7 +650,7 @@ impl App {
                 lines.push(format!("  • protocol: {}", proto));
             }
             lines.push(
-                "  • signals: ignis.{session, turn, llm_request, tool.execution} spans + ignis.*/gen_ai.* metrics".to_string()
+                "  • signals: `ignis.session`, `ignis.turn`, `ignis.llm_request`, `ignis.tool.execution` spans + `ignis.*` / `gen_ai.*` metrics".to_string()
             );
         }
         lines.push(format!(

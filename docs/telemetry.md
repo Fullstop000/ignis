@@ -43,9 +43,13 @@ Inspect runtime state any time inside the TUI with `/telemetry`.
 | Tier | What | Setup time | Use when |
 |---|---|---|---|
 | **`otel-tui`** (recommended) | Single-binary terminal UI, embedded OTLP receiver | 1 min | Personal use, dogfooding |
-| Console / file exporter | Built-in OTel SDK exporter to stdout / JSONL | 0 min | Debugging instrumentation |
 | Docker Grafana stack | Persistent Grafana dashboards | 5 min | Want history + saved queries |
 | Hosted (Honeycomb / Datadog / Grafana Cloud / SigNoz) | Cloud OTLP backend | Pre-existing | Team-wide aggregation |
+
+Ignis only ships the **OTLP** exporter (gRPC default, HTTP/protobuf via
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`). To inspect emitted spans without a
+collector, run the lightest collector — `otel-tui` — locally; that's the
+tier-1 path below.
 
 ### Tier 1 — `otel-tui` (default)
 
@@ -66,18 +70,7 @@ You'll see the session trace appear in `otel-tui` in real time, with the
 `ignis.session` → `ignis.turn` → `ignis.llm_request` / `ignis.tool.execution`
 hierarchy and the metric points panel.
 
-### Tier 2 — console / file exporter (debug)
-
-```bash
-IGNIS_ENABLE_TELEMETRY=1 \
-OTEL_TRACES_EXPORTER=console \
-OTEL_METRICS_EXPORTER=console \
-ignis "..."
-```
-
-Pretty-prints OTLP payloads to stdout. Use for inspecting exactly what Ignis emits.
-
-### Tier 3 — Docker Grafana stack (optional, persistent)
+### Tier 2 — Docker Grafana stack (optional, persistent)
 
 For a long-running dashboard with history:
 
@@ -89,7 +82,7 @@ docker run -d --name lgtm -p 3000:3000 -p 4317:4317 -p 4318:4318 \
 Then open `http://localhost:3000` (admin/admin). Traces appear under
 **Explore → Tempo**; metrics under **Explore → Prometheus**.
 
-### Tier 4 — hosted backend
+### Tier 3 — hosted backend
 
 Point at any OTLP-compliant ingestion endpoint:
 
