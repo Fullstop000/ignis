@@ -254,6 +254,192 @@ pub fn default_output_path(cwd: &Path, epoch_secs: u64) -> PathBuf {
     ))
 }
 
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+const STYLES: &str = r#"
+:root { color-scheme: light dark; --fg: #1a1a1a; --muted: #777; --border: #ddd; --row-alt: #f6f6f6; --accent: #4a6df5; }
+@media (prefers-color-scheme: dark) { :root { --fg: #ddd; --muted: #888; --border: #333; --row-alt: #1e1e1e; --accent: #7ea3ff; } }
+* { box-sizing: border-box; }
+body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--fg); margin: 24px; line-height: 1.4; }
+h1 { font-size: 20px; margin: 0 0 4px 0; }
+.sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+.cards { display: flex; gap: 12px; margin: 16px 0 24px 0; flex-wrap: wrap; }
+.card { border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; min-width: 140px; }
+.card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+.card .value { font-size: 20px; font-weight: 600; margin-top: 2px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+th { position: sticky; top: 0; background: var(--row-alt); cursor: pointer; user-select: none; }
+th .chev { color: var(--muted); margin-left: 4px; }
+tr.row:nth-child(even) { background: var(--row-alt); }
+.mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 12px; }
+.chip { display: inline-block; padding: 1px 6px; margin: 0 3px 2px 0; background: var(--row-alt); border: 1px solid var(--border); border-radius: 3px; font-size: 11px; font-family: "SFMono-Regular", Consolas, monospace; }
+.more { color: var(--muted); font-size: 11px; }
+footer { margin-top: 32px; color: var(--muted); font-size: 12px; }
+footer a { color: var(--accent); text-decoration: none; }
+.notice { padding: 32px; text-align: center; color: var(--muted); }
+"#;
+
+const SORT_JS: &str = r#"
+function sortBy(idx, type) {
+  const tbl = document.querySelector('table');
+  const tbody = tbl.tBodies[0];
+  const rows = Array.from(tbody.querySelectorAll('tr.row'));
+  const ths = tbl.querySelectorAll('th');
+  const th = ths[idx];
+  const asc = th.dataset.sort !== 'asc';
+  ths.forEach(h => { h.dataset.sort = ''; const c = h.querySelector('.chev'); if (c) c.textContent = ''; });
+  th.dataset.sort = asc ? 'asc' : 'desc';
+  const chev = th.querySelector('.chev'); if (chev) chev.textContent = asc ? ' ▲' : ' ▼';
+  const get = r => r.cells[idx].dataset.sort ?? r.cells[idx].textContent.trim();
+  rows.sort((a, b) => {
+    const A = get(a), B = get(b);
+    if (type === 'num') return asc ? (Number(A) - Number(B)) : (Number(B) - Number(A));
+    return asc ? A.localeCompare(B) : B.localeCompare(A);
+  });
+  rows.forEach(r => tbody.appendChild(r));
+}
+"#;
+
+fn render_chip_cloud(tool_calls: &BTreeMap<String, u64>) -> String {
+    let mut entries: Vec<(&String, &u64)> = tool_calls.iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    const MAX_CHIPS: usize = 6;
+    let mut html = String::new();
+    for (i, (name, count)) in entries.iter().enumerate() {
+        if i == MAX_CHIPS {
+            let rest = entries.len() - MAX_CHIPS;
+            let full: String = entries[MAX_CHIPS..]
+                .iter()
+                .map(|(n, c)| format!("{}×{}", n, c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            html.push_str(&format!(
+                r#"<span class="more" title="{}">+{} more</span>"#,
+                escape_html(&full),
+                rest
+            ));
+            break;
+        }
+        html.push_str(&format!(
+            r#"<span class="chip">{}×{}</span>"#,
+            escape_html(name),
+            count
+        ));
+    }
+    html
+}
+
+pub fn render_html(records: &[SessionRecord], scope: Scope, generated_at: u64) -> String {
+    let scope_label = match scope {
+        Scope::Current => "current project",
+        Scope::All => "all projects",
+    };
+    let total_sessions = records.len();
+    let total_messages: u64 = records.iter().map(|r| r.message_count).sum();
+    let total_tokens: u64 = records
+        .iter()
+        .map(|r| r.input_tokens + r.output_tokens)
+        .sum();
+    let total_tool_calls: u64 = records.iter().map(|r| r.tool_call_count).sum();
+
+    let version = env!("CARGO_PKG_VERSION");
+    let generated = format_timestamp_utc(generated_at);
+
+    let header = format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ignis sessions report</title>
+<style>{styles}</style>
+</head>
+<body>
+<h1>ignis sessions — {scope}</h1>
+<div class="sub">Generated {generated} UTC · {n} session{plural}</div>
+<div class="cards">
+  <div class="card"><div class="label">Sessions</div><div class="value">{n}</div></div>
+  <div class="card"><div class="label">Messages</div><div class="value">{msgs}</div></div>
+  <div class="card"><div class="label">Tokens (in+out)</div><div class="value">{tok}</div></div>
+  <div class="card"><div class="label">Tool calls</div><div class="value">{tcs}</div></div>
+</div>
+"#,
+        styles = STYLES,
+        scope = escape_html(scope_label),
+        generated = generated,
+        n = total_sessions,
+        plural = if total_sessions == 1 { "" } else { "s" },
+        msgs = total_messages,
+        tok = total_tokens,
+        tcs = total_tool_calls,
+    );
+
+    let body = if records.is_empty() {
+        r#"<div class="notice">No sessions found in scope.</div>"#.to_string()
+    } else {
+        let mut rows = String::new();
+        for r in records {
+            let started = r.started_at.map(format_timestamp_utc).unwrap_or_default();
+            let modified = r.last_modified.map(format_timestamp_utc).unwrap_or_default();
+            rows.push_str(&format!(
+                r#"<tr class="row"><td class="mono">{slug}</td><td class="mono">{id}</td><td data-sort="{ts_s}">{started}</td><td data-sort="{ts_m}">{modified}</td><td>{msgs}</td><td>{tok}</td><td>{tcc}</td><td>{tec}</td><td>{chips}</td></tr>"#,
+                slug = escape_html(&r.project_slug),
+                id = escape_html(&r.session_id),
+                ts_s = r.started_at.unwrap_or(0),
+                ts_m = r.last_modified.unwrap_or(0),
+                started = started,
+                modified = modified,
+                msgs = r.message_count,
+                tok = r.input_tokens + r.output_tokens,
+                tcc = r.tool_call_count,
+                tec = r.tool_error_count,
+                chips = render_chip_cloud(&r.tool_calls),
+            ));
+        }
+        format!(
+            r#"<table>
+<thead><tr>
+  <th onclick="sortBy(0,'str')">Project<span class="chev"></span></th>
+  <th onclick="sortBy(1,'str')">Session<span class="chev"></span></th>
+  <th onclick="sortBy(2,'num')">Started<span class="chev"></span></th>
+  <th onclick="sortBy(3,'num')">Modified<span class="chev"></span></th>
+  <th onclick="sortBy(4,'num')">Messages<span class="chev"></span></th>
+  <th onclick="sortBy(5,'num')">Tokens<span class="chev"></span></th>
+  <th onclick="sortBy(6,'num')">Tools<span class="chev"></span></th>
+  <th onclick="sortBy(7,'num')">Errors<span class="chev"></span></th>
+  <th>Tools used</th>
+</tr></thead>
+<tbody>{rows}</tbody>
+</table>
+<script>{js}</script>"#,
+            rows = rows,
+            js = SORT_JS,
+        )
+    };
+
+    let footer = format!(
+        r#"<footer>Generated by <a href="https://github.com/Fullstop000/ignis/releases">ignis v{version}</a></footer>
+</body>
+</html>"#,
+        version = version,
+    );
+
+    format!("{}{}{}", header, body, footer)
+}
+
 pub async fn run(_cmd: SessionsCmd) -> Result<()> {
     anyhow::bail!("not yet implemented");
 }
@@ -329,6 +515,61 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["s1", "s2"]);
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    fn sample_record() -> SessionRecord {
+        let mut tc = BTreeMap::new();
+        tc.insert("bash".to_string(), 3);
+        tc.insert("read".to_string(), 5);
+        SessionRecord {
+            session_id: "sess-<dangerous>".to_string(),
+            project_slug: "-home-u-proj".to_string(),
+            project_start_dir: Some("/home/u/proj".to_string()),
+            started_at: Some(1735787045),
+            last_modified: Some(1735787100),
+            message_count: 10,
+            input_tokens: 1234,
+            output_tokens: 56,
+            reasoning_tokens: 7,
+            cache_read_tokens: 200,
+            cache_write_tokens: 0,
+            tool_call_count: 8,
+            tool_error_count: 1,
+            tool_calls: tc,
+        }
+    }
+
+    #[test]
+    fn render_html_escapes_special_chars() {
+        let html = render_html(&[sample_record()], Scope::Current, 1735787100);
+        assert!(html.contains("sess-&lt;dangerous&gt;"));
+        assert!(!html.contains("sess-<dangerous>"));
+    }
+
+    #[test]
+    fn render_html_renders_one_row_per_record() {
+        let html = render_html(&[sample_record(), sample_record()], Scope::All, 1735787100);
+        assert_eq!(html.matches(r#"<tr class="row""#).count(), 2);
+    }
+
+    #[test]
+    fn render_html_emits_summary_totals() {
+        let html = render_html(&[sample_record()], Scope::Current, 1735787100);
+        assert!(html.contains(">1290<"));
+        assert!(html.contains(">8<"));
+    }
+
+    #[test]
+    fn render_html_includes_sort_script_and_styles() {
+        let html = render_html(&[sample_record()], Scope::Current, 1735787100);
+        assert!(html.contains("<style>"));
+        assert!(html.contains("function sortBy("));
+    }
+
+    #[test]
+    fn render_html_empty_records_shows_notice() {
+        let html = render_html(&[], Scope::Current, 1735787100);
+        assert!(html.contains("No sessions found"));
     }
 
     #[test]
