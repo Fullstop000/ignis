@@ -6,7 +6,10 @@ Wire-up:
         -m anthropic/claude-haiku-4-5 \\
         --agent-import-path ignis_agent.agent:IgnisAgent
 
-The harbor `-m` argument is parsed into provider/model. The provider segment
+The harbor `-m` argument is parsed into provider/model[@effort]. The optional
+`@effort` suffix (e.g. `deepseek/deepseek-v4-flash@max`) selects the model's
+reasoning level — the generated TOML declares it as a supported level for the
+model entry and sets the top-level `reasoning_effort`. The provider segment
 selects which env var holds the API key and (for OpenAI-compatible providers
 that need a URL) the default endpoint. We write a minimal ~/.ignis/config.toml
 inside the sandbox and invoke `ignis "<instruction>"` — a non-empty prompt arg
@@ -90,10 +93,24 @@ class IgnisAgent(BaseInstalledAgent):
     ) -> None:
         if not self.model_name or "/" not in self.model_name:
             raise ValueError(
-                "IgnisAgent: --model must be 'provider/name' "
+                "IgnisAgent: --model must be 'provider/name[@effort]' "
                 f"(got {self.model_name!r})"
             )
-        provider, model = self.model_name.split("/", 1)
+        provider, model_spec = self.model_name.split("/", 1)
+        # Optional `@<effort>` reasoning suffix — e.g. `deepseek-v4-flash@max`.
+        if "@" in model_spec:
+            model, effort = model_spec.split("@", 1)
+        else:
+            model, effort = model_spec, None
+        if not model or (effort is not None and not effort):
+            raise ValueError(
+                f"IgnisAgent: malformed --model {self.model_name!r}"
+            )
+        if effort and ('"' in effort or "\\" in effort):
+            raise ValueError(
+                f"IgnisAgent: reasoning effort {effort!r} contains characters "
+                "that would break the generated TOML"
+            )
         if provider not in _PROVIDERS:
             raise ValueError(
                 f"IgnisAgent: provider {provider!r} not wired. "
@@ -116,14 +133,21 @@ class IgnisAgent(BaseInstalledAgent):
                 "break the generated TOML config"
             )
 
-        config_lines = [
-            f'model = "{provider}/{model}"',
-            f"[providers.{provider}]",
-            f'api_key = "{api_key}"',
-        ]
+        config_lines = [f'model = "{provider}/{model}"']
+        if effort:
+            # Top-level reasoning_effort is only honored when the model entry
+            # below declares the same level as supported (see ignis config.rs).
+            config_lines.append(f'reasoning_effort = "{effort}"')
+        config_lines.append(f"[providers.{provider}]")
+        config_lines.append(f'api_key = "{api_key}"')
         if api_url:
             config_lines.append(f'api_url = "{api_url}"')
-        config_lines.append(f'models = ["{model}"]')
+        if effort:
+            config_lines.append(
+                f'models = [{{ name = "{model}", reasoning = ["{effort}"] }}]'
+            )
+        else:
+            config_lines.append(f'models = ["{model}"]')
         config_toml = "\n".join(config_lines) + "\n"
 
         # Single-quoted heredoc terminator → no variable expansion inside.
