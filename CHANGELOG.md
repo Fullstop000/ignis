@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-05-28
+
+### Added
+- TUI footer mode badge — peach `HANDS-FREE` or red `AFK` shown left of the model name whenever you're in an auto-approve mode, so it's obvious at a glance that tool calls aren't being prompted.
+
 ## [0.19.0] - 2026-05-28
 
 ### Added

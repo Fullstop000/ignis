@@ -42,7 +42,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--cols", type=int, default=100)
     ap.add_argument("--rows", type=int, default=35)
-    ap.add_argument("--args", default="--tui", help="space-separated args for the binary")
+    ap.add_argument("--args", default="", help="space-separated args for the binary")
     ap.add_argument("--font", default="/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
     ap.add_argument("--font-bold", default="/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf")
     ap.add_argument("--step", action="append", default=[], help="wait:N | type:TXT | key:NAME")

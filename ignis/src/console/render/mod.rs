@@ -746,6 +746,86 @@ mod tests {
         assert!(content.contains("/tmp"), "footer should show cwd");
         assert!(content.contains("tok"), "footer should show token count");
         assert!(content.contains("(0%)"), "footer should show context %");
+        // Off mode → no badge.
+        assert!(
+            !content.contains("HANDS-FREE") && !content.contains(" AFK "),
+            "Off mode should render no mode badge"
+        );
+    }
+
+    #[test]
+    fn render_footer_hands_free_badge_is_peach() {
+        use crate::console::colors::PEACH;
+        use crate::permissions::{runtime::PermissionState, Mode as PermMode};
+
+        let mut app = App::new(
+            "openai".to_string(),
+            "gpt-4".to_string(),
+            "work".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        app.permissions = Some(PermissionState::new(PermMode::HandsFree));
+
+        let mut term = test_terminal(120, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(
+            content.contains("HANDS-FREE"),
+            "footer should show HANDS-FREE badge under HandsFree mode"
+        );
+
+        // Verify the badge cells are peach (not the default SUBTEXT color).
+        let buf = term.backend().buffer();
+        let mut peach_cells = 0;
+        for cell in buf.content.iter() {
+            if cell.fg == PEACH {
+                peach_cells += 1;
+            }
+        }
+        assert!(
+            peach_cells >= "HANDS-FREE".len(),
+            "expected ≥{} peach cells for the badge, got {}",
+            "HANDS-FREE".len(),
+            peach_cells
+        );
+    }
+
+    #[test]
+    fn render_footer_fully_unattended_badge_is_red() {
+        use crate::console::colors::RED;
+        use crate::permissions::{runtime::PermissionState, Mode as PermMode};
+
+        let mut app = App::new(
+            "openai".to_string(),
+            "gpt-4".to_string(),
+            "work".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        app.permissions = Some(PermissionState::new(PermMode::FullyUnattended));
+
+        let mut term = test_terminal(120, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let content = buffer_content(&term);
+        assert!(
+            content.contains(" AFK "),
+            "footer should show AFK badge under FullyUnattended mode"
+        );
+
+        let buf = term.backend().buffer();
+        let mut red_cells = 0;
+        for cell in buf.content.iter() {
+            if cell.fg == RED {
+                red_cells += 1;
+            }
+        }
+        assert!(
+            red_cells >= "AFK".len(),
+            "expected ≥{} red cells for the badge, got {}",
+            "AFK".len(),
+            red_cells
+        );
     }
 
     #[test]

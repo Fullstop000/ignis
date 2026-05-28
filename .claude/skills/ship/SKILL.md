@@ -64,11 +64,34 @@ decide silently. Dogfooding means using the built binary the way a real user
 would, to catch what unit tests miss (TUI layout, real provider behavior, the
 exact path you changed). Skip only with their OK (e.g. docs/CI-only changes).
 
-If yes, use the **`dogfood`** skill (`.claude/skills/dogfood/`) for how — it covers
-both behavioral checks (one-shot CLI / state) and **visual** checks. For anything
-visual (TUI), you can't judge colors or layout from tool output: screenshot the
-real TUI to a PNG with `dogfood/tui_shot.py` and actually `Read` it. Report what
-you exercised and the result.
+**Cover every user-visible path of the feature, not just the change set.**
+Unit tests prove the mechanism (decision logic, picker question shape); only
+the real binary proves the *integrated path* (tool call → hook fires →
+channel ferries to TUI → renderer reads state → reply travels back → mode
+persists → next launch reads it). The classes of bug only dogfood catches:
+
+- Wrong picker / view tags on shared infrastructure (a hardcoded label that
+  was right for one caller and wrong for a later one)
+- Stale CLI flags / state fields that look fine in unit tests but break the
+  user-visible flow
+- Wiring gaps between subsystems (footer doesn't read the new state, slash
+  command doesn't persist, restart loses the setting)
+- Visual: any color, alignment, or layout claim — tool output is plain text,
+  you cannot judge colors from it, you must look at a PNG
+
+Before opening the PR, list every user-visible path of the feature (the
+slash command flow, the picker variants, the CLI flag, the state-restore on
+restart, every observable behavior toggle). Drive each one against the real
+binary. Skipping a path requires either (a) unit-test coverage that proves
+the integration boundary the path would exercise is unreachable, or (b)
+explicit human sign-off (e.g. `rm -rf /` family — the dogfood would put the
+host at risk, accept unit-test coverage + sandbox follow-up).
+
+Use the **`dogfood`** skill (`.claude/skills/dogfood/`) for how — it covers
+both behavioral checks (one-shot CLI / state) and **visual** checks. For
+anything visual (TUI), you can't judge colors or layout from tool output:
+screenshot the real TUI to a PNG with `dogfood/tui_shot.py` and actually
+`Read` it. Report exactly which paths you exercised and the result of each.
 
 ### 4. Secret scan — must be clean
 ```bash

@@ -133,8 +133,14 @@ pub(crate) fn draw_queued(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// Status footer under the input: working dir (left) and model + token usage (right).
+/// Status footer under the input: working dir (left) and mode badge (when in
+/// any AFK level) + model + token usage (right). The badge is the only visual
+/// indicator that you're auto-approving tool calls — it pays for itself the
+/// first time it stops a user from thinking they're in default mode.
 pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    use crate::console::colors::PEACH;
+    use crate::permissions::Mode as PermissionMode;
+
     let (ctx_tokens, ctx_pct) = app.context_usage();
     let model_str = match &app.effort {
         Some(e) => format!("{}/{} ({})", app.provider, app.model, e),
@@ -146,7 +152,16 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         format_tokens(ctx_tokens as usize),
         ctx_pct
     );
-    let right_w = right_str.chars().count() as u16;
+
+    // Mode badge: empty under Off (default), peach " HANDS-FREE ", red " AFK ".
+    let badge = match app.permissions.as_ref().map(|p| p.mode()) {
+        Some(PermissionMode::HandsFree) => Some((" HANDS-FREE ", PEACH)),
+        Some(PermissionMode::FullyUnattended) => Some((" AFK ", RED)),
+        _ => None,
+    };
+
+    let badge_w = badge.map(|(s, _)| s.chars().count() as u16).unwrap_or(0);
+    let right_w = right_str.chars().count() as u16 + badge_w;
     let split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(right_w)])
@@ -156,7 +171,19 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         format!("  {}", app.cwd.display()),
         Style::default().fg(TEXT_DIM),
     ));
-    let right = Line::from(Span::styled(right_str, Style::default().fg(SUBTEXT)));
+    let right = if let Some((label, color)) = badge {
+        Line::from(vec![
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(color)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::styled(right_str, Style::default().fg(SUBTEXT)),
+        ])
+    } else {
+        Line::from(Span::styled(right_str, Style::default().fg(SUBTEXT)))
+    };
 
     f.render_widget(
         Paragraph::new(left).style(Style::default().bg(SURFACE)),
