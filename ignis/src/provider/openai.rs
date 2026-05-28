@@ -13,10 +13,15 @@ pub struct OpenAiProvider {
     model: String,
     user_agent: String,
     reasoning_effort: Option<String>,
+    /// Provider label for telemetry attribution. The same struct is used for
+    /// "openai", "kimi-code", and "Moonshot Platform CN" — each construction
+    /// site passes its canonical name.
+    provider_name: String,
 }
 
 impl OpenAiProvider {
     pub fn new(
+        provider_name: impl Into<String>,
         api_key: String,
         api_url: String,
         model: String,
@@ -30,12 +35,21 @@ impl OpenAiProvider {
             model,
             user_agent: user_agent.unwrap_or_else(|| "ignis/0.1.0".to_string()),
             reasoning_effort,
+            provider_name: provider_name.into(),
         }
     }
 }
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
+    fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
     async fn chat_stream(
         &self,
         system_prompt: &str,

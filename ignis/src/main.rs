@@ -69,6 +69,11 @@ async fn main() -> Result<(), anyhow::Error> {
     if let Err(e) = ignis::logger::init(&ignis_home.join("logs")) {
         eprintln!("Failed to initialize logger: {}", e);
     }
+
+    // Telemetry — no-op unless IGNIS_ENABLE_TELEMETRY=1 (or [telemetry] enabled).
+    // Guard's Drop flushes + shuts down OTel providers on exit.
+    let _telemetry_guard = ignis::telemetry::init(&config);
+
     let storage_dir = project_sessions_dir(&storage_root, &cwd);
     let session_manager = SessionManager::new(storage_dir.clone());
     let auto_resume = config.auto_resume_last_session.unwrap_or(false);
@@ -97,6 +102,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let active_model = config
         .active_model()
         .unwrap_or_else(|| "default".to_string());
+
+    ignis::telemetry::record_session_start(&active_provider, &active_model);
 
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {

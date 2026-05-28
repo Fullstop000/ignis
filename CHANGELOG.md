@@ -7,12 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.16.0] - 2026-05-28
+## [0.17.0] - 2026-05-28
 
 ### Added
 - Agent permission control — every tool call now passes through a `default`/`bypassPermissions` mode gate; sensitive tools (`bash`, `edit_file`, `create_file`, `web_fetch`, `agent`, MCP) prompt with a 3-option picker (Approve once / Approve session / Deny). Built-in safety floor: ~30-command read-only auto-allow set (`ls`, `cat`, `git status`, …), protected paths (`.git/**`, `.ignis/**`, shell init), and a `rm -rf /` / `rm -rf ~` / `rm -rf $HOME` circuit breaker that always asks even under bypass.
-- `--permission-mode <default|bypassPermissions>` CLI flag and persisted `permission_mode` in `state.json`.
+- `--permission-mode <default|bypassPermissions>` CLI flag and persisted `permission_mode` in `state.json`. Typo'd values error out with a clear message listing valid options.
 - `--afk` CLI flag + `/afk` slash command — AFK mode auto-approves tool calls and auto-dismisses `ask_user` with structured guidance. Mid-session `/afk`-to-enable opens a confirmation picker (asymmetric gate); `/afk`-to-disable fires immediately. One-shot CLI (`ignis "do X"`) implicitly enables AFK so headless runs never hang on a missing TTY.
+- Opt-in OpenTelemetry export of session traces and token-usage metrics over OTLP — enable with `IGNIS_ENABLE_TELEMETRY=1`.
+- `/telemetry` — show OpenTelemetry export status.
+
+## [0.16.0] - 2026-05-28
+
+### Added
 - `benchmarks/terminal-bench/` — Harbor adapter that runs ignis as a Terminal-Bench 2 agent.
 
 ### Changed

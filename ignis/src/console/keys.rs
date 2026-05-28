@@ -410,6 +410,8 @@ pub(crate) async fn handle_key(
                     app.show_mcp_picker();
                 } else if command == "/afk" && arg_count == 1 {
                     handle_afk_toggle(app, picker_tx).await;
+                } else if command == "/telemetry" && arg_count == 1 {
+                    app.show_telemetry_status();
                 } else if command.starts_with('/')
                     && app
                         .skills

@@ -30,6 +30,14 @@ impl MockProvider {
 
 #[async_trait]
 impl LlmProvider for MockProvider {
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+
     async fn chat_stream(
         &self,
         _system_prompt: &str,
@@ -506,6 +514,14 @@ struct SteerOnceProvider {
 
 #[async_trait]
 impl LlmProvider for SteerOnceProvider {
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+
     async fn chat_stream(
         &self,
         _system_prompt: &str,
@@ -604,6 +620,7 @@ async fn session_captures_real_token_usage() {
         LlmResponseDelta::Usage(Usage {
             input_tokens: 1000,
             output_tokens: 50,
+            reasoning_tokens: 0,
             cache_read_tokens: 200,
             cache_write_tokens: 0,
         }),

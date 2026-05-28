@@ -80,6 +80,14 @@ struct GeminiFunctionCall {
 
 #[async_trait]
 impl LlmProvider for GeminiProvider {
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
+    fn provider_name(&self) -> &str {
+        "gemini"
+    }
+
     async fn chat_stream(
         &self,
         system_prompt: &str,

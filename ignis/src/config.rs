@@ -54,6 +54,19 @@ pub struct Config {
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+}
+
+/// OpenTelemetry export. Off by default — telemetry is also gated at runtime by
+/// the `IGNIS_ENABLE_TELEMETRY=1` env var, which overrides this config. Standard
+/// OTEL_* env vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
+/// `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_RESOURCE_ATTRIBUTES`, …) configure the
+/// destination — ignis does not duplicate them in TOML.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TelemetryConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// MCP (Model Context Protocol) server configuration. Each entry under
@@ -243,6 +256,7 @@ pub fn build_provider(config: &Config) -> Result<Box<dyn LlmProvider>, anyhow::E
             let api_key = prov_cfg.require(prov_cfg.api_key.clone(), "openai", "api_key")?;
             let api_url = prov_cfg.require(prov_cfg.api_url.clone(), "openai", "api_url")?;
             Ok(Box::new(crate::provider::OpenAiProvider::new(
+                "openai",
                 api_key,
                 api_url,
                 model,
@@ -272,6 +286,7 @@ pub fn build_provider(config: &Config) -> Result<Box<dyn LlmProvider>, anyhow::E
                 .clone()
                 .unwrap_or_else(|| "KimiCLI/1.44.0".to_string());
             Ok(Box::new(crate::provider::OpenAiProvider::new(
+                "kimi-code",
                 api_key,
                 api_url,
                 model,
@@ -285,6 +300,7 @@ pub fn build_provider(config: &Config) -> Result<Box<dyn LlmProvider>, anyhow::E
             let api_url =
                 prov_cfg.require(prov_cfg.api_url.clone(), "Moonshot Platform CN", "api_url")?;
             Ok(Box::new(crate::provider::OpenAiProvider::new(
+                "Moonshot Platform CN",
                 api_key,
                 api_url,
                 model,

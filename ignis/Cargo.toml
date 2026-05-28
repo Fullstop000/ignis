@@ -1,6 +1,6 @@
 [package]
 name = "ignis"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 description = "A single-binary, multi-provider AI coding agent for your terminal."
 license = "Apache-2.0"
@@ -32,6 +32,31 @@ rmcp = { version = "1.7", default-features = false, features = ["client", "trans
 toml_edit = "0.22"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+
+# `tracing` is always compiled — its `info_span!`/`#[instrument]` macros expand
+# to no-ops without a subscriber, so instrumentation lives next to the code with
+# no runtime cost when telemetry is disabled.
+tracing = "0.1"
+# The heavy OTel stack is opt-in via the `telemetry` Cargo feature.
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto", "tls-roots", "trace", "metrics"], optional = true }
+opentelemetry-semantic-conventions = { version = "0.32", optional = true }
+
+[features]
+default = ["telemetry"]
+# Enables OpenTelemetry export of traces + metrics. Runtime activation still
+# requires IGNIS_ENABLE_TELEMETRY=1; the feature flag controls compilation only.
+telemetry = [
+    "dep:tracing-subscriber",
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-semantic-conventions",
+]
 
 [dev-dependencies]
 portable-pty = "0.8"

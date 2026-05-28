@@ -9,6 +9,7 @@ pub mod provider;
 pub mod session;
 pub mod skills;
 pub mod state;
+pub mod telemetry;
 pub mod tools;
 pub use session::storage;
 pub mod console;
