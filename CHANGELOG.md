@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.2] - 2026-05-29
+
+### Fixed
+- `ignis upgrade` on Linux — downloads the musl release asset instead of a nonexistent gnu one (was failing with a 404).
+
 ## [0.25.1] - 2026-05-29
 
 ### Changed
