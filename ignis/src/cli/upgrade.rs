@@ -159,23 +159,48 @@ fn tag_from_release_url(url: &str) -> Result<String> {
     Ok(last.to_string())
 }
 
+/// Retry transient failures (connection resets, timeouts, 5xx) but not
+/// deterministic ones: a 4xx like 404 means a wrong asset URL and won't fix
+/// itself, so retrying just delays the error 3×. `None` (no HTTP status) is a
+/// connection/transport error — retry it.
+fn is_retryable(status: Option<reqwest::StatusCode>) -> bool {
+    status.is_none_or(|s| s.is_server_error())
+}
+
 async fn download(url: &str, dest: &Path) -> Result<()> {
-    let bytes = reqwest::Client::new()
-        .get(url)
-        .header(
-            reqwest::header::USER_AGENT,
-            format!("ignis-upgrade/{}", env!("CARGO_PKG_VERSION")),
-        )
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("HTTP error for {url}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("read body of {url}"))?;
-    std::fs::write(dest, &bytes).with_context(|| format!("write {}", dest.display()))?;
-    Ok(())
+    const MAX: u32 = 3;
+    let client = reqwest::Client::new();
+    // GitHub's release-asset CDN intermittently resets the TLS connection, so a
+    // single-shot GET surfaces a transient blip as a hard failure. Retry the
+    // transport before giving up; the next attempt almost always succeeds.
+    for attempt in 1..=MAX {
+        let fetch = async {
+            client
+                .get(url)
+                .header(
+                    reqwest::header::USER_AGENT,
+                    format!("ignis-upgrade/{}", env!("CARGO_PKG_VERSION")),
+                )
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await
+        }
+        .await;
+        match fetch {
+            Ok(bytes) => {
+                return std::fs::write(dest, &bytes)
+                    .with_context(|| format!("write {}", dest.display()));
+            }
+            Err(e) if attempt < MAX && is_retryable(e.status()) => {
+                eprintln!("download attempt {attempt}/{MAX} failed: {e}; retrying in 2s…");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(e) => return Err(e).with_context(|| format!("download {url}")),
+        }
+    }
+    unreachable!("loop returns on the final attempt")
 }
 
 fn extract_tar_gz(tarball: &Path, into: &Path) -> Result<()> {
@@ -374,6 +399,20 @@ mod tests {
             assert_eq!(mode, 0o755);
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn is_retryable_retries_transient_not_client_errors() {
+        use reqwest::StatusCode;
+        // Connection/transport error (no HTTP status) — the TLS-reset case.
+        assert!(is_retryable(None));
+        // 5xx is transient.
+        assert!(is_retryable(Some(StatusCode::INTERNAL_SERVER_ERROR)));
+        assert!(is_retryable(Some(StatusCode::SERVICE_UNAVAILABLE)));
+        // 4xx is deterministic — a 404 (wrong asset URL) must fail fast, not
+        // retry 3×.
+        assert!(!is_retryable(Some(StatusCode::NOT_FOUND)));
+        assert!(!is_retryable(Some(StatusCode::FORBIDDEN)));
     }
 
     #[test]

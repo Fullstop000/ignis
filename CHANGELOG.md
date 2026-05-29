@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `ignis upgrade` on Linux — downloads the musl release asset instead of a nonexistent gnu one (was failing with a 404).
+- `install.sh` and `ignis upgrade` — retry the download when GitHub's release CDN resets the connection, instead of failing on the first transient error.
 
 ## [0.25.1] - 2026-05-29
 

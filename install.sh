@@ -75,7 +75,22 @@ tmp=$(mktemp -d 2>/dev/null || mktemp -d -t ignis-install)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 echo "Downloading ${url}"
-curl -fsSL "$url" -o "$tmp/ignis.tar.gz"
+# GitHub's release-asset CDN intermittently resets the TLS connection (curl
+# exit 35 / SSL_ERROR_SYSCALL), which a single-shot download surfaces as a hard
+# failure. Retry a few times before giving up — the next attempt almost always
+# succeeds. (The failing command is the `until` condition, so `set -e` is fine.)
+attempt=1
+until curl -fsSL "$url" -o "$tmp/ignis.tar.gz"; do
+    if [ "$attempt" -ge 3 ]; then
+        echo "Download failed after 3 attempts: $url" >&2
+        echo "GitHub's release CDN may be unreachable from your network." >&2
+        echo "Retry, or download manually: https://github.com/$REPO/releases" >&2
+        exit 1
+    fi
+    echo "Download attempt $attempt failed; retrying in 2s..." >&2
+    attempt=$((attempt + 1))
+    sleep 2
+done
 tar -xzf "$tmp/ignis.tar.gz" -C "$tmp"
 
 src="$tmp/ignis-${VERSION}-${target}/ignis"
