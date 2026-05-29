@@ -7,10 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.23.0] - 2026-05-29
+## [0.24.0] - 2026-05-29
 
 ### Added
 - TB2 adapter — `-m provider/model@<effort>` suffix forces a reasoning level for the in-sandbox run.
+
+## [0.23.1] - 2026-05-29
+
+### Fixed
+- TB2 HTML report — caps each embedded agent log to a 512 KiB tail so a runaway run can't bloat the report to gigabytes.
+
+## [0.23.0] - 2026-05-29
+
+### Added
+- `[permissions]` config rules — pre-declare `allow`/`ask`/`deny` lists of `Tool(pattern)` rules (e.g. `bash(git *)`, `edit_file(src/**)`, `read_file(.env)`) so common tool calls stop prompting; evaluated deny > ask > allow, beneath the safety floor.
+- Permission picker "Always allow" — saves an arity-trimmed rule (e.g. `bash(git status *)`) to `state.json` so matching calls run silently in future sessions.
 
 ## [0.22.0] - 2026-05-29
 

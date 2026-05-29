@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
+use super::rule::RuleSet;
 use super::Mode;
 
 /// Mutable per-session state for the permission system. Wrapped in `Arc<RwLock>`
@@ -21,8 +22,13 @@ struct Inner {
     /// Tool names the user picked "Approve session" for. Keyed by tool name
     /// only (no argument patterns) — `bash` once approved means every
     /// subsequent `bash` call passes without prompting for this session.
-    /// Per-command allowlist grammar lands in v0.18.0.
     session_allow: HashSet<String>,
+    /// The user-rule layer: `config.toml` `[permissions]` rules with persisted
+    /// grants folded into `allow`. Consulted by `check()` on every tool call.
+    rules: RuleSet,
+    /// The persisted grant strings alone (config rules excluded), so an
+    /// "Always allow" click can re-write the full grant list to `state.json`.
+    grants: Vec<String>,
 }
 
 impl PermissionState {
@@ -30,9 +36,50 @@ impl PermissionState {
         Arc::new(Self {
             inner: RwLock::new(Inner {
                 mode,
-                session_allow: HashSet::new(),
+                ..Inner::default()
             }),
         })
+    }
+
+    /// Construct with a config-derived `RuleSet` and the persisted grants from
+    /// `state.json`; the grants fold into the rule set's `allow` list.
+    pub fn with_rules(mode: Mode, mut rules: RuleSet, grants: Vec<String>) -> Arc<Self> {
+        for g in &grants {
+            rules.add_grant(g);
+        }
+        Arc::new(Self {
+            inner: RwLock::new(Inner {
+                mode,
+                rules,
+                grants,
+                ..Inner::default()
+            }),
+        })
+    }
+
+    /// A clone of the live rule set, for feeding into `check()`.
+    pub fn rules_snapshot(&self) -> RuleSet {
+        self.inner
+            .read()
+            .expect("permissions lock poisoned")
+            .rules
+            .clone()
+    }
+
+    /// The persisted-grant strings, for re-writing `state.json`.
+    pub fn grants(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .expect("permissions lock poisoned")
+            .grants
+            .clone()
+    }
+
+    /// Fold a new "Always allow" grant into the live rules and the grant list.
+    pub fn add_grant(&self, grant: &str) {
+        let mut inner = self.inner.write().expect("permissions lock poisoned");
+        inner.rules.add_grant(grant);
+        inner.grants.push(grant.to_string());
     }
 
     pub fn mode(&self) -> Mode {
@@ -88,5 +135,44 @@ mod tests {
         s.add_session_allow("bash");
         assert!(s.is_session_allowed("bash"));
         assert!(!s.is_session_allowed("edit_file"));
+    }
+
+    #[test]
+    fn new_state_has_no_rules() {
+        let s = PermissionState::new(Mode::Off);
+        assert!(s.rules_snapshot().is_empty());
+        assert!(s.grants().is_empty());
+    }
+
+    #[test]
+    fn with_rules_folds_grants_into_allow() {
+        use crate::permissions::Decision;
+        let rules = RuleSet::from_strings(&[], &[], &["bash(rm -rf *)".to_string()]);
+        let grants = vec!["bash(git status *)".to_string()];
+        let s = PermissionState::with_rules(Mode::Off, rules, grants);
+        let snap = s.rules_snapshot();
+        // The config deny is present…
+        assert!(matches!(
+            snap.decide("bash", &serde_json::json!({"command": "rm -rf foo"})),
+            Some(Decision::Deny { .. })
+        ));
+        // …and the grant became an allow.
+        assert_eq!(
+            snap.decide("bash", &serde_json::json!({"command": "git status -s"})),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn add_grant_updates_live_rules_and_grant_list() {
+        use crate::permissions::Decision;
+        let s = PermissionState::new(Mode::Off);
+        s.add_grant("bash(cargo *)");
+        assert_eq!(s.grants(), vec!["bash(cargo *)".to_string()]);
+        assert_eq!(
+            s.rules_snapshot()
+                .decide("bash", &serde_json::json!({"command": "cargo build"})),
+            Some(Decision::Allow)
+        );
     }
 }

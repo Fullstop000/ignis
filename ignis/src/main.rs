@@ -55,7 +55,18 @@ async fn main() -> Result<(), anyhow::Error> {
             .and_then(ignis::permissions::Mode::parse)
             .unwrap_or_default()
     };
-    let permissions = ignis::permissions::runtime::PermissionState::new(resolved_mode);
+    // The user-declared rule layer: `[permissions]` from config.toml plus the
+    // persisted "always allow" grants from state.json (folded into `allow`).
+    let perm_rules = ignis::permissions::rule::RuleSet::from_strings(
+        &config.permissions.allow,
+        &config.permissions.ask,
+        &config.permissions.deny,
+    );
+    let permissions = ignis::permissions::runtime::PermissionState::with_rules(
+        resolved_mode,
+        perm_rules,
+        persisted_state.permission_grants.clone(),
+    );
 
     // 2. Resolve paths
     let home =
