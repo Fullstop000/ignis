@@ -4,8 +4,9 @@
 
 **Your AI coding agent, right in the terminal.**
 
-A single-binary, multi-provider coding agent — an interactive TUI and a one-shot
-CLI, with built-in tools, MCP servers, skills, and a permission system.
+Bring your own model — OpenAI, Anthropic, Gemini, DeepSeek, Kimi, or local
+Ollama — and switch between them mid-session, all from one fast, self-contained
+binary. No Node, no Python, no vendor lock-in.
 
 [![CI](https://github.com/Fullstop000/ignis/actions/workflows/ci.yml/badge.svg)](https://github.com/Fullstop000/ignis/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Fullstop000/ignis?sort=semver)](https://github.com/Fullstop000/ignis/releases)
