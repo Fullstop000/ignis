@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-05-29
+
 ### Changed
 - Internal — OpenAI-compatible providers (OpenAI, DeepSeek, Kimi, Moonshot) now share one `chat_stream` implementation and SSE parser instead of copy-pasted logic. No user-visible change.
 
