@@ -68,6 +68,7 @@ pub fn build_system_prompt(cwd: &Path) -> String {
  - If an approach fails, diagnose the failure before switching tactics.
  - Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.
  - Report outcomes faithfully: if verification fails or was not run, say so explicitly.
+ - Before finishing, check your work against the task's exact requirements: confirm any required output exists at the precise path and format requested (use the absolute path the task gives), and remove temporary or build artifacts you created from the deliverable location.
  - Carefully consider reversibility and blast radius. Local, reversible actions like editing files or running tests are usually fine. Actions that affect shared systems, publish state, delete data, or otherwise have high blast radius should be explicitly authorized by the user.
 
 # Tone & Style
@@ -298,6 +299,12 @@ async fn consume_turn_stream(
                         delta: format!("\n[Error in stream: {}]", err_msg),
                     })
                     .await;
+                // A streamed transport error (e.g. connection reset) means the
+                // connection is broken; remaining items are unreliable and a
+                // failing stream can re-yield the same error indefinitely. Stop
+                // consuming rather than spin — otherwise the turn loops until the
+                // agent timeout, emitting the same error millions of times.
+                break;
             }
             Ok(delta) => match delta {
                 LlmResponseDelta::Text(content) => {
@@ -918,6 +925,39 @@ mod tests {
 
         assert_eq!(with_catalog("BASE", None, None), "BASE");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn stream_error_stops_consuming_instead_of_looping() {
+        use futures_util::stream::StreamExt;
+        // Simulate a broken connection that re-yields the same transport error.
+        // Pre-fix, consume_turn_stream emitted the error once per item; a truly
+        // stuck stream looped millions of times until the agent timeout.
+        let errs: Vec<Result<LlmResponseDelta, anyhow::Error>> = (0..50)
+            .map(|_| {
+                Err(anyhow::anyhow!(
+                    "error reading a body from connection: connection reset"
+                ))
+            })
+            .collect();
+        let stream = futures_util::stream::iter(errs).boxed();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let result = consume_turn_stream(stream, &tx).await;
+        drop(tx);
+
+        let mut errors = 0;
+        while let Some(ev) = rx.recv().await {
+            if let AgentEvent::MessageUpdate { delta } = ev {
+                if delta.contains("Error in stream") {
+                    errors += 1;
+                }
+            }
+        }
+        assert_eq!(
+            errors, 1,
+            "should stop after the first stream error, not loop over all 50"
+        );
+        assert!(result.assistant_content.is_empty());
     }
 
     #[test]

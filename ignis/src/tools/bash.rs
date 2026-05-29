@@ -17,6 +17,21 @@ impl BashTool {
 
 const BASH_OUTPUT_LIMIT: usize = 50 * 1024;
 
+/// Truncate `s` to at most `limit` bytes without splitting a UTF-8 character.
+/// `String::truncate` panics if the byte index lands inside a multibyte char,
+/// which happens on binary/CJK command output (e.g. `cat`-ing an ISO); back off
+/// to the nearest char boundary first.
+fn truncate_on_char_boundary(s: &mut String, limit: usize) {
+    if s.len() <= limit {
+        return;
+    }
+    let mut end = limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 #[async_trait]
 impl AgentTool for BashTool {
     fn name(&self) -> &str {
@@ -89,7 +104,7 @@ impl AgentTool for BashTool {
                 }
 
                 if combined.len() > BASH_OUTPUT_LIMIT {
-                    combined.truncate(BASH_OUTPUT_LIMIT);
+                    truncate_on_char_boundary(&mut combined, BASH_OUTPUT_LIMIT);
                     combined.push_str("\n... [truncated]");
                 }
 
@@ -140,5 +155,19 @@ mod tests {
 
         assert!(res.is_error);
         assert!(res.content.contains("timed out"));
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_never_splits_a_multibyte_char() {
+        // 'é' (U+00E9) is 2 bytes; a 10-char string is 20 bytes. Truncating to
+        // an odd byte index lands mid-char — `String::truncate(5)` would panic.
+        let mut s = "é".repeat(10);
+        truncate_on_char_boundary(&mut s, 5);
+        assert!(s.is_char_boundary(s.len()));
+        assert_eq!(s.len(), 4); // largest char boundary <= 5
+                                // Shorter-than-limit strings are left untouched.
+        let mut short = "abc".to_string();
+        truncate_on_char_boundary(&mut short, 50 * 1024);
+        assert_eq!(short, "abc");
     }
 }

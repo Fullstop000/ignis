@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.1] - 2026-05-29
+
+### Fixed
+- Streaming transport errors (e.g. connection reset) now end the turn instead of looping — a broken stream could previously spin until the agent timeout, emitting the same error millions of times.
+- `bash` tool no longer panics when truncating binary or multibyte output at its size cap (it backs off to a UTF-8 char boundary).
+- TB2 adapter passes the prompt after `--`, so task instructions that begin with `-` no longer abort the run as an unknown flag.
+
+### Changed
+- Agent system prompt nudges verifying the task's exact required output path/format and cleaning up build artifacts before finishing.
+
 ## [0.26.0] - 2026-05-29
 
 ### Added
