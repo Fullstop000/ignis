@@ -670,6 +670,37 @@ impl App {
         self.add_assistant_notice(lines.join("\n"));
     }
 
+    /// `/sessions` — walk this project's session store and render a compact
+    /// stats block inline. The full sortable view stays in `ignis sessions
+    /// export --html`.
+    pub(crate) fn show_sessions_stats(&mut self) {
+        let projects_dir = match dirs::home_dir() {
+            Some(h) => h.join(".ignis/projects"),
+            None => {
+                self.add_assistant_notice("Could not locate home directory.".to_string());
+                return;
+            }
+        };
+        let records = match crate::cli::sessions::walk_sessions(
+            &projects_dir,
+            crate::cli::sessions::Scope::Current,
+            &self.cwd,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                self.add_assistant_notice(format!("Failed to load sessions: {e}"));
+                return;
+            }
+        };
+        let project_name = self
+            .cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project");
+        let block = crate::cli::sessions::render_sessions_inline(&records, project_name);
+        self.add_assistant_notice(block);
+    }
+
     pub(crate) fn start_new_session(&mut self, session_id: String) {
         self.exit_pending = false;
         self.session_id = session_id;
@@ -1102,6 +1133,7 @@ mod tests {
                 "/mcp",
                 "/afk",
                 "/telemetry",
+                "/sessions",
             ]
         );
     }

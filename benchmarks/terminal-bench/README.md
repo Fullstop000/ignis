@@ -10,8 +10,13 @@ benchmarks/terminal-bench/
 ├── ignis_agent/
 │   ├── __init__.py
 │   └── agent.py            # IgnisAgent (BaseInstalledAgent subclass)
+├── run.sh                  # reproducible runner with sane defaults + env presets
+├── scripts/                # stdlib-only result aggregator + HTML report generator
+├── history/                # committed per-run CSVs (linked from ../RESULTS.md)
 └── README.md
 ```
+
+Run history and headline scores live in [`../RESULTS.md`](../RESULTS.md).
 
 ## How it works
 
@@ -42,6 +47,11 @@ Add more in `_PROVIDERS` at the top of `ignis_agent/agent.py` — anything ignis
 already knows about (`ollama`, `kimi-code`, `Moonshot Platform CN`) just needs
 an entry.
 
+**Web search (optional).** If `BRAVE_API_KEY` (preferred) or `TAVILY_API_KEY` is
+in the adapter's env, it writes a `[web_search]` block into the sandbox config so
+the in-sandbox `web_search` tool works — needed for tasks that require looking
+something up. Absent → the tool stays disabled.
+
 ## Setup
 
 ```bash
@@ -59,26 +69,45 @@ Docker must be installed and running.
 
 ## Run a real benchmark with ignis
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+Use `run.sh` — it reads keys from `~/.ignis/config.toml`, picks sane defaults,
+and aggregates nothing on its own (run the `scripts/` afterward). Keys never
+print.
 
-uv run harbor run \
-  -d terminal-bench/terminal-bench-2 \
-  -m anthropic/claude-haiku-4-5 \
-  --agent-import-path ignis_agent.agent:IgnisAgent
+```bash
+./run.sh                                   # deepseek/deepseek-v4-flash@max on Daytona
+MODEL=anthropic/claude-haiku-4-5 ./run.sh  # any wired provider
+ENV=docker  ./run.sh                       # local, no cloud quota
+ENV=novita  ./run.sh                       # cheapest cloud, roomy disk
 ```
 
-Add `-n 32 --env daytona` (and `DAYTONA_API_KEY`) to fan out trials on Daytona
-sandboxes. The Harbor docs cover the rest:
-<https://www.harborframework.com/docs/tutorials/running-terminal-bench>.
+It sets `--max-retries 2` (a transient cloud blip retries the trial instead of
+crashing the whole job) and `--agent-timeout-multiplier 2.0` (compute-heavy
+tasks — builds, ML training — need more than the stock budget). Override any
+default via env: `MODEL`, `ENV`, `DATASET`, `NCONC`, `STORAGE_MB`,
+`TIMEOUT_MULT`, `MAX_RETRIES`.
+
+### Disk vs concurrency (the one real tradeoff)
+
+Tasks that install heavy wheels (torch, cudnn) need real disk, or the
+**verifier** dies with *"No space left on device"* and never tests the agent's
+work. But on Daytona, `disk × concurrency` must fit the ~50 GB account quota, so
+bigger disk forces lower `-n`. `run.sh` presets this per env:
+
+| `ENV`    | disk / sandbox | `-n` | notes |
+| -------- | -------------- | ---- | ----- |
+| `daytona`| 16 GB          | 3    | fits the quota; slower |
+| `novita` | 20 GB          | 8    | no tight quota — fast + roomy (cheapest, see RESULTS) |
+| `docker` | host disk      | 4    | local; no `--override-storage-mb` |
+
+So disk-heavy suites are better on local Docker or Novita than quota-limited
+Daytona. Note: any `--override-storage-mb` already disqualifies leaderboard
+submission — this is for measuring, not submitting.
+
+After a run, aggregate + report with `scripts/` (see [`../RESULTS.md`](../RESULTS.md)).
 
 ## Open knobs
 
-The first pass is intentionally small. Likely follow-ups once we have a score:
-
-- pin `IGNIS_VERSION` so a re-run is reproducible
-- emit an ATIF trajectory in `populate_context_post_run` (we currently only
-  tee raw stdout) so token counts + cost surface in Harbor's report
-- expose ignis-specific `CliFlag`s (reasoning effort, model context override)
-
-For now: install, model selection, one-shot invocation, log tee. That's it.
+- emit an ATIF trajectory in `populate_context_post_run` (we currently only tee
+  raw stdout) so cost surfaces in Harbor's report alongside the token counts
+- the ~17 capability-ceiling failures from the first run move with a stronger
+  model, not the harness

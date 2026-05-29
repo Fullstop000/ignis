@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.25.4] - 2026-05-29
+## [0.26.1] - 2026-05-29
 
 ### Fixed
 - Streaming transport errors (e.g. connection reset) now end the turn instead of looping — a broken stream could previously spin until the agent timeout, emitting the same error millions of times.
@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Agent system prompt nudges verifying the task's exact required output path/format and cleaning up build artifacts before finishing.
+
+## [0.26.0] - 2026-05-29
+
+### Added
+- `/sessions` — slash command that shows a compact session-stats block inline in the TUI for the current project.
+
+### Fixed
+- `ignis sessions export --html` — session timestamps now render correctly (the v0.21.0 report read milliseconds as seconds and produced year-58371 dates).
+
+### Changed
 - Internal — fixed a stale `ignis upgrade` doc comment (it described the JSON API the code no longer uses) and de-duplicated the request User-Agent string. No user-visible change.
 
 ## [0.25.3] - 2026-05-29

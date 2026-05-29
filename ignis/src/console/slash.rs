@@ -47,6 +47,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: Cow::Borrowed("/telemetry"),
         description: Cow::Borrowed("Show OpenTelemetry export status"),
     },
+    SlashCommand {
+        name: Cow::Borrowed("/sessions"),
+        description: Cow::Borrowed("Show session stats for this project"),
+    },
 ];
 
 pub(crate) fn slash_suggestions(

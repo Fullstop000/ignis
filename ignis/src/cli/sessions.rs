@@ -57,6 +57,10 @@ pub struct SessionRecord {
     pub started_at: Option<u64>,
     pub last_modified: Option<u64>,
     pub message_count: u64,
+    /// Messages with `role == "assistant"` (text + tool-call announcements).
+    pub agent_messages: u64,
+    /// Messages with `role == "user"` (each is one "turn" in the inline view).
+    pub user_queries: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
@@ -119,7 +123,13 @@ pub fn parse_session(
                     .and_then(|p| p.get("start_dir"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                rec.started_at = record.get("timestamp").and_then(|v| v.as_u64());
+                // The writer stamps `timestamp` in milliseconds
+                // (`storage::Persister::record` → `as_millis()`). Convert to
+                // seconds so `format_timestamp_*` doesn't render year 58371.
+                rec.started_at = record
+                    .get("timestamp")
+                    .and_then(|v| v.as_u64())
+                    .map(|ms| ms / 1000);
             }
             "message" => {
                 rec.message_count += 1;
@@ -130,6 +140,7 @@ pub fn parse_session(
                 let role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
 
                 if role == "assistant" {
+                    rec.agent_messages += 1;
                     if let Some(tcs) = payload.get("tool_calls").and_then(|v| v.as_array()) {
                         for tc in tcs {
                             let name = tc
@@ -143,6 +154,8 @@ pub fn parse_session(
                             }
                         }
                     }
+                } else if role == "user" {
+                    rec.user_queries += 1;
                 } else if role == "tool" {
                     if let Some(content) = payload.get("content").and_then(|v| v.as_str()) {
                         if let Ok(parsed) = serde_json::from_str::<Value>(content) {
@@ -218,9 +231,9 @@ pub fn walk_sessions(projects_dir: &Path, scope: Scope, cwd: &Path) -> Result<Ve
     Ok(out)
 }
 
-/// Format a Unix-epoch second count as `YYYY-MM-DD-HHMMSS` in UTC. Pure
-/// `std` — avoids pulling chrono/time as a dep just for one filename.
-pub fn format_timestamp_utc(epoch_secs: u64) -> String {
+/// Decompose a Unix-epoch second count into UTC civil-time parts. Pure `std` —
+/// Howard Hinnant's algorithm; avoids pulling chrono/time as a dep.
+fn epoch_to_civil(epoch_secs: u64) -> (i64, u32, u32, u64, u64, u64) {
     const SECS_PER_DAY: u64 = 86_400;
     let days = epoch_secs / SECS_PER_DAY;
     let rem = epoch_secs % SECS_PER_DAY;
@@ -228,8 +241,6 @@ pub fn format_timestamp_utc(epoch_secs: u64) -> String {
     let m = (rem % 3600) / 60;
     let s = rem % 60;
 
-    // Civil-from-days: derive (year, month, day) from days since 1970-01-01.
-    // Howard Hinnant's algorithm — shift the epoch so we count from 0000-03-01.
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = (z - era * 146_097) as u64;
@@ -240,8 +251,21 @@ pub fn format_timestamp_utc(epoch_secs: u64) -> String {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let year = if month <= 2 { y + 1 } else { y };
+    (year, month, d, h, m, s)
+}
 
-    format!("{year:04}-{month:02}-{d:02}-{h:02}{m:02}{s:02}")
+/// Format a Unix-epoch second count as `YYYY-MM-DD-HHMMSS` in UTC. Used for
+/// the default HTML output filename.
+pub fn format_timestamp_utc(epoch_secs: u64) -> String {
+    let (y, mo, d, h, m, s) = epoch_to_civil(epoch_secs);
+    format!("{y:04}-{mo:02}-{d:02}-{h:02}{m:02}{s:02}")
+}
+
+/// Format a Unix-epoch second count as `YYYY-MM-DD HH:MM` in UTC. Used for the
+/// `/sessions` inline table, which doesn't need second-precision.
+pub fn format_timestamp_short(epoch_secs: u64) -> String {
+    let (y, mo, d, h, m, _) = epoch_to_civil(epoch_secs);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
 }
 
 pub fn default_output_path(cwd: &Path, epoch_secs: u64) -> PathBuf {
@@ -440,6 +464,90 @@ pub fn render_html(records: &[SessionRecord], scope: Scope, generated_at: u64) -
     format!("{}{}{}", header, body, footer)
 }
 
+/// Human-friendly token count (`120` → `120`, `1500` → `1.5k`, `1_234_000` →
+/// `1.2M`). Kept local so this module doesn't pull in `crate::console`.
+fn fmt_tokens(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+/// Render a compact stats block for the TUI `/sessions` slash command. Wrapped
+/// in a markdown fenced code block so column alignment survives the renderer.
+/// Shows the top-N most recently modified sessions plus an "N older" hint.
+pub fn render_sessions_inline(records: &[SessionRecord], project_name: &str) -> String {
+    const TOP_N: usize = 5;
+
+    let n = records.len();
+    let total_tokens: u64 = records
+        .iter()
+        .map(|r| r.input_tokens + r.output_tokens)
+        .sum();
+    let total_tools: u64 = records.iter().map(|r| r.tool_call_count).sum();
+    let total_errors: u64 = records.iter().map(|r| r.tool_error_count).sum();
+
+    let summary = format!(
+        "{} · {} session{} · {} tokens · {} tool calls · {} error{}",
+        project_name,
+        n,
+        if n == 1 { "" } else { "s" },
+        fmt_tokens(total_tokens),
+        total_tools,
+        total_errors,
+        if total_errors == 1 { "" } else { "s" },
+    );
+
+    let mut out = String::new();
+    out.push_str("**Sessions stats**\n\n");
+    out.push_str(&summary);
+    out.push_str("\n\n");
+
+    if records.is_empty() {
+        out.push_str(
+            "No sessions found in this project.\n\
+             → Run `ignis sessions export --html --scope all` to see other projects.",
+        );
+        return out;
+    }
+
+    let mut sorted: Vec<&SessionRecord> = records.iter().collect();
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.last_modified.unwrap_or(0)));
+    let visible = sorted.iter().take(TOP_N);
+    let older = sorted.len().saturating_sub(TOP_N);
+
+    // Plain (non-fenced) lines — markdown renderer preserves multi-space runs
+    // within a span, and a fenced block would draw a stray "code" label.
+    out.push_str(&format!(
+        "{:<17}{:>6}{:>8}{:>9}{:>8}\n",
+        "STARTED", "MSGS", "TURNS", "TOK", "TOOLS"
+    ));
+    for r in visible {
+        let started = r
+            .started_at
+            .map(format_timestamp_short)
+            .unwrap_or_else(|| "?".to_string());
+        let tokens = fmt_tokens(r.input_tokens + r.output_tokens);
+        out.push_str(&format!(
+            "{:<17}{:>6}{:>8}{:>9}{:>8}\n",
+            started, r.agent_messages, r.user_queries, tokens, r.tool_call_count
+        ));
+    }
+    if older > 0 {
+        out.push_str(&format!(
+            "─ {} older session{} ─\n",
+            older,
+            if older == 1 { "" } else { "s" }
+        ));
+    }
+    out.push('\n');
+    out.push_str("→ Run `ignis sessions export --html` for the full sortable report.");
+    out
+}
+
 /// Inner, IO-mockable variant for tests. `is_tty` is the caller's view of
 /// whether stdin is interactive.
 fn resolve_scope_inner(flag: Option<Scope>, is_tty: bool) -> Result<Scope> {
@@ -501,13 +609,15 @@ mod tests {
     use super::*;
 
     fn fixture_jsonl() -> String {
+        // Timestamps are milliseconds — that's what `storage::Persister::record`
+        // writes via `SystemTime::duration_since(UNIX_EPOCH).as_millis()`.
         [
-            r#"{"type":"session_meta","timestamp":1779800000,"payload":{"id":"sess-abc","start_dir":"/home/u/proj"}}"#,
-            r#"{"type":"message","timestamp":1779800001,"payload":{"role":"user","content":"hi"}}"#,
-            r#"{"type":"message","timestamp":1779800002,"payload":{"role":"assistant","tool_calls":[{"id":"1","type":"function","function":{"name":"read","arguments":"{}"}},{"id":"2","type":"function","function":{"name":"bash","arguments":"{}"}}]}}"#,
-            r#"{"type":"message","timestamp":1779800003,"payload":{"role":"tool","name":"read","tool_call_id":"1","content":"{\"result\":\"ok\",\"is_error\":false}"}}"#,
-            r#"{"type":"message","timestamp":1779800004,"payload":{"role":"tool","name":"bash","tool_call_id":"2","content":"{\"result\":\"boom\",\"is_error\":true}"}}"#,
-            r#"{"type":"message","timestamp":1779800005,"payload":{"role":"assistant","content":"done"}}"#,
+            r#"{"type":"session_meta","timestamp":1779800000000,"payload":{"id":"sess-abc","start_dir":"/home/u/proj"}}"#,
+            r#"{"type":"message","timestamp":1779800001000,"payload":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"message","timestamp":1779800002000,"payload":{"role":"assistant","tool_calls":[{"id":"1","type":"function","function":{"name":"read","arguments":"{}"}},{"id":"2","type":"function","function":{"name":"bash","arguments":"{}"}}]}}"#,
+            r#"{"type":"message","timestamp":1779800003000,"payload":{"role":"tool","name":"read","tool_call_id":"1","content":"{\"result\":\"ok\",\"is_error\":false}"}}"#,
+            r#"{"type":"message","timestamp":1779800004000,"payload":{"role":"tool","name":"bash","tool_call_id":"2","content":"{\"result\":\"boom\",\"is_error\":true}"}}"#,
+            r#"{"type":"message","timestamp":1779800005000,"payload":{"role":"assistant","content":"done"}}"#,
         ]
         .join("\n")
     }
@@ -526,6 +636,9 @@ mod tests {
         assert_eq!(rec.project_start_dir.as_deref(), Some("/home/u/proj"));
         assert_eq!(rec.started_at, Some(1779800000));
         assert_eq!(rec.message_count, 5);
+        // 5 messages in fixture = 1 user + 2 assistant + 2 tool.
+        assert_eq!(rec.agent_messages, 2);
+        assert_eq!(rec.user_queries, 1);
         assert_eq!(rec.input_tokens, 1000);
         assert_eq!(rec.output_tokens, 50);
         assert_eq!(rec.reasoning_tokens, 10);
@@ -598,6 +711,8 @@ mod tests {
             started_at: Some(1735787045),
             last_modified: Some(1735787100),
             message_count: 10,
+            agent_messages: 6,
+            user_queries: 3,
             input_tokens: 1234,
             output_tokens: 56,
             reasoning_tokens: 7,
@@ -660,6 +775,63 @@ mod tests {
             p.to_string_lossy(),
             "/tmp/work/ignis-sessions-2025-01-02-030405.html"
         );
+    }
+
+    #[test]
+    fn format_timestamp_short_drops_seconds() {
+        assert_eq!(format_timestamp_short(1735787045), "2025-01-02 03:04");
+    }
+
+    #[test]
+    fn fmt_tokens_buckets_correctly() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1500), "1.5k");
+        assert_eq!(fmt_tokens(120_000), "120.0k");
+        assert_eq!(fmt_tokens(1_234_000), "1.2M");
+    }
+
+    fn record_with(started: u64, agent: u64, user: u64, in_tok: u64, tools: u64) -> SessionRecord {
+        SessionRecord {
+            session_id: format!("sess-{started}"),
+            project_slug: "p".to_string(),
+            started_at: Some(started),
+            last_modified: Some(started),
+            agent_messages: agent,
+            user_queries: user,
+            input_tokens: in_tok,
+            tool_call_count: tools,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn render_sessions_inline_shows_summary_and_pointer() {
+        let recs = vec![record_with(1735787045, 38, 4, 18_000, 67)];
+        let s = render_sessions_inline(&recs, "ignis");
+        assert!(s.contains("**Sessions stats**"));
+        assert!(s.contains("ignis · 1 session ·"));
+        assert!(s.contains("18.0k tokens"));
+        assert!(s.contains("67 tool calls"));
+        assert!(s.contains("ignis sessions export --html"));
+    }
+
+    #[test]
+    fn render_sessions_inline_caps_at_top_n_and_emits_older_hint() {
+        let recs: Vec<SessionRecord> = (0..7)
+            .map(|i| record_with(1_735_787_045 + i * 86_400, 10, 1, 1000, 5))
+            .collect();
+        let s = render_sessions_inline(&recs, "ignis");
+        // 5 rendered rows, 2 older.
+        assert_eq!(s.matches("2025-").count(), 5, "rendered = {s}");
+        assert!(s.contains("─ 2 older sessions ─"));
+    }
+
+    #[test]
+    fn render_sessions_inline_empty_shows_notice() {
+        let s = render_sessions_inline(&[], "ignis");
+        assert!(s.contains("ignis · 0 sessions"));
+        assert!(s.contains("No sessions found"));
     }
 
     #[test]

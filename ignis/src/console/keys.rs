@@ -412,6 +412,8 @@ pub(crate) async fn handle_key(
                     handle_afk_toggle(app, picker_tx).await;
                 } else if command == "/telemetry" && arg_count == 1 {
                     app.show_telemetry_status();
+                } else if command == "/sessions" && arg_count == 1 {
+                    app.show_sessions_stats();
                 } else if command.starts_with('/')
                     && app
                         .skills

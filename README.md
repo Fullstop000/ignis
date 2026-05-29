@@ -1,99 +1,99 @@
+<div align="center">
+
 # 🔥 Ignis
 
+**Your AI coding agent, right in the terminal.**
+
 [![CI](https://github.com/Fullstop000/ignis/actions/workflows/ci.yml/badge.svg)](https://github.com/Fullstop000/ignis/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Fullstop000/ignis?sort=semver)](https://github.com/Fullstop000/ignis/releases)
 [![codecov](https://codecov.io/gh/Fullstop000/ignis/graph/badge.svg)](https://codecov.io/gh/Fullstop000/ignis)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A single-binary, multi-provider AI coding agent for your terminal — an interactive
-TUI and a one-shot CLI, with built-in tools.
+<img src="assets/demo.png" alt="Ignis running in the terminal" width="820">
 
-## Features
+</div>
 
-- **Two modes** — a native terminal TUI (`ratatui` + `crossterm`) and a one-shot CLI.
-- **Multiple LLM providers** — OpenAI, DeepSeek, Kimi, Anthropic, Gemini, Ollama
-  (anything OpenAI-compatible), selected in config.
-- **Streaming agent loop** — incremental text + reasoning, with parallel or
-  sequential tool execution and lifecycle hooks.
-- **Built-in tools** — `read_file`, `create_file`, `edit_file`, `list_dir`,
-  `grep`, `glob`, `bash`, `web_fetch`, `web_search` (switchable Brave / Tavily
-  backends), and `agent` (delegate a subtask to a one-level sub-agent).
-- **Sessions** — project-scoped JSONL history, `--resume`, auto-resume, and
-  slash commands (`/resume`, `/clear`, `/compact`, `/copy`, `/model`).
-- **Runtime model switching** — `/model` picks the provider/model and (for
-  reasoning models) the effort level, and saves it back to your config.
-- **Permission modes** — every tool call passes a gate; sensitive tools prompt
-  with approve-once / approve-session / deny. `/afk` opens a picker to enter
-  either *Hands-free* (auto-approve tools, still answer `ask_user`) or *Fully
-  unattended* (auto-approve everything, dismiss `ask_user`). Built-in safety
-  floor (`rm -rf /` family, `.git/**`, `.ignis/**`, shell init files) always
-  asks under Off/Hands-free and hard-denies under Fully unattended. See
-  [`docs/permissions.md`](docs/permissions.md).
-- **Single binary** — no external runtime dependencies.
-
-> `/copy` (copy the last reply to the clipboard) uses a platform clipboard tool:
-> `pbcopy` (macOS), `clip` (Windows), `clip.exe` (WSL) — all built in. On a Linux
-> desktop, install `wl-clipboard` (`wl-copy`) or `xclip`.
+---
 
 ## Install
-
-One-liner (Linux / macOS — drops the binary in `~/.ignis/bin`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Fullstop000/ignis/master/install.sh | sh
 ```
 
-Override the version or install dir:
+Drops the binary in `~/.ignis/bin`. Already installed? Update in place with
+`ignis upgrade`.
+
+<details>
+<summary>Other ways to install</summary>
 
 ```bash
+# Pin a version or install dir
 curl -fsSL …/install.sh | IGNIS_VERSION=v0.14.1 IGNIS_INSTALL_DIR=/usr/local/bin sh
-```
 
-Already installed? Self-update in place:
-
-```bash
-ignis upgrade              # download + replace the running binary
-ignis upgrade --check      # report whether an update is available
+# Self-update
+ignis upgrade                     # download + replace the running binary
+ignis upgrade --check             # report whether an update is available
 ignis upgrade --version v0.14.1   # pin to a specific tag
+
+# From source (stable Rust toolchain)
+git clone https://github.com/Fullstop000/ignis.git
+cd ignis && cargo build --release   # → target/release/ignis
 ```
 
-From source (any platform, requires a stable Rust toolchain):
+Prebuilt binaries for Linux, macOS, and Windows are attached to every
+[GitHub Release](https://github.com/Fullstop000/ignis/releases).
+
+</details>
+
+## Quickstart
 
 ```bash
-git clone https://github.com/Fullstop000/ignis.git
-cd ignis
-cargo build --release
-# binary at target/release/ignis
+# 1. Point ignis at a provider and key
+mkdir -p ~/.ignis && cat > ~/.ignis/config.toml <<'TOML'
+model = "deepseek/deepseek-v4-flash"
+
+[providers.deepseek]
+api_key = "sk-your-deepseek-key"
+models  = ["deepseek-v4-flash"]
+TOML
+
+# 2. Launch the TUI…
+ignis
+
+# …or run one-shot from the shell
+ignis "fix the failing test in src/parser.rs"
 ```
 
-Prebuilt binaries for Linux, macOS, and Windows are attached to each
-[GitHub Release](https://github.com/Fullstop000/ignis/releases).
+See [Configure](#configure) for more providers and per-model options.
+
+## Features
+
+- **TUI + CLI** — a native terminal TUI (`ratatui` + `crossterm`) and a one-shot
+  CLI from the same binary.
+- **Bring your own model** — OpenAI, DeepSeek, Kimi, Anthropic, Gemini, Ollama,
+  and anything OpenAI-compatible. Switch model and reasoning effort at runtime
+  with `/model`.
+- **Streaming agent loop** — incremental text and reasoning, parallel or
+  sequential tool execution, and lifecycle hooks.
+- **Built-in tools** — read, write, and edit files; `grep`, `glob`, `list_dir`;
+  `bash`; `web_fetch` and `web_search`; `ask_user`; and `agent` to delegate a
+  subtask to a one-level sub-agent.
+- **MCP servers** — connect external stdio [MCP](https://modelcontextprotocol.io)
+  servers; their tools appear alongside the built-ins.
+- **Skills** — load reusable `SKILL.md` instruction sets on demand, sharable
+  across Claude Code, Codex, OpenCode, and Kimi.
+- **Permission system** — every tool call passes a gate, with a built-in safety
+  floor and user-declarable allow/ask/deny rules.
+- **Sessions** — project-scoped history with `--resume`, auto-resume, and
+  context compaction; export per-session stats with `ignis sessions export`.
+- **Single binary** — no external runtime dependencies, with built-in
+  self-update.
 
 ## Configure
 
-Ignis reads its configuration from `~/.ignis/config.toml`. Start from the example:
-
-```bash
-mkdir -p ~/.ignis
-cp config.example.toml ~/.ignis/config.toml
-# then edit ~/.ignis/config.toml and add your API key(s)
-```
-
-Minimal `config.toml` — the top-level `model` is the active selection
-(`provider/model`, an optional default); each provider lists the models it offers:
-
-```toml
-model = "kimi-code/kimi-for-coding"
-
-[providers."kimi-code"]
-api_key = "sk-your-kimi-key"
-api_url = "https://api.kimi.com/coding/v1"
-models  = ["kimi-for-coding"]
-```
-
-`/model` switches the active selection at runtime. It writes the choice to
-`~/.ignis/state.json` (which takes priority over the config default) — your
-`config.toml` is never auto-edited. A model entry is either a bare name or an
-inline table carrying that model's metadata:
+Ignis reads `~/.ignis/config.toml`. The top-level `model` is the active
+selection (`provider/model`); each provider lists the models it offers:
 
 ```toml
 model = "deepseek/deepseek-v4-flash"
@@ -106,63 +106,58 @@ models  = [
 ]
 ```
 
-- `reasoning` — effort levels (differ by model); the picker shows the effort
-  control only for models that declare them.
-- `context` — the window shown in the picker. Optional: windows are looked up by
-  name from [models.dev](https://models.dev) (cached at `~/.ignis/models.json`,
-  refreshed in the background); set it only to override or for a model models.dev
-  doesn't know.
+A model entry is either a bare name or an inline table with per-model metadata:
+`reasoning` (effort levels the picker offers) and `context` (window size, else
+looked up from [models.dev](https://models.dev)). `/model` switches the active
+selection at runtime, saving it to `~/.ignis/state.json` — your `config.toml` is
+never auto-edited. See [`config.example.toml`](config.example.toml) for every
+provider and optional `web_search` / `compaction` settings.
 
-> Your `~/.ignis/config.toml` holds secrets. The repo-level `config.toml` /
-> `config.yaml` are git-ignored on purpose — commit `config.example.toml` only.
+> Your `~/.ignis/config.toml` holds secrets and is never committed. The
+> repo-level `config.toml` is git-ignored on purpose — commit
+> `config.example.toml` only.
 
 ## Usage
 
-```bash
-ignis                                          # interactive TUI (default)
-ignis "fix the failing test in foo.rs"         # one-shot CLI
-ignis --resume                                 # resume the latest session
-ignis --resume <id> "follow-up prompt"         # resume + one-shot
-ignis --afk                                    # fully unattended (auto-approve + dismiss ask_user)
-ignis --help                                   # full flag/subcommand list
+| Command | What it does |
+| --- | --- |
+| `ignis` | Interactive TUI (default) |
+| `ignis "<prompt>"` | One-shot to stdout |
+| `ignis --resume [id] [prompt]` | Resume the latest (or given) session |
+| `ignis --afk` | Fully unattended: auto-approve tools, dismiss `ask_user` |
+| `ignis mcp …` | Manage MCP servers (`add`, `list`, `get`, `remove`, `enable`, `disable`) |
+| `ignis sessions export --html` | Export an HTML report of session stats |
+| `ignis upgrade` | Update to the latest release |
+| `ignis --help` | Full flag and subcommand list |
+
+In the TUI: `Enter` sends, `↑/↓` walk history, `Ctrl+D` exits. Output renders
+inline in the normal buffer, so scroll with your terminal/tmux as usual. Type
+`/` for slash-command suggestions:
+
+`/model` · `/afk` · `/resume` · `/clear` · `/compact` · `/copy` · `/skills` · `/mcp` · `/telemetry`
+
+> `/copy` uses a built-in platform clipboard tool: `pbcopy` (macOS), `clip` /
+> `clip.exe` (Windows/WSL). On a Linux desktop, install `wl-clipboard` or
+> `xclip`.
+
+## Permissions
+
+Every tool call passes a permission gate before it runs. A built-in **safety
+floor** (the `rm -rf /` family, edits to `.git/**`, `.ignis/**`, and shell init
+files) always asks — and hard-denies under fully-unattended mode. On top of that
+you can declare your own `allow` / `ask` / `deny` rules in config:
+
+```toml
+[permissions]
+allow = ["bash(cargo *)", "edit_file(src/**)"]
+ask   = ["bash(git push *)"]
+deny  = ["read_file(.env)", "read_file(**/secrets/**)"]
 ```
 
-In the TUI: `Enter` sends, `↑/↓` history, `Ctrl+D` exit. Output renders inline in
-the normal buffer, so scroll with your terminal/tmux as usual. Type `/` for
-slash-command suggestions.
-
-## Skills
-
-Skills are reusable instruction sets the model can load on demand. Each skill is
-a `SKILL.md` file in its own directory:
-
-```
-~/.ignis/skills/<name>/SKILL.md       # global (all projects)
-<repo>/.ignis/skills/<name>/SKILL.md   # project-local
-```
-
-`.agents/skills/` is also scanned at both levels for cross-tool portability. On a
-name clash, project beats global and `.ignis` beats `.agents`.
-
-```markdown
----
-name: react-patterns
-description: Use when working with React components, hooks, or state.
----
-# React Patterns
-...your instructions...
-```
-
-- The model sees each skill's name + description and loads one with the `skill`
-  tool when a task matches.
-- Force-load one yourself: `/react-patterns refactor this component`.
-- Enable or disable skills at runtime: `/skills`.
-- A skill can bundle supporting files (scripts, templates) in its directory;
-  when the skill loads, the model is shown the file list and reads them as the
-  instructions reference them.
-
-The `SKILL.md` format matches the cross-tool convention used by Claude Code,
-Codex, OpenCode, and Kimi, so skills in `~/.agents/skills` are shared across them.
+Switch modes at runtime with `/afk`: *Hands-free* auto-approves tools but still
+answers `ask_user`; *Fully unattended* auto-approves everything. The TUI footer
+shows the active mode. Full grammar and precedence in
+[`docs/permissions.md`](docs/permissions.md).
 
 ## Development
 
@@ -172,8 +167,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
-[CLAUDE.md](CLAUDE.md) for the coding guidelines.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and
+[CLAUDE.md](CLAUDE.md) for coding guidelines.
 
 ## License
 

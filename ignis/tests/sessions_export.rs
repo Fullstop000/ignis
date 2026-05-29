@@ -37,10 +37,11 @@ fn export_writes_html_with_session_row() {
     let proj = projects.join(&slug);
     std::fs::create_dir_all(&proj).unwrap();
 
+    // Timestamps are ms (matches storage::Persister::record's `as_millis()`).
     let jsonl = format!(
         "{}\n{}\n",
-        r#"{"type":"session_meta","timestamp":1735787045,"payload":{"id":"sess-it","start_dir":"/tmp/x"}}"#,
-        r#"{"type":"message","timestamp":1735787046,"payload":{"role":"user","content":"hi"}}"#,
+        r#"{"type":"session_meta","timestamp":1735787045000,"payload":{"id":"sess-it","start_dir":"/tmp/x"}}"#,
+        r#"{"type":"message","timestamp":1735787046000,"payload":{"role":"user","content":"hi"}}"#,
     );
     std::fs::write(proj.join("sess-it.jsonl"), jsonl).unwrap();
     std::fs::write(
