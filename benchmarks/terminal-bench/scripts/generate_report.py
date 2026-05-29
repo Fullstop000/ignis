@@ -108,6 +108,28 @@ def _read_log_tail(path: Path, cap: int = _LOG_EMBED_CAP) -> tuple[str, int]:
     return f"… [{size:,} bytes total — showing last {cap:,}] …\n{tail}", size
 
 
+def _file_contains(path: Path, needle: str, chunk: int = 1 << 20) -> bool:
+    """Stream-scan a (possibly multi-GB) file for `needle` without loading it whole.
+
+    Carries a `len(needle)`-byte overlap across reads so a marker straddling a
+    chunk boundary is still found. Used for rate-limit detection, which must see
+    the WHOLE log — not just the embedded tail — to classify the trial correctly.
+    """
+    nb = needle.encode()
+    try:
+        with path.open("rb") as fh:
+            carry = b""
+            while True:
+                buf = fh.read(chunk)
+                if not buf:
+                    return False
+                if nb in carry + buf:
+                    return True
+                carry = buf[-len(nb):]
+    except OSError:
+        return False
+
+
 @dataclass
 class Trial:
     task: str
@@ -152,7 +174,9 @@ def walk_trials(job_dir: Path) -> list[Trial]:
         log_text, log_bytes = (
             _read_log_tail(agent_log_path) if agent_log_path.exists() else ("", 0)
         )
-        rate_limited = "rate_limit_reached_error" in log_text
+        # Scan the FULL file, not the embedded tail — a rate-limit marker early
+        # in a huge log must still flip the trial to the `quota` bucket.
+        rate_limited = _file_contains(agent_log_path, "rate_limit_reached_error")
 
         n_in, n_out, n_cache = _sum_usage(trial_dir / "agent" / "ignis-projects")
         cache_rate = (n_cache / n_in) if n_in else None
