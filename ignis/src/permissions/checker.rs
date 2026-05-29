@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use super::runtime::PermissionState;
-use super::{check, default_policy_for_tool, Decision};
+use super::{check, default_policy_for_tool, rule, Decision};
 use crate::console::picker::{
     PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse,
 };
@@ -25,6 +25,7 @@ use crate::tools::tool::ToolHooks;
 
 const APPROVE_ONCE: &str = "Approve once";
 const APPROVE_SESSION: &str = "Approve session";
+const ALWAYS_ALLOW: &str = "Always allow";
 const DENY: &str = "Deny";
 
 /// Hook impl. Holds the runtime state and an optional picker channel — the
@@ -110,11 +111,32 @@ impl PermissionChecker {
                     preview: None,
                 },
                 PickerOption {
+                    label: ALWAYS_ALLOW.to_string(),
+                    description: match rule::suggest_grant(tool_name, args) {
+                        Some(g) => {
+                            format!("Save `{g}` to state.json — silent in every future session.")
+                        }
+                        None => format!("Always allow `{tool_name}` — saved to state.json."),
+                    },
+                    preview: None,
+                },
+                PickerOption {
                     label: DENY.to_string(),
                     description: "Refuse — the model sees an error.".to_string(),
                     preview: None,
                 },
             ],
+        }
+    }
+
+    /// Persist an "Always allow" grant: derive the `Tool(pattern)` string, fold
+    /// it into the live rules, and re-write `state.json`. A disk-write failure
+    /// is logged, not fatal — the in-memory grant still takes effect this run.
+    fn persist_always_allow(&self, tool_name: &str, args: &serde_json::Value) {
+        let grant = rule::suggest_grant(tool_name, args).unwrap_or_else(|| tool_name.to_string());
+        self.state.add_grant(&grant);
+        if let Err(e) = crate::state::persist_permission_grants(&self.state.grants()) {
+            tracing::warn!(error = %e, grant = %grant, "failed to persist permission grant");
         }
     }
 }
@@ -138,6 +160,7 @@ impl ToolHooks for PermissionChecker {
             default_policy_for_tool(tool_name),
             self.state.mode(),
             session_allowed,
+            &self.state.rules_snapshot(),
         );
 
         match decision {
@@ -189,6 +212,10 @@ impl ToolHooks for PermissionChecker {
                             APPROVE_ONCE => Ok(()),
                             APPROVE_SESSION => {
                                 self.state.add_session_allow(tool_name);
+                                Ok(())
+                            }
+                            ALWAYS_ALLOW => {
+                                self.persist_always_allow(tool_name, args);
                                 Ok(())
                             }
                             DENY => Err(format!(
@@ -335,7 +362,7 @@ mod tests {
         let q = q.expect("picker request reached the channel");
         assert!(!q.multi_select);
         assert!(!q.allow_other);
-        assert_eq!(q.options.len(), 3);
+        assert_eq!(q.options.len(), 4);
         // Did NOT persist into session_allow.
         assert!(!state.is_session_allowed("bash"));
     }
@@ -398,6 +425,87 @@ mod tests {
             "expected command in question body, got: {}",
             q.question
         );
+    }
+
+    // Not `#[tokio::test]`: the env lock (a std `Mutex`) must not be held across
+    // an await point. We drive the async body with a current-thread runtime so
+    // the guard stays in a purely synchronous scope.
+    #[test]
+    fn picker_always_allow_persists_grant_and_silences_followups() {
+        let _env = crate::util::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = crate::util::unique_temp_dir("ignis-checker-grant");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = PermissionState::new(Mode::Off);
+            let (result, _) = run_with_picker_reply(
+                state.clone(),
+                "bash",
+                json!({"command": "cargo build --release"}),
+                PickerResponse::Answered(vec![PickerAnswer::Single(ALWAYS_ALLOW.to_string())]),
+            )
+            .await;
+            assert!(result.is_ok());
+
+            // Grant folded into the live rules — arity-trimmed to the subcommand
+            // (`cargo build`), not all of `cargo`, so it's useful but not broad.
+            assert!(
+                state.grants().iter().any(|g| g == "bash(cargo build *)"),
+                "grants: {:?}",
+                state.grants()
+            );
+            // It persisted to state.json.
+            let persisted = crate::state::load_state();
+            assert!(persisted
+                .permission_grants
+                .iter()
+                .any(|g| g == "bash(cargo build *)"));
+            // Another `cargo build` variant now runs silently — no picker.
+            let follow = PermissionChecker::new(state.clone());
+            let r2 = follow
+                .before_tool_call("bash", &json!({"command": "cargo build --offline"}))
+                .await;
+            assert!(r2.is_ok(), "follow-up should be allowed by the grant");
+        });
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn config_deny_rule_blocks_through_checker() {
+        let rules = rule::RuleSet::from_strings(&[], &[], &["bash(rm -rf *)".to_string()]);
+        let state = PermissionState::with_rules(Mode::Off, rules, vec![]);
+        let checker = PermissionChecker::new(state);
+        let result = checker
+            .before_tool_call("bash", &json!({"command": "rm -rf build"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("denied by permission rule"));
+    }
+
+    #[tokio::test]
+    async fn config_allow_rule_runs_without_picker() {
+        // No picker attached: a config allow rule must let the call through
+        // rather than falling to the "no interactive console" Deny.
+        let rules = rule::RuleSet::from_strings(&["bash(cargo *)".to_string()], &[], &[]);
+        let state = PermissionState::with_rules(Mode::Off, rules, vec![]);
+        let checker = PermissionChecker::new(state);
+        let result = checker
+            .before_tool_call("bash", &json!({"command": "cargo build"}))
+            .await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

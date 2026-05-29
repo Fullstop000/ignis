@@ -22,6 +22,11 @@ pub struct State {
     /// `Off` default at next launch). Set by `/afk` (via the picker).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Persisted "always allow" permission grants — `Tool(pattern)` strings in
+    /// the same grammar as `config.toml`'s `[permissions]`, folded into the
+    /// `allow` list at launch. Appended when the user picks "Always allow".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permission_grants: Vec<String>,
 }
 
 fn state_path() -> Result<std::path::PathBuf, anyhow::Error> {
@@ -85,9 +90,70 @@ pub fn persist_permission_mode(mode: Option<&str>) -> Result<(), anyhow::Error> 
     write_state(&state)
 }
 
+/// Persist the "always allow" permission grants, preserving every other field.
+/// Called when the user picks "Always allow" in the permission picker.
+pub fn persist_permission_grants(grants: &[String]) -> Result<(), anyhow::Error> {
+    let mut state = load_state();
+    state.permission_grants = grants.to_vec();
+    write_state(&state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_grants_round_trip() {
+        let state = State {
+            permission_grants: vec!["bash(git status *)".to_string()],
+            ..State::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.permission_grants,
+            vec!["bash(git status *)".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_permission_grants_omitted_from_json() {
+        let json = serde_json::to_string(&State::default()).unwrap();
+        assert!(!json.contains("permission_grants"));
+    }
+
+    #[test]
+    fn persist_permission_grants_preserves_siblings() {
+        let _env = crate::util::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = crate::util::unique_temp_dir("ignis-state-grants-rmw");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        persist_model_selection("deepseek", "deepseek-v4-pro", Some("high")).unwrap();
+        persist_permission_grants(&["bash(git status *)".to_string()]).unwrap();
+        let s = load_state();
+        assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(s.permission_grants, vec!["bash(git status *)".to_string()]);
+
+        // Re-saving grants must not touch the model selection.
+        persist_permission_grants(&[
+            "bash(git status *)".to_string(),
+            "edit_file(src/main.rs)".to_string(),
+        ])
+        .unwrap();
+        let s = load_state();
+        assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(s.permission_grants.len(), 2);
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 
     #[test]
     fn state_round_trips_as_json() {
@@ -97,6 +163,7 @@ mod tests {
             disabled_skills: vec![],
             disabled_mcp_servers: vec![],
             mode: None,
+            permission_grants: vec![],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -112,6 +179,7 @@ mod tests {
             disabled_skills: vec!["a".to_string(), "b".to_string()],
             disabled_mcp_servers: vec![],
             mode: None,
+            permission_grants: vec![],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -134,6 +202,7 @@ mod tests {
             disabled_skills: vec![],
             disabled_mcp_servers: vec!["github".to_string(), "fs".to_string()],
             mode: None,
+            permission_grants: vec![],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -180,6 +249,7 @@ mod tests {
                 disabled_skills: vec![],
                 disabled_mcp_servers: vec![],
                 mode: Some(value.to_string()),
+                permission_grants: vec![],
             };
             let json = serde_json::to_string(&state).unwrap();
             let back: State = serde_json::from_str(&json).unwrap();

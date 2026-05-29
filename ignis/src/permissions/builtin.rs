@@ -61,20 +61,25 @@ const READ_ONLY_BASH_MULTIWORD: &[&str] = &[
 /// wrappers (NOT honored — sudo always asks). Then check the first token
 /// against `READ_ONLY_BASH`, then the first two against `READ_ONLY_BASH_MULTIWORD`.
 ///
-/// Returns `false` for any command containing shell injection patterns
-/// (`$()`, backticks, `&&`, `||`, `;`, `|`) — those need to be evaluated
-/// segment-by-segment (v0.17.0). For v0.16.0 we conservatively make the user
-/// approve compound commands.
+/// Returns `false` for any command containing shell metacharacters
+/// (`$()`, backticks, `&&`, `&`, `||`, `;`, `|`, newlines, redirects) — a
+/// read-only leading command must not auto-allow whatever a separator chains
+/// after it. Compound commands are conservatively left to the gate.
 pub fn is_read_only_bash(command: &str) -> bool {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return false;
     }
-    // Compound / substitution → never auto-allow in v0.16.0.
-    if trimmed.contains("&&")
+    // Compound / substitution / redirection → never auto-allow. A single `&`
+    // (backgrounding) and a newline are separators too — without them a
+    // read-only leading command (`git status & rm -rf y`) would auto-allow a
+    // destructive trailing one.
+    if trimmed.contains('&')
         || trimmed.contains("||")
         || trimmed.contains(';')
         || trimmed.contains('|')
+        || trimmed.contains('\n')
+        || trimmed.contains('\r')
         || trimmed.contains("$(")
         || trimmed.contains('`')
         || trimmed.contains('>')
@@ -144,7 +149,11 @@ pub fn circuit_breaker_label(command: &str) -> Option<&'static str> {
 /// check independently. Splits on `;`, `&&`, `||`, `|`, and pulls out the
 /// inside of any `$(…)` or `\`…\`` substitutions. Cheap and intentionally
 /// over-eager — false positives only cost an extra `Ask`, not a real run.
-fn split_command_segments(command: &str) -> Vec<String> {
+///
+/// `pub(crate)` so the user-rule matcher (`rule.rs`) splits compound commands
+/// the same way the circuit breaker does — one tokenizer, one notion of
+/// "segment", no drift between the floor and the rule layer.
+pub(crate) fn split_command_segments(command: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut chars = command.chars().peekable();
@@ -183,12 +192,18 @@ fn split_command_segments(command: &str) -> Vec<String> {
                     out.extend(split_command_segments(&inner));
                 }
             }
-            // Segment separators.
-            ';' => {
+            // Segment separators. `;`, newlines, and a *single* `&`
+            // (backgrounding) all terminate a simple command, same as `&&`,
+            // `||`, and `|`/`|&` — so a destructive trailing segment can't ride
+            // through on the back of an innocent one.
+            ';' | '\n' | '\r' => {
                 push_nonempty(&mut out, std::mem::take(&mut current));
             }
             '&' if chars.peek() == Some(&'&') => {
                 chars.next();
+                push_nonempty(&mut out, std::mem::take(&mut current));
+            }
+            '&' => {
                 push_nonempty(&mut out, std::mem::take(&mut current));
             }
             '|' if chars.peek() == Some(&'|') => {
@@ -441,6 +456,19 @@ mod tests {
     }
 
     #[test]
+    fn read_only_rejects_background_amp_and_newline() {
+        // Regression (review finding): a single `&` (backgrounding) and a
+        // newline are real separators — a read-only leading command must not
+        // auto-allow a destructive trailing one.
+        for cmd in ["git status & rm -rf y", "ls\nrm -rf y", "ls |& rm -rf y"] {
+            assert!(
+                !is_read_only_bash(cmd),
+                "must not auto-allow compound via separator: {cmd}"
+            );
+        }
+    }
+
+    #[test]
     fn read_only_rejects_sudo() {
         assert!(!is_read_only_bash("sudo ls"));
         assert!(!is_read_only_bash("sudo cat /etc/passwd"));
@@ -500,6 +528,22 @@ mod tests {
             assert!(
                 is_circuit_breaker(cmd),
                 "circuit breaker must catch hidden destructive segment in: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_catches_background_amp_and_newline_segments() {
+        // Regression (review finding): single `&` and newline separators must
+        // be split so a hidden `rm -rf /` segment still trips the breaker.
+        for cmd in [
+            "git status & rm -rf /",
+            "ls\nrm -rf /",
+            "echo hi |& rm -rf $HOME",
+        ] {
+            assert!(
+                is_circuit_breaker(cmd),
+                "breaker must catch hidden segment in: {cmd}"
             );
         }
     }

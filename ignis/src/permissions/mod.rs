@@ -14,6 +14,7 @@
 
 pub mod builtin;
 pub mod checker;
+pub mod rule;
 pub mod runtime;
 
 use serde::{Deserialize, Serialize};
@@ -100,17 +101,21 @@ impl Decision {
 /// 2. **Protected-path edits** (`edit_file`/`create_file` targeting
 ///    `.git/**`, `.ignis/**`, shell init, etc.) — same `Ask`/`Deny` split as
 ///    step 1. Same precedence rule: floor first.
-/// 3. **Session-allow** shortcut (only after the floor has had its say).
-/// 4. **Read-only bash auto-allow** for ~30 curated commands.
-/// 5. **HandsFree / FullyUnattended** auto-approve the sensitive tools whose
+/// 3. **User rule layer** — config `[permissions]` + persisted grants, ordered
+///    `deny > ask > allow`. Beats session-allow and the auto-approve modes; an
+///    `ask` hardens to `Deny` under FullyUnattended. Still below the floor.
+/// 4. **Session-allow** shortcut (only after the floor has had its say).
+/// 5. **Read-only bash auto-allow** for ~30 curated commands.
+/// 6. **HandsFree / FullyUnattended** auto-approve the sensitive tools whose
 ///    per-tool default would otherwise be `Ask`.
-/// 6. **Per-tool default** policy.
+/// 7. **Per-tool default** policy.
 pub fn check(
     tool_name: &str,
     arguments_json: &str,
     default_for_tool: Decision,
     mode: Mode,
     session_allowed: bool,
+    ruleset: &rule::RuleSet,
 ) -> Decision {
     let args: serde_json::Value = serde_json::from_str(arguments_json).unwrap_or_default();
 
@@ -151,14 +156,35 @@ pub fn check(
         }
     }
 
-    // Step 3: session-allow shortcut. Only reaches here once we've cleared
+    // Step 3: user-declared rule layer (config `[permissions]` + persisted
+    // grants). Sits *below* the non-negotiable floor (steps 1+2) but *above*
+    // session-allow and the auto-approve modes: a config `deny` is the user's
+    // explicit hard no (beats session-allow + HandsFree), and a config `ask`
+    // forces oversight even under HandsFree. Under FullyUnattended an `ask`
+    // becomes `Deny` (no human to confirm), mirroring the floor.
+    match ruleset.decide(tool_name, &args) {
+        Some(Decision::Deny { reason }) => return Decision::deny(reason),
+        Some(Decision::Ask { reason }) => {
+            return if mode.is_fully_unattended() {
+                Decision::deny(format!(
+                    "fully-unattended mode: {reason}. Toggle off and authorize manually."
+                ))
+            } else {
+                Decision::ask(reason)
+            };
+        }
+        Some(Decision::Allow) => return Decision::Allow,
+        None => {}
+    }
+
+    // Step 4: session-allow shortcut. Only reaches here once we've cleared
     // the safety floor (steps 1+2 return above). "Approve session" was
     // explicit consent for the tool — honor it, but never against the floor.
     if session_allowed {
         return Decision::Allow;
     }
 
-    // Step 4: read-only bash auto-allow.
+    // Step 5: read-only bash auto-allow.
     if tool_name == "bash" {
         if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
             if builtin::is_read_only_bash(cmd) {
@@ -167,7 +193,7 @@ pub fn check(
         }
     }
 
-    // Step 5: per-tool default. Auto-approve modes promote an `Ask` to `Allow`.
+    // Step 6: per-tool default. Auto-approve modes promote an `Ask` to `Allow`.
     match default_for_tool {
         Decision::Ask { .. } if mode.auto_approves_sensitive() => Decision::Allow,
         other => other,
@@ -266,6 +292,7 @@ mod tests {
             default_policy_for_tool("read_file"),
             Mode::Off,
             false,
+            &rule::RuleSet::default(),
         );
         assert_eq!(d, Decision::Allow);
     }
@@ -278,6 +305,7 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::Off,
             false,
+            &rule::RuleSet::default(),
         );
         assert!(matches!(d, Decision::Ask { .. }));
     }
@@ -290,6 +318,7 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::Off,
             false,
+            &rule::RuleSet::default(),
         );
         assert_eq!(d, Decision::Allow);
     }
@@ -302,6 +331,7 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::HandsFree,
             false,
+            &rule::RuleSet::default(),
         );
         assert_eq!(d, Decision::Allow);
     }
@@ -314,6 +344,7 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::FullyUnattended,
             false,
+            &rule::RuleSet::default(),
         );
         assert_eq!(d, Decision::Allow);
     }
@@ -333,6 +364,7 @@ mod tests {
                 default_policy_for_tool("bash"),
                 Mode::HandsFree,
                 false,
+                &rule::RuleSet::default(),
             );
             assert!(
                 matches!(d, Decision::Ask { .. }),
@@ -351,6 +383,7 @@ mod tests {
             default_policy_for_tool("edit_file"),
             Mode::HandsFree,
             false,
+            &rule::RuleSet::default(),
         );
         assert!(matches!(d, Decision::Ask { .. }));
     }
@@ -363,6 +396,7 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::FullyUnattended,
             false,
+            &rule::RuleSet::default(),
         );
         assert!(
             matches!(d, Decision::Deny { ref reason } if reason.contains("fully-unattended")),
@@ -379,6 +413,7 @@ mod tests {
             default_policy_for_tool("edit_file"),
             Mode::FullyUnattended,
             false,
+            &rule::RuleSet::default(),
         );
         assert!(
             matches!(d, Decision::Deny { ref reason } if reason.contains("fully-unattended")),
@@ -398,6 +433,7 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::Off,
             true, // session_allowed — must NOT win against the safety floor
+            &rule::RuleSet::default(),
         );
         assert!(
             matches!(d, Decision::Ask { .. }),
@@ -414,6 +450,7 @@ mod tests {
             default_policy_for_tool("edit_file"),
             Mode::Off,
             true,
+            &rule::RuleSet::default(),
         );
         assert!(
             matches!(d, Decision::Ask { .. }),
@@ -430,8 +467,114 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::Off,
             true,
+            &rule::RuleSet::default(),
         );
         assert_eq!(d, Decision::Allow);
+    }
+
+    // ---- config rule layer (deny > ask > allow, between floor and session) ----
+
+    fn rules(allow: &[&str], ask: &[&str], deny: &[&str]) -> rule::RuleSet {
+        let conv = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        rule::RuleSet::from_strings(&conv(allow), &conv(ask), &conv(deny))
+    }
+
+    #[test]
+    fn config_allow_silences_a_normally_asked_tool() {
+        let d = check(
+            "bash",
+            json(r#"{"command":"cargo build"}"#),
+            default_policy_for_tool("bash"),
+            Mode::Off,
+            false,
+            &rules(&["bash(cargo *)"], &[], &[]),
+        );
+        assert_eq!(d, Decision::Allow);
+    }
+
+    #[test]
+    fn config_deny_beats_session_allow() {
+        // Even with the tool session-allowed, a config deny rule blocks it.
+        let d = check(
+            "bash",
+            json(r#"{"command":"cargo publish"}"#),
+            default_policy_for_tool("bash"),
+            Mode::Off,
+            true, // session_allowed
+            &rules(&[], &[], &["bash(cargo publish *)"]),
+        );
+        assert!(matches!(d, Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn config_deny_beats_hands_free_auto_approve() {
+        let d = check(
+            "bash",
+            json(r#"{"command":"cargo publish"}"#),
+            default_policy_for_tool("bash"),
+            Mode::HandsFree,
+            false,
+            &rules(&[], &[], &["bash(cargo publish *)"]),
+        );
+        assert!(matches!(d, Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn config_ask_beats_hands_free_auto_approve() {
+        // HandsFree would auto-approve, but a config ask rule forces the prompt.
+        let d = check(
+            "bash",
+            json(r#"{"command":"git push origin main"}"#),
+            default_policy_for_tool("bash"),
+            Mode::HandsFree,
+            false,
+            &rules(&[], &["bash(git push *)"], &[]),
+        );
+        assert!(matches!(d, Decision::Ask { .. }));
+    }
+
+    #[test]
+    fn config_ask_becomes_deny_under_fully_unattended() {
+        let d = check(
+            "bash",
+            json(r#"{"command":"git push origin main"}"#),
+            default_policy_for_tool("bash"),
+            Mode::FullyUnattended,
+            false,
+            &rules(&[], &["bash(git push *)"], &[]),
+        );
+        assert!(matches!(d, Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn floor_still_beats_config_allow() {
+        // A blanket bash allow does NOT override the circuit breaker.
+        let d = check(
+            "bash",
+            json(r#"{"command":"rm -rf /"}"#),
+            default_policy_for_tool("bash"),
+            Mode::Off,
+            false,
+            &rules(&["bash"], &[], &[]),
+        );
+        assert!(matches!(d, Decision::Ask { .. }));
+    }
+
+    #[test]
+    fn floor_still_beats_config_allow_under_fully_unattended() {
+        let d = check(
+            "bash",
+            json(r#"{"command":"rm -rf /"}"#),
+            default_policy_for_tool("bash"),
+            Mode::FullyUnattended,
+            false,
+            &rules(&["bash"], &[], &[]),
+        );
+        assert!(
+            matches!(d, Decision::Deny { ref reason } if reason.contains("fully-unattended")),
+            "floor must win over config allow, got {:?}",
+            d
+        );
     }
 
     #[test]
@@ -442,6 +585,7 @@ mod tests {
             default_policy_for_tool("bash"),
             Mode::Off,
             false,
+            &rule::RuleSet::default(),
         );
         assert!(matches!(d, Decision::Ask { .. }));
     }
