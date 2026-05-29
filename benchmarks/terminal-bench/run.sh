@@ -32,6 +32,7 @@ DATASET="${DATASET:-terminal-bench/terminal-bench-2}"
 TIMEOUT_MULT="${TIMEOUT_MULT:-2.0}"
 MAX_RETRIES="${MAX_RETRIES:-2}"
 CONFIG="$HOME/.ignis/config.toml"
+[ -f "$CONFIG" ] || { echo "run.sh: $CONFIG not found (need provider keys)" >&2; exit 2; }
 
 # --- provider key (from the [providers.<name>] block in config.toml) ----------
 provider="${MODEL%%/*}"
@@ -43,9 +44,13 @@ case "$provider" in
     kimi-code) key_env=KIMI_CODE_API_KEY ;;
     *) echo "run.sh: unknown provider '$provider' in MODEL=$MODEL" >&2; exit 2 ;;
 esac
-_toml_key() { # $1 = section header (e.g. [web_search]); reads api_key under it
+_toml_key() { # $1 = section header (e.g. [web_search]); reads api_key under it.
+    # Compare against a de-quoted copy of each line so both `[providers.kimi-code]`
+    # and the quoted `[providers."kimi-code"]` form (valid TOML, used in
+    # config.example.toml) match the unquoted section we build.
     awk -v sect="$1" '
-        $0==sect {f=1; next} /^\[/{f=0}
+        { hdr=$0; gsub(/"/, "", hdr) }
+        hdr==sect {f=1; next} /^\[/{f=0}
         f && /^api_key/ {gsub(/^api_key *= *"/,""); gsub(/".*/,""); print; exit}
     ' "$CONFIG"
 }
@@ -56,6 +61,7 @@ fi
 
 # --- optional web_search key (forwarded by the adapter into the sandbox) ------
 ws_provider="$(awk '/^\[web_search\]/{f=1;next} /^\[/{f=0} f && /^provider/{gsub(/^provider *= *"/,""); gsub(/".*/,""); print; exit}' "$CONFIG")"
+ws_provider="${ws_provider:-brave}"  # ignis defaults web_search to brave when unset
 ws_key="$(_toml_key "[web_search]")"
 if [ -n "$ws_key" ]; then
     case "$ws_provider" in
