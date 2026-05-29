@@ -1,10 +1,7 @@
-use super::{
-    bytes_to_lines, ChatCompletionsRequest, Chunk, LlmProvider, LlmResponseDelta, StreamOptions,
-};
+use super::{openai_compatible_chat_stream, LlmProvider, LlmResponseDelta};
 use crate::Message;
-use anyhow::anyhow;
 use async_trait::async_trait;
-use futures_util::stream::{BoxStream, StreamExt};
+use futures_util::stream::BoxStream;
 
 pub struct DeepSeekProvider {
     client: reqwest::Client,
@@ -55,115 +52,19 @@ impl LlmProvider for DeepSeekProvider {
         messages: &[Message],
         tools: &[serde_json::Value],
     ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error> {
-        let mut request_messages = vec![Message {
-            role: "system".to_string(),
-            content: Some(system_prompt.to_string()),
-            reasoning_content: None,
-            name: None,
-            tool_call_id: None,
-            tool_calls: None,
-        }];
-        request_messages.extend_from_slice(messages);
-
-        let req_body = ChatCompletionsRequest {
-            model: &self.model,
-            messages: request_messages,
+        // DeepSeek is OpenAI-compatible; it differs from `OpenAiProvider` only in
+        // omitting the `User-Agent` header (hence `None`).
+        openai_compatible_chat_stream(
+            &self.client,
+            &self.api_url,
+            &self.api_key,
+            &self.model,
+            self.reasoning_effort.as_deref(),
+            None,
+            system_prompt,
+            messages,
             tools,
-            stream: true,
-            stream_options: Some(StreamOptions {
-                include_usage: true,
-            }),
-            reasoning_effort: self.reasoning_effort.as_deref(),
-        };
-
-        let endpoint = if self.api_url.ends_with("/chat/completions") {
-            self.api_url.clone()
-        } else {
-            format!("{}/chat/completions", self.api_url.trim_end_matches('/'))
-        };
-
-        let res = self
-            .client
-            .post(&endpoint)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&req_body)
-            .send()
-            .await?;
-
-        if !res.status().is_success() {
-            let error_text = res
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(anyhow!("LLM API returned error: {}", error_text));
-        }
-
-        let byte_stream = res.bytes_stream();
-        let line_stream = bytes_to_lines(byte_stream);
-
-        let delta_stream = line_stream.filter_map(|line_result| async move {
-            match line_result {
-                Err(err) => Some(Err(err)),
-                Ok(line) => {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        return None;
-                    }
-                    let data_part = match line.strip_prefix("data:") {
-                        Some(d) => d.trim(),
-                        None => return None,
-                    };
-                    if data_part == "[DONE]" {
-                        return None;
-                    }
-                    match serde_json::from_str::<Chunk>(data_part) {
-                        Err(_) => None,
-                        Ok(chunk) => {
-                            if let Some(choices) = &chunk.choices {
-                                if let Some(choice) = choices.first() {
-                                    if let Some(content) = &choice.delta.content {
-                                        if !content.is_empty() {
-                                            return Some(Ok(LlmResponseDelta::Text(
-                                                content.clone(),
-                                            )));
-                                        }
-                                    }
-                                    if let Some(reasoning) = &choice.delta.reasoning_content {
-                                        if !reasoning.is_empty() {
-                                            return Some(Ok(LlmResponseDelta::Reasoning(
-                                                reasoning.clone(),
-                                            )));
-                                        }
-                                    }
-                                    if let Some(tool_calls) = &choice.delta.tool_calls {
-                                        if let Some(tc) = tool_calls.first() {
-                                            let name =
-                                                tc.function.as_ref().and_then(|f| f.name.clone());
-                                            let args = tc
-                                                .function
-                                                .as_ref()
-                                                .and_then(|f| f.arguments.clone())
-                                                .unwrap_or_default();
-                                            return Some(Ok(LlmResponseDelta::ToolCall {
-                                                index: tc.index,
-                                                id: tc.id.clone(),
-                                                name,
-                                                arguments: args,
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(u) = &chunk.usage {
-                                return Some(Ok(LlmResponseDelta::Usage(u.to_usage())));
-                            }
-                            None
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(delta_stream.boxed())
+        )
+        .await
     }
 }

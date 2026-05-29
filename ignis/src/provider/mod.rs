@@ -207,6 +207,122 @@ where
     )
 }
 
+/// Parse one SSE line's payload into a response delta. Returns `None` for lines
+/// that carry no delta: blank lines, comments / non-`data:` lines, the terminal
+/// `[DONE]`, unparseable JSON, and empty-content deltas. Shared by every
+/// OpenAI-compatible provider so the mapping lives — and is tested — once.
+pub(crate) fn parse_sse_line(line: &str) -> Option<LlmResponseDelta> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let data_part = line.strip_prefix("data:")?.trim();
+    if data_part == "[DONE]" {
+        return None;
+    }
+    let chunk: Chunk = serde_json::from_str(data_part).ok()?;
+    if let Some(choice) = chunk.choices.as_ref().and_then(|c| c.first()) {
+        if let Some(content) = &choice.delta.content {
+            if !content.is_empty() {
+                return Some(LlmResponseDelta::Text(content.clone()));
+            }
+        }
+        if let Some(reasoning) = &choice.delta.reasoning_content {
+            if !reasoning.is_empty() {
+                return Some(LlmResponseDelta::Reasoning(reasoning.clone()));
+            }
+        }
+        if let Some(tc) = choice.delta.tool_calls.as_ref().and_then(|t| t.first()) {
+            let name = tc.function.as_ref().and_then(|f| f.name.clone());
+            let arguments = tc
+                .function
+                .as_ref()
+                .and_then(|f| f.arguments.clone())
+                .unwrap_or_default();
+            return Some(LlmResponseDelta::ToolCall {
+                index: tc.index,
+                id: tc.id.clone(),
+                name,
+                arguments,
+            });
+        }
+    }
+    if let Some(u) = &chunk.usage {
+        return Some(LlmResponseDelta::Usage(u.to_usage()));
+    }
+    None
+}
+
+/// Stream a chat completion from an OpenAI-compatible endpoint. The only
+/// provider-specific knob is `user_agent`: `Some` sets the header (OpenAI/Kimi/
+/// Moonshot), `None` omits it (DeepSeek). All response parsing is shared via
+/// `parse_sse_line`, so a streaming-parser change happens in exactly one place.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn openai_compatible_chat_stream(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_key: &str,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    user_agent: Option<&str>,
+    system_prompt: &str,
+    messages: &[Message],
+    tools: &[serde_json::Value],
+) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error> {
+    let mut request_messages = vec![Message {
+        role: "system".to_string(),
+        content: Some(system_prompt.to_string()),
+        reasoning_content: None,
+        name: None,
+        tool_call_id: None,
+        tool_calls: None,
+    }];
+    request_messages.extend_from_slice(messages);
+
+    let req_body = ChatCompletionsRequest {
+        model,
+        messages: request_messages,
+        tools,
+        stream: true,
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }),
+        reasoning_effort,
+    };
+
+    let endpoint = if api_url.ends_with("/chat/completions") {
+        api_url.to_string()
+    } else {
+        format!("{}/chat/completions", api_url.trim_end_matches('/'))
+    };
+
+    let mut req = client
+        .post(&endpoint)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&req_body);
+    if let Some(ua) = user_agent {
+        req = req.header("User-Agent", ua);
+    }
+    let res = req.send().await?;
+
+    if !res.status().is_success() {
+        let error_text = res
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(anyhow::anyhow!("LLM API returned error: {}", error_text));
+    }
+
+    let line_stream = bytes_to_lines(res.bytes_stream());
+    let delta_stream = line_stream.filter_map(|line_result| async move {
+        match line_result {
+            Err(err) => Some(Err(err)),
+            Ok(line) => parse_sse_line(&line).map(Ok),
+        }
+    });
+    Ok(delta_stream.boxed())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +351,79 @@ mod tests {
         assert_eq!(u.input_tokens, 2157);
         assert_eq!(u.output_tokens, 2);
         assert_eq!(u.cache_read_tokens, 1920);
+    }
+
+    // ---- parse_sse_line: the SSE-line → delta mapping shared by every
+    // OpenAI-compatible provider (previously copy-pasted into each). ----
+
+    #[test]
+    fn parse_sse_text_delta() {
+        let d = parse_sse_line(r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#);
+        assert!(matches!(d, Some(LlmResponseDelta::Text(t)) if t == "hello"));
+    }
+
+    #[test]
+    fn parse_sse_reasoning_delta() {
+        let d = parse_sse_line(r#"data: {"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#);
+        assert!(matches!(d, Some(LlmResponseDelta::Reasoning(t)) if t == "hmm"));
+    }
+
+    #[test]
+    fn parse_sse_tool_call_delta() {
+        let d = parse_sse_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":"}}]}}]}"#,
+        );
+        match d {
+            Some(LlmResponseDelta::ToolCall {
+                index,
+                id,
+                name,
+                arguments,
+            }) => {
+                assert_eq!(index, 0);
+                assert_eq!(id.as_deref(), Some("call_1"));
+                assert_eq!(name.as_deref(), Some("bash"));
+                assert_eq!(arguments, r#"{"command":"#);
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_tool_call_missing_arguments_defaults_empty() {
+        let d = parse_sse_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"x"}}]}}]}"#,
+        );
+        assert!(
+            matches!(d, Some(LlmResponseDelta::ToolCall { arguments, .. }) if arguments.is_empty())
+        );
+    }
+
+    #[test]
+    fn parse_sse_usage_delta() {
+        let d = parse_sse_line(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3}}"#,
+        );
+        assert!(matches!(d, Some(LlmResponseDelta::Usage(u)) if u.input_tokens == 10));
+    }
+
+    #[test]
+    fn parse_sse_done_and_noise_yield_none() {
+        assert!(parse_sse_line("data: [DONE]").is_none());
+        assert!(parse_sse_line("").is_none());
+        assert!(parse_sse_line("   ").is_none());
+        assert!(parse_sse_line(": keep-alive comment").is_none()); // not a data: line
+        assert!(parse_sse_line("data: {not json}").is_none());
+        // Empty content delta carries no signal.
+        assert!(parse_sse_line(r#"data: {"choices":[{"delta":{"content":""}}]}"#).is_none());
+    }
+
+    #[test]
+    fn parse_sse_prefers_content_over_reasoning() {
+        // When both are present, content wins (matches the prior per-provider order).
+        let d = parse_sse_line(
+            r#"data: {"choices":[{"delta":{"content":"a","reasoning_content":"b"}}]}"#,
+        );
+        assert!(matches!(d, Some(LlmResponseDelta::Text(t)) if t == "a"));
     }
 }
