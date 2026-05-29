@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.3] - 2026-05-29
+
 ### Changed
 - Internal — the ~600-line `Agent::run` is decomposed into focused helpers (`consume_turn_stream`, `execute_tool_calls`, `execute_single_tool`, `push_with_hook`); the loop body and nested closures are gone. No user-visible change.
 

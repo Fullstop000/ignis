@@ -1,6 +1,6 @@
 [package]
 name = "ignis"
-version = "0.25.2"
+version = "0.25.3"
 edition = "2021"
 description = "A single-binary, multi-provider AI coding agent for your terminal."
 license = "Apache-2.0"
