@@ -21,7 +21,10 @@ const REPO: &str = "Fullstop000/ignis";
 /// The release-artifact target triple for this build. `None` means we don't
 /// ship a prebuilt binary for the host and `ignis upgrade` should refuse.
 pub const TARGET: Option<&str> = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-    Some("x86_64-unknown-linux-gnu")
+    // musl, not gnu: the release pipeline ships a static musl build for Linux
+    // (see `.github/workflows/release.yml`) so the binary runs on older glibc.
+    // This MUST match the asset name or the download 404s.
+    Some("x86_64-unknown-linux-musl")
 } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
     Some("x86_64-apple-darwin")
 } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -156,23 +159,48 @@ fn tag_from_release_url(url: &str) -> Result<String> {
     Ok(last.to_string())
 }
 
+/// Retry transient failures (connection resets, timeouts, 5xx) but not
+/// deterministic ones: a 4xx like 404 means a wrong asset URL and won't fix
+/// itself, so retrying just delays the error 3×. `None` (no HTTP status) is a
+/// connection/transport error — retry it.
+fn is_retryable(status: Option<reqwest::StatusCode>) -> bool {
+    status.is_none_or(|s| s.is_server_error())
+}
+
 async fn download(url: &str, dest: &Path) -> Result<()> {
-    let bytes = reqwest::Client::new()
-        .get(url)
-        .header(
-            reqwest::header::USER_AGENT,
-            format!("ignis-upgrade/{}", env!("CARGO_PKG_VERSION")),
-        )
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("HTTP error for {url}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("read body of {url}"))?;
-    std::fs::write(dest, &bytes).with_context(|| format!("write {}", dest.display()))?;
-    Ok(())
+    const MAX: u32 = 3;
+    let client = reqwest::Client::new();
+    // GitHub's release-asset CDN intermittently resets the TLS connection, so a
+    // single-shot GET surfaces a transient blip as a hard failure. Retry the
+    // transport before giving up; the next attempt almost always succeeds.
+    for attempt in 1..=MAX {
+        let fetch = async {
+            client
+                .get(url)
+                .header(
+                    reqwest::header::USER_AGENT,
+                    format!("ignis-upgrade/{}", env!("CARGO_PKG_VERSION")),
+                )
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await
+        }
+        .await;
+        match fetch {
+            Ok(bytes) => {
+                return std::fs::write(dest, &bytes)
+                    .with_context(|| format!("write {}", dest.display()));
+            }
+            Err(e) if attempt < MAX && is_retryable(e.status()) => {
+                eprintln!("download attempt {attempt}/{MAX} failed: {e}; retrying in 2s…");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(e) => return Err(e).with_context(|| format!("download {url}")),
+        }
+    }
+    unreachable!("loop returns on the final attempt")
 }
 
 fn extract_tar_gz(tarball: &Path, into: &Path) -> Result<()> {
@@ -340,16 +368,16 @@ mod tests {
 
     #[test]
     fn target_matches_release_workflow_for_supported_hosts() {
-        // If the host is one of the supported triples, the constant resolves;
-        // otherwise it is `None`. Either way the constant exists and compiles.
-        let known = [
-            "x86_64-unknown-linux-gnu",
-            "x86_64-apple-darwin",
-            "aarch64-apple-darwin",
-        ];
-        if let Some(t) = TARGET {
-            assert!(known.contains(&t), "unexpected target triple {t}");
-        }
+        // Pin the exact triple per host: `TARGET` becomes the asset filename, so
+        // it must match `.github/workflows/release.yml` byte-for-byte or the
+        // download 404s. Linux is musl (static build), NOT gnu — a weaker
+        // "is it in a known set" check let that drift slip through once.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(TARGET, Some("x86_64-unknown-linux-musl"));
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        assert_eq!(TARGET, Some("x86_64-apple-darwin"));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(TARGET, Some("aarch64-apple-darwin"));
     }
 
     #[test]
@@ -371,6 +399,20 @@ mod tests {
             assert_eq!(mode, 0o755);
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn is_retryable_retries_transient_not_client_errors() {
+        use reqwest::StatusCode;
+        // Connection/transport error (no HTTP status) — the TLS-reset case.
+        assert!(is_retryable(None));
+        // 5xx is transient.
+        assert!(is_retryable(Some(StatusCode::INTERNAL_SERVER_ERROR)));
+        assert!(is_retryable(Some(StatusCode::SERVICE_UNAVAILABLE)));
+        // 4xx is deterministic — a 404 (wrong asset URL) must fail fast, not
+        // retry 3×.
+        assert!(!is_retryable(Some(StatusCode::NOT_FOUND)));
+        assert!(!is_retryable(Some(StatusCode::FORBIDDEN)));
     }
 
     #[test]
