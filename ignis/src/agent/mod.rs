@@ -153,6 +153,280 @@ async fn drain_injected(
     n
 }
 
+/// Append a tool-result message to `history`, running the `after_tool_call` hook
+/// first if one is set (the hook may transform the result content/error). The
+/// stored content is re-serialized as the `{result, is_error}` JSON envelope.
+async fn push_with_hook(history: &mut Vec<Message>, hooks: Option<&dyn ToolHooks>, msg: Message) {
+    if let Some(h) = hooks {
+        let content_str = msg.content.clone().unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(&content_str).unwrap_or_default();
+        let original_result = ToolResult {
+            content: parsed["result"]
+                .as_str()
+                .unwrap_or(&content_str)
+                .to_string(),
+            is_error: parsed["is_error"].as_bool().unwrap_or(false),
+        };
+        let transformed = h
+            .after_tool_call(msg.name.as_deref().unwrap_or(""), original_result)
+            .await;
+        let result_json = serde_json::json!({
+            "result": transformed.content,
+            "is_error": transformed.is_error
+        });
+        history.push(Message {
+            content: Some(result_json.to_string()),
+            ..msg
+        });
+    } else {
+        history.push(msg);
+    }
+}
+
+/// Run one tool call end-to-end: emit `ToolExecutionStart`, parse arguments,
+/// dispatch to the tool (or surface a not-found / bad-JSON error), record the
+/// `ignis.tool.execution` span + telemetry, emit `ToolExecutionEnd`, and return
+/// the `role:"tool"` result message. Captures nothing from the agent, so it runs
+/// safely in parallel across calls.
+async fn execute_single_tool(
+    tc: ToolCall,
+    tools_map: HashMap<String, Arc<dyn AgentTool>>,
+    tx_inner: tokio::sync::mpsc::Sender<AgentEvent>,
+) -> Message {
+    let tc_id = tc.id;
+    let tool_name = tc.function.name;
+    let arguments_str = tc.function.arguments;
+    let maybe_tool = tools_map.get(&tool_name).cloned();
+
+    // ignis.tool.execution span. Captures wall-clock via construct→drop;
+    // tool.arguments included only when IGNIS_LOG_TOOL_DETAILS=1.
+    let tool_span = tracing::info_span!(
+        "ignis.tool.execution",
+        tool.name = %tool_name,
+        tool.call_id = %tc_id,
+        success = tracing::field::Empty,
+        is_error = tracing::field::Empty,
+        tool.arguments = tracing::field::Empty,
+    );
+    if crate::telemetry::log_tool_details() {
+        tool_span.record("tool.arguments", arguments_str.as_str());
+    }
+    let tool_start = std::time::Instant::now();
+
+    let _ = tx_inner
+        .send(AgentEvent::ToolExecutionStart {
+            tool_call_id: tc_id.clone(),
+            tool_name: tool_name.clone(),
+            arguments: arguments_str.clone(),
+        })
+        .await;
+
+    let parsed_args_res: Result<serde_json::Value, serde_json::Error> =
+        serde_json::from_str(&arguments_str);
+
+    let result = match parsed_args_res {
+        Err(e) => {
+            let err_msg = Agent::sanitize_and_truncate_error(&e.to_string());
+            ToolResult::error(format!("Invalid JSON arguments: {}", err_msg))
+        }
+        Ok(args) => match maybe_tool {
+            None => ToolResult::error(format!("Tool '{}' not found", tool_name)),
+            Some(tool) => tool.call(args).await,
+        },
+    };
+
+    tool_span.record("success", !result.is_error);
+    tool_span.record("is_error", result.is_error);
+    crate::telemetry::record_tool_call(&tool_name, tool_start.elapsed(), !result.is_error);
+    drop(tool_span);
+
+    let _ = tx_inner
+        .send(AgentEvent::ToolExecutionEnd {
+            tool_call_id: tc_id.clone(),
+            result: result.clone(),
+        })
+        .await;
+
+    // Build tool result message — send content as JSON for consistency.
+    let result_json = serde_json::json!({
+        "result": result.content,
+        "is_error": result.is_error
+    });
+
+    Message {
+        role: "tool".to_string(),
+        content: Some(result_json.to_string()),
+        reasoning_content: None,
+        name: Some(tool_name),
+        tool_call_id: Some(tc_id),
+        tool_calls: None,
+    }
+}
+
+/// The accumulated result of consuming one streamed LLM turn.
+struct TurnStream {
+    assistant_content: String,
+    reasoning_content: String,
+    tool_calls: Vec<ToolCall>,
+    message_started: bool,
+    reasoning_streaming: bool,
+    turn_usage: Usage,
+}
+
+/// Consume one streamed turn: accumulate text / reasoning / tool-call / usage
+/// deltas, emitting `MessageStart`/`MessageUpdate`/`MessageEnd` for streamed text
+/// and the 💭-prefixed reasoning block. Returns the accumulated content, the
+/// index-sorted tool calls, the streaming flags, and the turn's token usage.
+async fn consume_turn_stream(
+    mut stream: futures_util::stream::BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
+    tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) -> TurnStream {
+    use futures_util::stream::StreamExt;
+    let mut assistant_content = String::new();
+    let mut reasoning_content = String::new();
+    let mut pending_tool_calls: HashMap<usize, AccumulatingToolCall> = HashMap::new();
+    let mut message_started = false;
+    let mut reasoning_streaming = false;
+    let mut turn_usage = Usage::default();
+
+    while let Some(delta_result) = stream.next().await {
+        match delta_result {
+            Err(err) => {
+                let err_msg = Agent::sanitize_and_truncate_error(&err.to_string());
+                let _ = tx
+                    .send(AgentEvent::MessageUpdate {
+                        delta: format!("\n[Error in stream: {}]", err_msg),
+                    })
+                    .await;
+            }
+            Ok(delta) => match delta {
+                LlmResponseDelta::Text(content) => {
+                    if reasoning_streaming {
+                        // Close the reasoning block before opening the text block.
+                        let _ = tx
+                            .send(AgentEvent::MessageEnd {
+                                message: Message {
+                                    role: "assistant".to_string(),
+                                    content: None,
+                                    reasoning_content: Some(reasoning_content.clone()),
+                                    name: None,
+                                    tool_call_id: None,
+                                    tool_calls: None,
+                                },
+                            })
+                            .await;
+                        reasoning_streaming = false;
+                    }
+                    if !message_started {
+                        let _ = tx
+                            .send(AgentEvent::MessageStart {
+                                message: Message {
+                                    role: "assistant".to_string(),
+                                    content: Some(String::new()),
+                                    reasoning_content: None,
+                                    name: None,
+                                    tool_call_id: None,
+                                    tool_calls: None,
+                                },
+                            })
+                            .await;
+                        message_started = true;
+                    }
+                    assistant_content.push_str(&content);
+                    let _ = tx.send(AgentEvent::MessageUpdate { delta: content }).await;
+                }
+                LlmResponseDelta::Reasoning(reasoning) => {
+                    // Stream reasoning as a 💭-prefixed assistant block so users
+                    // see the model's thinking incrementally. If text streaming
+                    // has already started, fall back to silent accumulation —
+                    // the final Message still carries reasoning_content.
+                    if !message_started {
+                        if !reasoning_streaming {
+                            let _ = tx
+                                .send(AgentEvent::MessageStart {
+                                    message: Message {
+                                        role: "assistant".to_string(),
+                                        content: None,
+                                        reasoning_content: Some(String::new()),
+                                        name: None,
+                                        tool_call_id: None,
+                                        tool_calls: None,
+                                    },
+                                })
+                                .await;
+                            let _ = tx
+                                .send(AgentEvent::MessageUpdate {
+                                    delta: "💭 ".to_string(),
+                                })
+                                .await;
+                            reasoning_streaming = true;
+                        }
+                        let _ = tx
+                            .send(AgentEvent::MessageUpdate {
+                                delta: reasoning.clone(),
+                            })
+                            .await;
+                    }
+                    reasoning_content.push_str(&reasoning);
+                }
+                LlmResponseDelta::ToolCall {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    let entry =
+                        pending_tool_calls
+                            .entry(index)
+                            .or_insert_with(|| AccumulatingToolCall {
+                                id: String::new(),
+                                name: String::new(),
+                                arguments: String::new(),
+                            });
+                    if let Some(id_val) = id {
+                        entry.id.push_str(&id_val);
+                    }
+                    if let Some(name_val) = name {
+                        entry.name.push_str(&name_val);
+                    }
+                    entry.arguments.push_str(&arguments);
+                }
+                LlmResponseDelta::Usage(u) => {
+                    turn_usage.add(&u);
+                }
+            },
+        }
+    }
+
+    // Sort by index to maintain deterministic order
+    let mut tool_calls = Vec::new();
+    if !pending_tool_calls.is_empty() {
+        let mut sorted_keys: Vec<&usize> = pending_tool_calls.keys().collect();
+        sorted_keys.sort();
+        for key in sorted_keys {
+            if let Some(pending) = pending_tool_calls.get(key) {
+                tool_calls.push(ToolCall {
+                    id: pending.id.clone(),
+                    r#type: "function".to_string(),
+                    function: ToolCallFunction {
+                        name: pending.name.clone(),
+                        arguments: pending.arguments.clone(),
+                    },
+                });
+            }
+        }
+    }
+
+    TurnStream {
+        assistant_content,
+        reasoning_content,
+        tool_calls,
+        message_started,
+        reasoning_streaming,
+        turn_usage,
+    }
+}
+
 /// Compose the effective system prompt: base + the enabled-skills catalog +
 /// the connected-MCP-servers' `instructions` block.
 fn with_catalog(base: &str, skills: Option<&SkillRegistry>, mcp: Option<&McpRegistry>) -> String {
@@ -299,7 +573,7 @@ impl Agent {
             );
             let llm_start = std::time::Instant::now();
 
-            let mut stream = match self
+            let stream = match self
                 .provider
                 .chat_stream(&effective_prompt, &*history, &tool_schemas)
                 .await
@@ -349,121 +623,14 @@ impl Agent {
                 }
             };
 
-            let mut assistant_content = String::new();
-            let mut reasoning_content = String::new();
-            let mut pending_tool_calls: HashMap<usize, AccumulatingToolCall> = HashMap::new();
-            let mut message_started = false;
-            let mut reasoning_streaming = false;
-            let mut turn_usage = Usage::default();
-
-            use futures_util::stream::StreamExt;
-            while let Some(delta_result) = stream.next().await {
-                match delta_result {
-                    Err(err) => {
-                        let err_msg = Self::sanitize_and_truncate_error(&err.to_string());
-                        let _ = tx
-                            .send(AgentEvent::MessageUpdate {
-                                delta: format!("\n[Error in stream: {}]", err_msg),
-                            })
-                            .await;
-                    }
-                    Ok(delta) => match delta {
-                        LlmResponseDelta::Text(content) => {
-                            if reasoning_streaming {
-                                // Close the reasoning block before opening the text block.
-                                let _ = tx
-                                    .send(AgentEvent::MessageEnd {
-                                        message: Message {
-                                            role: "assistant".to_string(),
-                                            content: None,
-                                            reasoning_content: Some(reasoning_content.clone()),
-                                            name: None,
-                                            tool_call_id: None,
-                                            tool_calls: None,
-                                        },
-                                    })
-                                    .await;
-                                reasoning_streaming = false;
-                            }
-                            if !message_started {
-                                let _ = tx
-                                    .send(AgentEvent::MessageStart {
-                                        message: Message {
-                                            role: "assistant".to_string(),
-                                            content: Some(String::new()),
-                                            reasoning_content: None,
-                                            name: None,
-                                            tool_call_id: None,
-                                            tool_calls: None,
-                                        },
-                                    })
-                                    .await;
-                                message_started = true;
-                            }
-                            assistant_content.push_str(&content);
-                            let _ = tx.send(AgentEvent::MessageUpdate { delta: content }).await;
-                        }
-                        LlmResponseDelta::Reasoning(reasoning) => {
-                            // Stream reasoning as a 💭-prefixed assistant block so users
-                            // see the model's thinking incrementally. If text streaming
-                            // has already started, fall back to silent accumulation —
-                            // the final Message still carries reasoning_content.
-                            if !message_started {
-                                if !reasoning_streaming {
-                                    let _ = tx
-                                        .send(AgentEvent::MessageStart {
-                                            message: Message {
-                                                role: "assistant".to_string(),
-                                                content: None,
-                                                reasoning_content: Some(String::new()),
-                                                name: None,
-                                                tool_call_id: None,
-                                                tool_calls: None,
-                                            },
-                                        })
-                                        .await;
-                                    let _ = tx
-                                        .send(AgentEvent::MessageUpdate {
-                                            delta: "💭 ".to_string(),
-                                        })
-                                        .await;
-                                    reasoning_streaming = true;
-                                }
-                                let _ = tx
-                                    .send(AgentEvent::MessageUpdate {
-                                        delta: reasoning.clone(),
-                                    })
-                                    .await;
-                            }
-                            reasoning_content.push_str(&reasoning);
-                        }
-                        LlmResponseDelta::ToolCall {
-                            index,
-                            id,
-                            name,
-                            arguments,
-                        } => {
-                            let entry = pending_tool_calls.entry(index).or_insert_with(|| {
-                                AccumulatingToolCall {
-                                    id: String::new(),
-                                    name: String::new(),
-                                    arguments: String::new(),
-                                }
-                            });
-                            if let Some(id_val) = id {
-                                entry.id.push_str(&id_val);
-                            }
-                            if let Some(name_val) = name {
-                                entry.name.push_str(&name_val);
-                            }
-                            entry.arguments.push_str(&arguments);
-                        }
-                        LlmResponseDelta::Usage(u) => {
-                            turn_usage.add(&u);
-                        }
-                    },
-                }
-            }
+            let TurnStream {
+                assistant_content,
+                reasoning_content,
+                tool_calls,
+                message_started,
+                reasoning_streaming,
+                turn_usage,
+            } = consume_turn_stream(stream, &tx).await;
 
             // Record final LLM-request span attrs + duration metric. Span drops
             // at the end of this loop iteration; record before drop.
@@ -487,25 +654,6 @@ impl Agent {
                 );
                 total_usage.add(&turn_usage);
                 let _ = tx.send(AgentEvent::Usage(turn_usage)).await;
-            }
-
-            // Sort by index to maintain deterministic order
-            let mut tool_calls = Vec::new();
-            if !pending_tool_calls.is_empty() {
-                let mut sorted_keys: Vec<&usize> = pending_tool_calls.keys().collect();
-                sorted_keys.sort();
-                for key in sorted_keys {
-                    if let Some(pending) = pending_tool_calls.get(key) {
-                        tool_calls.push(ToolCall {
-                            id: pending.id.clone(),
-                            r#type: "function".to_string(),
-                            function: ToolCallFunction {
-                                name: pending.name.clone(),
-                                arguments: pending.arguments.clone(),
-                            },
-                        });
-                    }
-                }
             }
 
             let has_content = !assistant_content.is_empty();
@@ -557,289 +705,7 @@ impl Agent {
             }
 
             if has_tools {
-                let tx_clone = tx.clone();
-                let tools_map: HashMap<String, Arc<dyn AgentTool>> = self
-                    .tools
-                    .iter()
-                    .map(|t| (t.name().to_string(), t.clone()))
-                    .collect();
-
-                // Check if any tool requires sequential execution
-                let force_sequential = tool_calls.iter().any(|tc| {
-                    tools_map
-                        .get(&tc.function.name)
-                        .map(|t| t.execution_mode() == ExecutionMode::Sequential)
-                        .unwrap_or(false)
-                });
-
-                let hooks = &self.hooks;
-                let tool_calls_owned = tool_calls.clone();
-
-                let execute_single_tool =
-                    |tc: ToolCall,
-                     tools_map: HashMap<String, Arc<dyn AgentTool>>,
-                     tx_inner: tokio::sync::mpsc::Sender<AgentEvent>| {
-                        async move {
-                            let tc_id = tc.id;
-                            let tool_name = tc.function.name;
-                            let arguments_str = tc.function.arguments;
-                            let maybe_tool = tools_map.get(&tool_name).cloned();
-
-                            // ignis.tool.execution span. Captures wall-clock via
-                            // construct→drop; tool.arguments included only when
-                            // IGNIS_LOG_TOOL_DETAILS=1.
-                            let tool_span = tracing::info_span!(
-                                "ignis.tool.execution",
-                                tool.name = %tool_name,
-                                tool.call_id = %tc_id,
-                                success = tracing::field::Empty,
-                                is_error = tracing::field::Empty,
-                                tool.arguments = tracing::field::Empty,
-                            );
-                            if crate::telemetry::log_tool_details() {
-                                tool_span.record("tool.arguments", arguments_str.as_str());
-                            }
-                            let tool_start = std::time::Instant::now();
-
-                            let _ = tx_inner
-                                .send(AgentEvent::ToolExecutionStart {
-                                    tool_call_id: tc_id.clone(),
-                                    tool_name: tool_name.clone(),
-                                    arguments: arguments_str.clone(),
-                                })
-                                .await;
-
-                            let parsed_args_res: Result<serde_json::Value, serde_json::Error> =
-                                serde_json::from_str(&arguments_str);
-
-                            let result = match parsed_args_res {
-                                Err(e) => {
-                                    let err_msg =
-                                        Agent::sanitize_and_truncate_error(&e.to_string());
-                                    ToolResult::error(format!(
-                                        "Invalid JSON arguments: {}",
-                                        err_msg
-                                    ))
-                                }
-                                Ok(args) => match maybe_tool {
-                                    None => {
-                                        ToolResult::error(format!("Tool '{}' not found", tool_name))
-                                    }
-                                    Some(tool) => tool.call(args).await,
-                                },
-                            };
-
-                            tool_span.record("success", !result.is_error);
-                            tool_span.record("is_error", result.is_error);
-                            crate::telemetry::record_tool_call(
-                                &tool_name,
-                                tool_start.elapsed(),
-                                !result.is_error,
-                            );
-                            drop(tool_span);
-
-                            let _ = tx_inner
-                                .send(AgentEvent::ToolExecutionEnd {
-                                    tool_call_id: tc_id.clone(),
-                                    result: result.clone(),
-                                })
-                                .await;
-
-                            // Build tool result message — send content as JSON for consistency
-                            let result_json = serde_json::json!({
-                                "result": result.content,
-                                "is_error": result.is_error
-                            });
-
-                            Message {
-                                role: "tool".to_string(),
-                                content: Some(result_json.to_string()),
-                                reasoning_content: None,
-                                name: Some(tool_name),
-                                tool_call_id: Some(tc_id),
-                                tool_calls: None,
-                            }
-                        }
-                    };
-
-                let results = if force_sequential {
-                    // Sequential execution
-                    let mut results = Vec::new();
-                    for tc in tool_calls_owned {
-                        // Run beforeToolCall hook
-                        let args_val: serde_json::Value =
-                            serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                        if let Some(h) = hooks {
-                            if let Err(reason) =
-                                h.before_tool_call(&tc.function.name, &args_val).await
-                            {
-                                let _ = tx_clone
-                                    .send(AgentEvent::ToolExecutionStart {
-                                        tool_call_id: tc.id.clone(),
-                                        tool_name: tc.function.name.clone(),
-                                        arguments: tc.function.arguments.clone(),
-                                    })
-                                    .await;
-                                let blocked_result =
-                                    ToolResult::error(format!("Blocked by hook: {}", reason));
-                                let _ = tx_clone
-                                    .send(AgentEvent::ToolExecutionEnd {
-                                        tool_call_id: tc.id.clone(),
-                                        result: blocked_result.clone(),
-                                    })
-                                    .await;
-                                let result_json = serde_json::json!({
-                                    "result": blocked_result.content,
-                                    "is_error": blocked_result.is_error
-                                });
-                                results.push(Message {
-                                    role: "tool".to_string(),
-                                    content: Some(result_json.to_string()),
-                                    reasoning_content: None,
-                                    name: Some(tc.function.name),
-                                    tool_call_id: Some(tc.id),
-                                    tool_calls: None,
-                                });
-                                continue;
-                            }
-                        }
-                        let msg =
-                            execute_single_tool(tc, tools_map.clone(), tx_clone.clone()).await;
-                        results.push(msg);
-                    }
-                    results
-                } else {
-                    // Parallel execution — run beforeToolCall hooks first sequentially
-                    let mut allowed_calls = Vec::new();
-                    let mut blocked_results = Vec::new();
-
-                    for tc in &tool_calls_owned {
-                        let args_val: serde_json::Value =
-                            serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                        if let Some(h) = hooks {
-                            if let Err(reason) =
-                                h.before_tool_call(&tc.function.name, &args_val).await
-                            {
-                                let _ = tx_clone
-                                    .send(AgentEvent::ToolExecutionStart {
-                                        tool_call_id: tc.id.clone(),
-                                        tool_name: tc.function.name.clone(),
-                                        arguments: tc.function.arguments.clone(),
-                                    })
-                                    .await;
-                                let blocked_result =
-                                    ToolResult::error(format!("Blocked by hook: {}", reason));
-                                let _ = tx_clone
-                                    .send(AgentEvent::ToolExecutionEnd {
-                                        tool_call_id: tc.id.clone(),
-                                        result: blocked_result.clone(),
-                                    })
-                                    .await;
-                                let result_json = serde_json::json!({
-                                    "result": blocked_result.content,
-                                    "is_error": blocked_result.is_error
-                                });
-                                blocked_results.push((
-                                    tc.id.clone(),
-                                    Message {
-                                        role: "tool".to_string(),
-                                        content: Some(result_json.to_string()),
-                                        reasoning_content: None,
-                                        name: Some(tc.function.name.clone()),
-                                        tool_call_id: Some(tc.id.clone()),
-                                        tool_calls: None,
-                                    },
-                                ));
-                                continue;
-                            }
-                        }
-                        allowed_calls.push(tc.clone());
-                    }
-
-                    let tool_futures = allowed_calls
-                        .into_iter()
-                        .map(|tc| execute_single_tool(tc, tools_map.clone(), tx_clone.clone()));
-
-                    let mut parallel_results: Vec<Message> =
-                        futures_util::stream::iter(tool_futures)
-                            .buffer_unordered(5)
-                            .collect::<Vec<Message>>()
-                            .await;
-
-                    // Merge blocked results
-                    for (_id, msg) in blocked_results {
-                        parallel_results.push(msg);
-                    }
-                    parallel_results
-                };
-
-                // Re-align results with original order to maintain history determinism.
-                // Results lacking a tool_call_id, or whose id is not in `tool_calls`,
-                // are appended afterward as orphans so they are never silently dropped.
-                let (mut results_by_id, mut orphans): (HashMap<String, Message>, Vec<Message>) = {
-                    let mut by_id = HashMap::new();
-                    let mut no_id = Vec::new();
-                    for msg in results {
-                        match msg.tool_call_id.clone() {
-                            Some(id) => {
-                                by_id.insert(id, msg);
-                            }
-                            None => no_id.push(msg),
-                        }
-                    }
-                    (by_id, no_id)
-                };
-
-                async fn push_with_hook(
-                    history: &mut Vec<Message>,
-                    hooks: Option<&dyn ToolHooks>,
-                    msg: Message,
-                ) {
-                    if let Some(h) = hooks {
-                        let content_str = msg.content.clone().unwrap_or_default();
-                        let parsed: serde_json::Value =
-                            serde_json::from_str(&content_str).unwrap_or_default();
-                        let original_result = ToolResult {
-                            content: parsed["result"]
-                                .as_str()
-                                .unwrap_or(&content_str)
-                                .to_string(),
-                            is_error: parsed["is_error"].as_bool().unwrap_or(false),
-                        };
-                        let transformed = h
-                            .after_tool_call(msg.name.as_deref().unwrap_or(""), original_result)
-                            .await;
-                        let result_json = serde_json::json!({
-                            "result": transformed.content,
-                            "is_error": transformed.is_error
-                        });
-                        history.push(Message {
-                            content: Some(result_json.to_string()),
-                            ..msg
-                        });
-                    } else {
-                        history.push(msg);
-                    }
-                }
-
-                for tc in &tool_calls {
-                    if let Some(msg) = results_by_id.remove(&tc.id) {
-                        push_with_hook(history, hooks.as_deref(), msg).await;
-                    }
-                }
-
-                // Drain any remaining orphan results (unmatched IDs or missing IDs)
-                // so we never silently lose a tool result. Sort by tool_call_id so
-                // the appended order is deterministic across runs (HashMap drain
-                // order is not).
-                let mut leftover: Vec<(String, Message)> = results_by_id.drain().collect();
-                leftover.sort_by(|a, b| a.0.cmp(&b.0));
-                for (_, msg) in leftover {
-                    push_with_hook(history, hooks.as_deref(), msg).await;
-                }
-                for msg in orphans.drain(..) {
-                    push_with_hook(history, hooks.as_deref(), msg).await;
-                }
+                self.execute_tool_calls(&tool_calls, history, &tx).await;
 
                 let _ = tx.send(AgentEvent::TurnEnd).await;
                 // Continue Turn loop since we provided tool results back to LLM
@@ -857,6 +723,177 @@ impl Agent {
 
         let _ = tx.send(AgentEvent::AgentEnd).await;
         Ok(total_usage)
+    }
+
+    /// Run all tool calls for a turn and append their results to `history`.
+    /// Honors `before_tool_call`/`after_tool_call` hooks, runs in parallel
+    /// (bounded) unless any tool demands sequential execution, and re-aligns
+    /// results to the original call order so history stays deterministic (with
+    /// any orphan results appended rather than dropped).
+    async fn execute_tool_calls(
+        &self,
+        tool_calls: &[ToolCall],
+        history: &mut Vec<Message>,
+        tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    ) {
+        use futures_util::stream::StreamExt;
+        let tx_clone = tx.clone();
+        let tools_map: HashMap<String, Arc<dyn AgentTool>> = self
+            .tools
+            .iter()
+            .map(|t| (t.name().to_string(), t.clone()))
+            .collect();
+
+        // Check if any tool requires sequential execution
+        let force_sequential = tool_calls.iter().any(|tc| {
+            tools_map
+                .get(&tc.function.name)
+                .map(|t| t.execution_mode() == ExecutionMode::Sequential)
+                .unwrap_or(false)
+        });
+
+        let hooks = &self.hooks;
+        let tool_calls_owned = tool_calls.to_vec();
+
+        let results = if force_sequential {
+            // Sequential execution
+            let mut results = Vec::new();
+            for tc in tool_calls_owned {
+                // Run beforeToolCall hook
+                let args_val: serde_json::Value =
+                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                if let Some(h) = hooks {
+                    if let Err(reason) = h.before_tool_call(&tc.function.name, &args_val).await {
+                        let _ = tx_clone
+                            .send(AgentEvent::ToolExecutionStart {
+                                tool_call_id: tc.id.clone(),
+                                tool_name: tc.function.name.clone(),
+                                arguments: tc.function.arguments.clone(),
+                            })
+                            .await;
+                        let blocked_result =
+                            ToolResult::error(format!("Blocked by hook: {}", reason));
+                        let _ = tx_clone
+                            .send(AgentEvent::ToolExecutionEnd {
+                                tool_call_id: tc.id.clone(),
+                                result: blocked_result.clone(),
+                            })
+                            .await;
+                        let result_json = serde_json::json!({
+                            "result": blocked_result.content,
+                            "is_error": blocked_result.is_error
+                        });
+                        results.push(Message {
+                            role: "tool".to_string(),
+                            content: Some(result_json.to_string()),
+                            reasoning_content: None,
+                            name: Some(tc.function.name),
+                            tool_call_id: Some(tc.id),
+                            tool_calls: None,
+                        });
+                        continue;
+                    }
+                }
+                let msg = execute_single_tool(tc, tools_map.clone(), tx_clone.clone()).await;
+                results.push(msg);
+            }
+            results
+        } else {
+            // Parallel execution — run beforeToolCall hooks first sequentially
+            let mut allowed_calls = Vec::new();
+            let mut blocked_results = Vec::new();
+
+            for tc in &tool_calls_owned {
+                let args_val: serde_json::Value =
+                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                if let Some(h) = hooks {
+                    if let Err(reason) = h.before_tool_call(&tc.function.name, &args_val).await {
+                        let _ = tx_clone
+                            .send(AgentEvent::ToolExecutionStart {
+                                tool_call_id: tc.id.clone(),
+                                tool_name: tc.function.name.clone(),
+                                arguments: tc.function.arguments.clone(),
+                            })
+                            .await;
+                        let blocked_result =
+                            ToolResult::error(format!("Blocked by hook: {}", reason));
+                        let _ = tx_clone
+                            .send(AgentEvent::ToolExecutionEnd {
+                                tool_call_id: tc.id.clone(),
+                                result: blocked_result.clone(),
+                            })
+                            .await;
+                        let result_json = serde_json::json!({
+                            "result": blocked_result.content,
+                            "is_error": blocked_result.is_error
+                        });
+                        blocked_results.push((
+                            tc.id.clone(),
+                            Message {
+                                role: "tool".to_string(),
+                                content: Some(result_json.to_string()),
+                                reasoning_content: None,
+                                name: Some(tc.function.name.clone()),
+                                tool_call_id: Some(tc.id.clone()),
+                                tool_calls: None,
+                            },
+                        ));
+                        continue;
+                    }
+                }
+                allowed_calls.push(tc.clone());
+            }
+
+            let tool_futures = allowed_calls
+                .into_iter()
+                .map(|tc| execute_single_tool(tc, tools_map.clone(), tx_clone.clone()));
+
+            let mut parallel_results: Vec<Message> = futures_util::stream::iter(tool_futures)
+                .buffer_unordered(5)
+                .collect::<Vec<Message>>()
+                .await;
+
+            // Merge blocked results
+            for (_id, msg) in blocked_results {
+                parallel_results.push(msg);
+            }
+            parallel_results
+        };
+
+        // Re-align results with original order to maintain history determinism.
+        // Results lacking a tool_call_id, or whose id is not in `tool_calls`,
+        // are appended afterward as orphans so they are never silently dropped.
+        let (mut results_by_id, mut orphans): (HashMap<String, Message>, Vec<Message>) = {
+            let mut by_id = HashMap::new();
+            let mut no_id = Vec::new();
+            for msg in results {
+                match msg.tool_call_id.clone() {
+                    Some(id) => {
+                        by_id.insert(id, msg);
+                    }
+                    None => no_id.push(msg),
+                }
+            }
+            (by_id, no_id)
+        };
+
+        for tc in tool_calls {
+            if let Some(msg) = results_by_id.remove(&tc.id) {
+                push_with_hook(history, hooks.as_deref(), msg).await;
+            }
+        }
+
+        // Drain any remaining orphan results (unmatched IDs or missing IDs) so we
+        // never silently lose a tool result. Sort by tool_call_id so the appended
+        // order is deterministic across runs (HashMap drain order is not).
+        let mut leftover: Vec<(String, Message)> = results_by_id.drain().collect();
+        leftover.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, msg) in leftover {
+            push_with_hook(history, hooks.as_deref(), msg).await;
+        }
+        for msg in orphans.drain(..) {
+            push_with_hook(history, hooks.as_deref(), msg).await;
+        }
     }
 }
 
