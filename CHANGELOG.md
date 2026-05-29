@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Markdown tables now render as aligned box-drawing grids in the TUI (display-width columns, `:--`/`--:`/`:-:` alignment) instead of raw pipe-delimited text.
+
 ## [0.24.0] - 2026-05-29
 
 ### Added
