@@ -144,7 +144,11 @@ pub fn circuit_breaker_label(command: &str) -> Option<&'static str> {
 /// check independently. Splits on `;`, `&&`, `||`, `|`, and pulls out the
 /// inside of any `$(…)` or `\`…\`` substitutions. Cheap and intentionally
 /// over-eager — false positives only cost an extra `Ask`, not a real run.
-fn split_command_segments(command: &str) -> Vec<String> {
+///
+/// `pub(crate)` so the user-rule matcher (`rule.rs`) splits compound commands
+/// the same way the circuit breaker does — one tokenizer, one notion of
+/// "segment", no drift between the floor and the rule layer.
+pub(crate) fn split_command_segments(command: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut chars = command.chars().peekable();

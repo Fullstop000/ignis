@@ -56,6 +56,22 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
+}
+
+/// Pre-declared permission rules. Each entry is a `Tool(pattern)` string
+/// (e.g. `"bash(git *)"`, `"edit_file(src/**)"`, a bare `"bash"` for every use);
+/// see `permissions::rule`. Evaluated `deny > ask > allow`, beneath the safety
+/// floor and above session-allow / auto-approve modes.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct PermissionsConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 /// OpenTelemetry export. Off by default — telemetry is also gated at runtime by
@@ -488,6 +504,7 @@ models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", 
             disabled_skills: vec![],
             disabled_mcp_servers: vec![],
             mode: None,
+            permission_grants: vec![],
         });
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(cfg.active_effort().as_deref(), Some("high"));
@@ -506,6 +523,41 @@ models = ["deepseek-v4-flash", "deepseek-v4-pro"]
         .unwrap();
         cfg.apply_state(State::default());
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn permissions_section_parses_three_lists() {
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.deepseek]
+api_key = "x"
+models = ["m"]
+
+[permissions]
+allow = ["bash(git *)", "edit_file(src/**)"]
+ask = ["bash(git push *)"]
+deny = ["bash(rm -rf *)"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.permissions.allow.len(), 2);
+        assert_eq!(cfg.permissions.ask, vec!["bash(git push *)".to_string()]);
+        assert_eq!(cfg.permissions.deny, vec!["bash(rm -rf *)".to_string()]);
+    }
+
+    #[test]
+    fn empty_permissions_section_is_default() {
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.deepseek]
+api_key = "x"
+models = ["m"]
+"#,
+        )
+        .unwrap();
+        assert!(cfg.permissions.allow.is_empty());
+        assert!(cfg.permissions.ask.is_empty());
+        assert!(cfg.permissions.deny.is_empty());
     }
 
     #[test]
@@ -618,6 +670,7 @@ models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", 
             disabled_skills: vec![],
             disabled_mcp_servers: vec![],
             mode: None,
+            permission_grants: vec![],
         });
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(cfg.active_effort(), None);
