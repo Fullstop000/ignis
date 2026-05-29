@@ -86,6 +86,50 @@ def _tail_lines(text: str, n: int) -> str:
     return "\n".join(lines[-n:])
 
 
+# Cap how much of the agent log we inline into the HTML. A runaway/looping
+# agent run can produce a multi-GB ignis.txt; embedding it verbatim bloats the
+# report past what a browser can open (and reading it whole would load GBs into
+# RAM). We show the tail — where the outcome/timeout lands — and report the
+# true on-disk size in the drill-down summary.
+_LOG_EMBED_CAP = 512 * 1024  # 512 KiB
+
+
+def _read_log_tail(path: Path, cap: int = _LOG_EMBED_CAP) -> tuple[str, int]:
+    """Return (display_text, true_size_bytes); reads at most `cap` bytes from EOF."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "", 0
+    if size <= cap:
+        return path.read_text(errors="ignore"), size
+    with path.open("rb") as fh:
+        fh.seek(size - cap)
+        tail = fh.read().decode("utf-8", errors="ignore")
+    return f"… [{size:,} bytes total — showing last {cap:,}] …\n{tail}", size
+
+
+def _file_contains(path: Path, needle: str, chunk: int = 1 << 20) -> bool:
+    """Stream-scan a (possibly multi-GB) file for `needle` without loading it whole.
+
+    Carries a `len(needle)`-byte overlap across reads so a marker straddling a
+    chunk boundary is still found. Used for rate-limit detection, which must see
+    the WHOLE log — not just the embedded tail — to classify the trial correctly.
+    """
+    nb = needle.encode()
+    try:
+        with path.open("rb") as fh:
+            carry = b""
+            while True:
+                buf = fh.read(chunk)
+                if not buf:
+                    return False
+                if nb in carry + buf:
+                    return True
+                carry = buf[-len(nb):]
+    except OSError:
+        return False
+
+
 @dataclass
 class Trial:
     task: str
@@ -102,6 +146,7 @@ class Trial:
     started_at: str
     finished_at: str
     log_full: str
+    log_bytes: int = 0
     tool_calls: Counter[str] = field(default_factory=Counter)
     verifier_reward_raw: str = ""
     verifier_test_tail: str = ""
@@ -126,8 +171,12 @@ def walk_trials(job_dir: Path) -> list[Trial]:
         reward = verifier.get("reward")
         exc = result.get("exception_info")
         agent_log_path = trial_dir / "agent" / "ignis.txt"
-        log_text = agent_log_path.read_text(errors="ignore") if agent_log_path.exists() else ""
-        rate_limited = "rate_limit_reached_error" in log_text
+        log_text, log_bytes = (
+            _read_log_tail(agent_log_path) if agent_log_path.exists() else ("", 0)
+        )
+        # Scan the FULL file, not the embedded tail — a rate-limit marker early
+        # in a huge log must still flip the trial to the `quota` bucket.
+        rate_limited = _file_contains(agent_log_path, "rate_limit_reached_error")
 
         n_in, n_out, n_cache = _sum_usage(trial_dir / "agent" / "ignis-projects")
         cache_rate = (n_cache / n_in) if n_in else None
@@ -155,6 +204,7 @@ def walk_trials(job_dir: Path) -> list[Trial]:
                 started_at=result.get("started_at", ""),
                 finished_at=result.get("finished_at", ""),
                 log_full=log_text,
+                log_bytes=log_bytes,
                 tool_calls=_parse_tool_calls(log_text),
                 verifier_reward_raw=verifier_reward_raw,
                 verifier_test_tail=verifier_test_tail,
@@ -279,7 +329,7 @@ def _render_trial_drilldown(t: Trial) -> str:
         f'<pre>{html.escape(t.log_full)}</pre>'
         if t.log_full else '<div style="color:#999;font-size:12px">(no agent log captured)</div>'
     )
-    log_size = len(t.log_full)
+    log_size = t.log_bytes
 
     return f"""<details>
   <summary>drill-down · {tool_total} tool calls · verifier reward {reward_raw} · agent log {log_size:,} bytes</summary>
@@ -287,7 +337,7 @@ def _render_trial_drilldown(t: Trial) -> str:
     <div><h4>tool call counts</h4>{tool_rows}</div>
     <div><h4>verifier output (tail)</h4>{verifier_block}</div>
   </div>
-  <h4 style="margin-top:0.8rem">agent log — full</h4>
+  <h4 style="margin-top:0.8rem">agent log — tail if large</h4>
   {log_block}
 </details>"""
 
