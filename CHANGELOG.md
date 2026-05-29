@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.4] - 2026-05-29
+
+### Fixed
+- Streaming transport errors (e.g. connection reset) now end the turn instead of looping — a broken stream could previously spin until the agent timeout, emitting the same error millions of times.
+- `bash` tool no longer panics when truncating binary or multibyte output at its size cap (it backs off to a UTF-8 char boundary).
+- TB2 adapter passes the prompt after `--`, so task instructions that begin with `-` no longer abort the run as an unknown flag.
+
 ### Changed
+- Agent system prompt nudges verifying the task's exact required output path/format and cleaning up build artifacts before finishing.
 - Internal — fixed a stale `ignis upgrade` doc comment (it described the JSON API the code no longer uses) and de-duplicated the request User-Agent string. No user-visible change.
 
 ## [0.25.3] - 2026-05-29

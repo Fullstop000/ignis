@@ -12,8 +12,9 @@ reasoning level — the generated TOML declares it as a supported level for the
 model entry and sets the top-level `reasoning_effort`. The provider segment
 selects which env var holds the API key and (for OpenAI-compatible providers
 that need a URL) the default endpoint. We write a minimal ~/.ignis/config.toml
-inside the sandbox and invoke `ignis "<instruction>"` — a non-empty prompt arg
-switches ignis off TUI mode into one-shot streaming.
+inside the sandbox and invoke `ignis -- "<instruction>"` — a non-empty prompt arg
+switches ignis off TUI mode into one-shot streaming (`--` lets instructions that
+start with `-` through clap's flag parser).
 """
 
 import json
@@ -167,7 +168,11 @@ class IgnisAgent(BaseInstalledAgent):
             await self.exec_as_agent(
                 environment,
                 command=(
-                    f"ignis {shlex.quote(instruction)} "
+                    # `--` ends ignis's flag parsing: a task instruction that
+                    # begins with `-` (clap otherwise rejects it as an unknown
+                    # flag and the run dies before any tool call) is passed as
+                    # the positional prompt.
+                    f"ignis -- {shlex.quote(instruction)} "
                     f"2>&1 | stdbuf -oL tee {shlex.quote(log_path)}"
                 ),
             )
