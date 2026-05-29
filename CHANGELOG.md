@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Internal — fixed a stale `ignis upgrade` doc comment (it described the JSON API the code no longer uses) and de-duplicated the request User-Agent string. No user-visible change.
+
 ## [0.25.3] - 2026-05-29
 
 ### Changed

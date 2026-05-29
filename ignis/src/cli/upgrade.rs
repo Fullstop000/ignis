@@ -7,16 +7,21 @@
 //! match one of those, we refuse with a build-from-source pointer. Windows is
 //! deliberately out of scope until the release pipeline ships an installer.
 //!
-//! Network: one HTTPS GET to `api.github.com/repos/<repo>/releases/latest`
-//! (anonymous, User-Agent set), then one HTTPS GET for the tarball. Extraction
-//! shells out to `tar -xzf`, which is on every supported platform — keeps us
-//! out of an extra `tar`/`flate2` Rust dep.
+//! Network: one HTTPS GET to `github.com/<repo>/releases/latest`, reading the
+//! tag from the 302 redirect target (the anonymous JSON API is rate-limited to
+//! 60 req/hr/IP — shared IPs hit that constantly), then a GET for the tarball,
+//! retried on transient failures. Extraction shells out to `tar -xzf`, which is
+//! on every supported platform — keeps us out of an extra `tar`/`flate2` dep.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 
 const REPO: &str = "Fullstop000/ignis";
+
+/// User-Agent for our GitHub requests. `concat!`/`env!` are const macros, so this
+/// is one compile-time string instead of a `format!` repeated at each call site.
+const UA: &str = concat!("ignis-upgrade/", env!("CARGO_PKG_VERSION"));
 
 /// The release-artifact target triple for this build. `None` means we don't
 /// ship a prebuilt binary for the host and `ignis upgrade` should refuse.
@@ -127,10 +132,7 @@ async fn fetch_latest_tag() -> Result<String> {
     let url = format!("https://github.com/{}/releases/latest", REPO);
     let resp = reqwest::Client::new()
         .get(&url)
-        .header(
-            reqwest::header::USER_AGENT,
-            format!("ignis-upgrade/{}", env!("CARGO_PKG_VERSION")),
-        )
+        .header(reqwest::header::USER_AGENT, UA)
         .send()
         .await
         .context("fetch latest release")?
@@ -177,10 +179,7 @@ async fn download(url: &str, dest: &Path) -> Result<()> {
         let fetch = async {
             client
                 .get(url)
-                .header(
-                    reqwest::header::USER_AGENT,
-                    format!("ignis-upgrade/{}", env!("CARGO_PKG_VERSION")),
-                )
+                .header(reqwest::header::USER_AGENT, UA)
                 .send()
                 .await?
                 .error_for_status()?
