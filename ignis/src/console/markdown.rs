@@ -1,5 +1,6 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use super::{
     sanitize, ACCENT, BORDER, CODE_BG, GREEN, LAVENDER, MAUVE, PEACH, SUBTEXT, TEAL, TEXT, YELLOW,
@@ -108,10 +109,12 @@ pub(crate) fn render_md_block(text: &str, is_streaming: bool) -> Vec<Line<'stati
     let mut in_code_block = false;
     let mut code_lang = String::new();
 
-    for raw_line in text.lines() {
-        // Expand tabs / strip control chars so they can't desync the layout.
-        let raw_line = sanitize(raw_line);
-        let raw_line = raw_line.as_str();
+    // Expand tabs / strip control chars up front so they can't desync the
+    // layout, and so the table detector can look ahead one line cheaply.
+    let src: Vec<String> = text.lines().map(sanitize).collect();
+    let mut i = 0;
+    while i < src.len() {
+        let raw_line = src[i].as_str();
         if raw_line.starts_with("```") {
             if in_code_block {
                 // End code block
@@ -138,6 +141,7 @@ pub(crate) fn render_md_block(text: &str, is_streaming: bool) -> Vec<Line<'stati
                 ]));
                 in_code_block = true;
             }
+            i += 1;
             continue;
         }
 
@@ -146,6 +150,15 @@ pub(crate) fn render_md_block(text: &str, is_streaming: bool) -> Vec<Line<'stati
                 Span::styled("  │ ", Style::default().fg(BORDER)),
                 Span::styled(raw_line.to_string(), Style::default().fg(GREEN)),
             ]));
+            i += 1;
+            continue;
+        }
+
+        // Table: a row followed by a `|---|`-style separator on the next line.
+        if is_table_row(raw_line) && src.get(i + 1).map(|n| is_separator_row(n)).unwrap_or(false) {
+            let (table_lines, consumed) = render_table(&src[i..]);
+            lines.extend(table_lines);
+            i += consumed;
             continue;
         }
 
@@ -190,6 +203,7 @@ pub(crate) fn render_md_block(text: &str, is_streaming: bool) -> Vec<Line<'stati
             spans.extend(render_md_spans(raw_line, base));
             lines.push(Line::from(spans));
         }
+        i += 1;
     }
 
     // Streaming cursor
@@ -201,6 +215,239 @@ pub(crate) fn render_md_block(text: &str, is_streaming: bool) -> Vec<Line<'stati
     }
 
     lines
+}
+
+// ---- Markdown tables -----------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Right,
+    Center,
+}
+
+/// A line that could be a table row: non-empty and contains a pipe.
+fn is_table_row(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && t.contains('|')
+}
+
+/// A GitHub-style separator/alignment row: every cell is `:?-+:?`.
+fn is_separator_row(line: &str) -> bool {
+    let cells = split_cells(line);
+    !cells.is_empty()
+        && cells.iter().all(|c| {
+            let c = c.trim();
+            let body = c.strip_prefix(':').unwrap_or(c);
+            let body = body.strip_suffix(':').unwrap_or(body);
+            !body.is_empty() && body.bytes().all(|b| b == b'-')
+        })
+}
+
+/// Split a `| a | b |` row into trimmed cells, dropping the optional outer pipes.
+fn split_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+fn alignment_of(sep_cell: &str) -> Align {
+    let c = sep_cell.trim();
+    match (c.starts_with(':'), c.ends_with(':')) {
+        (true, true) => Align::Center,
+        (false, true) => Align::Right,
+        _ => Align::Left,
+    }
+}
+
+fn cell_at(row: &[String], c: usize) -> &str {
+    row.get(c).map(|s| s.as_str()).unwrap_or("")
+}
+
+/// Pad `cell` to `width` display columns under `align` (display-width aware, so
+/// CJK / wide glyphs line up — see [[insert-before-wide-char-spaces]]).
+fn pad_cell(cell: &str, width: usize, align: Align) -> String {
+    let pad = width.saturating_sub(UnicodeWidthStr::width(cell));
+    match align {
+        Align::Left => format!("{cell}{}", " ".repeat(pad)),
+        Align::Right => format!("{}{cell}", " ".repeat(pad)),
+        Align::Center => {
+            let lp = pad / 2;
+            format!("{}{cell}{}", " ".repeat(lp), " ".repeat(pad - lp))
+        }
+    }
+}
+
+/// Render a markdown table given a slice whose first line is the header and
+/// second is the separator; consumes body rows until a non-row line. Returns
+/// the rendered lines and how many source lines were consumed.
+fn render_table(block: &[String]) -> (Vec<Line<'static>>, usize) {
+    let header = split_cells(&block[0]);
+    let aligns_src = split_cells(&block[1]);
+    let mut body: Vec<Vec<String>> = Vec::new();
+    let mut consumed = 2;
+    for line in &block[2..] {
+        if !is_table_row(line) {
+            break;
+        }
+        body.push(split_cells(line));
+        consumed += 1;
+    }
+
+    let ncols = header
+        .len()
+        .max(aligns_src.len())
+        .max(body.iter().map(|r| r.len()).max().unwrap_or(0));
+    let aligns: Vec<Align> = (0..ncols)
+        .map(|c| {
+            aligns_src
+                .get(c)
+                .map(|s| alignment_of(s))
+                .unwrap_or(Align::Left)
+        })
+        .collect();
+    let mut widths = vec![0usize; ncols];
+    for (c, w) in widths.iter_mut().enumerate() {
+        *w = UnicodeWidthStr::width(cell_at(&header, c));
+        for row in &body {
+            *w = (*w).max(UnicodeWidthStr::width(cell_at(row, c)));
+        }
+    }
+
+    let border = Style::default().fg(BORDER);
+    let head_style = Style::default().fg(TEAL).add_modifier(Modifier::BOLD);
+    let cell_style = Style::default().fg(TEXT);
+
+    let rule = |left: char, mid: char, right: char| -> Line<'static> {
+        let mut s = format!("  {left}");
+        for (c, w) in widths.iter().enumerate() {
+            s.push_str(&"─".repeat(w + 2));
+            s.push(if c + 1 == ncols { right } else { mid });
+        }
+        Line::from(Span::styled(s, border))
+    };
+    let data_row = |cells: &[String], style: Style| -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = vec![Span::styled("  │", border)];
+        for c in 0..ncols {
+            let padded = pad_cell(cell_at(cells, c), widths[c], aligns[c]);
+            spans.push(Span::styled(format!(" {padded} "), style));
+            spans.push(Span::styled("│", border));
+        }
+        Line::from(spans)
+    };
+
+    let mut out = vec![
+        rule('┌', '┬', '┐'),
+        data_row(&header, head_style),
+        rule('├', '┼', '┤'),
+    ];
+    for row in &body {
+        out.push(data_row(row, cell_style));
+    }
+    out.push(rule('└', '┴', '┘'));
+    (out, consumed)
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    /// Flatten each rendered Line to its concatenated span text — enough to
+    /// assert structure and alignment (colors are a visual/dogfood concern).
+    fn flat(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn renders_full_grid_box_matching_spec() {
+        let md = "\
+| Name | Age | City |
+|------|-----|------|
+| Alice | 30 | Beijing |
+| Bob | 25 | Shanghai |";
+        let out = flat(&render_md_block(md, false));
+        assert_eq!(
+            out,
+            vec![
+                "  ┌───────┬─────┬──────────┐",
+                "  │ Name  │ Age │ City     │",
+                "  ├───────┼─────┼──────────┤",
+                "  │ Alice │ 30  │ Beijing  │",
+                "  │ Bob   │ 25  │ Shanghai │",
+                "  └───────┴─────┴──────────┘",
+            ]
+        );
+    }
+
+    #[test]
+    fn right_align_marker_right_pads_left() {
+        let md = "\
+| Item | Qty |
+|------|----:|
+| Pen | 3 |
+| Notebook | 12 |";
+        let out = flat(&render_md_block(md, false));
+        // Qty column width 3 (header "Qty"); values right-aligned.
+        assert!(out.iter().any(|l| l.contains("│   3 │")), "rows: {out:?}");
+        assert!(out.iter().any(|l| l.contains("│  12 │")), "rows: {out:?}");
+    }
+
+    #[test]
+    fn center_align_marker_centers() {
+        let md = "\
+| K | V |
+|:-:|---|
+| ab | x |
+| c | y |";
+        let out = flat(&render_md_block(md, false));
+        // K column width 2 ("ab"); "c" centered → " c". Cell is ` ` + content + ` `.
+        assert!(
+            out.iter().any(|l| l.starts_with("  │ c  │")),
+            "rows: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cjk_columns_use_display_width() {
+        // "中文" has display width 4; the column border segment must be 4+2=6.
+        let md = "\
+| x |
+|---|
+| 中文 |";
+        let out = flat(&render_md_block(md, false));
+        assert_eq!(out[0], "  ┌──────┐", "top border: {out:?}");
+        assert_eq!(out[3], "  │ 中文 │", "cjk row: {out:?}");
+    }
+
+    #[test]
+    fn pipe_block_without_separator_falls_back_to_plaintext() {
+        let md = "| a | b |\n| c | d |";
+        let out = flat(&render_md_block(md, false));
+        assert!(
+            out.iter().all(|l| !l.contains('┌') && !l.contains('│')),
+            "should not render a box without a separator row: {out:?}"
+        );
+        // Rendered as ordinary text lines (indented).
+        assert!(out.iter().any(|l| l.contains("| a | b |")), "out: {out:?}");
+    }
+
+    #[test]
+    fn table_surrounded_by_prose_renders_both() {
+        let md = "before\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nafter";
+        let out = flat(&render_md_block(md, false));
+        assert!(out.iter().any(|l| l.contains("before")));
+        assert!(out.iter().any(|l| l.starts_with("  ┌")));
+        assert!(out.iter().any(|l| l.contains("after")));
+    }
 }
 
 // ==========================================
