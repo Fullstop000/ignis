@@ -133,6 +133,21 @@ class IgnisAgent(BaseInstalledAgent):
                 "break the generated TOML config"
             )
 
+        # Optional: forward a web-search key so the in-sandbox `web_search` tool
+        # actually works (Brave takes precedence over Tavily). Absent from the
+        # env → no [web_search] block and the tool stays disabled, as before.
+        search_provider = search_key = None
+        for env_name, prov in (("BRAVE_API_KEY", "brave"), ("TAVILY_API_KEY", "tavily")):
+            val = self._get_env(env_name)
+            if val:
+                search_provider, search_key = prov, val
+                break
+        if search_key and ('"' in search_key or "\\" in search_key):
+            raise ValueError(
+                "IgnisAgent: web-search key contains characters that would "
+                "break the generated TOML config"
+            )
+
         config_lines = [f'model = "{provider}/{model}"']
         if effort:
             # Top-level reasoning_effort is only honored when the model entry
@@ -148,6 +163,10 @@ class IgnisAgent(BaseInstalledAgent):
             )
         else:
             config_lines.append(f'models = ["{model}"]')
+        if search_key:
+            config_lines.append("[web_search]")
+            config_lines.append(f'provider = "{search_provider}"')
+            config_lines.append(f'api_key = "{search_key}"')
         config_toml = "\n".join(config_lines) + "\n"
 
         # Single-quoted heredoc terminator → no variable expansion inside.
