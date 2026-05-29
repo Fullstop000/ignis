@@ -697,7 +697,11 @@ impl App {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("project");
-        let block = crate::cli::sessions::render_sessions_inline(&records, project_name);
+        let block = crate::cli::sessions::render_sessions_inline(
+            &records,
+            project_name,
+            Some(&self.session_id),
+        );
         self.add_assistant_notice(block);
     }
 
