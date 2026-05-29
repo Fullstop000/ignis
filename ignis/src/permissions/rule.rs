@@ -229,11 +229,19 @@ fn parse_list(items: &[String]) -> Vec<Rule> {
 pub fn suggest_grant(tool: &str, args: &Value) -> Option<String> {
     if tool == "bash" {
         let command = args.get("command").and_then(|v| v.as_str())?;
-        let tokens: Vec<&str> = command.split_whitespace().collect();
+        let all: Vec<&str> = command.split_whitespace().collect();
+        // Strip leading `sudo` and `KEY=VAL` env assignments before deciding the
+        // arity, so we never suggest `bash(sudo *)` or `bash(FOO=bar *)` (the
+        // latter would glob-match `FOO=bar rm -rf x`).
+        let start = all
+            .iter()
+            .position(|t| *t != "sudo" && !is_env_assignment(t))
+            .unwrap_or(all.len());
+        let tokens = &all[start..];
         if tokens.is_empty() {
             return None;
         }
-        let keep = bash_arity(&tokens).min(tokens.len());
+        let keep = bash_arity(tokens).min(tokens.len());
         let prefix = tokens[..keep].join(" ");
         return Some(format!("bash({prefix} *)"));
     }
@@ -247,6 +255,16 @@ pub fn suggest_grant(tool: &str, args: &Value) -> Option<String> {
         return Some(format!("web_fetch(domain:{host})"));
     }
     Some(tool.to_string())
+}
+
+/// A `KEY=VALUE` shell env-assignment prefix (key is non-empty and alnum/`_`).
+fn is_env_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((key, _)) => {
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
 }
 
 /// Longest-prefix lookup in `BASH_ARITY`; defaults to 1 (keep the command name).
@@ -292,9 +310,36 @@ fn simple_glob(pattern: &str, candidate: &str) -> bool {
 /// relative (leading slash dropped), a bare filename becomes `**/<name>`.
 fn path_glob(pattern: &str, path: &str) -> bool {
     let normalized_pattern = normalize_path_pattern(pattern);
-    let candidate = path.trim().trim_start_matches("./");
+    let candidate = normalize_path_segments(path.trim().trim_start_matches("./"));
     let re = format!("^{}$", path_pattern_to_regex(&normalized_pattern));
-    regex_matches(&re, candidate)
+    regex_matches(&re, &candidate)
+}
+
+/// Lexically collapse `.` and `..` segments in a candidate path so a traversal
+/// like `src/../../etc/passwd` can't sneak past a `src/**` anchor. Purely
+/// textual (no filesystem access); a leading `/` is preserved, and `..` that
+/// would climb above the root is kept verbatim (it can't match an in-tree glob).
+fn normalize_path_segments(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => match out.last() {
+                Some(&prev) if prev != ".." => {
+                    out.pop();
+                }
+                _ => out.push(".."),
+            },
+            other => out.push(other),
+        }
+    }
+    let joined = out.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 fn normalize_path_pattern(pattern: &str) -> String {
@@ -379,20 +424,22 @@ fn regex_matches(re: &str, candidate: &str) -> bool {
     }
 }
 
-/// Pull the host out of an http(s) URL: strip the scheme, take everything up to
-/// the first `/`, `:` (port) or `?`.
+/// Pull the host out of an http(s) URL. Strip the scheme, isolate the authority
+/// (up to the first `/`, `?`, or `#`), drop any `user[:pass]@` userinfo, then
+/// drop the `:port`. Skipping userinfo matters: `https://trusted.com@evil.com/`
+/// connects to `evil.com`, so a `domain:` rule must see `evil.com`.
 fn extract_host(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    let host: String = rest
-        .chars()
-        .take_while(|c| !matches!(c, '/' | ':' | '?'))
-        .collect();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Userinfo ends at the last `@`; the host[:port] is whatever follows.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host_port.split(':').next().unwrap_or(host_port);
     if host.is_empty() {
         None
     } else {
-        Some(host)
+        Some(host.to_string())
     }
 }
 
@@ -487,6 +534,34 @@ mod tests {
     }
 
     #[test]
+    fn bash_allow_does_not_green_light_background_amp_or_newline_segment() {
+        // Regression (review finding): a single `&` and a newline are real
+        // command separators — they must NOT smuggle an un-allowed segment
+        // through an allow rule the way `&&` is blocked.
+        let set = rs(&["bash(git *)"], &[], &[]);
+        for cmd in [
+            "git status & rm -rf y",
+            "git status\nrm -rf y",
+            "git log |& rm -rf y",
+        ] {
+            assert_eq!(
+                set.decide("bash", &json!({ "command": cmd })),
+                None,
+                "allow rule must not cover hidden segment in: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_deny_matches_background_amp_segment() {
+        let set = rs(&[], &[], &["bash(rm -rf *)"]);
+        assert!(matches!(
+            set.decide("bash", &json!({"command": "ls & rm -rf foo"})),
+            Some(Decision::Deny { .. })
+        ));
+    }
+
+    #[test]
     fn bash_allow_requires_a_rule_hit() {
         // No bash allow rule → never an Allow even for an innocent command.
         let set = rs(&[], &[], &[]);
@@ -565,6 +640,55 @@ mod tests {
         assert_eq!(
             set.decide("edit_file", &json!({"path": "src/a/b.rs"})),
             None
+        );
+    }
+
+    #[test]
+    fn path_traversal_does_not_escape_anchored_allow() {
+        // Regression (review finding): `..` must be normalized so a path-anchored
+        // allow rule can't be tricked into matching a file outside the anchor.
+        let set = rs(&["edit_file(src/**)"], &[], &[]);
+        assert_eq!(
+            set.decide("edit_file", &json!({"path": "src/../../secrets/key"})),
+            None
+        );
+        // A normal in-tree path still matches.
+        assert_eq!(
+            set.decide("edit_file", &json!({"path": "src/a/b.rs"})),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn path_traversal_normalizes_for_deny() {
+        // `a/../secrets/key` resolves to `secrets/key` and must trip the deny.
+        let set = rs(&[], &[], &["read_file(secrets/**)"]);
+        assert!(matches!(
+            set.decide("read_file", &json!({"path": "a/../secrets/key.pem"})),
+            Some(Decision::Deny { .. })
+        ));
+    }
+
+    #[test]
+    fn domain_deny_sees_real_host_past_userinfo() {
+        // Regression (review finding): `user@host` userinfo must not be mistaken
+        // for the host, or a deny rule silently fails to fire.
+        let set = rs(&[], &[], &["web_fetch(domain:evil.com)"]);
+        assert!(matches!(
+            set.decide(
+                "web_fetch",
+                &json!({"url": "https://trusted.com@evil.com/x"})
+            ),
+            Some(Decision::Deny { .. })
+        ));
+        // And a fragment doesn't leak into the host.
+        let set2 = rs(&["web_fetch(domain:example.com)"], &[], &[]);
+        assert_eq!(
+            set2.decide(
+                "web_fetch",
+                &json!({"url": "https://example.com#@evil.com"})
+            ),
+            Some(Decision::Allow)
         );
     }
 
@@ -683,6 +807,23 @@ mod tests {
         assert_eq!(
             suggest_grant("bash", &json!({"command": "ls -la"})),
             Some("bash(ls *)".to_string())
+        );
+    }
+
+    #[test]
+    fn suggest_bash_strips_sudo_and_env_prefix() {
+        // Regression (review finding): the grant suggestion must not propose
+        // `bash(sudo *)` or `bash(FOO=bar *)` — strip the wrappers first.
+        assert_eq!(
+            suggest_grant("bash", &json!({"command": "sudo rm -rf /tmp/x"})),
+            Some("bash(rm *)".to_string())
+        );
+        assert_eq!(
+            suggest_grant(
+                "bash",
+                &json!({"command": "FOO=bar git status --porcelain"})
+            ),
+            Some("bash(git status *)".to_string())
         );
     }
 
