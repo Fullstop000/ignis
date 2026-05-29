@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-05-29
+
+### Fixed
+- TB2 HTML report — caps each embedded agent log to a 512 KiB tail so a runaway run can't bloat the report to gigabytes.
+
 ## [0.23.0] - 2026-05-29
 
 ### Added
