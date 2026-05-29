@@ -21,7 +21,10 @@ const REPO: &str = "Fullstop000/ignis";
 /// The release-artifact target triple for this build. `None` means we don't
 /// ship a prebuilt binary for the host and `ignis upgrade` should refuse.
 pub const TARGET: Option<&str> = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-    Some("x86_64-unknown-linux-gnu")
+    // musl, not gnu: the release pipeline ships a static musl build for Linux
+    // (see `.github/workflows/release.yml`) so the binary runs on older glibc.
+    // This MUST match the asset name or the download 404s.
+    Some("x86_64-unknown-linux-musl")
 } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
     Some("x86_64-apple-darwin")
 } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -340,16 +343,16 @@ mod tests {
 
     #[test]
     fn target_matches_release_workflow_for_supported_hosts() {
-        // If the host is one of the supported triples, the constant resolves;
-        // otherwise it is `None`. Either way the constant exists and compiles.
-        let known = [
-            "x86_64-unknown-linux-gnu",
-            "x86_64-apple-darwin",
-            "aarch64-apple-darwin",
-        ];
-        if let Some(t) = TARGET {
-            assert!(known.contains(&t), "unexpected target triple {t}");
-        }
+        // Pin the exact triple per host: `TARGET` becomes the asset filename, so
+        // it must match `.github/workflows/release.yml` byte-for-byte or the
+        // download 404s. Linux is musl (static build), NOT gnu — a weaker
+        // "is it in a known set" check let that drift slip through once.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(TARGET, Some("x86_64-unknown-linux-musl"));
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        assert_eq!(TARGET, Some("x86_64-apple-darwin"));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(TARGET, Some("aarch64-apple-darwin"));
     }
 
     #[test]
