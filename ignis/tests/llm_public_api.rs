@@ -7,7 +7,7 @@ fn llm_module_exposes_public_model_and_protocol_api() {
 
     let option = ModelOption {
         provider: "openai".to_string(),
-        model: "o3".to_string(),
+        model: "gpt-5.5".to_string(),
         effort_levels: vec!["low".to_string()],
         context: Some(200_000),
     };

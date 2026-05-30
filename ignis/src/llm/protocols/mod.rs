@@ -92,7 +92,7 @@ pub struct Resolved {
     pub auth: Auth,
     pub api_key: Option<String>,
     pub model: String,
-    pub user_agent: Option<String>,
+    pub request_headers: Vec<(String, String)>,
     pub reasoning_effort: Option<String>,
 }
 
@@ -310,9 +310,10 @@ pub(crate) fn parse_sse_line(line: &str) -> Option<LlmResponseDelta> {
 }
 
 /// Stream a chat completion from an OpenAI-compatible endpoint. The only
-/// provider-specific knob is `user_agent`: `Some` sets the header (OpenAI/Kimi/
-/// Moonshot), `None` omits it (DeepSeek). All response parsing is shared via
-/// `parse_sse_line`, so a streaming-parser change happens in exactly one place.
+/// provider-specific knob is `request_headers`: built-in provider declarations
+/// can add headers such as Kimi's whitelisted `User-Agent`. All response parsing
+/// is shared via `parse_sse_line`, so a streaming-parser change happens in
+/// exactly one place.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn openai_compatible_chat_stream(
     client: &reqwest::Client,
@@ -320,7 +321,7 @@ pub(crate) async fn openai_compatible_chat_stream(
     api_key: &str,
     model: &str,
     reasoning_effort: Option<&str>,
-    user_agent: Option<&str>,
+    request_headers: &[(String, String)],
     system_prompt: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
@@ -356,8 +357,8 @@ pub(crate) async fn openai_compatible_chat_stream(
         .post(&endpoint)
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&req_body);
-    if let Some(ua) = user_agent {
-        req = req.header("User-Agent", ua);
+    for (name, value) in request_headers {
+        req = req.header(name.as_str(), value.as_str());
     }
     let res = req.send().await?;
 

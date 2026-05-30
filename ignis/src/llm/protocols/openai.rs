@@ -5,15 +5,16 @@ use futures_util::stream::BoxStream;
 
 /// Any OpenAI-compatible endpoint — OpenAI, DeepSeek, Kimi, Moonshot, MiniMax's
 /// `/v1`, or a user's `custom` endpoint. The only per-brand knobs are the base
-/// URL, the optional `User-Agent` (some plans whitelist one), and reasoning
-/// effort; all response parsing is shared via [`openai_compatible_chat_stream`].
+/// URL, optional request headers (some plans whitelist a `User-Agent`), and
+/// reasoning effort; all response parsing is shared via
+/// [`openai_compatible_chat_stream`].
 pub struct OpenAiCompatible {
     client: reqwest::Client,
     provider_id: String,
     api_key: String,
     base_url: String,
     model: String,
-    user_agent: Option<String>,
+    request_headers: Vec<(String, String)>,
     reasoning_effort: Option<String>,
 }
 
@@ -25,7 +26,7 @@ impl OpenAiCompatible {
             api_key: r.api_key.unwrap_or_default(),
             base_url: r.base_url,
             model: r.model,
-            user_agent: r.user_agent,
+            request_headers: r.request_headers,
             reasoning_effort: r.reasoning_effort,
         }
     }
@@ -53,7 +54,7 @@ impl LlmProvider for OpenAiCompatible {
             &self.api_key,
             &self.model,
             self.reasoning_effort.as_deref(),
-            self.user_agent.as_deref(),
+            &self.request_headers,
             system_prompt,
             messages,
             tools,

@@ -37,8 +37,9 @@ pub struct ProviderSpec {
     /// endpoint is synthesized from config.
     pub endpoints: &'static [Endpoint],
     pub api_key_required: bool,
-    /// Whitelisted User-Agent baked in (e.g. Kimi); else `None`.
-    pub user_agent: Option<&'static str>,
+    /// Extra HTTP headers baked in for a provider plan (e.g. Kimi's whitelisted
+    /// User-Agent). Auth headers are owned by [`Endpoint::auth`], not this list.
+    pub request_headers: &'static [(&'static str, &'static str)],
     /// Built-in model list. Empty for `custom` (declared in config).
     pub models: &'static [ModelSpec],
 }
@@ -57,17 +58,17 @@ static SPECS: &[ProviderSpec] = &[
             auth: Auth::Bearer,
         }],
         api_key_required: true,
-        user_agent: None,
+        request_headers: &[],
         models: &[
             ModelSpec {
-                name: "gpt-4o",
-                context: None,
-                reasoning_effort: &[],
+                name: "gpt-5.5",
+                context: Some(1_000_000),
+                reasoning_effort: &["none", "low", "medium", "high", "xhigh"],
             },
             ModelSpec {
-                name: "o3",
-                context: None,
-                reasoning_effort: &["low", "medium", "high"],
+                name: "gpt-5.4-mini",
+                context: Some(400_000),
+                reasoning_effort: &["none", "low", "medium", "high", "xhigh"],
             },
         ],
     },
@@ -82,12 +83,19 @@ static SPECS: &[ProviderSpec] = &[
             auth: Auth::XApiKey,
         }],
         api_key_required: true,
-        user_agent: None,
-        models: &[ModelSpec {
-            name: "claude-sonnet-4-20250514",
-            context: None,
-            reasoning_effort: &[],
-        }],
+        request_headers: &[],
+        models: &[
+            ModelSpec {
+                name: "claude-sonnet-4-6",
+                context: Some(1_000_000),
+                reasoning_effort: &[],
+            },
+            ModelSpec {
+                name: "claude-opus-4-8",
+                context: Some(1_000_000),
+                reasoning_effort: &[],
+            },
+        ],
     },
     // ── DeepSeek ────────────────────────────────────────────────────────────
     ProviderSpec {
@@ -99,7 +107,7 @@ static SPECS: &[ProviderSpec] = &[
             auth: Auth::Bearer,
         }],
         api_key_required: true,
-        user_agent: None,
+        request_headers: &[],
         models: &[
             ModelSpec {
                 name: "deepseek-v4-flash",
@@ -123,7 +131,7 @@ static SPECS: &[ProviderSpec] = &[
             auth: Auth::QueryKey,
         }],
         api_key_required: true,
-        user_agent: None,
+        request_headers: &[],
         models: &[ModelSpec {
             name: "gemini-2.5-pro",
             context: None,
@@ -140,7 +148,7 @@ static SPECS: &[ProviderSpec] = &[
             auth: Auth::Bearer,
         }],
         api_key_required: true,
-        user_agent: Some("KimiCLI/1.44.0"),
+        request_headers: &[("User-Agent", "KimiCLI/1.44.0")],
         models: &[ModelSpec {
             name: "kimi-for-coding",
             // models.dev doesn't know this alias; declare its 256K window.
@@ -158,8 +166,18 @@ static SPECS: &[ProviderSpec] = &[
             auth: Auth::Bearer,
         }],
         api_key_required: true,
-        user_agent: None,
+        request_headers: &[],
         models: &[
+            ModelSpec {
+                name: "kimi-k2.6",
+                context: None,
+                reasoning_effort: &[],
+            },
+            ModelSpec {
+                name: "kimi-k2.5",
+                context: Some(262_144),
+                reasoning_effort: &[],
+            },
             ModelSpec {
                 name: "kimi-latest",
                 context: None,
@@ -167,7 +185,7 @@ static SPECS: &[ProviderSpec] = &[
             },
             ModelSpec {
                 name: "moonshot-v1-128k",
-                context: None,
+                context: Some(131_072),
                 reasoning_effort: &[],
             },
         ],
@@ -194,7 +212,7 @@ static SPECS: &[ProviderSpec] = &[
             },
         ],
         api_key_required: true,
-        user_agent: None,
+        request_headers: &[],
         models: &[
             ModelSpec {
                 name: "MiniMax-M2.7",
@@ -218,7 +236,7 @@ static SPECS: &[ProviderSpec] = &[
             auth: Auth::None,
         }],
         api_key_required: false,
-        user_agent: None,
+        request_headers: &[],
         models: &[ModelSpec {
             name: "llama3",
             context: None,
@@ -234,7 +252,7 @@ static SPECS: &[ProviderSpec] = &[
         display_name: "Custom (OpenAI-compatible)",
         endpoints: &[],
         api_key_required: true,
-        user_agent: None,
+        request_headers: &[],
         models: &[],
     },
 ];
@@ -292,5 +310,20 @@ mod tests {
             Some("minimax-token-plan")
         );
         assert!(lookup("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn baked_models_track_current_default_ids() {
+        let openai = lookup("openai").unwrap();
+        assert_eq!(openai.models[0].name, "gpt-5.5");
+        assert_eq!(openai.models[1].name, "gpt-5.4-mini");
+
+        let anthropic = lookup("anthropic").unwrap();
+        assert_eq!(anthropic.models[0].name, "claude-sonnet-4-6");
+        assert!(anthropic.models.iter().any(|m| m.name == "claude-opus-4-8"));
+
+        let moonshot = lookup("moonshot-platform-cn").unwrap();
+        assert_eq!(moonshot.models[0].name, "kimi-k2.6");
+        assert!(moonshot.models.iter().any(|m| m.name == "kimi-k2.5"));
     }
 }

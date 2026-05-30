@@ -226,9 +226,7 @@ impl Config {
         if spec.api_key_required && api_key.is_none() {
             return Err(anyhow!("provider '{id}' requires `api_key` in config"));
         }
-        let user_agent = cfg
-            .and_then(|c| c.user_agent.clone())
-            .or_else(|| spec.user_agent.map(str::to_string));
+        let request_headers = resolved_request_headers(spec, cfg);
 
         Ok(Resolved {
             provider_id: id,
@@ -237,7 +235,7 @@ impl Config {
             auth,
             api_key,
             model,
-            user_agent,
+            request_headers,
             reasoning_effort: self.active_effort(),
         })
     }
@@ -388,6 +386,24 @@ fn select_endpoint(
     Ok((endpoint.protocol, base, endpoint.auth))
 }
 
+fn resolved_request_headers(
+    spec: &providers::ProviderSpec,
+    cfg: Option<&ProviderConfig>,
+) -> Vec<(String, String)> {
+    let mut headers = spec
+        .request_headers
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect::<Vec<_>>();
+
+    if let Some(user_agent) = cfg.and_then(|c| c.user_agent.clone()) {
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("User-Agent"));
+        headers.push(("User-Agent".to_string(), user_agent));
+    }
+
+    headers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,10 +429,13 @@ api_key = "y"
             ("deepseek", "deepseek-v4-flash")
         );
         assert!(opts[0].effort_levels.is_empty());
-        // o3 carries its baked effort levels.
-        let o3 = opts.iter().find(|o| o.model == "o3").unwrap();
-        assert_eq!(o3.provider, "openai");
-        assert_eq!(o3.effort_levels, vec!["low", "medium", "high"]);
+        // GPT-5.5 carries its baked effort levels.
+        let gpt55 = opts.iter().find(|o| o.model == "gpt-5.5").unwrap();
+        assert_eq!(gpt55.provider, "openai");
+        assert_eq!(
+            gpt55.effort_levels,
+            vec!["none", "low", "medium", "high", "xhigh"]
+        );
     }
 
     #[test]
@@ -507,19 +526,16 @@ api_key = "y"
         .unwrap();
         assert_eq!(
             cfg.active_selection(),
-            Some((
-                "anthropic".to_string(),
-                "claude-sonnet-4-20250514".to_string()
-            ))
+            Some(("anthropic".to_string(), "claude-sonnet-4-6".to_string()))
         );
     }
 
     #[test]
     fn active_effort_only_returns_declared_levels() {
-        // o3's levels come from the catalog — no config `models` needed.
+        // GPT-5.5's levels come from the catalog — no config `models` needed.
         let cfg: Config = toml::from_str(
             r#"
-model = "openai/o3"
+model = "openai/gpt-5.5"
 reasoning_effort = "high"
 [providers.openai]
 api_key = "x"
@@ -533,14 +549,14 @@ api_key = "x"
     fn active_effort_none_for_model_without_levels() {
         let cfg: Config = toml::from_str(
             r#"
-model = "openai/gpt-4o"
+model = "anthropic/claude-sonnet-4-6"
 reasoning_effort = "high"
-[providers.openai]
+[providers.anthropic]
 api_key = "x"
 "#,
         )
         .unwrap();
-        // gpt-4o declares no levels → no effort even though one is set.
+        // Anthropic declarations expose no effort levels to this config path.
         assert_eq!(cfg.active_effort(), None);
     }
 
@@ -548,7 +564,7 @@ api_key = "x"
     fn active_effort_ignores_undeclared_value() {
         let cfg: Config = toml::from_str(
             r#"
-model = "openai/o3"
+model = "openai/gpt-5.5"
 reasoning_effort = "ultra"
 [providers.openai]
 api_key = "x"
@@ -589,6 +605,38 @@ protocol = "openai"
     }
 
     #[test]
+    fn baked_request_headers_are_resolved_and_user_agent_can_override() {
+        let cfg: Config = toml::from_str(
+            r#"
+model = "kimi-code/kimi-for-coding"
+[providers.kimi-code]
+api_key = "x"
+"#,
+        )
+        .unwrap();
+        let r = cfg.resolve().unwrap();
+        assert_eq!(
+            r.request_headers,
+            vec![("User-Agent".to_string(), "KimiCLI/1.44.0".to_string())]
+        );
+
+        let cfg: Config = toml::from_str(
+            r#"
+model = "kimi-code/kimi-for-coding"
+[providers.kimi-code]
+api_key = "x"
+user_agent = "CustomClient/1.0"
+"#,
+        )
+        .unwrap();
+        let r = cfg.resolve().unwrap();
+        assert_eq!(
+            r.request_headers,
+            vec![("User-Agent".to_string(), "CustomClient/1.0".to_string())]
+        );
+    }
+
+    #[test]
     fn resolve_unknown_provider_errors() {
         let cfg: Config = toml::from_str(
             r#"
@@ -605,7 +653,7 @@ api_key = "x"
     fn resolve_missing_api_key_errors() {
         let cfg: Config = toml::from_str(
             r#"
-model = "openai/gpt-4o"
+model = "openai/gpt-5.5"
 [providers.openai]
 "#,
         )
@@ -655,14 +703,14 @@ api_key = "x"
         )
         .unwrap();
         cfg.apply_state(State {
-            model: Some("openai/o3".to_string()),
+            model: Some("openai/gpt-5.4-mini".to_string()),
             reasoning_effort: Some("high".to_string()),
             disabled_skills: vec![],
             disabled_mcp_servers: vec![],
             mode: None,
             permission_grants: vec![],
         });
-        assert_eq!(cfg.active_model().as_deref(), Some("o3"));
+        assert_eq!(cfg.active_model().as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(cfg.active_effort().as_deref(), Some("high"));
     }
 
@@ -811,7 +859,7 @@ models = ["m"]
         // Switching to a non-reasoning model via state drops a prior effort.
         let mut cfg: Config = toml::from_str(
             r#"
-model = "openai/o3"
+model = "openai/gpt-5.5"
 reasoning_effort = "high"
 [providers.openai]
 api_key = "x"
