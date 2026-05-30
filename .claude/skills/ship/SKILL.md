@@ -140,8 +140,10 @@ If red: open the failing job, root-cause, fix, push, re-watch. Proceed only when
 2. Set `version` in `ignis/Cargo.toml` to `X.Y.Z`, then `cargo build` to refresh `Cargo.lock`.
 3. `CHANGELOG.md`: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]`.
    **Entries are one-line summaries only.** State *what changed* for a user, nothing more. No detail, no how-it-works, no implementation list, no rationale or trade-offs, no parentheticals enumerating internals. One short line per change.
-   - Good: `` - `/copy` — copy the last assistant reply to the system clipboard. ``
-   - Bad: `` - `/copy` slash command — copies the last reply via a platform CLI tool (`pbcopy`/`clip`/`clip.exe`/`wl-copy`/…); 1 MiB cap, no native-clipboard dependency. ``
+   **Every entry ends with a PR reference** `([#NNN](https://github.com/Fullstop000/ignis/pull/NNN))` so readers can jump to the diff and discussion. Group commits by the PR that landed them; one entry per PR is the norm. For commits with no PR (rare — direct pushes to master), omit the reference.
+   - Good: `` - `/copy` — copy the last assistant reply to the system clipboard. ([#42](https://github.com/Fullstop000/ignis/pull/42)) ``
+   - Bad (no PR link): `` - `/copy` — copy the last assistant reply to the system clipboard. ``
+   - Bad (verbose): `` - `/copy` slash command — copies the last reply via a platform CLI tool (`pbcopy`/`clip`/`clip.exe`/`wl-copy`/…); 1 MiB cap, no native-clipboard dependency. ``
 4. `git commit -am "chore(release): vX.Y.Z" && git push`
 5. Re-confirm CI is green on the new commit.
 6. **STOP.** Tell the user: "PR <url> is green, bumped to vX.Y.Z — approve squash-merge?" Wait for an explicit yes.
