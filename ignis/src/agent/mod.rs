@@ -12,6 +12,8 @@ use serde::Serialize;
 use crate::provider::{LlmProvider, LlmResponseDelta, Message, ToolCall, ToolCallFunction, Usage};
 use crate::tools::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
 
+pub mod agents_md;
+
 /// Events emitted by the agent loop as it streams a turn.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "payload")]
@@ -458,6 +460,9 @@ pub struct Agent {
     hooks: Option<Box<dyn ToolHooks>>,
     skills: Option<Arc<SkillRegistry>>,
     mcp: Option<Arc<McpRegistry>>,
+    /// Project instructions (from `AGENTS.md`) prepended to each request as a
+    /// synthetic first user turn. Not stored in `history`.
+    project_instructions: Option<String>,
 }
 
 struct AccumulatingToolCall {
@@ -475,7 +480,13 @@ impl Agent {
             hooks: None,
             skills: None,
             mcp: None,
+            project_instructions: None,
         }
+    }
+
+    /// Set the `AGENTS.md` project instructions prepended to each model request.
+    pub fn set_project_instructions(&mut self, instructions: Option<String>) {
+        self.project_instructions = instructions;
     }
 
     pub fn register_tool(&mut self, tool: Arc<dyn AgentTool>) {
@@ -580,9 +591,15 @@ impl Agent {
             );
             let llm_start = std::time::Instant::now();
 
+            // Prepend the AGENTS.md project instructions as a synthetic first
+            // user turn when present. Kept out of `history` so it never persists
+            // or renders, and always reflects the current file (zero-copy when
+            // there is no AGENTS.md).
+            let messages = agents_md::prepend(self.project_instructions.as_deref(), history);
+
             let stream = match self
                 .provider
-                .chat_stream(&effective_prompt, &*history, &tool_schemas)
+                .chat_stream(&effective_prompt, &messages, &tool_schemas)
                 .await
             {
                 Ok(s) => s,

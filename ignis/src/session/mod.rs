@@ -49,12 +49,17 @@ impl Session {
     ) -> Result<Self, anyhow::Error> {
         let history = storage.load_session(&id).await?;
         let usage = storage.load_usage(&id).await.unwrap_or_default();
+        let mut agent = Agent::new(system_prompt, provider);
+        agent.set_project_instructions(crate::agent::agents_md::load(
+            Path::new(&start_dir),
+            dirs::home_dir().as_deref(),
+        ));
         Ok(Self {
             id,
             history,
             storage,
             start_dir,
-            agent: Agent::new(system_prompt, provider),
+            agent,
             compaction: CompactionConfig::default(),
             usage,
             inject_rx: None,
