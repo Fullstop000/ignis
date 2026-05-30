@@ -476,10 +476,29 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// Render a compact stats block for the TUI `/sessions` slash command. Wrapped
-/// in a markdown fenced code block so column alignment survives the renderer.
-/// Shows the top-N most recently modified sessions plus an "N older" hint.
-pub fn render_sessions_inline(records: &[SessionRecord], project_name: &str) -> String {
+/// Truncate a session id for inline display: keep the first N chars + `…`.
+fn truncate_id(id: &str) -> String {
+    const KEEP: usize = 15;
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= KEEP {
+        id.to_string()
+    } else {
+        format!("{}…", chars.into_iter().take(KEEP).collect::<String>())
+    }
+}
+
+/// Render a compact stats block for the TUI `/sessions` slash command. Plain
+/// (non-fenced) text — markdown renderer preserves multi-space runs within a
+/// span, and a fenced block would draw a stray "code" label. Shows the top-N
+/// most recently modified sessions plus an "N older" hint, marks the current
+/// session with `▸ ` in a 2-char gutter when it's in the visible page, and
+/// always surfaces the current session in a "You are here" line above the
+/// table (covers the case where it's not in the top-N).
+pub fn render_sessions_inline(
+    records: &[SessionRecord],
+    project_name: &str,
+    current_session_id: Option<&str>,
+) -> String {
     const TOP_N: usize = 5;
 
     let n = records.len();
@@ -514,31 +533,63 @@ pub fn render_sessions_inline(records: &[SessionRecord], project_name: &str) -> 
         return out;
     }
 
+    // Always-on current-session line (covers the case where the current
+    // session isn't in the top-N rows, where the `▸` marker would hide).
+    if let Some(cur_id) = current_session_id {
+        let line = match records.iter().find(|r| r.session_id == cur_id) {
+            Some(r) => {
+                let started = r
+                    .started_at
+                    .map(format_timestamp_short)
+                    .unwrap_or_else(|| "?".to_string());
+                format!(
+                    "You are here · {} · started {} · {} msgs / {} turn{}",
+                    truncate_id(&r.session_id),
+                    started,
+                    r.agent_messages,
+                    r.user_queries,
+                    if r.user_queries == 1 { "" } else { "s" },
+                )
+            }
+            None => format!(
+                "You are here · {} · no messages persisted yet",
+                truncate_id(cur_id)
+            ),
+        };
+        out.push_str(&line);
+        out.push_str("\n\n");
+    }
+
     let mut sorted: Vec<&SessionRecord> = records.iter().collect();
     sorted.sort_by_key(|r| std::cmp::Reverse(r.last_modified.unwrap_or(0)));
     let visible = sorted.iter().take(TOP_N);
     let older = sorted.len().saturating_sub(TOP_N);
 
-    // Plain (non-fenced) lines — markdown renderer preserves multi-space runs
-    // within a span, and a fenced block would draw a stray "code" label.
+    // 2-char leftmost gutter holds the current-row marker; header + non-current
+    // rows pad with two spaces to keep the column grid aligned.
     out.push_str(&format!(
-        "{:<17}{:>6}{:>8}{:>9}{:>8}\n",
+        "  {:<17}{:>6}{:>8}{:>9}{:>8}\n",
         "STARTED", "MSGS", "TURNS", "TOK", "TOOLS"
     ));
     for r in visible {
+        let marker = if current_session_id == Some(r.session_id.as_str()) {
+            "▸ "
+        } else {
+            "  "
+        };
         let started = r
             .started_at
             .map(format_timestamp_short)
             .unwrap_or_else(|| "?".to_string());
         let tokens = fmt_tokens(r.input_tokens + r.output_tokens);
         out.push_str(&format!(
-            "{:<17}{:>6}{:>8}{:>9}{:>8}\n",
-            started, r.agent_messages, r.user_queries, tokens, r.tool_call_count
+            "{}{:<17}{:>6}{:>8}{:>9}{:>8}\n",
+            marker, started, r.agent_messages, r.user_queries, tokens, r.tool_call_count
         ));
     }
     if older > 0 {
         out.push_str(&format!(
-            "─ {} older session{} ─\n",
+            "  ─ {} older session{} ─\n",
             older,
             if older == 1 { "" } else { "s" }
         ));
@@ -808,7 +859,7 @@ mod tests {
     #[test]
     fn render_sessions_inline_shows_summary_and_pointer() {
         let recs = vec![record_with(1735787045, 38, 4, 18_000, 67)];
-        let s = render_sessions_inline(&recs, "ignis");
+        let s = render_sessions_inline(&recs, "ignis", None);
         assert!(s.contains("**Sessions stats**"));
         assert!(s.contains("ignis · 1 session ·"));
         assert!(s.contains("18.0k tokens"));
@@ -821,7 +872,7 @@ mod tests {
         let recs: Vec<SessionRecord> = (0..7)
             .map(|i| record_with(1_735_787_045 + i * 86_400, 10, 1, 1000, 5))
             .collect();
-        let s = render_sessions_inline(&recs, "ignis");
+        let s = render_sessions_inline(&recs, "ignis", None);
         // 5 rendered rows, 2 older.
         assert_eq!(s.matches("2025-").count(), 5, "rendered = {s}");
         assert!(s.contains("─ 2 older sessions ─"));
@@ -829,9 +880,59 @@ mod tests {
 
     #[test]
     fn render_sessions_inline_empty_shows_notice() {
-        let s = render_sessions_inline(&[], "ignis");
+        let s = render_sessions_inline(&[], "ignis", None);
         assert!(s.contains("ignis · 0 sessions"));
         assert!(s.contains("No sessions found"));
+    }
+
+    #[test]
+    fn truncate_id_keeps_short_unchanged_and_clips_long() {
+        assert_eq!(truncate_id("sess-abc"), "sess-abc");
+        assert_eq!(
+            truncate_id("session-1779599272-9d2f16cd"),
+            "session-1779599…"
+        );
+    }
+
+    #[test]
+    fn render_sessions_inline_marks_current_row_when_in_top_n() {
+        let recs = vec![record_with(1_735_787_045 + 86_400, 38, 4, 18_000, 67)];
+        let s = render_sessions_inline(&recs, "ignis", Some("sess-1735873445"));
+        // "You are here" line + ▸ marker on the matching row.
+        assert!(
+            s.contains("You are here · sess-1735873445"),
+            "missing You are here line: {s}"
+        );
+        assert!(s.contains("▸ 2025-"), "missing ▸ on current row: {s}");
+        // Header still gets the 2-char gutter so columns stay aligned.
+        assert!(
+            s.contains("  STARTED"),
+            "header lost its leading gutter: {s}"
+        );
+    }
+
+    #[test]
+    fn render_sessions_inline_you_are_here_when_current_not_in_top_n() {
+        // 7 records, current is the 6th-newest → falls in the "older" bucket
+        // so the ▸ marker can't render. The "You are here" line must.
+        let recs: Vec<SessionRecord> = (0..7)
+            .map(|i| record_with(1_735_787_045 + i * 86_400, 10, 1, 1000, 5))
+            .collect();
+        let cur = recs[1].session_id.clone(); // second-oldest, sorted-newest-first goes to bottom
+        let s = render_sessions_inline(&recs, "ignis", Some(&cur));
+        assert!(s.contains(&format!("You are here · {}", cur)), "{s}");
+        // No marker row in the visible top-5.
+        assert!(!s.contains("▸ "), "marker leaked into off-page row: {s}");
+    }
+
+    #[test]
+    fn render_sessions_inline_falls_back_when_current_id_unknown() {
+        let recs = vec![record_with(1_735_787_045, 10, 1, 1000, 5)];
+        let s = render_sessions_inline(&recs, "ignis", Some("sess-not-yet-persisted"));
+        assert!(
+            s.contains("You are here · sess-not-yet-pe… · no messages persisted yet"),
+            "fallback line missing or wrong: {s}"
+        );
     }
 
     #[test]

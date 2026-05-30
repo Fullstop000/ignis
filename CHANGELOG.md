@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-05-30
+
+### Added
+- `/sessions` — marks the current session with a `▸` glyph in the table and surfaces it above the table with a `You are here · sess-… · started … · X msgs / Y turns` line that's always visible (even when the row falls off the visible top-5).
+
 ## [0.26.1] - 2026-05-29
 
 ### Fixed
