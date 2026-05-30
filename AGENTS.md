@@ -1,1 +1,1 @@
-/home/zht/.claude/CLAUDE.md
+CLAUDE.md
