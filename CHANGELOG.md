@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Providers are now built in — pick one and supply `api_key`; `config.toml` is overrides-only.
 
+### Fixed
+- Anthropic-compatible requests now send the required `max_tokens` field — without it MiniMax (default Anthropic endpoint) and real Anthropic both 400 before streaming. ([#61](https://github.com/Fullstop000/ignis/pull/61))
+- `AGENTS.md` symlink now points at the project `CLAUDE.md` instead of an absolute path on the author's machine. ([#61](https://github.com/Fullstop000/ignis/pull/61))
+
 ### Breaking
 - Provider id `Moonshot Platform CN` is now `moonshot-platform-cn`.
 
