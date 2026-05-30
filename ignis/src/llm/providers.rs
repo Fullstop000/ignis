@@ -1,4 +1,4 @@
-//! Built-in provider catalog: brand metadata (endpoints, auth, model lists)
+//! Built-in provider declarations: brand metadata (endpoints, auth, model lists)
 //! compiled into the binary. `config.toml` only supplies the API key plus
 //! optional overrides; everything else is baked here. Adding a provider is a new
 //! [`ProviderSpec`] literal in the `SPECS` table below — there is no dispatch
@@ -7,45 +7,7 @@
 //! Model lists are a curated, coding-relevant subset per brand; extend or
 //! override any of them via `[providers.<id>].models` in config.toml.
 
-use serde::Deserialize;
-
-/// Wire protocol — selects the concrete provider struct in
-/// [`crate::provider::build`] and gates tool support (only `Ollama` lacks it).
-/// Deserialized directly from a config `protocol = "..."` override.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Protocol {
-    #[serde(alias = "openai-compatible")]
-    OpenAi,
-    Anthropic,
-    Gemini,
-    Ollama,
-}
-
-impl Protocol {
-    pub fn label(self) -> &'static str {
-        match self {
-            Protocol::OpenAi => "openai",
-            Protocol::Anthropic => "anthropic",
-            Protocol::Gemini => "gemini",
-            Protocol::Ollama => "ollama",
-        }
-    }
-}
-
-/// How the API key is attached. Decoupled from [`Protocol`]: MiniMax's Anthropic
-/// endpoint uses `Bearer`, while real Anthropic uses `XApiKey`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Auth {
-    /// `Authorization: Bearer <key>`
-    Bearer,
-    /// `x-api-key: <key>` (Anthropic)
-    XApiKey,
-    /// `?key=<key>` query parameter (Gemini)
-    QueryKey,
-    /// No credential (Ollama)
-    None,
-}
+use crate::llm::protocols::{Auth, Protocol};
 
 /// One protocol variant a provider exposes.
 pub struct Endpoint {

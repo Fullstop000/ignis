@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use crate::provider::Message;
+use crate::llm::Message;
 
 const AGENTS_MD_FILENAME: &str = "AGENTS.md";
 /// Per-file byte budget; a runaway file must not blow the context window.

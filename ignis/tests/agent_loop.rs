@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use ignis::{
     config::CompactionConfig,
-    provider::{LlmProvider, LlmResponseDelta},
+    llm::{LlmProvider, LlmResponseDelta},
     storage::{InMemoryStorage, SessionStorage},
     tools::tool::{AgentTool, ToolResult},
     AgentEvent, Message, Session, Usage,

@@ -139,7 +139,7 @@ impl ModelPicker {
     /// (falls back to row 0 / level 0 when no match). Returns `None` when there
     /// are no options to show.
     pub(crate) fn open(
-        options: &[crate::models::ModelOption],
+        options: &[crate::llm::ModelOption],
         provider: &str,
         model: &str,
         effort: Option<&str>,
@@ -165,7 +165,7 @@ impl ModelPicker {
     pub(crate) fn select(
         &mut self,
         direction: SelectionDirection,
-        options: &[crate::models::ModelOption],
+        options: &[crate::llm::ModelOption],
     ) {
         if options.is_empty() {
             return;
@@ -181,7 +181,7 @@ impl ModelPicker {
     pub(crate) fn cycle_effort(
         &mut self,
         direction: SelectionDirection,
-        options: &[crate::models::ModelOption],
+        options: &[crate::llm::ModelOption],
     ) {
         let levels = options
             .get(self.selected)
@@ -198,7 +198,7 @@ impl ModelPicker {
     /// levels; context_window is `None` when the option doesn't declare one.
     pub(crate) fn resolve(
         &self,
-        options: &[crate::models::ModelOption],
+        options: &[crate::llm::ModelOption],
     ) -> Option<(String, String, Option<String>, Option<u64>)> {
         let opt = options.get(self.selected)?;
         let effort = if opt.effort_levels.is_empty() {
@@ -234,7 +234,7 @@ pub(crate) struct App {
     pub(crate) slash_selection: usize,
     pub(crate) session_picker: Option<SessionPicker>,
     /// Choices for the `/model` picker, flattened from config.
-    pub(crate) model_options: Vec<crate::models::ModelOption>,
+    pub(crate) model_options: Vec<crate::llm::ModelOption>,
     pub(crate) model_picker: Option<ModelPicker>,
     pub(crate) skill_picker: Option<SkillPicker>,
     pub(crate) mcp_picker: Option<McpPicker>,
@@ -736,7 +736,7 @@ impl App {
     /// Supply the `/model` picker choices and the active effort level.
     pub(crate) fn set_model_options(
         &mut self,
-        options: Vec<crate::models::ModelOption>,
+        options: Vec<crate::llm::ModelOption>,
         effort: Option<String>,
     ) {
         self.model_options = options;
@@ -1173,13 +1173,13 @@ mod tests {
         app.context_window = 500_000; // pretend a prior known window
         app.set_model_options(
             vec![
-                crate::models::ModelOption {
+                crate::llm::ModelOption {
                     provider: "x".to_string(),
                     model: "big".to_string(),
                     effort_levels: vec![],
                     context: Some(1_000_000),
                 },
-                crate::models::ModelOption {
+                crate::llm::ModelOption {
                     provider: "x".to_string(),
                     model: "unknown".to_string(),
                     effort_levels: vec![],
@@ -1212,7 +1212,7 @@ mod tests {
             "s".to_string(),
             PathBuf::from("/tmp"),
         );
-        let opt = |provider: &str, model: &str, levels: &[&str]| crate::models::ModelOption {
+        let opt = |provider: &str, model: &str, levels: &[&str]| crate::llm::ModelOption {
             provider: provider.to_string(),
             model: model.to_string(),
             effort_levels: levels.iter().map(|s| s.to_string()).collect(),

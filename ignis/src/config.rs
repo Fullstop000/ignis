@@ -1,5 +1,6 @@
-use crate::models::{ModelCatalog, ModelOption, ProviderConfig};
-use crate::provider::{catalog, Auth, LlmProvider, Protocol, Resolved};
+use crate::llm::{
+    providers, Auth, LlmProvider, ModelCatalog, ModelOption, Protocol, ProviderConfig, Resolved,
+};
 use crate::state::{load_state, State};
 use anyhow::anyhow;
 use serde::Deserialize;
@@ -156,7 +157,7 @@ impl Config {
             if let Some(m) = self.providers[name].models.first() {
                 return Some((name.clone(), m.name().to_string()));
             }
-            catalog::lookup(name)
+            providers::lookup(name)
                 .and_then(|s| s.models.first())
                 .map(|m| (name.clone(), m.name.to_string()))
         })
@@ -191,7 +192,7 @@ impl Config {
     }
 
     /// Merged reasoning-effort levels for `(id, model)`: a config override (if
-    /// non-empty) else the catalog's baked levels.
+    /// non-empty) else the baked provider declaration's levels.
     fn effort_levels_for(&self, id: &str, model: &str) -> Vec<String> {
         if let Some(cfg) = self.providers.get(id) {
             let lvls = cfg.effort_levels(model);
@@ -199,19 +200,19 @@ impl Config {
                 return lvls;
             }
         }
-        catalog::lookup(id)
+        providers::lookup(id)
             .and_then(|s| s.models.iter().find(|m| m.name == model))
             .map(|m| m.reasoning_effort.iter().map(|s| s.to_string()).collect())
             .unwrap_or_default()
     }
 
-    /// Merge catalog metadata with config overrides into a [`Resolved`] selection.
+    /// Merge provider metadata with config overrides into a [`Resolved`] selection.
     pub(crate) fn resolve(&self) -> Result<Resolved, anyhow::Error> {
         let (id, model) = self.active_selection().ok_or_else(|| {
             anyhow!("no active model — set `model = \"provider/model\"` and a provider's `models`")
         })?;
-        let spec = catalog::lookup(&id).ok_or_else(|| {
-            let known = catalog::all()
+        let spec = providers::lookup(&id).ok_or_else(|| {
+            let known = providers::all()
                 .iter()
                 .map(|s| s.id)
                 .collect::<Vec<_>>()
@@ -241,9 +242,9 @@ impl Config {
         })
     }
 
-    /// Flatten every provider's catalog into picker entries (sorted by provider,
+    /// Flatten every provider's declared models into picker entries (sorted by provider,
     /// then by the order models are listed). Each model's context window is its
-    /// config-declared override, else the models.dev `catalog` value.
+    /// config-declared override, else the models.dev catalog value.
     pub fn model_options(&self, catalog_dev: &ModelCatalog) -> Vec<ModelOption> {
         let mut ids: Vec<&String> = self.providers.keys().collect();
         ids.sort();
@@ -251,8 +252,8 @@ impl Config {
         for id in ids {
             let cfg = &self.providers[id];
             let mut seen = std::collections::HashSet::new();
-            // Catalog models first, with any per-model config override applied.
-            if let Some(spec) = catalog::lookup(id) {
+            // Baked provider models first, with any per-model config override applied.
+            if let Some(spec) = providers::lookup(id) {
                 for m in spec.models {
                     let cfg_entry = cfg.models.iter().find(|e| e.name() == m.name);
                     let effort = cfg_entry
@@ -274,7 +275,7 @@ impl Config {
                     seen.insert(m.name.to_string());
                 }
             }
-            // Config-only models (not in the catalog), e.g. `custom` or extras.
+            // Config-only models (not baked in), e.g. `custom` or extras.
             for entry in &cfg.models {
                 if seen.contains(entry.name()) {
                     continue;
@@ -293,7 +294,7 @@ impl Config {
     }
 
     /// Context window of the active model: its config-declared override, else the
-    /// models.dev `catalog` value.
+    /// models.dev catalog value.
     pub fn active_context(&self, catalog_dev: &ModelCatalog) -> Option<u64> {
         let (provider, model) = self.active_selection()?;
         if let Some(c) = self
@@ -303,7 +304,7 @@ impl Config {
         {
             return Some(c);
         }
-        if let Some(c) = catalog::lookup(&provider)
+        if let Some(c) = providers::lookup(&provider)
             .and_then(|s| s.models.iter().find(|m| m.name == model))
             .and_then(|m| m.context)
         {
@@ -342,14 +343,14 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
 }
 
 pub fn build_provider(config: &Config) -> Result<Box<dyn LlmProvider>, anyhow::Error> {
-    Ok(crate::provider::build(config.resolve()?))
+    Ok(crate::llm::build(config.resolve()?))
 }
 
 /// Choose the endpoint for a provider: a config `protocol` override, else the
-/// catalog's default (`endpoints[0]`). For `custom` (no baked endpoints) the
+/// provider declaration's default (`endpoints[0]`). For `custom` (no baked endpoints) the
 /// endpoint is synthesized as OpenAI + Bearer from the config `api_url`.
 fn select_endpoint(
-    spec: &catalog::ProviderSpec,
+    spec: &providers::ProviderSpec,
     cfg: Option<&ProviderConfig>,
 ) -> Result<(Protocol, String, Auth), anyhow::Error> {
     let forced = cfg.and_then(|c| c.protocol);

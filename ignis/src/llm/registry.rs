@@ -3,7 +3,7 @@
 //! (`ModelOption`). The active selection and provider construction live on
 //! [`crate::config::Config`].
 
-use crate::provider::Protocol;
+use crate::llm::protocols::Protocol;
 use serde::Deserialize;
 
 /// A model in a provider's `models` list: either a bare name, or an inline table

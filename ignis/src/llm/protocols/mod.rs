@@ -40,14 +40,49 @@ pub trait LlmProvider: Send + Sync + 'static {
 }
 
 mod anthropic;
-pub mod catalog;
 mod gemini;
 mod ollama;
 mod openai;
 
-pub use catalog::{Auth, Endpoint, ModelSpec, Protocol, ProviderSpec};
+/// Wire protocol — selects the concrete protocol client in [`build`] and gates
+/// tool support (only `Ollama` lacks it). Deserialized directly from a config
+/// `protocol = "..."` override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[serde(alias = "openai-compatible")]
+    OpenAi,
+    Anthropic,
+    Gemini,
+    Ollama,
+}
 
-/// A fully-resolved active selection: catalog metadata merged with config
+impl Protocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Protocol::OpenAi => "openai",
+            Protocol::Anthropic => "anthropic",
+            Protocol::Gemini => "gemini",
+            Protocol::Ollama => "ollama",
+        }
+    }
+}
+
+/// How the API key is attached. Decoupled from [`Protocol`]: MiniMax's Anthropic
+/// endpoint uses `Bearer`, while real Anthropic uses `XApiKey`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Auth {
+    /// `Authorization: Bearer <key>`
+    Bearer,
+    /// `x-api-key: <key>` (Anthropic)
+    XApiKey,
+    /// `?key=<key>` query parameter (Gemini)
+    QueryKey,
+    /// No credential (Ollama)
+    None,
+}
+
+/// A fully-resolved active selection: provider metadata merged with config
 /// overrides, with one endpoint chosen. [`build`] turns it into a concrete
 /// [`LlmProvider`].
 pub struct Resolved {
@@ -61,7 +96,7 @@ pub struct Resolved {
     pub reasoning_effort: Option<String>,
 }
 
-/// Construct the concrete provider for a [`Resolved`] selection. The single
+/// Construct the concrete protocol client for a [`Resolved`] selection. The single
 /// `match` on `protocol` lives here (build time) — never inside `chat_stream`.
 pub fn build(r: Resolved) -> Box<dyn LlmProvider> {
     match r.protocol {

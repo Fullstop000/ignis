@@ -351,7 +351,7 @@ mod tests {
             "s".to_string(),
             PathBuf::from("/tmp"),
         );
-        let opt = |p: &str, m: &str, l: &[&str]| crate::models::ModelOption {
+        let opt = |p: &str, m: &str, l: &[&str]| crate::llm::ModelOption {
             provider: p.to_string(),
             model: m.to_string(),
             effort_levels: l.iter().map(|s| s.to_string()).collect(),

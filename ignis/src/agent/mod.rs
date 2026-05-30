@@ -9,7 +9,7 @@ use crate::skills::SkillRegistry;
 
 use serde::Serialize;
 
-use crate::provider::{LlmProvider, LlmResponseDelta, Message, ToolCall, ToolCallFunction, Usage};
+use crate::llm::{LlmProvider, LlmResponseDelta, Message, ToolCall, ToolCallFunction, Usage};
 use crate::tools::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
 
 pub mod agents_md;
