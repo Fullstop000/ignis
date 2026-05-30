@@ -31,6 +31,13 @@ impl AnthropicCompatible {
     }
 }
 
+/// Output-token cap sent on every request. Anthropic's Messages API requires
+/// `max_tokens`; the value is a ceiling (the model stops earlier when it's
+/// done), so we pick a value safely under every supported model's max output
+/// (Sonnet 4.6 / Haiku 4.5 / Opus 4.6+ all allow ≥ 64k; MiniMax M2.7 accepts
+/// the same range).
+const DEFAULT_MAX_TOKENS: u64 = 32_768;
+
 #[derive(Serialize)]
 struct AnthropicMessagesRequest {
     model: String,
@@ -39,6 +46,7 @@ struct AnthropicMessagesRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<serde_json::Value>,
     stream: bool,
+    max_tokens: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -169,6 +177,7 @@ impl LlmProvider for AnthropicCompatible {
             messages: anthropic_messages,
             tools: anthropic_tools,
             stream: true,
+            max_tokens: DEFAULT_MAX_TOKENS,
         };
 
         let endpoint = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
@@ -275,5 +284,27 @@ impl LlmProvider for AnthropicCompatible {
         });
 
         Ok(delta_stream.boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_body_includes_max_tokens() {
+        // Anthropic's POST /v1/messages requires `max_tokens`; without it the
+        // API rejects the request before streaming. Guards against the field
+        // being dropped from `AnthropicMessagesRequest` in future refactors.
+        let body = AnthropicMessagesRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            stream: true,
+            max_tokens: DEFAULT_MAX_TOKENS,
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["max_tokens"], serde_json::json!(DEFAULT_MAX_TOKENS));
     }
 }
