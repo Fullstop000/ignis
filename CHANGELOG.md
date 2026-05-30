@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-05-30
+
+- `AGENTS.md` — ignis reads project (`./AGENTS.md`) and global (`~/.ignis/AGENTS.md`) instructions; the project file overrides the global one.
+
 ## [0.27.0] - 2026-05-30
 
 ### Added
