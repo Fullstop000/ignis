@@ -3,7 +3,7 @@
 //! (`ModelOption`). The active selection and provider construction live on
 //! [`crate::config::Config`].
 
-use anyhow::anyhow;
+use crate::provider::Protocol;
 use serde::Deserialize;
 
 /// A model in a provider's `models` list: either a bare name, or an inline table
@@ -64,9 +64,14 @@ impl ModelEntry {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProviderConfig {
     pub api_key: Option<String>,
+    /// Override the selected endpoint's base URL (required for the `custom` brand).
     pub api_url: Option<String>,
+    /// Force a protocol when a brand offers more than one (e.g. `"openai"` to use
+    /// MiniMax's OpenAI-compatible endpoint instead of the default Anthropic one).
+    pub protocol: Option<Protocol>,
     pub user_agent: Option<String>,
-    /// Models this provider offers in the `/model` picker, in display order.
+    /// Extra models on top of the baked catalog (and the only source for `custom`).
+    /// Merged by name, config winning on a clash.
     #[serde(default)]
     pub models: Vec<ModelEntry>,
 }
@@ -87,15 +92,6 @@ impl ProviderConfig {
             .iter()
             .find(|m| m.name() == model)
             .and_then(|m| m.context())
-    }
-
-    pub(crate) fn require(
-        &self,
-        field: Option<String>,
-        provider: &str,
-        name: &str,
-    ) -> Result<String, anyhow::Error> {
-        field.ok_or_else(|| anyhow!("{} provider requires {}", provider, name))
     }
 }
 

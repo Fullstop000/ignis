@@ -40,16 +40,37 @@ pub trait LlmProvider: Send + Sync + 'static {
 }
 
 mod anthropic;
-mod deepseek;
+pub mod catalog;
 mod gemini;
 mod ollama;
 mod openai;
 
-pub use anthropic::AnthropicProvider;
-pub use deepseek::DeepSeekProvider;
-pub use gemini::GeminiProvider;
-pub use ollama::OllamaProvider;
-pub use openai::OpenAiProvider;
+pub use catalog::{Auth, Endpoint, ModelSpec, Protocol, ProviderSpec};
+
+/// A fully-resolved active selection: catalog metadata merged with config
+/// overrides, with one endpoint chosen. [`build`] turns it into a concrete
+/// [`LlmProvider`].
+pub struct Resolved {
+    pub provider_id: String,
+    pub protocol: Protocol,
+    pub base_url: String,
+    pub auth: Auth,
+    pub api_key: Option<String>,
+    pub model: String,
+    pub user_agent: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+/// Construct the concrete provider for a [`Resolved`] selection. The single
+/// `match` on `protocol` lives here (build time) — never inside `chat_stream`.
+pub fn build(r: Resolved) -> Box<dyn LlmProvider> {
+    match r.protocol {
+        Protocol::OpenAi => Box::new(openai::OpenAiCompatible::new(r)),
+        Protocol::Anthropic => Box::new(anthropic::AnthropicCompatible::new(r)),
+        Protocol::Gemini => Box::new(gemini::Gemini::new(r)),
+        Protocol::Ollama => Box::new(ollama::Ollama::new(r)),
+    }
+}
 
 // ==========================================
 // OpenAI-compatible request/response types

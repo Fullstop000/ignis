@@ -1,53 +1,65 @@
-# Ignis configuration — copy to ~/.ignis/config.toml and fill in your keys.
-# ========================================================================
+# Ignis configuration — copy to ~/.ignis/config.toml and fill in your key.
+# ======================================================================
+#
+# Pick a provider and drop in your API key — that's it. Each provider's
+# endpoint(s), model list, context windows, and reasoning levels are built into
+# ignis, so you normally only need `api_key`. `/model` switches the active model
+# at runtime (saved to ~/.ignis/state.json, which ignis owns and you may edit).
 
-# Active selection as "provider/model" (an optional default). `/model` switches
-# it at runtime, saving the choice to ~/.ignis/state.json — this file is yours
-# to edit and is never auto-written.
-model = "kimi-code/kimi-for-coding"
+# Active selection as "provider/model".
+model = "minimax-token-plan/MiniMax-M2.7"
 auto_resume_last_session = false
 
-[providers."kimi-code"]
-api_key = "sk-your-kimi-key"
-api_url = "https://api.kimi.com/coding/v1"
-# models.dev doesn't know this alias, so declare its window here (256K = 262144).
-models  = [{ name = "kimi-for-coding", context = 262144 }]
+# MiniMax Token Plan — serves the same models over both an OpenAI- and an
+# Anthropic-compatible endpoint. ignis auto-selects the Anthropic one (MiniMax
+# recommends it); set `protocol = "openai"` to use the OpenAI endpoint instead.
+[providers.minimax-token-plan]
+api_key = "sk-cp-your-key"
+# protocol = "openai"
 
-# Each provider lists the models it offers in `models`; the active one is the
-# top-level `model` above. A model entry is either a bare name or an inline table
-# with per-model metadata, all in one place:
-#   - `reasoning`: effort levels (the picker shows the control only for these).
-#   - `context`:   context window in tokens. Optional — windows are looked up from
-#                  models.dev by name (cached at ~/.ignis/models.json); set this
-#                  only to override or for a model models.dev doesn't know.
+# ─ Other built-in providers — uncomment one and add your key ──────────────────
 #
 # [providers.openai]
 # api_key = "sk-your-openai-key"
-# api_url = "https://api.openai.com/v1"
-# models  = [
-#   "gpt-4o",
-#   { name = "o3", reasoning = ["low", "medium", "high"] },
-# ]
+#
+# [providers.anthropic]
+# api_key = "your-anthropic-key"
 #
 # [providers.deepseek]
 # api_key = "sk-your-deepseek-key"
-# api_url = "https://api.deepseek.com/v1"
+#
+# [providers.gemini]
+# api_key = "your-gemini-key"
+#
+# [providers."kimi-code"]
+# api_key = "sk-your-kimi-key"
+#
+# [providers."moonshot-platform-cn"]
+# api_key = "sk-your-moonshot-key"
+#
+# [providers.ollama]                 # local; no API key needed
+
+# ─ Optional overrides ─────────────────────────────────────────────────────────
+# Everything here is optional — the built-in catalog already supplies each
+# provider's URL and models. Override only when you need to:
+#   - api_url : point at a different endpoint (a proxy, a region).
+#   - models  : add models the catalog doesn't list, or override a model's
+#               `reasoning` (effort levels) / `context` (window in tokens).
+#               A model entry is a bare name or an inline table.
+#
+# [providers.deepseek]
+# api_key = "sk-your-deepseek-key"
 # models  = [
 #   "deepseek-v4-flash",
 #   { name = "deepseek-v4-pro", reasoning = ["high", "max"], context = 128000 },
 # ]
-#
-# [providers.anthropic]
-# api_key = "your-anthropic-key"
-# models  = ["claude-sonnet-4-20250514"]
-#
-# [providers.gemini]
-# api_key = "your-gemini-key"
-# models  = ["gemini-2.5-pro"]
-#
-# [providers.ollama]
-# api_url = "http://localhost:11434"
-# models  = ["llama3"]
+
+# ─ Custom OpenAI-compatible endpoint (self-hosted, vLLM, any gateway) ──────────
+# The `custom` provider bakes in nothing — you supply the endpoint and models.
+# [providers.custom]
+# api_key = "your-key"
+# api_url = "https://your-host/v1"
+# models  = ["your-model"]
 
 # Web search tool (optional). Switch backends via `provider`.
 # See docs/web-search.md for details.

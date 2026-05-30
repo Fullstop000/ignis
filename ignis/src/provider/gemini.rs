@@ -1,22 +1,27 @@
-use super::{bytes_to_lines, LlmProvider, LlmResponseDelta};
+use super::{bytes_to_lines, LlmProvider, LlmResponseDelta, Resolved};
 use crate::Message;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 
-pub struct GeminiProvider {
+/// Google Gemini (`generativelanguage` API). Auth is a `?key=` query parameter.
+pub struct Gemini {
     client: reqwest::Client,
+    provider_id: String,
     api_key: String,
+    base_url: String,
     model: String,
 }
 
-impl GeminiProvider {
-    pub fn new(api_key: String, model: String) -> Self {
+impl Gemini {
+    pub fn new(r: Resolved) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key,
-            model,
+            provider_id: r.provider_id,
+            api_key: r.api_key.unwrap_or_default(),
+            base_url: r.base_url,
+            model: r.model,
         }
     }
 }
@@ -79,13 +84,13 @@ struct GeminiFunctionCall {
 }
 
 #[async_trait]
-impl LlmProvider for GeminiProvider {
+impl LlmProvider for Gemini {
     fn model_id(&self) -> &str {
         &self.model
     }
 
     fn provider_name(&self) -> &str {
-        "gemini"
+        &self.provider_id
     }
 
     async fn chat_stream(
@@ -193,10 +198,12 @@ impl LlmProvider for GeminiProvider {
             tools: gemini_tools,
         };
 
-        // Stream endpoint
+        // Stream endpoint: `{base_url}/models/{model}:streamGenerateContent?key=…`
         let endpoint = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?key={}",
-            self.model, self.api_key
+            "{}/models/{}:streamGenerateContent?key={}",
+            self.base_url.trim_end_matches('/'),
+            self.model,
+            self.api_key
         );
 
         let res = self.client.post(&endpoint).json(&req_body).send().await?;

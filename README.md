@@ -55,7 +55,6 @@ model = "deepseek/deepseek-v4-flash"
 
 [providers.deepseek]
 api_key = "sk-your-deepseek-key"
-models  = ["deepseek-v4-flash"]
 TOML
 
 # 2. Launch the TUI…
@@ -71,9 +70,10 @@ See [Configure](#configure) for more providers and per-model options.
 
 - **TUI + CLI** — a native terminal TUI (`ratatui` + `crossterm`) and a one-shot
   CLI from the same binary.
-- **Bring your own model** — OpenAI, DeepSeek, Kimi, Anthropic, Gemini, Ollama,
-  and anything OpenAI-compatible. Switch model and reasoning effort at runtime
-  with `/model`.
+- **Bring your own model** — OpenAI, Anthropic, DeepSeek, Gemini, Kimi, MiniMax,
+  Moonshot, Ollama, and any OpenAI-compatible endpoint (the `custom` provider).
+  Providers are built in — drop in an API key and go. Switch model and reasoning
+  effort at runtime with `/model`.
 - **Streaming agent loop** — incremental text and reasoning, parallel or
   sequential tool execution, and lifecycle hooks.
 - **Built-in tools** — read, write, and edit files; `grep`, `glob`, `list_dir`;
@@ -92,26 +92,27 @@ See [Configure](#configure) for more providers and per-model options.
 
 ## Configure
 
-Ignis reads `~/.ignis/config.toml`. The top-level `model` is the active
-selection (`provider/model`); each provider lists the models it offers:
+Ignis reads `~/.ignis/config.toml`. Each provider — its endpoint(s), model list,
+context windows, and reasoning levels — is **built in**, so you normally just
+pick one and supply an `api_key`:
 
 ```toml
-model = "deepseek/deepseek-v4-flash"
+model = "minimax-token-plan/MiniMax-M2.7"
 
-[providers.deepseek]
-api_key = "sk-your-deepseek-key"
-models  = [
-  "deepseek-v4-flash",
-  { name = "deepseek-v4-pro", reasoning = ["high", "max"], context = 128000 },
-]
+[providers.minimax-token-plan]
+api_key = "sk-cp-your-key"
+# protocol = "openai"   # MiniMax serves both protocols; ignis defaults to Anthropic
 ```
 
-A model entry is either a bare name or an inline table with per-model metadata:
-`reasoning` (effort levels the picker offers) and `context` (window size, else
-looked up from [models.dev](https://models.dev)). `/model` switches the active
-selection at runtime, saving it to `~/.ignis/state.json` — your `config.toml` is
-never auto-edited. See [`config.example.toml`](config.example.toml) for every
-provider and optional `web_search` / `compaction` settings.
+`config.toml` is overrides-only: set `api_url` to point at a different endpoint,
+or add a `models` list to extend the catalog or override a model's `reasoning`
+(effort levels) / `context` (window, else looked up from
+[models.dev](https://models.dev)). For any other OpenAI-compatible endpoint, use
+the built-in `custom` provider (supply `api_url` + `models`). `/model` switches
+the active selection at runtime, saving it to `~/.ignis/state.json` — your
+`config.toml` is never auto-edited. See
+[`config.example.toml`](config.example.toml) for every provider and optional
+`web_search` / `compaction` settings.
 
 > Your `~/.ignis/config.toml` holds secrets and is never committed. The
 > repo-level `config.toml` is git-ignored on purpose — commit

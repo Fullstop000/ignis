@@ -1,5 +1,5 @@
 use crate::models::{ModelCatalog, ModelOption, ProviderConfig};
-use crate::provider::LlmProvider;
+use crate::provider::{catalog, Auth, LlmProvider, Protocol, Resolved};
 use crate::state::{load_state, State};
 use anyhow::anyhow;
 use serde::Deserialize;
@@ -153,10 +153,12 @@ impl Config {
         let mut names: Vec<&String> = self.providers.keys().collect();
         names.sort();
         names.into_iter().find_map(|name| {
-            self.providers[name]
-                .models
-                .first()
-                .map(|m| (name.clone(), m.name().to_string()))
+            if let Some(m) = self.providers[name].models.first() {
+                return Some((name.clone(), m.name().to_string()));
+            }
+            catalog::lookup(name)
+                .and_then(|s| s.models.first())
+                .map(|m| (name.clone(), m.name.to_string()))
         })
     }
 
@@ -183,27 +185,104 @@ impl Config {
     pub fn active_effort(&self) -> Option<String> {
         let level = self.reasoning_effort.as_deref()?;
         let (provider, model) = self.active_selection()?;
-        self.providers
-            .get(&provider)?
-            .effort_levels(&model)
+        self.effort_levels_for(&provider, &model)
             .into_iter()
             .find(|l| l == level)
+    }
+
+    /// Merged reasoning-effort levels for `(id, model)`: a config override (if
+    /// non-empty) else the catalog's baked levels.
+    fn effort_levels_for(&self, id: &str, model: &str) -> Vec<String> {
+        if let Some(cfg) = self.providers.get(id) {
+            let lvls = cfg.effort_levels(model);
+            if !lvls.is_empty() {
+                return lvls;
+            }
+        }
+        catalog::lookup(id)
+            .and_then(|s| s.models.iter().find(|m| m.name == model))
+            .map(|m| m.reasoning_effort.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Merge catalog metadata with config overrides into a [`Resolved`] selection.
+    pub(crate) fn resolve(&self) -> Result<Resolved, anyhow::Error> {
+        let (id, model) = self.active_selection().ok_or_else(|| {
+            anyhow!("no active model — set `model = \"provider/model\"` and a provider's `models`")
+        })?;
+        let spec = catalog::lookup(&id).ok_or_else(|| {
+            let known = catalog::all()
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow!("unknown provider '{id}'; known: {known}")
+        })?;
+        let cfg = self.providers.get(&id);
+        let (protocol, base_url, auth) = select_endpoint(spec, cfg)?;
+
+        let api_key = cfg.and_then(|c| c.api_key.clone());
+        if spec.api_key_required && api_key.is_none() {
+            return Err(anyhow!("provider '{id}' requires `api_key` in config"));
+        }
+        let user_agent = cfg
+            .and_then(|c| c.user_agent.clone())
+            .or_else(|| spec.user_agent.map(str::to_string));
+
+        Ok(Resolved {
+            provider_id: id,
+            protocol,
+            base_url,
+            auth,
+            api_key,
+            model,
+            user_agent,
+            reasoning_effort: self.active_effort(),
+        })
     }
 
     /// Flatten every provider's catalog into picker entries (sorted by provider,
     /// then by the order models are listed). Each model's context window is its
     /// config-declared override, else the models.dev `catalog` value.
-    pub fn model_options(&self, catalog: &ModelCatalog) -> Vec<ModelOption> {
-        let mut names: Vec<&String> = self.providers.keys().collect();
-        names.sort();
+    pub fn model_options(&self, catalog_dev: &ModelCatalog) -> Vec<ModelOption> {
+        let mut ids: Vec<&String> = self.providers.keys().collect();
+        ids.sort();
         let mut out = Vec::new();
-        for name in names {
-            let pcfg = &self.providers[name];
-            for entry in &pcfg.models {
+        for id in ids {
+            let cfg = &self.providers[id];
+            let mut seen = std::collections::HashSet::new();
+            // Catalog models first, with any per-model config override applied.
+            if let Some(spec) = catalog::lookup(id) {
+                for m in spec.models {
+                    let cfg_entry = cfg.models.iter().find(|e| e.name() == m.name);
+                    let effort = cfg_entry
+                        .map(|e| e.reasoning().to_vec())
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| {
+                            m.reasoning_effort.iter().map(|s| s.to_string()).collect()
+                        });
+                    let context = cfg_entry
+                        .and_then(|e| e.context())
+                        .or(m.context)
+                        .or_else(|| catalog_dev.context_for(m.name));
+                    out.push(ModelOption {
+                        provider: id.clone(),
+                        model: m.name.to_string(),
+                        effort_levels: effort,
+                        context,
+                    });
+                    seen.insert(m.name.to_string());
+                }
+            }
+            // Config-only models (not in the catalog), e.g. `custom` or extras.
+            for entry in &cfg.models {
+                if seen.contains(entry.name()) {
+                    continue;
+                }
                 let model = entry.name().to_string();
-                let context = entry.context().or_else(|| catalog.context_for(&model));
+                let context = entry.context().or_else(|| catalog_dev.context_for(&model));
                 out.push(ModelOption {
-                    provider: name.clone(),
+                    provider: id.clone(),
                     model,
                     effort_levels: entry.reasoning().to_vec(),
                     context,
@@ -215,12 +294,22 @@ impl Config {
 
     /// Context window of the active model: its config-declared override, else the
     /// models.dev `catalog` value.
-    pub fn active_context(&self, catalog: &ModelCatalog) -> Option<u64> {
+    pub fn active_context(&self, catalog_dev: &ModelCatalog) -> Option<u64> {
         let (provider, model) = self.active_selection()?;
-        self.providers
+        if let Some(c) = self
+            .providers
             .get(&provider)
             .and_then(|p| p.context(&model))
-            .or_else(|| catalog.context_for(&model))
+        {
+            return Some(c);
+        }
+        if let Some(c) = catalog::lookup(&provider)
+            .and_then(|s| s.models.iter().find(|m| m.name == model))
+            .and_then(|m| m.context)
+        {
+            return Some(c);
+        }
+        catalog_dev.context_for(&model)
     }
 }
 
@@ -253,100 +342,49 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
 }
 
 pub fn build_provider(config: &Config) -> Result<Box<dyn LlmProvider>, anyhow::Error> {
-    let (provider_name, model) = config.active_selection().ok_or_else(|| {
-        anyhow!("no active model — set `model = \"provider/model\"` and a provider's `models`")
-    })?;
-    let prov_cfg = config.providers.get(&provider_name).ok_or_else(|| {
-        anyhow!(
-            "Configuration for active provider '{}' not found",
-            provider_name
-        )
-    })?;
+    Ok(crate::provider::build(config.resolve()?))
+}
 
-    // Reasoning effort applies only to OpenAI-compatible providers below, and
-    // only when it's a declared level for the active model.
-    let effort = config.active_effort();
+/// Choose the endpoint for a provider: a config `protocol` override, else the
+/// catalog's default (`endpoints[0]`). For `custom` (no baked endpoints) the
+/// endpoint is synthesized as OpenAI + Bearer from the config `api_url`.
+fn select_endpoint(
+    spec: &catalog::ProviderSpec,
+    cfg: Option<&ProviderConfig>,
+) -> Result<(Protocol, String, Auth), anyhow::Error> {
+    let forced = cfg.and_then(|c| c.protocol);
 
-    match provider_name.as_str() {
-        "openai" => {
-            let api_key = prov_cfg.require(prov_cfg.api_key.clone(), "openai", "api_key")?;
-            let api_url = prov_cfg.require(prov_cfg.api_url.clone(), "openai", "api_url")?;
-            Ok(Box::new(crate::provider::OpenAiProvider::new(
-                "openai",
-                api_key,
-                api_url,
-                model,
-                prov_cfg.user_agent.clone(),
-                effort,
-            )))
-        }
-        "deepseek" => {
-            let api_key = prov_cfg.require(prov_cfg.api_key.clone(), "deepseek", "api_key")?;
-            let api_url = prov_cfg
-                .api_url
-                .clone()
-                .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
-            Ok(Box::new(crate::provider::DeepSeekProvider::with_url(
-                api_key, api_url, model, effort,
-            )))
-        }
-        "kimi-code" => {
-            let api_key = prov_cfg.require(prov_cfg.api_key.clone(), "kimi-code", "api_key")?;
-            let api_url = prov_cfg
-                .api_url
-                .clone()
-                .unwrap_or_else(|| "https://api.kimi.com/coding/v1".to_string());
-            // Kimi Coding Plan requires a whitelisted User-Agent
-            let ua = prov_cfg
-                .user_agent
-                .clone()
-                .unwrap_or_else(|| "KimiCLI/1.44.0".to_string());
-            Ok(Box::new(crate::provider::OpenAiProvider::new(
-                "kimi-code",
-                api_key,
-                api_url,
-                model,
-                Some(ua),
-                effort,
-            )))
-        }
-        "Moonshot Platform CN" => {
-            let api_key =
-                prov_cfg.require(prov_cfg.api_key.clone(), "Moonshot Platform CN", "api_key")?;
-            let api_url =
-                prov_cfg.require(prov_cfg.api_url.clone(), "Moonshot Platform CN", "api_url")?;
-            Ok(Box::new(crate::provider::OpenAiProvider::new(
-                "Moonshot Platform CN",
-                api_key,
-                api_url,
-                model,
-                prov_cfg.user_agent.clone(),
-                effort,
-            )))
-        }
-        "anthropic" => {
-            let api_key = prov_cfg.require(prov_cfg.api_key.clone(), "anthropic", "api_key")?;
-            Ok(Box::new(crate::provider::AnthropicProvider::new(
-                api_key, model,
-            )))
-        }
-        "gemini" => {
-            let api_key = prov_cfg.require(prov_cfg.api_key.clone(), "gemini", "api_key")?;
-            Ok(Box::new(crate::provider::GeminiProvider::new(
-                api_key, model,
-            )))
-        }
-        "ollama" => {
-            let api_url = prov_cfg
-                .api_url
-                .clone()
-                .unwrap_or_else(|| "http://localhost:11434".to_string());
-            Ok(Box::new(crate::provider::OllamaProvider::new(
-                api_url, model,
-            )))
-        }
-        other => Err(anyhow!("Unknown provider type: {}", other)),
+    if spec.endpoints.is_empty() {
+        let base = cfg
+            .and_then(|c| c.api_url.clone())
+            .ok_or_else(|| anyhow!("provider '{}' requires `api_url` in config", spec.id))?;
+        return Ok((forced.unwrap_or(Protocol::OpenAi), base, Auth::Bearer));
     }
+
+    let endpoint = match forced {
+        Some(want) => spec
+            .endpoints
+            .iter()
+            .find(|e| e.protocol == want)
+            .ok_or_else(|| {
+                let offered = spec
+                    .endpoints
+                    .iter()
+                    .map(|e| e.protocol.label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow!(
+                    "provider '{}' does not offer protocol '{}'; offers: {offered}",
+                    spec.id,
+                    want.label()
+                )
+            })?,
+        None => &spec.endpoints[0],
+    };
+    let base = cfg
+        .and_then(|c| c.api_url.clone())
+        .unwrap_or_else(|| endpoint.base_url.to_string());
+    Ok((endpoint.protocol, base, endpoint.auth))
 }
 
 #[cfg(test)]
@@ -354,52 +392,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_options_flattens_providers_with_effort_levels() {
+    fn model_options_uses_catalog_with_effort_levels() {
+        // No config `models`: the picker is populated from the baked catalog.
         let cfg: Config = toml::from_str(
             r#"
 model = "deepseek/deepseek-v4-flash"
 [providers.deepseek]
 api_key = "x"
-models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
-[providers.kimi-code]
+[providers.openai]
 api_key = "y"
-models = ["kimi-for-coding"]
 "#,
         )
         .unwrap();
         let opts = cfg.model_options(&ModelCatalog::default());
-        // Sorted by provider name (deepseek before kimi-code).
-        assert_eq!(opts.len(), 3);
+        // Sorted by provider (deepseek before openai); 2 models each.
+        assert_eq!(opts.len(), 4);
         assert_eq!(
             (opts[0].provider.as_str(), opts[0].model.as_str()),
             ("deepseek", "deepseek-v4-flash")
         );
         assert!(opts[0].effort_levels.is_empty());
-        assert_eq!(opts[1].model, "deepseek-v4-pro");
-        assert_eq!(opts[1].effort_levels, vec!["high", "max"]);
-        assert_eq!(
-            (opts[2].provider.as_str(), opts[2].model.as_str()),
-            ("kimi-code", "kimi-for-coding")
-        );
-        assert!(opts[2].effort_levels.is_empty());
+        // o3 carries its baked effort levels.
+        let o3 = opts.iter().find(|o| o.model == "o3").unwrap();
+        assert_eq!(o3.provider, "openai");
+        assert_eq!(o3.effort_levels, vec!["low", "medium", "high"]);
     }
 
     #[test]
-    fn inline_context_is_an_override() {
-        // A model's inline `context` wins; a bare model has none (empty catalog).
+    fn config_models_extend_and_override_catalog() {
         let cfg: Config = toml::from_str(
             r#"
-model = "deepseek/deepseek-v4-pro"
 [providers.deepseek]
 api_key = "x"
-models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", context = 128000 }]
+models = ["my-extra", { name = "deepseek-v4-flash", reasoning = ["low", "high"] }]
 "#,
         )
         .unwrap();
         let opts = cfg.model_options(&ModelCatalog::default());
-        assert_eq!(opts[0].context, None);
-        assert_eq!(opts[1].context, Some(128000));
+        // Config effort override applied to the catalog model.
+        let chat = opts
+            .iter()
+            .find(|o| o.model == "deepseek-v4-flash")
+            .unwrap();
+        assert_eq!(chat.effort_levels, vec!["low", "high"]);
+        // Config-only model is appended.
+        assert!(opts.iter().any(|o| o.model == "my-extra"));
+    }
+
+    #[test]
+    fn inline_context_is_an_override() {
+        // A config-declared `context` wins over the catalog / models.dev.
+        let cfg: Config = toml::from_str(
+            r#"
+model = "deepseek/deepseek-v4-flash"
+[providers.deepseek]
+api_key = "x"
+models = [{ name = "deepseek-v4-flash", context = 128000 }]
+"#,
+        )
+        .unwrap();
+        let opts = cfg.model_options(&ModelCatalog::default());
+        let chat = opts
+            .iter()
+            .find(|o| o.model == "deepseek-v4-flash")
+            .unwrap();
+        assert_eq!(chat.context, Some(128000));
         assert_eq!(cfg.active_context(&ModelCatalog::default()), Some(128000));
+    }
+
+    #[test]
+    fn baked_context_is_used_when_no_override() {
+        // Kimi's window is baked into the catalog (models.dev doesn't know it).
+        let cfg: Config = toml::from_str(
+            r#"
+model = "kimi-code/kimi-for-coding"
+[providers.kimi-code]
+api_key = "x"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.active_context(&ModelCatalog::default()), Some(262144));
     }
 
     #[test]
@@ -409,7 +481,6 @@ models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", context = 128000 }]
 model = "deepseek/deepseek-v4-pro"
 [providers.deepseek]
 api_key = "x"
-models = ["deepseek-v4-flash", "deepseek-v4-pro"]
 "#,
         )
         .unwrap();
@@ -422,53 +493,53 @@ models = ["deepseek-v4-flash", "deepseek-v4-pro"]
     }
 
     #[test]
-    fn active_selection_falls_back_to_first_provider_model() {
-        // No top-level `model`: first provider (sorted) with a catalog wins.
+    fn active_selection_falls_back_to_first_catalog_model() {
+        // No top-level `model`: first provider (sorted) → its first catalog model.
         let cfg: Config = toml::from_str(
             r#"
-[providers.kimi-code]
-api_key = "y"
-models = ["kimi-for-coding"]
 [providers.deepseek]
 api_key = "x"
-models = ["deepseek-v4-flash", "deepseek-v4-pro"]
+[providers.anthropic]
+api_key = "y"
 "#,
         )
         .unwrap();
         assert_eq!(
             cfg.active_selection(),
-            Some(("deepseek".to_string(), "deepseek-v4-flash".to_string()))
+            Some((
+                "anthropic".to_string(),
+                "claude-sonnet-4-20250514".to_string()
+            ))
         );
     }
 
     #[test]
     fn active_effort_only_returns_declared_levels() {
+        // o3's levels come from the catalog — no config `models` needed.
         let cfg: Config = toml::from_str(
             r#"
-model = "deepseek/deepseek-v4-pro"
-reasoning_effort = "max"
-[providers.deepseek]
+model = "openai/o3"
+reasoning_effort = "high"
+[providers.openai]
 api_key = "x"
-models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.active_effort().as_deref(), Some("max"));
+        assert_eq!(cfg.active_effort().as_deref(), Some("high"));
     }
 
     #[test]
     fn active_effort_none_for_model_without_levels() {
         let cfg: Config = toml::from_str(
             r#"
-model = "deepseek/deepseek-v4-flash"
-reasoning_effort = "max"
-[providers.deepseek]
+model = "openai/gpt-4o"
+reasoning_effort = "high"
+[providers.openai]
 api_key = "x"
-models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
 "#,
         )
         .unwrap();
-        // flash declares no levels → no effort even though one is set.
+        // gpt-4o declares no levels → no effort even though one is set.
         assert_eq!(cfg.active_effort(), None);
     }
 
@@ -476,11 +547,10 @@ models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", 
     fn active_effort_ignores_undeclared_value() {
         let cfg: Config = toml::from_str(
             r#"
-model = "deepseek/deepseek-v4-pro"
+model = "openai/o3"
 reasoning_effort = "ultra"
-[providers.deepseek]
+[providers.openai]
 api_key = "x"
-models = [{ name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
 "#,
         )
         .unwrap();
@@ -488,25 +558,110 @@ models = [{ name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
     }
 
     #[test]
+    fn minimax_defaults_to_anthropic_then_openai_override() {
+        let cfg: Config = toml::from_str(
+            r#"
+model = "minimax-token-plan/MiniMax-M2.7"
+[providers.minimax-token-plan]
+api_key = "sk-cp-x"
+"#,
+        )
+        .unwrap();
+        let r = cfg.resolve().unwrap();
+        assert_eq!(r.protocol, Protocol::Anthropic);
+        assert_eq!(r.base_url, "https://api.minimaxi.com/anthropic");
+        assert_eq!(r.auth, Auth::Bearer);
+        assert_eq!(r.model, "MiniMax-M2.7");
+
+        let cfg: Config = toml::from_str(
+            r#"
+model = "minimax-token-plan/MiniMax-M2.7"
+[providers.minimax-token-plan]
+api_key = "sk-cp-x"
+protocol = "openai"
+"#,
+        )
+        .unwrap();
+        let r = cfg.resolve().unwrap();
+        assert_eq!(r.protocol, Protocol::OpenAi);
+        assert_eq!(r.base_url, "https://api.minimaxi.com/v1");
+    }
+
+    #[test]
+    fn resolve_unknown_provider_errors() {
+        let cfg: Config = toml::from_str(
+            r#"
+model = "nope/m"
+[providers.nope]
+api_key = "x"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.resolve().is_err());
+    }
+
+    #[test]
+    fn resolve_missing_api_key_errors() {
+        let cfg: Config = toml::from_str(
+            r#"
+model = "openai/gpt-4o"
+[providers.openai]
+"#,
+        )
+        .unwrap();
+        assert!(cfg.resolve().is_err());
+    }
+
+    #[test]
+    fn custom_synthesizes_openai_endpoint_and_requires_api_url() {
+        // Without api_url → error.
+        let cfg: Config = toml::from_str(
+            r#"
+model = "custom/my-model"
+[providers.custom]
+api_key = "x"
+models = ["my-model"]
+"#,
+        )
+        .unwrap();
+        assert!(cfg.resolve().is_err());
+
+        // With api_url → OpenAI + Bearer at that URL.
+        let cfg: Config = toml::from_str(
+            r#"
+model = "custom/my-model"
+[providers.custom]
+api_key = "x"
+api_url = "https://my.endpoint/v1"
+models = ["my-model"]
+"#,
+        )
+        .unwrap();
+        let r = cfg.resolve().unwrap();
+        assert_eq!(r.protocol, Protocol::OpenAi);
+        assert_eq!(r.base_url, "https://my.endpoint/v1");
+        assert_eq!(r.auth, Auth::Bearer);
+    }
+
+    #[test]
     fn state_overrides_config_default() {
         let mut cfg: Config = toml::from_str(
             r#"
-model = "deepseek/deepseek-v4-flash"
-[providers.deepseek]
+model = "openai/gpt-4o"
+[providers.openai]
 api_key = "x"
-models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
 "#,
         )
         .unwrap();
         cfg.apply_state(State {
-            model: Some("deepseek/deepseek-v4-pro".to_string()),
+            model: Some("openai/o3".to_string()),
             reasoning_effort: Some("high".to_string()),
             disabled_skills: vec![],
             disabled_mcp_servers: vec![],
             mode: None,
             permission_grants: vec![],
         });
-        assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(cfg.active_model().as_deref(), Some("o3"));
         assert_eq!(cfg.active_effort().as_deref(), Some("high"));
     }
 
@@ -517,7 +672,6 @@ models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", 
 model = "deepseek/deepseek-v4-flash"
 [providers.deepseek]
 api_key = "x"
-models = ["deepseek-v4-flash", "deepseek-v4-pro"]
 "#,
         )
         .unwrap();
@@ -656,23 +810,22 @@ models = ["m"]
         // Switching to a non-reasoning model via state drops a prior effort.
         let mut cfg: Config = toml::from_str(
             r#"
-model = "deepseek/deepseek-v4-pro"
+model = "openai/o3"
 reasoning_effort = "high"
-[providers.deepseek]
+[providers.openai]
 api_key = "x"
-models = ["deepseek-v4-flash", { name = "deepseek-v4-pro", reasoning = ["high", "max"] }]
 "#,
         )
         .unwrap();
         cfg.apply_state(State {
-            model: Some("deepseek/deepseek-v4-flash".to_string()),
+            model: Some("openai/gpt-4o".to_string()),
             reasoning_effort: None,
             disabled_skills: vec![],
             disabled_mcp_servers: vec![],
             mode: None,
             permission_grants: vec![],
         });
-        assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(cfg.active_model().as_deref(), Some("gpt-4o"));
         assert_eq!(cfg.active_effort(), None);
     }
 }

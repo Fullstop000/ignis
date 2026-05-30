@@ -1,4 +1,4 @@
-use super::{bytes_to_lines, LlmProvider, LlmResponseDelta};
+use super::{bytes_to_lines, Auth, LlmProvider, LlmResponseDelta, Resolved};
 use crate::Message;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -6,18 +6,27 @@ use futures_util::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub struct AnthropicProvider {
+/// Any Anthropic-Messages-compatible endpoint — real Anthropic (`x-api-key`) or
+/// MiniMax's `/anthropic` endpoint (`Bearer`). The base URL is the API root; we
+/// append `/v1/messages`, and the auth header is chosen from [`Auth`].
+pub struct AnthropicCompatible {
     client: reqwest::Client,
+    provider_id: String,
     api_key: String,
+    base_url: String,
+    auth: Auth,
     model: String,
 }
 
-impl AnthropicProvider {
-    pub fn new(api_key: String, model: String) -> Self {
+impl AnthropicCompatible {
+    pub fn new(r: Resolved) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key,
-            model,
+            provider_id: r.provider_id,
+            api_key: r.api_key.unwrap_or_default(),
+            base_url: r.base_url,
+            auth: r.auth,
+            model: r.model,
         }
     }
 }
@@ -70,13 +79,13 @@ enum AnthropicDelta {
 }
 
 #[async_trait]
-impl LlmProvider for AnthropicProvider {
+impl LlmProvider for AnthropicCompatible {
     fn model_id(&self) -> &str {
         &self.model
     }
 
     fn provider_name(&self) -> &str {
-        "anthropic"
+        &self.provider_id
     }
 
     async fn chat_stream(
@@ -162,14 +171,16 @@ impl LlmProvider for AnthropicProvider {
             stream: true,
         };
 
-        let res = self
+        let endpoint = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let mut req = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&req_body)
-            .send()
-            .await?;
+            .post(&endpoint)
+            .header("anthropic-version", "2023-06-01");
+        req = match self.auth {
+            Auth::XApiKey => req.header("x-api-key", self.api_key.clone()),
+            _ => req.header("Authorization", format!("Bearer {}", self.api_key)),
+        };
+        let res = req.json(&req_body).send().await?;
 
         if !res.status().is_success() {
             let error_text = res

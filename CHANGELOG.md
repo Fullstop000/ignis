@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- MiniMax Token Plan provider — same models over OpenAI- and Anthropic-compatible endpoints, Anthropic auto-selected.
+- `custom` provider for any OpenAI-compatible endpoint.
+
+### Changed
+- Providers are now built in — pick one and supply `api_key`; `config.toml` is overrides-only.
+
+### Breaking
+- Provider id `Moonshot Platform CN` is now `moonshot-platform-cn`.
+
 ## [0.28.0] - 2026-05-30
 
 - `AGENTS.md` — ignis reads project (`./AGENTS.md`) and global (`~/.ignis/AGENTS.md`) instructions; the project file overrides the global one.

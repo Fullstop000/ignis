@@ -1,22 +1,25 @@
-use super::{bytes_to_lines, LlmProvider, LlmResponseDelta};
+use super::{bytes_to_lines, LlmProvider, LlmResponseDelta, Resolved};
 use crate::Message;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 
-pub struct OllamaProvider {
+/// Local Ollama inference. No auth, no tool support (tools are ignored).
+pub struct Ollama {
     client: reqwest::Client,
+    provider_id: String,
+    base_url: String,
     model: String,
-    api_url: String,
 }
 
-impl OllamaProvider {
-    pub fn new(api_url: String, model: String) -> Self {
+impl Ollama {
+    pub fn new(r: Resolved) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_url,
-            model,
+            provider_id: r.provider_id,
+            base_url: r.base_url,
+            model: r.model,
         }
     }
 }
@@ -39,13 +42,13 @@ struct OllamaMessage {
 }
 
 #[async_trait]
-impl LlmProvider for OllamaProvider {
+impl LlmProvider for Ollama {
     fn model_id(&self) -> &str {
         &self.model
     }
 
     fn provider_name(&self) -> &str {
-        "ollama"
+        &self.provider_id
     }
 
     async fn chat_stream(
@@ -70,7 +73,7 @@ impl LlmProvider for OllamaProvider {
             stream: true,
         };
 
-        let endpoint = format!("{}/api/chat", self.api_url.trim_end_matches('/'));
+        let endpoint = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
 
         let res = self.client.post(&endpoint).json(&req_body).send().await?;
 
