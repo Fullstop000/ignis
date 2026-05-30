@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-05-30
+
 ### Added
 - MiniMax Token Plan provider — same models over OpenAI- and Anthropic-compatible endpoints, Anthropic auto-selected.
 - `custom` provider for any OpenAI-compatible endpoint.
