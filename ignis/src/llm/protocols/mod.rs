@@ -40,7 +40,6 @@ pub trait LlmProvider: Send + Sync + 'static {
 }
 
 mod anthropic;
-mod gemini;
 mod ollama;
 mod openai;
 
@@ -53,7 +52,6 @@ pub enum Protocol {
     #[serde(alias = "openai-compatible")]
     OpenAi,
     Anthropic,
-    Gemini,
     Ollama,
 }
 
@@ -62,7 +60,6 @@ impl Protocol {
         match self {
             Protocol::OpenAi => "openai",
             Protocol::Anthropic => "anthropic",
-            Protocol::Gemini => "gemini",
             Protocol::Ollama => "ollama",
         }
     }
@@ -76,8 +73,6 @@ pub enum Auth {
     Bearer,
     /// `x-api-key: <key>` (Anthropic)
     XApiKey,
-    /// `?key=<key>` query parameter (Gemini)
-    QueryKey,
     /// No credential (Ollama)
     None,
 }
@@ -102,7 +97,6 @@ pub fn build(r: Resolved) -> Box<dyn LlmProvider> {
     match r.protocol {
         Protocol::OpenAi => Box::new(openai::OpenAiCompatible::new(r)),
         Protocol::Anthropic => Box::new(anthropic::AnthropicCompatible::new(r)),
-        Protocol::Gemini => Box::new(gemini::Gemini::new(r)),
         Protocol::Ollama => Box::new(ollama::Ollama::new(r)),
     }
 }

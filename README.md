@@ -70,7 +70,7 @@ See [Configure](#configure) for more providers and per-model options.
 
 - **TUI + CLI** — a native terminal TUI (`ratatui` + `crossterm`) and a one-shot
   CLI from the same binary.
-- **Bring your own model** — OpenAI, Anthropic, DeepSeek, Gemini, Kimi, MiniMax,
+- **Bring your own model** — OpenAI, Anthropic, DeepSeek, Kimi, MiniMax,
   Moonshot, Ollama, and any OpenAI-compatible endpoint (the `custom` provider).
   Providers are built in — drop in an API key and go. Switch model and reasoning
   effort at runtime with `/model`.

@@ -428,7 +428,7 @@ api_key = "y"
             (opts[0].provider.as_str(), opts[0].model.as_str()),
             ("deepseek", "deepseek-v4-flash")
         );
-        assert!(opts[0].effort_levels.is_empty());
+        assert_eq!(opts[0].effort_levels, vec!["high", "max"]);
         // GPT-5.5 carries its baked effort levels.
         let gpt55 = opts.iter().find(|o| o.model == "gpt-5.5").unwrap();
         assert_eq!(gpt55.provider, "openai");

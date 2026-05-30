@@ -28,8 +28,6 @@ api_key = "sk-cp-your-key"
 # [providers.deepseek]
 # api_key = "sk-your-deepseek-key"
 #
-# [providers.gemini]
-# api_key = "your-gemini-key"
 #
 # [providers."kimi-code"]
 # api_key = "sk-your-kimi-key"

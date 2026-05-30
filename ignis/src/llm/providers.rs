@@ -111,32 +111,15 @@ static SPECS: &[ProviderSpec] = &[
         models: &[
             ModelSpec {
                 name: "deepseek-v4-flash",
-                context: None,
-                reasoning_effort: &[],
+                context: Some(1_000_000),
+                reasoning_effort: &["high", "max"],
             },
             ModelSpec {
                 name: "deepseek-v4-pro",
-                context: Some(128000),
+                context: Some(1_000_000),
                 reasoning_effort: &["high", "max"],
             },
         ],
-    },
-    // ── Google Gemini ───────────────────────────────────────────────────────
-    ProviderSpec {
-        id: "gemini",
-        display_name: "Google Gemini",
-        endpoints: &[Endpoint {
-            protocol: Protocol::Gemini,
-            base_url: "https://generativelanguage.googleapis.com/v1beta",
-            auth: Auth::QueryKey,
-        }],
-        api_key_required: true,
-        request_headers: &[],
-        models: &[ModelSpec {
-            name: "gemini-2.5-pro",
-            context: None,
-            reasoning_effort: &[],
-        }],
     },
     // ── Kimi Coding Plan (whitelisted User-Agent baked in) ──────────────────
     ProviderSpec {
@@ -300,6 +283,7 @@ mod tests {
             serde_json::from_str::<Protocol>("\"anthropic\"").unwrap(),
             Protocol::Anthropic
         );
+        assert!(serde_json::from_str::<Protocol>("\"gemini\"").is_err());
         assert!(serde_json::from_str::<Protocol>("\"nope\"").is_err());
     }
 
@@ -325,5 +309,20 @@ mod tests {
         let moonshot = lookup("moonshot-platform-cn").unwrap();
         assert_eq!(moonshot.models[0].name, "kimi-k2.6");
         assert!(moonshot.models.iter().any(|m| m.name == "kimi-k2.5"));
+    }
+
+    #[test]
+    fn gemini_is_not_baked_in() {
+        assert!(lookup("gemini").is_none());
+        assert!(!all().iter().any(|s| s.id == "gemini"));
+    }
+
+    #[test]
+    fn deepseek_metadata_matches_current_v4_docs() {
+        let deepseek = lookup("deepseek").unwrap();
+        for model in deepseek.models {
+            assert_eq!(model.context, Some(1_000_000));
+            assert_eq!(model.reasoning_effort, &["high", "max"]);
+        }
     }
 }
