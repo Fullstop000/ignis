@@ -123,24 +123,30 @@ gh pr create --base master --title "<concise>" --body "<concise summary + checkl
 
 **If step 3's dogfood produced PNG screenshots showing the feature working** — banners, pickers, footer segments, the resumed conversation view, before/after of a visual change — post them in a PR comment right after `gh pr create`. Reviewers shouldn't have to take "it looks correct" on faith.
 
-Recommended mechanism — public gist (no repo bloat, no commit to the feature branch):
-```bash
-URL=$(gh gist create /tmp/<shot1>.png /tmp/<shot2>.png --public -d "PR #<num> screenshots" | tail -1)
-# Visit $URL to grab the per-file raw URLs (gh gist view <id> --files lists them),
-# then post a comment referencing each shot:
+Mechanism — commit the shots into the feature branch under `.github/screenshots/pr-<num>/` and reference them by raw URL. (`gh gist create` and `gh api` both refuse binary uploads, so the branch is the most reliable host.)
 
-gh pr comment <num> --body "$(cat <<'EOF'
+```bash
+mkdir -p .github/screenshots/pr-<num>
+cp /tmp/<shot1>.png /tmp/<shot2>.png .github/screenshots/pr-<num>/
+git add .github/screenshots/pr-<num>/
+git commit -m "docs(pr-<num>): dogfood screenshots"
+git push
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+BASE="https://raw.githubusercontent.com/Fullstop000/ignis/${BRANCH}/.github/screenshots/pr-<num>"
+
+gh pr comment <num> --body "$(cat <<EOF
 ## Screenshots from dogfood
 
 | Path | Result |
 |---|---|
-| <step-1 label> | ![](<raw-url-1>) |
-| <step-2 label> | ![](<raw-url-2>) |
+| <step-1 label> | ![](${BASE}/<shot1>.png) |
+| <step-2 label> | ![](${BASE}/<shot2>.png) |
 EOF
 )"
 ```
 
-Pick the **production-ready** shots — the final ones that show the integrated feature, not intermediate debug captures from the dogfood iteration. One shot per user-visible path is enough; resist the urge to dump every PNG. Skip this step entirely when the change is non-visual (CLI flag, internal refactor, doc-only PR).
+Pick the **production-ready** shots — the final ones that show the integrated feature, not intermediate debug captures from the dogfood iteration. One shot per user-visible path is enough; resist dumping every PNG (the squash-merge carries them into master forever). Skip this step entirely when the change is non-visual (CLI flag, internal refactor, doc-only PR).
 
 ### 6. Review (ask the human which reviewer)
 Get a code review of the PR diff before chasing CI. **Ask the human which reviewer
