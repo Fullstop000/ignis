@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-05-31
+
 ### Changed
 - Reasoning content now renders as its own dim `✻ Thinking` block instead of a `💭`-prefixed reply, and keeps streaming even when reasoning arrives after text starts. ([#83](https://github.com/Fullstop000/ignis/pull/83))
 
