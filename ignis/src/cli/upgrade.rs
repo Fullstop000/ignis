@@ -270,6 +270,133 @@ fn parse_semver(s: &str) -> (u32, u32, u32) {
     )
 }
 
+// ─── Auto-update check (called from the TUI's `run_console`) ─────────────
+//
+// Tells the user, via a footer segment in the inline TUI, that a newer
+// release exists. Notify-only — does not download, does not self-replace; the
+// user runs `ignis upgrade` (above) to actually upgrade. Reuses
+// `fetch_latest_tag`, `strip_v`, `version_lt`, and the `TARGET` cfg-gate so
+// hosts without a prebuilt binary never see the notice.
+
+const TTL_SECS: u64 = 24 * 60 * 60;
+
+/// What the TUI footer needs to render the "new version available" segment.
+/// Carried back from the background `tokio::spawn` via a oneshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpdateNotice {
+    pub current: String,
+    pub latest_tag: String,
+}
+
+/// Decide whether to even attempt the check on this run. Single audit point —
+/// see the spec for the rationale on each branch. The inner helper is pure
+/// (takes env + tty as data) so tests don't race on `std::env::set_var`.
+pub(crate) fn should_check_for_update() -> bool {
+    // Dev builds are noisy: `cargo run` would nag every iteration. The release
+    // workflow strips debug_assertions.
+    if cfg!(debug_assertions) {
+        return false;
+    }
+    should_check_inner(
+        |k| std::env::var(k).ok(),
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+    )
+}
+
+fn should_check_inner(env_get: impl Fn(&str) -> Option<String>, stderr_is_tty: bool) -> bool {
+    // No prebuilt binary → `ignis upgrade` would refuse anyway; suggesting it
+    // would be a dead-end.
+    if TARGET.is_none() {
+        return false;
+    }
+    if env_get("IGNIS_NO_UPDATE_NOTIFIER").is_some() {
+        return false;
+    }
+    if env_get("CI").is_some()
+        || env_get("CONTINUOUS_INTEGRATION").is_some()
+        || env_get("CODESPACES").is_some()
+    {
+        return false;
+    }
+    // stderr-not-TTY catches `ignis 2>logfile`, headless invocations, etc.
+    if !stderr_is_tty {
+        return false;
+    }
+    true
+}
+
+/// 24 h-cached check. Returns `(new_cache_state, optional_notice)` — the
+/// caller persists `new_cache_state` to state.json. `fetch` is injected so
+/// tests don't hit the network; production passes `fetch_latest_tag`.
+pub(crate) async fn check_for_update_cached<F, Fut>(
+    prior: Option<crate::state::UpdateCheckState>,
+    current: &str,
+    now: u64,
+    ttl_secs: u64,
+    fetch: F,
+) -> (Option<crate::state::UpdateCheckState>, Option<UpdateNotice>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    // Cache hit: within TTL, compare against the cached tag — no network call.
+    if let Some(p) = &prior {
+        if now.saturating_sub(p.checked_at) < ttl_secs {
+            return (prior.clone(), build_notice(current, &p.latest_tag));
+        }
+    }
+    // Cache miss or expired: refresh from GitHub. On failure we deliberately
+    // leave state untouched so the next launch retries — flaky networks
+    // shouldn't pin us into a "skip permanently" state.
+    match fetch().await {
+        Ok(latest_tag) => {
+            let new_state = Some(crate::state::UpdateCheckState {
+                checked_at: now,
+                latest_tag: latest_tag.clone(),
+            });
+            let notice = build_notice(current, &latest_tag);
+            (new_state, notice)
+        }
+        Err(e) => {
+            log::debug!("update check fetch failed: {e}");
+            (prior, None)
+        }
+    }
+}
+
+fn build_notice(current: &str, latest_tag: &str) -> Option<UpdateNotice> {
+    if version_lt(current, strip_v(latest_tag)) {
+        Some(UpdateNotice {
+            current: current.to_string(),
+            latest_tag: latest_tag.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Spawn the check on a tokio task and return a oneshot that resolves to the
+/// notice (or `None` if no update / failed / cache says we're current). The
+/// task does its own state.json read/write — the caller just polls the rx.
+pub(crate) fn spawn_update_check() -> tokio::sync::oneshot::Receiver<Option<UpdateNotice>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let current = env!("CARGO_PKG_VERSION");
+    tokio::spawn(async move {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let prior = crate::state::load_state().update_check;
+        let (new_state, notice) =
+            check_for_update_cached(prior, current, now, TTL_SECS, fetch_latest_tag).await;
+        // Best-effort persist; a failure here just means the next launch
+        // re-fetches — not user-visible.
+        let _ = crate::state::persist_update_check(new_state);
+        let _ = tx.send(notice);
+    });
+    rx
+}
+
 /// Create a fresh empty directory under `std::env::temp_dir()` with a random
 /// suffix. Inlined to avoid a `tempfile` runtime dep just for one call.
 fn mkdtemp(prefix: &str) -> Result<PathBuf> {
@@ -303,6 +430,145 @@ impl Drop for TmpDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::UpdateCheckState;
+
+    // ── Auto-update-check tests ──
+
+    /// Build a fake env_get closure from a slice of (key, value) pairs. Avoids
+    /// touching `std::env::set_var` (which races with parallel tests).
+    fn env_from<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn skip_when_opt_out_env_set() {
+        assert!(!should_check_inner(
+            env_from(&[("IGNIS_NO_UPDATE_NOTIFIER", "1")]),
+            true
+        ));
+    }
+
+    #[test]
+    fn skip_when_ci_env_set() {
+        for (key, val) in [
+            ("CI", "true"),
+            ("CONTINUOUS_INTEGRATION", "1"),
+            ("CODESPACES", "1"),
+        ] {
+            assert!(
+                !should_check_inner(env_from(&[(key, val)]), true),
+                "expected skip when {key} is set"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_when_stderr_not_tty() {
+        assert!(!should_check_inner(env_from(&[]), false));
+    }
+
+    /// On a supported host (the CI matrix), no skip env, TTY stderr → check
+    /// runs. Hosts where TARGET is None will fail this — but our CI is all
+    /// supported triples, and the check is a one-line cfg gate.
+    #[test]
+    fn allow_check_when_no_skips_apply() {
+        if TARGET.is_none() {
+            return; // unsupported host — skip-gate fires elsewhere
+        }
+        assert!(should_check_inner(env_from(&[]), true));
+    }
+
+    #[tokio::test]
+    async fn cache_hit_within_ttl_skips_fetch() {
+        let prior = Some(UpdateCheckState {
+            checked_at: 1_000_000,
+            latest_tag: "v9.9.9".to_string(),
+        });
+        let fetch_called = std::cell::Cell::new(false);
+        let (new_state, notice) = check_for_update_cached(
+            prior.clone(),
+            "0.30.0",
+            1_000_000 + 60, // 1 min later, well within 24 h
+            TTL_SECS,
+            || async {
+                fetch_called.set(true);
+                Ok::<String, anyhow::Error>("v9.9.9".to_string())
+            },
+        )
+        .await;
+        assert!(!fetch_called.get(), "fetch must not be called on cache hit");
+        assert_eq!(new_state, prior, "state must round-trip unchanged");
+        assert_eq!(notice.unwrap().latest_tag, "v9.9.9");
+    }
+
+    #[tokio::test]
+    async fn cache_hit_no_notice_when_current_matches() {
+        let prior = Some(UpdateCheckState {
+            checked_at: 1_000_000,
+            latest_tag: "v0.30.0".to_string(),
+        });
+        let (_, notice) =
+            check_for_update_cached(prior, "0.30.0", 1_000_000 + 60, TTL_SECS, || async {
+                Ok::<_, anyhow::Error>("unused".to_string())
+            })
+            .await;
+        assert!(notice.is_none(), "no notice when already at latest");
+    }
+
+    #[tokio::test]
+    async fn cache_miss_after_ttl_calls_fetch_and_updates_state() {
+        let prior = Some(UpdateCheckState {
+            checked_at: 1_000_000,
+            latest_tag: "v0.29.0".to_string(),
+        });
+        let (new_state, notice) = check_for_update_cached(
+            prior,
+            "0.30.0",
+            1_000_000 + TTL_SECS + 1, // just past TTL
+            TTL_SECS,
+            || async { Ok::<_, anyhow::Error>("v0.31.0".to_string()) },
+        )
+        .await;
+        let s = new_state.unwrap();
+        assert_eq!(s.checked_at, 1_000_000 + TTL_SECS + 1);
+        assert_eq!(s.latest_tag, "v0.31.0");
+        assert_eq!(notice.unwrap().latest_tag, "v0.31.0");
+    }
+
+    #[tokio::test]
+    async fn fetch_error_leaves_prior_state_untouched() {
+        let prior = Some(UpdateCheckState {
+            checked_at: 1_000_000,
+            latest_tag: "v0.30.0".to_string(),
+        });
+        let (new_state, notice) = check_for_update_cached(
+            prior.clone(),
+            "0.30.0",
+            1_000_000 + TTL_SECS + 1,
+            TTL_SECS,
+            || async { Err::<String, _>(anyhow!("offline")) },
+        )
+        .await;
+        assert_eq!(new_state, prior, "prior state must survive a fetch error");
+        assert!(notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_prior_with_successful_fetch_writes_fresh_state() {
+        let (new_state, notice) = check_for_update_cached(None, "0.30.0", 42, TTL_SECS, || async {
+            Ok::<_, anyhow::Error>("v0.31.0".to_string())
+        })
+        .await;
+        let s = new_state.unwrap();
+        assert_eq!(s.checked_at, 42);
+        assert_eq!(s.latest_tag, "v0.31.0");
+        assert_eq!(notice.unwrap().latest_tag, "v0.31.0");
+    }
 
     #[test]
     fn strip_v_handles_both_forms() {
