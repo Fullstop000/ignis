@@ -169,8 +169,11 @@ pub fn extract_turns(jsonl: &str) -> Vec<TurnSummary> {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        // Storage writes tool replies as `type: "tool_result"` and assistant /
+        // user messages as `type: "message"` — accept both so real persisted
+        // sessions render tool events in the waterfall.
         let kind = record.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if kind != "message" {
+        if kind != "message" && kind != "tool_result" {
             continue;
         }
         let ts = record
@@ -220,7 +223,8 @@ pub fn extract_turns(jsonl: &str) -> Vec<TurnSummary> {
         let Ok(record) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        if record.get("type").and_then(|v| v.as_str()) != Some("message") {
+        let kind = record.get("type").and_then(|v| v.as_str());
+        if kind != Some("message") && kind != Some("tool_result") {
             continue;
         }
         let ts = record
@@ -470,23 +474,53 @@ pub fn walk_sessions(projects_dir: &Path, scope: Scope, cwd: &Path) -> Result<Ve
         }
         for file in std::fs::read_dir(&path)?.flatten() {
             let fp = file.path();
-            if fp.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            // Scan both .jsonl (current) and .json (legacy) so older sessions
+            // saved before the JSONL migration still show up — matches the
+            // discoverability of `SessionManager::list()`.
+            let ext = fp.extension().and_then(|e| e.to_str());
+            if ext != Some("jsonl") && ext != Some("json") {
+                continue;
+            }
+            // Skip atomic-write temp files (".json.tmp").
+            if fp
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.contains(".tmp"))
+                .unwrap_or(false)
+            {
                 continue;
             }
             let stem = match fp.file_stem().and_then(|s| s.to_str()) {
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            let jsonl = match std::fs::read_to_string(&fp) {
+            // Sibling usage files are `<id>.usage.json` — their stem ends in
+            // `.usage`. Skip so they don't show up as phantom sessions.
+            if stem.ends_with(".usage") {
+                continue;
+            }
+            let raw = match std::fs::read_to_string(&fp) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if jsonl.trim().is_empty() {
+            if raw.trim().is_empty() {
                 continue;
             }
             let usage_path = path.join(format!("{stem}.usage.json"));
             let usage_raw = std::fs::read_to_string(&usage_path).ok();
-            let mut rec = parse_session(&stem, &slug, &jsonl, usage_raw.as_deref())?;
+            // For legacy `.json` files we only have the message array — no
+            // envelope timestamps — so parse_session sees an empty stream and
+            // reports zero turn/tool counts. That's the best we can derive
+            // without re-parsing the JSON; the file still lists in the picker.
+            let mut rec = if ext == Some("jsonl") {
+                parse_session(&stem, &slug, &raw, usage_raw.as_deref())?
+            } else {
+                SessionRecord {
+                    session_id: stem.clone(),
+                    project_slug: slug.clone(),
+                    ..Default::default()
+                }
+            };
             if let Ok(meta) = std::fs::metadata(&fp) {
                 if let Ok(mtime) = meta.modified() {
                     if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {

@@ -106,6 +106,7 @@ fn project_instructions_message(block: &str) -> Message {
         name: None,
         tool_call_id: None,
         tool_calls: None,
+        created_at_ms: None,
     }
 }
 
@@ -252,6 +253,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             tool_calls: None,
+            created_at_ms: None,
         }
     }
 

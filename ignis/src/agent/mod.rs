@@ -9,7 +9,9 @@ use crate::skills::SkillRegistry;
 
 use serde::Serialize;
 
-use crate::llm::{LlmProvider, LlmResponseDelta, Message, ToolCall, ToolCallFunction, Usage};
+use crate::llm::{
+    now_ms, LlmProvider, LlmResponseDelta, Message, ToolCall, ToolCallFunction, Usage,
+};
 use crate::tools::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
 
 pub mod agents_md;
@@ -148,6 +150,7 @@ async fn drain_injected(
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: Some(now_ms()),
             });
             let _ = tx.send(AgentEvent::UserInjected { text }).await;
             n += 1;
@@ -263,6 +266,7 @@ async fn execute_single_tool(
         name: Some(tool_name),
         tool_call_id: Some(tc_id),
         tool_calls: None,
+        created_at_ms: Some(now_ms()),
     }
 }
 
@@ -325,6 +329,7 @@ async fn consume_turn_stream(
                                     name: None,
                                     tool_call_id: None,
                                     tool_calls: None,
+                                    created_at_ms: None,
                                 },
                             })
                             .await;
@@ -340,6 +345,7 @@ async fn consume_turn_stream(
                                     name: None,
                                     tool_call_id: None,
                                     tool_calls: None,
+                                    created_at_ms: None,
                                 },
                             })
                             .await;
@@ -364,6 +370,7 @@ async fn consume_turn_stream(
                                     name: None,
                                     tool_call_id: None,
                                     tool_calls: None,
+                                    created_at_ms: None,
                                 },
                             })
                             .await;
@@ -379,6 +386,7 @@ async fn consume_turn_stream(
                                     name: None,
                                     tool_call_id: None,
                                     tool_calls: None,
+                                    created_at_ms: None,
                                 },
                             })
                             .await;
@@ -636,6 +644,7 @@ impl Agent {
                                 name: None,
                                 tool_call_id: None,
                                 tool_calls: None,
+                                created_at_ms: None,
                             },
                         })
                         .await;
@@ -653,6 +662,7 @@ impl Agent {
                                 name: None,
                                 tool_call_id: None,
                                 tool_calls: None,
+                                created_at_ms: None,
                             },
                         })
                         .await;
@@ -717,6 +727,7 @@ impl Agent {
                     } else {
                         None
                     },
+                    created_at_ms: Some(now_ms()),
                 };
 
                 if message_started || reasoning_streaming {
@@ -832,6 +843,7 @@ impl Agent {
                             name: Some(tc.function.name),
                             tool_call_id: Some(tc.id),
                             tool_calls: None,
+                            created_at_ms: Some(now_ms()),
                         });
                         continue;
                     }
@@ -878,6 +890,7 @@ impl Agent {
                                 name: Some(tc.function.name.clone()),
                                 tool_call_id: Some(tc.id.clone()),
                                 tool_calls: None,
+                                created_at_ms: Some(now_ms()),
                             },
                         ));
                         continue;

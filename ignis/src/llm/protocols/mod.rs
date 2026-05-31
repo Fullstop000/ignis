@@ -3,7 +3,7 @@ use futures_util::stream::{BoxStream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 mod message;
-pub use message::{Message, ToolCall, ToolCallFunction, Usage};
+pub use message::{now_ms, Message, ToolCall, ToolCallFunction, Usage};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LlmResponseDelta {
@@ -327,6 +327,7 @@ pub(crate) async fn openai_compatible_chat_stream(
         name: None,
         tool_call_id: None,
         tool_calls: None,
+        created_at_ms: None,
     }];
     request_messages.extend_from_slice(messages);
 

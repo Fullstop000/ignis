@@ -210,6 +210,7 @@ pub async fn run_console(
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             };
             let tx = agent_tx.clone();
             match prompt {

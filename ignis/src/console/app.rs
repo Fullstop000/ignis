@@ -2085,6 +2085,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
         });
         assert!(matches!(app.blocks.last(), Some(UIBlock::Reasoning(s)) if s.is_empty()));
@@ -2101,6 +2102,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
         });
         assert!(matches!(app.blocks.last(), Some(UIBlock::Assistant(s)) if s.is_empty()));
@@ -2117,6 +2119,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
         });
         app.handle_event(AgentEvent::MessageUpdate {
@@ -2142,6 +2145,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
         };
         let text_start = || AgentEvent::MessageStart {
@@ -2152,6 +2156,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
         };
         let end = || AgentEvent::MessageEnd {
@@ -2162,6 +2167,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
         };
 
