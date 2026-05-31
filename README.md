@@ -134,7 +134,7 @@ the active selection at runtime, saving it to `~/.ignis/state.json` — your
 In the TUI: `Enter` sends, `↑/↓` walk history, `Ctrl+D` exits. Output renders
 inline in the normal buffer, so scroll with your terminal/tmux as usual. Type
 `/` for slash-command suggestions — see
-[`docs/commands.md`](docs/commands.md) for the full reference.
+[`docs/usage/commands.md`](docs/usage/commands.md) for the full reference.
 
 ## Permissions
 
@@ -153,7 +153,7 @@ deny  = ["read_file(.env)", "read_file(**/secrets/**)"]
 Switch modes at runtime with `/afk`: *Hands-free* auto-approves tools but still
 answers `ask_user`; *Fully unattended* auto-approves everything. The TUI footer
 shows the active mode. Full grammar and precedence in
-[`docs/permissions.md`](docs/permissions.md).
+[`docs/configure/permissions.md`](docs/configure/permissions.md).
 
 ## Development
 

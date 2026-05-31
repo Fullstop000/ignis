@@ -125,7 +125,7 @@ sample run-time counters) as an assistant notice. Read-only.
 /telemetry
 ```
 
-See [telemetry.md](./telemetry.md) for setup.
+See [configure/telemetry.md](../configure/telemetry.md) for setup.
 
 ---
 
