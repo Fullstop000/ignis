@@ -48,8 +48,9 @@ session is saved over the existing session id.
 ### `/copy`
 
 Copy the last assistant message to the system clipboard. Uses the platform
-clipboard CLI (`pbcopy` / `clip` / `clip.exe` / `wl-copy` / `xclip`) — no
-native dependency.
+clipboard CLI (`pbcopy` on macOS, `clip` / `clip.exe` on Windows/WSL,
+`wl-copy` or `xclip` on Linux desktop — install one if neither is present) —
+no native dependency.
 
 ```
 /copy
