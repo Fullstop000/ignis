@@ -135,7 +135,7 @@ pub(crate) fn render_tool_block(
     };
 
     // Parse tool arguments for a compact display
-    let args_compact = sanitize(&compact_tool_args(&entry.arguments, cwd));
+    let args_compact = sanitize(&compact_tool_args(&entry.name, &entry.arguments, cwd));
 
     lines.push(Line::from(""));
     // Header line: ┌─ ⚙ tool_name(args) [1.2s]
@@ -285,13 +285,21 @@ fn push_diff_line(
 /// Produce a compact arg summary from JSON, showing **values only** (never the
 /// parameter names): `grep("fn main")`, `read_file(src/main.rs)`. Path-valued
 /// args render bare and relative to `cwd`; other strings keep their quotes.
-pub(crate) fn compact_tool_args(json_str: &str, cwd: &Path) -> String {
+///
+/// `edit_file` and `create_file` carry large `old_string`/`new_string`/`content`
+/// payloads that drown out the path; for those tools we render only `file_path`.
+pub(crate) fn compact_tool_args(tool_name: &str, json_str: &str, cwd: &Path) -> String {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
         return truncate(json_str, 60);
     };
     let Some(obj) = val.as_object() else {
         return truncate(json_str, 60);
     };
+    if matches!(tool_name, "edit_file" | "create_file") {
+        if let Some(serde_json::Value::String(p)) = obj.get("file_path") {
+            return truncate(&relativize_path(p, cwd), 60);
+        }
+    }
     let mut parts = Vec::new();
     for (k, v) in obj {
         let s = match v {

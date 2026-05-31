@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- TUI `edit_file`/`create_file` headers now show only the `file_path` instead of dumping `old_string`/`new_string`/`content` into the header. ([#76](https://github.com/Fullstop000/ignis/issues/76))
+
 ## [0.30.0] - 2026-05-31
 
 ### Added
