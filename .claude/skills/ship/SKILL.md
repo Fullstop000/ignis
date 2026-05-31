@@ -15,7 +15,8 @@ tag is `v<that version>`. There is no separate VERSION file.
 
 - **Never push a diff that contains a secret.** Scan first; abort on any hit.
 - **Never squash-merge without explicit human approval.** Prepare everything, then stop and ask.
-- **Bump version + CHANGELOG inside the PR, before merge** — never as a direct commit to `master` after.
+- **Before touching the CHANGELOG, ask the user**: add this change to `## [Unreleased]`, or bump to `vX.Y.Z` and cut a release? The answer decides what step 8 writes — but it all stays in **one** PR (no separate bump PR).
+- **Never edit `Cargo.toml`/`Cargo.lock` versions or rename `## [Unreleased]` without that answer.** A bump that wasn't asked for is a process violation.
 - Every gate must pass. On failure: stop, show the output, fix, re-run. No skipping.
 
 ```dot
@@ -24,17 +25,30 @@ digraph ship {
     "Abort, remove secret" [shape=box];
     "CI green?" [shape=diamond];
     "Read failure, fix, push" [shape=box];
+    "Ask: bump or [Unreleased]?" [shape=diamond];
+    "Edit CHANGELOG [Unreleased]" [shape=box];
+    "Bump Cargo.toml + rename [Unreleased]" [shape=box];
     "Human approved merge?" [shape=diamond];
     "Wait — do not merge" [shape=box];
-    "Squash-merge, tag, await release" [shape=box];
+    "Squash-merge" [shape=box];
+    "Bump chosen?" [shape=diamond];
+    "Done — entry holds in [Unreleased]" [shape=box];
+    "Tag, await release" [shape=box];
 
     "Secrets in diff?" -> "Abort, remove secret" [label="yes"];
     "Secrets in diff?" -> "CI green?" [label="no"];
     "CI green?" -> "Read failure, fix, push" [label="no"];
     "Read failure, fix, push" -> "CI green?";
-    "CI green?" -> "Human approved merge?" [label="yes"];
+    "CI green?" -> "Ask: bump or [Unreleased]?" [label="yes"];
+    "Ask: bump or [Unreleased]?" -> "Edit CHANGELOG [Unreleased]" [label="hold"];
+    "Ask: bump or [Unreleased]?" -> "Bump Cargo.toml + rename [Unreleased]" [label="bump"];
+    "Edit CHANGELOG [Unreleased]" -> "Human approved merge?";
+    "Bump Cargo.toml + rename [Unreleased]" -> "Human approved merge?";
     "Human approved merge?" -> "Wait — do not merge" [label="no"];
-    "Human approved merge?" -> "Squash-merge, tag, await release" [label="yes"];
+    "Human approved merge?" -> "Squash-merge" [label="yes"];
+    "Squash-merge" -> "Bump chosen?";
+    "Bump chosen?" -> "Done — entry holds in [Unreleased]" [label="no"];
+    "Bump chosen?" -> "Tag, await release" [label="yes"];
 }
 ```
 
@@ -131,34 +145,75 @@ gh pr checks --watch
 ```
 If red: open the failing job, root-cause, fix, push, re-watch. Proceed only when every check is green.
 
-### 8. Version + CHANGELOG (commit to the PR, then STOP)
-1. Pick the bump from commits since the last tag — `feat:` → minor, `fix:`/`chore:`/`docs:` → patch, `!`/`BREAKING CHANGE` → major:
-   ```bash
-   git log "$(git describe --tags --abbrev=0 2>/dev/null || echo)"..HEAD --pretty=%s
-   ```
-   No prior tag → this is the initial release; keep the current version.
-2. Set `version` in `ignis/Cargo.toml` to `X.Y.Z`, then `cargo build` to refresh `Cargo.lock`.
-3. `CHANGELOG.md`: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]`.
-   **Entries are one-line summaries only.** State *what changed* for a user, nothing more. No detail, no how-it-works, no implementation list, no rationale or trade-offs, no parentheticals enumerating internals. One short line per change.
-   **Every entry ends with a PR reference** `([#NNN](https://github.com/Fullstop000/ignis/pull/NNN))` so readers can jump to the diff and discussion. Group commits by the PR that landed them; one entry per PR is the norm. For commits with no PR (rare — direct pushes to master), omit the reference.
-   - Good: `` - `/copy` — copy the last assistant reply to the system clipboard. ([#42](https://github.com/Fullstop000/ignis/pull/42)) ``
-   - Bad (no PR link): `` - `/copy` — copy the last assistant reply to the system clipboard. ``
-   - Bad (verbose): `` - `/copy` slash command — copies the last reply via a platform CLI tool (`pbcopy`/`clip`/`clip.exe`/`wl-copy`/…); 1 MiB cap, no native-clipboard dependency. ``
-4. `git commit -am "chore(release): vX.Y.Z" && git push`
-5. Re-confirm CI is green on the new commit.
-6. **STOP.** Tell the user: "PR <url> is green, bumped to vX.Y.Z — approve squash-merge?" Wait for an explicit yes.
+### 8. Ask the user — bump or `[Unreleased]`? — then write the CHANGELOG
+**Before editing anything in `CHANGELOG.md` or `Cargo.toml`, ask the user explicitly:**
 
-### 9. Squash-merge (only after approval)
+> "This PR is ready to land. Add the entry to `[Unreleased]`, or bump to `vX.Y.Z` (suggested from commits since the last tag) and cut a release after merge?"
+
+Compute the suggested version from commits since the last tag — `feat:` → minor, `fix:`/`chore:`/`docs:` → patch, `!`/`BREAKING CHANGE` → major. No prior tag → initial release; keep current version. Quote the suggested version in the question.
+
 ```bash
-gh pr merge <num> --squash --delete-branch
+git log "$(git describe --tags --abbrev=0 2>/dev/null || echo)"..HEAD --pretty=%s
 ```
 
-### 10. Tag + await release
+Whichever the user picks, all the edits land **in this same PR** — never split into a separate bump PR.
+
+#### CHANGELOG entry rules (apply to both branches)
+
+**Entries are one-line summaries only.** State *what changed* for a user, nothing more. No detail, no how-it-works, no implementation list, no rationale or trade-offs, no parentheticals enumerating internals. One short line per change.
+
+**Every entry ends with a PR reference** `([#NNN](https://github.com/Fullstop000/ignis/pull/NNN))` so readers can jump to the diff and discussion. Group commits by the PR that landed them; one entry per PR is the norm.
+- Good: `` - `/copy` — copy the last assistant reply to the system clipboard. ([#42](https://github.com/Fullstop000/ignis/pull/42)) ``
+- Bad (no PR link): `` - `/copy` — copy the last assistant reply to the system clipboard. ``
+- Bad (verbose): `` - `/copy` slash command — copies the last reply via a platform CLI tool (`pbcopy`/`clip`/`clip.exe`/…); 1 MiB cap, no native-clipboard dependency. ``
+
+Section heading (`### Added` / `### Changed` / `### Fixed` / `### Security` / `### Breaking`) matches the change kind.
+
+#### Branch A — user picked "hold under `[Unreleased]`"
+Edit only `CHANGELOG.md`:
+- Add the one-line entry under `## [Unreleased]`, in the right section heading.
+- Do **not** touch `Cargo.toml`, `Cargo.lock`, or rename `[Unreleased]`.
+
 ```bash
-git switch master && git pull
+git commit -am "docs(changelog): add #<N> under [Unreleased]"
+git push
+```
+
+Skip step 10 entirely at merge time — no tag this round.
+
+#### Branch B — user picked "bump to `vX.Y.Z`"
+Edit all three in one commit:
+1. `ignis/Cargo.toml`: `version = "X.Y.Z"`
+2. `Cargo.lock`: refresh via `cargo build`
+3. `CHANGELOG.md`: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` (carrying over any existing entries plus this PR's new line), then add a fresh empty `## [Unreleased]` above it.
+
+```bash
+cargo build                                # refresh Cargo.lock
+git commit -am "chore(release): vX.Y.Z"
+git push
+```
+
+Re-confirm CI green on the new commit.
+
+### 9. Squash-merge (only after approval)
+**STOP.** Tell the user the exact state:
+- Branch A: "PR `<url>` is green, entry added under `[Unreleased]` — approve squash-merge?"
+- Branch B: "PR `<url>` is green, bumped to `vX.Y.Z` — approve squash-merge?"
+
+Wait for an explicit yes.
+```bash
+gh pr merge <num> --squash --delete-branch
+git switch master && git pull --ff-only
+```
+
+### 10. Tag + await release (Branch B only)
+If the user picked **hold** at step 8, stop here — the entry is on master under `[Unreleased]`, no tag this round.
+
+If the user picked **bump**:
+```bash
 git tag vX.Y.Z && git push origin vX.Y.Z      # triggers the Release workflow
 gh run watch "$(gh run list --workflow Release --limit 1 --json databaseId -q '.[0].databaseId')"
-gh release view vX.Y.Z                          # confirm binaries are attached
+gh release view vX.Y.Z                         # confirm binaries are attached
 ```
 Report the release URL.
 
@@ -166,8 +221,11 @@ Report the release URL.
 
 | Mistake | Do instead |
 |---------|-----------|
-| Bump version after merge | Bump in the PR; the squash-merge carries it |
+| Edit `Cargo.toml` or rename `[Unreleased]` without asking | Step 8 always starts with the bump-vs-hold question |
+| Split the bump into a second PR | One PR carries the entry, the bump (if any), AND the feature work |
+| Bump silently because "this commit looks like a feat:" | Conventional commits suggest the bump *version*, not the bump *decision* — the user owns the decision |
+| Direct-push CHANGELOG or version edits to master | Everything rides on the feature PR |
 | Auto-merge when CI turns green | Always wait for explicit approval |
 | Tag ≠ `ignis/Cargo.toml` version | Tag is exactly `v<Cargo.toml version>` |
-| Skip `cargo build` after bump | Stale `Cargo.lock` fails the `--locked` release build |
+| Skip `cargo build` after editing `Cargo.toml` | Stale `Cargo.lock` fails the `--locked` release build |
 | Secret-scan false alarm on placeholders | The regex targets real key shapes; `sk-your-…` placeholders are short and won't match |
