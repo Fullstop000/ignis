@@ -86,8 +86,15 @@ async fn handle(
             *opts.captured_auth.lock().unwrap() = Some(s.to_string());
         }
     }
-    if req.method() != Method::POST || req.uri().path() != "/mcp" {
+    if req.uri().path() != "/mcp" {
         return Ok(reply_status(StatusCode::NOT_FOUND, "no"));
+    }
+    if req.method() != Method::POST {
+        // rmcp opens a background GET /mcp SSE stream after init; a real
+        // Streamable HTTP server without an SSE channel returns 405, which
+        // rmcp handles cleanly via `ServerDoesNotSupportSse`. Returning 404
+        // here generates a noisy worker error in test output.
+        return Ok(reply_status(StatusCode::METHOD_NOT_ALLOWED, "no sse"));
     }
     if let Some(expected) = &opts.require_bearer {
         let ok = req

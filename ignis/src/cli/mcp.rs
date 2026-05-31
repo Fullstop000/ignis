@@ -174,58 +174,62 @@ fn cmd_add(args: AddArgs) -> Result<()> {
             path.display()
         ));
     }
+
+    // Build a `McpServerConfig` from the flags and run the same `validate()`
+    // the runtime loader uses. Catching mistakes here means a typo'd `--url`
+    // or HTTP/stdio-flag mixing fails the CLI invocation — instead of writing
+    // a config that breaks the next ignis launch.
+    let (cmd_head, cmd_rest) = match args.command.split_first() {
+        Some((h, r)) => (Some(h.clone()), r.to_vec()),
+        None => (None, Vec::new()),
+    };
+    let headers = headers_to_map(&args.headers)?;
+    let cfg = McpServerConfig {
+        command: cmd_head,
+        args: cmd_rest,
+        env: args.env.iter().cloned().collect(),
+        cwd: args.cwd.clone(),
+        url: args.url.clone(),
+        headers: headers.clone(),
+        bearer_token_env_var: args.bearer_token_env_var.clone(),
+        startup_timeout_secs: args.startup_timeout_secs.unwrap_or(30),
+        tool_timeout_secs: args.tool_timeout_secs.unwrap_or(120),
+    };
+    cfg.validate(&args.name)?;
+
     let mut block = Table::new();
     block.set_implicit(false);
-    if let Some(url) = &args.url {
-        // HTTP path. clap's ArgGroup has already guaranteed --url xor command,
-        // and these stdio-only flags would silently no-op otherwise — reject
-        // explicitly so the user notices the typo.
-        if !args.command.is_empty() {
-            return Err(anyhow!("`--url` is mutually exclusive with `-- <command>`"));
-        }
-        if !args.env.is_empty() || args.cwd.is_some() {
-            return Err(anyhow!(
-                "`--env` and `--cwd` are stdio-only; drop them when using `--url`"
-            ));
-        }
-        block["url"] = value(url);
-        if let Some(ev) = &args.bearer_token_env_var {
+    if cfg.url.is_some() {
+        block["url"] = value(cfg.url.as_deref().unwrap());
+        if let Some(ev) = &cfg.bearer_token_env_var {
             block["bearer_token_env_var"] = value(ev);
         }
-        if !args.headers.is_empty() {
+        if !headers.is_empty() {
             let mut hdrs = InlineTable::new();
+            // Preserve CLI-given header order (stable for round-trip diffs)
+            // by iterating the original Vec, which `headers_to_map` validated.
             for (k, v) in &args.headers {
                 hdrs.insert(k, v.into());
             }
             block["headers"] = value(hdrs);
         }
     } else {
-        // stdio path. ArgGroup guarantees command is non-empty.
-        if !args.headers.is_empty() || args.bearer_token_env_var.is_some() {
-            return Err(anyhow!(
-                "`--header` and `--bearer-token-env-var` are HTTP-only; drop them when using a `-- <command>`"
-            ));
-        }
-        let (command, rest) = args
-            .command
-            .split_first()
-            .ok_or_else(|| anyhow!("missing command after --"))?;
-        block["command"] = value(command);
-        if !rest.is_empty() {
+        block["command"] = value(cfg.command.as_deref().unwrap());
+        if !cfg.args.is_empty() {
             let mut arr = Array::new();
-            for a in rest {
+            for a in &cfg.args {
                 arr.push(a.clone());
             }
             block["args"] = value(arr);
         }
-        if !args.env.is_empty() {
+        if !cfg.env.is_empty() {
             let mut env = InlineTable::new();
             for (k, v) in &args.env {
                 env.insert(k, v.into());
             }
             block["env"] = value(env);
         }
-        if let Some(cwd) = &args.cwd {
+        if let Some(cwd) = &cfg.cwd {
             block["cwd"] = value(cwd.to_string_lossy().to_string());
         }
     }
@@ -239,6 +243,25 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     save_doc(&path, &doc)?;
     println!("✓ added '{}' to {}", args.name, path.display());
     Ok(())
+}
+
+/// Fold `--header K:V` pairs into a `HashMap`, rejecting duplicate keys
+/// (case-insensitive — `X-Foo` and `x-foo` are the same HTTP header). Without
+/// this, the second occurrence would silently win in the `InlineTable::insert`
+/// loop downstream, which is a real footgun for Set-Cookie / X-Forwarded-* etc.
+fn headers_to_map(pairs: &[(String, String)]) -> Result<HashMap<String, String>> {
+    let mut out: HashMap<String, String> = HashMap::with_capacity(pairs.len());
+    let mut seen_lower: HashMap<String, String> = HashMap::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        let key_lower = k.to_ascii_lowercase();
+        if let Some(prev) = seen_lower.insert(key_lower, k.clone()) {
+            return Err(anyhow!(
+                "duplicate `--header` key: `{prev}` and `{k}` collide (HTTP headers are case-insensitive)"
+            ));
+        }
+        out.insert(k.clone(), v.clone());
+    }
+    Ok(out)
 }
 
 fn cmd_remove(name: String) -> Result<()> {
