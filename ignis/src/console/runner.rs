@@ -17,7 +17,6 @@ use crate::console::format::AgentRequest;
 use crate::console::inline_picker;
 use crate::console::keys::{handle_key, ActiveInject};
 use crate::console::render::{self, draw};
-use crate::session::SessionManager;
 use crate::{AgentEvent, Message, Session};
 
 /// Create an inline-viewport terminal over stdout. Recreated when the live band
@@ -85,7 +84,6 @@ pub async fn run_console(
     let picker_tx_runner = picker_tx.clone();
     let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
     let active_inject_runner = active_inject.clone();
-    let session_manager = SessionManager::new(storage_dir.clone());
 
     let agent_system_prompt = system_prompt;
     let agent_storage_dir = storage_dir.clone();
@@ -212,6 +210,7 @@ pub async fn run_console(
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             };
             let tx = agent_tx.clone();
             match prompt {
@@ -340,7 +339,6 @@ pub async fn run_console(
                     &prompt_tx,
                     &cancel_tx,
                     &active_inject,
-                    &session_manager,
                     &ui_storage_dir,
                     &picker_tx,
                 )

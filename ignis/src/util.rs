@@ -38,7 +38,12 @@ pub fn parse_jsonl_messages(content: &str) -> Vec<Message> {
         let Some(payload) = record.get("payload") else {
             continue;
         };
-        if let Ok(message) = serde_json::from_value::<Message>(payload.clone()) {
+        // Lift the record envelope's timestamp onto the Message so saved
+        // sessions round-trip per-message capture time. `created_at_ms` is
+        // `#[serde(skip)]`, so it never appears in the payload — we have to
+        // populate it from the envelope explicitly.
+        if let Ok(mut message) = serde_json::from_value::<Message>(payload.clone()) {
+            message.created_at_ms = record.get("timestamp").and_then(|v| v.as_u64());
             messages.push(message);
         }
     }

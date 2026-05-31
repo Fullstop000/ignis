@@ -464,6 +464,7 @@ async fn session_compact_summarizes_old_history() {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             });
         }
     }

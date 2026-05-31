@@ -7,7 +7,7 @@ pub mod registry;
 
 pub use catalog::ModelCatalog;
 pub use protocols::{
-    build, Auth, LlmProvider, LlmResponseDelta, Message, Protocol, Resolved, ToolCall,
+    build, now_ms, Auth, LlmProvider, LlmResponseDelta, Message, Protocol, Resolved, ToolCall,
     ToolCallFunction, Usage,
 };
 pub use registry::{ModelOption, ProviderConfig};

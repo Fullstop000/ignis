@@ -137,14 +137,18 @@ impl Session {
         {
             let _ = self.compact().await;
         }
-        self.history.push(Message {
-            role: "user".to_string(),
-            content: Some(text.to_string()),
-            reasoning_content: None,
-            name: None,
-            tool_call_id: None,
-            tool_calls: None,
-        });
+        self.history.push(
+            Message {
+                role: "user".to_string(),
+                content: Some(text.to_string()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                created_at_ms: None,
+            }
+            .stamp_now(),
+        );
         let turn_usage = self
             .agent
             .run(&mut self.history, tx, self.inject_rx.as_mut())
@@ -194,6 +198,7 @@ impl Session {
                     name: None,
                     tool_call_id: None,
                     tool_calls: None,
+                    created_at_ms: None,
                 }],
             )
             .await?;
@@ -206,6 +211,7 @@ impl Session {
             name: None,
             tool_call_id: None,
             tool_calls: None,
+            created_at_ms: None,
         };
 
         let mut compacted = Vec::with_capacity(1 + n - cut);
@@ -582,6 +588,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
             crate::Message {
                 role: "assistant".to_string(),
@@ -590,6 +597,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
         ];
 
