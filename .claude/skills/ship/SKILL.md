@@ -123,7 +123,7 @@ gh pr create --base master --title "<concise>" --body "<concise summary + checkl
 
 **If step 3's dogfood produced PNG screenshots showing the feature working** — banners, pickers, footer segments, the resumed conversation view, before/after of a visual change — post them in a PR comment right after `gh pr create`. Reviewers shouldn't have to take "it looks correct" on faith.
 
-Mechanism — commit the shots into the feature branch under `.github/screenshots/pr-<num>/` and reference them by raw URL. (`gh gist create` and `gh api` both refuse binary uploads, so the branch is the most reliable host.)
+Mechanism — commit the shots into the feature branch under `.github/screenshots/pr-<num>/` and reference them by **commit-SHA** raw URL. (`gh gist create` and `gh api` both refuse binary uploads, so the branch is the most reliable host. SHA URLs survive both the branch deletion at merge time and the eventual master path — they keep working forever as long as GitHub keeps the commit object reachable, which is effectively forever.)
 
 ```bash
 mkdir -p .github/screenshots/pr-<num>
@@ -132,8 +132,8 @@ git add .github/screenshots/pr-<num>/
 git commit -m "docs(pr-<num>): dogfood screenshots"
 git push
 
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
-BASE="https://raw.githubusercontent.com/Fullstop000/ignis/${BRANCH}/.github/screenshots/pr-<num>"
+SHA=$(git rev-parse HEAD)
+BASE="https://raw.githubusercontent.com/Fullstop000/ignis/${SHA}/.github/screenshots/pr-<num>"
 
 gh pr comment <num> --body "$(cat <<EOF
 ## Screenshots from dogfood
