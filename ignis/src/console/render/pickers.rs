@@ -149,7 +149,18 @@ pub(crate) fn render_mcp_picker(
     let visible = max_rows.max(1);
     let start = slash_window_start(sel, visible, entries.len());
     let end = (start + visible).min(entries.len());
+    // Row budget so a many-tool server doesn't push later entries off-screen.
+    // Each iteration reserves one row per remaining-in-window server *before*
+    // adding tool sub-rows for the current one, so the selected entry (always
+    // inside [start, end) by construction) is guaranteed to render its main
+    // row. Tools near the band's bottom may get truncated — fine; full list
+    // is in `ignis mcp get <name>`.
+    let mut rows_used: usize = 0;
+    let mut servers_remaining_in_window = end.saturating_sub(start);
     for (idx, entry) in entries.iter().enumerate().take(end).skip(start) {
+        if rows_used >= visible {
+            break;
+        }
         let selected = idx == sel;
         let marker = if selected { ">" } else { " " };
         let check = match entry.status {
@@ -166,6 +177,9 @@ pub(crate) fn render_mcp_picker(
             crate::mcp::McpStatus::Disabled => style.fg(if selected { BG } else { TEXT_DIM }),
             _ => style.fg(if selected { BG } else { GREEN }),
         };
+        // `(stdio)` and `(http)` both fit in 7 chars — pad to 7 so the status
+        // column aligns regardless of which transport this row uses.
+        let tag = format!("({})", entry.transport);
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {marker} {check} "),
@@ -175,8 +189,49 @@ pub(crate) fn render_mcp_picker(
                 format!("{:<14}", truncate(&entry.name, 14)),
                 style.add_modifier(Modifier::BOLD),
             ),
+            Span::styled(
+                format!(" {tag:<7}"),
+                style.fg(if selected { BG } else { TEXT_DIM }),
+            ),
             Span::styled(format!(" {}", entry.status.label()), status_style),
         ]));
+        rows_used += 1;
+        servers_remaining_in_window = servers_remaining_in_window.saturating_sub(1);
+
+        // For connected servers, list the tools indented underneath. Cap at
+        // TOOL_PREVIEW_MAX so a single 23-tool server (e.g. GitHub) doesn't
+        // monopolise the band; `ignis mcp get <name>` shows the full list.
+        // Reserve one row per still-to-render server so a many-tool first
+        // entry can't starve the rest of the window.
+        if matches!(entry.status, crate::mcp::McpStatus::Connected { .. }) {
+            const TOOL_PREVIEW_MAX: usize = 8;
+            let tool_budget = visible
+                .saturating_sub(rows_used)
+                .saturating_sub(servers_remaining_in_window);
+            let tools = reg.mcp_tool_list(&entry.name);
+            let show = tools.len().min(TOOL_PREVIEW_MAX).min(tool_budget);
+            for tool in tools.iter().take(show) {
+                lines.push(Line::from(Span::styled(
+                    format!("        · {tool}"),
+                    Style::default().fg(SUBTEXT),
+                )));
+                rows_used += 1;
+            }
+            // Show the overflow hint when the cap (not the budget) elided
+            // tools — otherwise users get "+N more" lines that are really
+            // "screen ran out" lines.
+            if tools.len() > show && show == TOOL_PREVIEW_MAX && rows_used < visible {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "        … +{n} more (see `ignis mcp get {name}`)",
+                        n = tools.len() - show,
+                        name = entry.name
+                    ),
+                    Style::default().fg(TEXT_DIM),
+                )));
+                rows_used += 1;
+            }
+        }
     }
 
     lines.push(Line::from(Span::styled(

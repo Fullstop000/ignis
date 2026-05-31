@@ -16,6 +16,7 @@ use tokio::process::Command;
 
 use crate::config::McpServerConfig;
 
+pub mod http;
 pub mod server;
 pub mod tool;
 
@@ -49,6 +50,9 @@ impl McpStatus {
 #[derive(Debug, Clone)]
 pub struct McpServerEntry {
     pub name: String,
+    /// `"stdio"` or `"http"` — surfaced in the picker so users can tell at a
+    /// glance which transport a server uses.
+    pub transport: &'static str,
     pub status: McpStatus,
 }
 
@@ -66,6 +70,9 @@ pub struct McpRegistry {
     /// Names of every server present in config (connected, failed, or
     /// disabled), kept for stable ordering in pickers/CLI output.
     all_names: Vec<String>,
+    /// Captured-at-spawn transport ("stdio"/"http") per server name. Used by
+    /// pickers and CLI output to label rows without re-reading the config.
+    transports: HashMap<String, &'static str>,
 }
 
 impl McpRegistry {
@@ -77,6 +84,7 @@ impl McpRegistry {
             failed: HashMap::new(),
             disabled: Mutex::new(HashSet::new()),
             all_names: Vec::new(),
+            transports: HashMap::new(),
         })
     }
 
@@ -121,11 +129,16 @@ impl McpRegistry {
             }
         }
 
+        let transports = servers
+            .iter()
+            .map(|(n, c)| (n.clone(), c.transport()))
+            .collect();
         Arc::new(Self {
             connected,
             failed,
             disabled: Mutex::new(disabled),
             all_names,
+            transports,
         })
     }
 
@@ -161,6 +174,7 @@ impl McpRegistry {
                 };
                 McpServerEntry {
                     name: name.clone(),
+                    transport: self.transports.get(name).copied().unwrap_or("stdio"),
                     status,
                 }
             })
@@ -238,6 +252,30 @@ impl McpRegistry {
         out
     }
 
+    /// Short tool names (sanitized, NO `mcp__<server>__` prefix) advertised by
+    /// a connected server, in advertised order. Empty when the server isn't
+    /// connected. Skips tools that wouldn't actually be exposed to the model
+    /// — same filter as [`Self::wrappers`].
+    pub fn mcp_tool_list(&self, name: &str) -> Vec<String> {
+        let Some(server) = self.connected.get(name) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for tool in server.tools() {
+            let sanitized = tool::sanitize_tool_name(&tool.name);
+            let qualified_len = "mcp__".len() + name.len() + "__".len() + sanitized.len();
+            if qualified_len > MAX_TOOL_NAME_LEN {
+                continue;
+            }
+            if !seen.insert(sanitized.clone()) {
+                continue;
+            }
+            out.push(sanitized);
+        }
+        out
+    }
+
     /// `<mcp_servers>` block for the system prompt, listing each connected
     /// server's `instructions` text. Returns `None` if no server has
     /// instructions (so we don't emit an empty wrapper).
@@ -304,39 +342,15 @@ enum ConnectResult {
 async fn connect_one(name: &str, cfg: &McpServerConfig) -> ConnectResult {
     let timeout = std::time::Duration::from_secs(cfg.startup_timeout_secs);
     let attempt = async {
-        let mut cmd = Command::new(&cfg.command);
-        cmd.args(&cfg.args).envs(&cfg.env);
-        if let Some(dir) = &cfg.cwd {
-            cmd.current_dir(dir);
-        }
-        // `kill_on_drop` is set by rmcp's TokioChildProcess wrapper already,
-        // but a Unix process group lets us terminate descendants too.
-        #[cfg(unix)]
-        cmd.process_group(0);
-
-        let (transport, stderr) = TokioChildProcess::builder(cmd)
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn error: {e}"))?;
-
-        // Capture the PID before handing the transport off to rmcp's `serve`,
-        // which consumes it. Needed for the SIGTERM/SIGKILL fallback in
-        // `McpServer::shutdown` so wrapper-spawned descendants don't orphan.
-        let child_pid = transport.id();
-
-        // Forward server stderr to ignis's log; named per-server. Lives until
-        // the child exits.
-        if let Some(stderr) = stderr {
-            let server_name = name.to_string();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    log::debug!(target: "mcp", "[{server_name}] {line}");
-                }
-            });
-        }
-
-        let service = ().serve(transport).await.map_err(|e| format!("initialize failed: {e}"))?;
+        // Build the rmcp service over the right transport. `child_pid` is only
+        // captured for stdio (Unix-only SIGTERM fallback in McpServer::shutdown);
+        // HTTP transports leave it `None`.
+        let (service, child_pid) = if cfg.url.is_some() {
+            let svc = http::connect_streamable_http(cfg).await?;
+            (svc, None)
+        } else {
+            connect_stdio(name, cfg).await?
+        };
 
         let init = service.peer_info();
         let instructions = init.and_then(|r| r.instructions.clone());
@@ -364,6 +378,58 @@ async fn connect_one(name: &str, cfg: &McpServerConfig) -> ConnectResult {
         Ok(Err(reason)) => ConnectResult::Failed(reason),
         Ok(Ok(server)) => ConnectResult::Connected(server),
     }
+}
+
+/// Spawn the child process and run the stdio `initialize` handshake. Returns
+/// the rmcp service plus the immediate child PID (used by
+/// [`McpServer::shutdown`] on Unix to terminate descendant process groups).
+async fn connect_stdio(
+    name: &str,
+    cfg: &McpServerConfig,
+) -> Result<
+    (
+        rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        Option<u32>,
+    ),
+    String,
+> {
+    let command = cfg
+        .command
+        .as_deref()
+        .expect("validated: McpServerConfig.command is set on the stdio path");
+    let mut cmd = Command::new(command);
+    cmd.args(&cfg.args).envs(&cfg.env);
+    if let Some(dir) = &cfg.cwd {
+        cmd.current_dir(dir);
+    }
+    // `kill_on_drop` is set by rmcp's TokioChildProcess wrapper already, but a
+    // Unix process group lets us terminate descendants too.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let (transport, stderr) = TokioChildProcess::builder(cmd)
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn error: {e}"))?;
+
+    // Capture the PID before handing the transport off to rmcp's `serve`,
+    // which consumes it.
+    let child_pid = transport.id();
+
+    // Forward server stderr to ignis's log; named per-server. Lives until the
+    // child exits.
+    if let Some(stderr) = stderr {
+        let server_name = name.to_string();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                log::debug!(target: "mcp", "[{server_name}] {line}");
+            }
+        });
+    }
+
+    let service = ().serve(transport).await.map_err(|e| format!("initialize failed: {e}"))?;
+    Ok((service, child_pid))
 }
 
 #[cfg(test)]

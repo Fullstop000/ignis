@@ -15,15 +15,14 @@ fn mock_path() -> String {
 
 fn server(env: &[(&str, &str)]) -> McpServerConfig {
     McpServerConfig {
-        command: mock_path(),
-        args: vec![],
+        command: Some(mock_path()),
         env: env
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect(),
-        cwd: None,
         startup_timeout_secs: 5,
         tool_timeout_secs: 5,
+        ..Default::default()
     }
 }
 
@@ -79,12 +78,10 @@ async fn bad_command_is_recorded_as_failed_but_session_continues() {
     servers.insert(
         "ghost".to_string(),
         McpServerConfig {
-            command: "/no/such/path/please_dont_exist".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            cwd: None,
+            command: Some("/no/such/path/please_dont_exist".to_string()),
             startup_timeout_secs: 2,
             tool_timeout_secs: 2,
+            ..Default::default()
         },
     );
     let reg = McpRegistry::spawn_all(&servers, HashSet::new()).await;
@@ -111,13 +108,12 @@ async fn startup_timeout_marks_failed_within_budget() {
     servers.insert(
         "slow".to_string(),
         McpServerConfig {
-            command: mock_path(),
-            args: vec![],
+            command: Some(mock_path()),
             // Mock sleeps 3s before initialize; budget is 1s → must time out.
             env: HashMap::from([("MOCK_SLEEP_MS".to_string(), "3000".to_string())]),
-            cwd: None,
             startup_timeout_secs: 1,
             tool_timeout_secs: 2,
+            ..Default::default()
         },
     );
     let start = std::time::Instant::now();
@@ -236,16 +232,15 @@ async fn real_filesystem_server_list_and_call() {
     servers.insert(
         "fs".to_string(),
         McpServerConfig {
-            command: "npx".to_string(),
+            command: Some("npx".to_string()),
             args: vec![
                 "-y".to_string(),
                 "@modelcontextprotocol/server-filesystem".to_string(),
                 tmp.path().to_string_lossy().to_string(),
             ],
-            env: HashMap::new(),
-            cwd: None,
             startup_timeout_secs: 60, // npx download can be slow
             tool_timeout_secs: 30,
+            ..Default::default()
         },
     );
     let reg = McpRegistry::spawn_all(&servers, HashSet::new()).await;

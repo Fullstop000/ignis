@@ -79,9 +79,9 @@ See [Configure](#configure) for more providers and per-model options.
 - **Built-in tools** — read, write, and edit files; `grep`, `glob`, `list_dir`;
   `bash`; `web_fetch` and `web_search`; `ask_user`; and `agent` to delegate a
   subtask to a one-level sub-agent.
-- **[MCP servers](docs/configure/mcp.md)** — connect external stdio
-  [MCP](https://modelcontextprotocol.io) servers; their tools appear alongside
-  the built-ins.
+- **[MCP servers](docs/configure/mcp.md)** — connect external stdio or
+  HTTP [MCP](https://modelcontextprotocol.io) servers; their tools appear
+  alongside the built-ins.
 - **[Skills](docs/configure/skills.md)** — load reusable `SKILL.md` instruction
   sets on demand, sharable across Claude Code, Codex, OpenCode, and Kimi.
 - **[Permissions](docs/configure/permissions.md)** — every tool call passes a
