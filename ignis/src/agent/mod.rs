@@ -277,9 +277,13 @@ struct TurnStream {
 }
 
 /// Consume one streamed turn: accumulate text / reasoning / tool-call / usage
-/// deltas, emitting `MessageStart`/`MessageUpdate`/`MessageEnd` for streamed text
-/// and the 💭-prefixed reasoning block. Returns the accumulated content, the
-/// index-sorted tool calls, the streaming flags, and the turn's token usage.
+/// deltas, emitting `MessageStart`/`MessageUpdate`/`MessageEnd` for streamed
+/// text and reasoning blocks. Text and reasoning open as separate blocks; when
+/// the active kind flips (text-while-streaming-text → reasoning, or the
+/// reverse) the current block is closed and a fresh one opened, so
+/// `interleaved-thinking`-style streams render in order rather than getting
+/// glued together. Returns the accumulated content, the index-sorted tool
+/// calls, the streaming flags, and the turn's token usage.
 async fn consume_turn_stream(
     mut stream: futures_util::stream::BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
@@ -345,37 +349,46 @@ async fn consume_turn_stream(
                     let _ = tx.send(AgentEvent::MessageUpdate { delta: content }).await;
                 }
                 LlmResponseDelta::Reasoning(reasoning) => {
-                    // Stream reasoning as a 💭-prefixed assistant block so users
-                    // see the model's thinking incrementally. If text streaming
-                    // has already started, fall back to silent accumulation —
-                    // the final Message still carries reasoning_content.
-                    if !message_started {
-                        if !reasoning_streaming {
-                            let _ = tx
-                                .send(AgentEvent::MessageStart {
-                                    message: Message {
-                                        role: "assistant".to_string(),
-                                        content: None,
-                                        reasoning_content: Some(String::new()),
-                                        name: None,
-                                        tool_call_id: None,
-                                        tool_calls: None,
-                                    },
-                                })
-                                .await;
-                            let _ = tx
-                                .send(AgentEvent::MessageUpdate {
-                                    delta: "💭 ".to_string(),
-                                })
-                                .await;
-                            reasoning_streaming = true;
-                        }
+                    // Reasoning arrived. If text was mid-stream, close it so
+                    // the user sees the reasoning as its own block in order
+                    // (symmetric to the text-after-reasoning path above).
+                    // The renderer attaches a "✻ Thinking" header — no
+                    // in-band prefix delta.
+                    if message_started {
                         let _ = tx
-                            .send(AgentEvent::MessageUpdate {
-                                delta: reasoning.clone(),
+                            .send(AgentEvent::MessageEnd {
+                                message: Message {
+                                    role: "assistant".to_string(),
+                                    content: Some(assistant_content.clone()),
+                                    reasoning_content: None,
+                                    name: None,
+                                    tool_call_id: None,
+                                    tool_calls: None,
+                                },
                             })
                             .await;
+                        message_started = false;
                     }
+                    if !reasoning_streaming {
+                        let _ = tx
+                            .send(AgentEvent::MessageStart {
+                                message: Message {
+                                    role: "assistant".to_string(),
+                                    content: None,
+                                    reasoning_content: Some(String::new()),
+                                    name: None,
+                                    tool_call_id: None,
+                                    tool_calls: None,
+                                },
+                            })
+                            .await;
+                        reasoning_streaming = true;
+                    }
+                    let _ = tx
+                        .send(AgentEvent::MessageUpdate {
+                            delta: reasoning.clone(),
+                        })
+                        .await;
                     reasoning_content.push_str(&reasoning);
                 }
                 LlmResponseDelta::ToolCall {
@@ -712,7 +725,12 @@ impl Agent {
                             message: msg.clone(),
                         })
                         .await;
-                } else if has_tools || has_reasoning {
+                } else if has_tools {
+                    // No streamed content but the turn produced tool calls
+                    // — synthesize a Start/End pair so the UI's bookkeeping
+                    // matches the persisted message. (`has_reasoning` can't
+                    // reach here: any reasoning chunk would have flipped
+                    // `reasoning_streaming` above.)
                     let _ = tx
                         .send(AgentEvent::MessageStart {
                             message: msg.clone(),
