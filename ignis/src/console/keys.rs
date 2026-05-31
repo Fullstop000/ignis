@@ -10,7 +10,6 @@ use crate::console::app::{App, Mode};
 use crate::console::format::{AgentRequest, SelectionDirection};
 use crate::console::inline_picker;
 use crate::console::slash::build_skill_prompt;
-use crate::session::SessionManager;
 use crate::storage::{FileStorage, SessionStorage};
 
 /// Shared handle to the *current* prompt run's inject sender. `Some` iff a prompt
@@ -123,7 +122,6 @@ pub(crate) async fn handle_key(
     prompt_tx: &mpsc::Sender<AgentRequest>,
     cancel_tx: &mpsc::Sender<()>,
     active_inject: &ActiveInject,
-    session_manager: &SessionManager,
     storage_dir: &std::path::Path,
     picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
 ) {
@@ -319,7 +317,8 @@ pub(crate) async fn handle_key(
         }
     }
 
-    if app.session_picker.is_some() {
+    if let Some(picker) = app.session_picker.as_ref() {
+        let in_detail = picker.is_detail();
         match key.code {
             KeyCode::Enter => {
                 if let Some(session_id) = app.selected_session_id() {
@@ -336,12 +335,37 @@ pub(crate) async fn handle_key(
                 }
                 return;
             }
-            KeyCode::Up => {
+            KeyCode::Up if !in_detail => {
                 app.select_session_picker(SelectionDirection::Previous);
                 return;
             }
-            KeyCode::Down => {
+            KeyCode::Down if !in_detail => {
                 app.select_session_picker(SelectionDirection::Next);
+                return;
+            }
+            // → drills the highlighted row into the detail panel (no-op if
+            // already there or if the row has no persisted JSONL yet).
+            KeyCode::Right if !in_detail => {
+                if let Some(p) = app.session_picker.as_mut() {
+                    p.enter_detail();
+                }
+                return;
+            }
+            // ← / Esc: pop Detail back to List, or close the picker from List.
+            KeyCode::Left if in_detail => {
+                if let Some(p) = app.session_picker.as_mut() {
+                    p.exit_detail();
+                }
+                return;
+            }
+            KeyCode::Esc => {
+                if in_detail {
+                    if let Some(p) = app.session_picker.as_mut() {
+                        p.exit_detail();
+                    }
+                } else {
+                    app.session_picker = None;
+                }
                 return;
             }
             KeyCode::Char(_) => {
@@ -414,32 +438,44 @@ pub(crate) async fn handle_key(
             if !text.is_empty() {
                 let command = text.split_whitespace().next().unwrap_or("");
                 let arg_count = text.split_whitespace().count();
-                if command == "/resume" && arg_count == 1 {
-                    let mut sessions = session_manager.list();
-                    if !sessions.iter().any(|s| s.id == app.session_id) {
+                if command == "/sessions" && arg_count == 1 {
+                    let projects_dir = match dirs::home_dir() {
+                        Some(h) => h.join(".ignis/projects"),
+                        None => {
+                            app.add_assistant_notice(
+                                "Could not locate home directory.".to_string(),
+                            );
+                            return;
+                        }
+                    };
+                    let mut records = crate::cli::sessions::walk_sessions(
+                        &projects_dir,
+                        crate::cli::sessions::Scope::Current,
+                        &app.cwd,
+                    )
+                    .unwrap_or_default();
+                    // The currently-running session may not be on disk yet
+                    // (no messages persisted). Splice in a synthetic record so
+                    // the user can still see "themselves" in the list and the
+                    // ▸ marker has a row to land on.
+                    if !records.iter().any(|r| r.session_id == app.session_id) {
                         let user_count = app
                             .blocks
                             .iter()
                             .filter(|b| matches!(b, crate::console::app::UIBlock::User(_)))
-                            .count();
-                        let preview = app
-                            .blocks
-                            .iter()
-                            .find_map(|b| match b {
-                                crate::console::app::UIBlock::User(text) => Some(text.clone()),
-                                _ => None,
-                            })
-                            .unwrap_or_default();
-                        sessions.push(crate::session::SessionMeta {
-                            id: app.session_id.clone(),
-                            message_count: user_count,
-                            last_modified: u64::MAX,
-                            preview,
-                            start_dir: Some(app.cwd.to_string_lossy().to_string()),
+                            .count() as u64;
+                        records.push(crate::cli::sessions::SessionRecord {
+                            session_id: app.session_id.clone(),
+                            project_slug: crate::session::project_slug(&app.cwd),
+                            project_start_dir: Some(app.cwd.to_string_lossy().to_string()),
+                            // Sort to the top — synthetic row represents "now".
+                            last_modified: Some(u64::MAX),
+                            user_queries: user_count,
+                            ..Default::default()
                         });
-                        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_modified));
                     }
-                    app.show_session_picker(sessions);
+                    records.sort_by_key(|r| std::cmp::Reverse(r.last_modified.unwrap_or(0)));
+                    app.show_session_picker(records, projects_dir);
                 } else if command == "/clear" && arg_count == 1 {
                     let new_id = crate::session::SessionManager::create_id();
                     // Create an empty session file so /sessions can see it
@@ -454,7 +490,7 @@ pub(crate) async fn handle_key(
                     // Single guard for every command (and the agent prompt
                     // path) that needs a live provider. Anything benign in
                     // no-provider mode — /skills, /mcp, /sessions, /afk,
-                    // /telemetry, /clear, /resume — falls through unchanged.
+                    // /telemetry, /clear — falls through unchanged.
                     app.add_assistant_notice(NO_PROVIDER_HINT.to_string());
                 } else if command == "/compact" && arg_count == 1 {
                     app.turn_in_flight = true;
@@ -475,8 +511,6 @@ pub(crate) async fn handle_key(
                     handle_afk_toggle(app, picker_tx).await;
                 } else if command == "/telemetry" && arg_count == 1 {
                     handle_telemetry_picker(app, picker_tx).await;
-                } else if command == "/sessions" && arg_count == 1 {
-                    app.show_sessions_stats();
                 } else if command.starts_with('/')
                     && app
                         .skills

@@ -45,6 +45,11 @@ pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
         return rows.clamp(4, cap);
     }
     if let Some(p) = &app.session_picker {
+        // Detail view is dense (header, tokens bar, tool rollup, up to ~10
+        // turn bars, footer). Give it the full band so nothing clips.
+        if p.is_detail() {
+            return cap;
+        }
         let rows = p.sessions.len().max(1) as u16 + 4;
         return rows.clamp(4, cap);
     }
@@ -715,22 +720,29 @@ mod tests {
         app.blocks.push(UIBlock::User("trigger picker".to_string()));
         app.session_picker = Some(SessionPicker {
             sessions: vec![
-                crate::session::SessionMeta {
-                    id: "alpha".to_string(),
-                    message_count: 3,
-                    last_modified: 1234567890,
-                    preview: "first prompt".to_string(),
-                    start_dir: None,
+                crate::cli::sessions::SessionRecord {
+                    session_id: "alpha".to_string(),
+                    project_slug: "p".to_string(),
+                    started_at: Some(1_735_787_045),
+                    last_modified: Some(1_735_787_045),
+                    agent_messages: 3,
+                    user_queries: 1,
+                    ..Default::default()
                 },
-                crate::session::SessionMeta {
-                    id: "beta".to_string(),
-                    message_count: 5,
-                    last_modified: 1234567891,
-                    preview: "second prompt".to_string(),
-                    start_dir: None,
+                crate::cli::sessions::SessionRecord {
+                    session_id: "beta".to_string(),
+                    project_slug: "p".to_string(),
+                    started_at: Some(1_735_873_445),
+                    last_modified: Some(1_735_873_445),
+                    agent_messages: 5,
+                    user_queries: 2,
+                    ..Default::default()
                 },
             ],
             selected: 0,
+            mode: crate::console::app::SessionPickerMode::List,
+            current_session_id: "alpha".to_string(),
+            projects_dir: std::path::PathBuf::from("/tmp"),
         });
 
         let mut term = test_terminal(80, 24);
@@ -738,8 +750,13 @@ mod tests {
 
         let content = buffer_content(&term);
         assert!(content.contains("Sessions"), "should show picker title");
-        assert!(content.contains("alpha"), "should list session alpha");
-        assert!(content.contains("beta"), "should list session beta");
+        assert!(content.contains("STARTED"), "should show columns header");
+        assert!(content.contains("2025-01-"), "should render row timestamps");
+        assert!(content.contains("▸"), "should mark current session with ▸");
+        assert!(
+            content.contains("details"),
+            "footer should advertise → details"
+        );
     }
 
     #[test]
@@ -1122,14 +1139,17 @@ mod tests {
         app.blocks
             .push(UIBlock::User("PRE_RESUME_MESSAGE".to_string()));
         app.session_picker = Some(SessionPicker {
-            sessions: vec![crate::session::SessionMeta {
-                id: "alpha".to_string(),
-                message_count: 1,
-                last_modified: 1,
-                preview: "hi".to_string(),
-                start_dir: None,
+            sessions: vec![crate::cli::sessions::SessionRecord {
+                session_id: "alpha".to_string(),
+                project_slug: "p".to_string(),
+                started_at: Some(1_735_787_045),
+                last_modified: Some(1),
+                ..Default::default()
             }],
             selected: 0,
+            mode: crate::console::app::SessionPickerMode::List,
+            current_session_id: "alpha".to_string(),
+            projects_dir: std::path::PathBuf::from("/tmp"),
         });
 
         let mut term = test_terminal(80, 24);
@@ -1137,10 +1157,9 @@ mod tests {
 
         let content = buffer_content(&term);
         assert!(content.contains("Sessions"), "picker should render");
-        assert!(content.contains("alpha"), "picker should list sessions");
         assert!(
             !content.contains("PRE_RESUME_MESSAGE"),
-            "prior conversation must be hidden during resume"
+            "prior conversation must be hidden while picker is open"
         );
     }
 
