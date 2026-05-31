@@ -44,6 +44,11 @@ pub(crate) enum ToolStatus {
 pub(crate) enum UIBlock {
     User(String),
     Assistant(String),
+    /// Streamed chain-of-thought (`reasoning_content` from OpenAI-compatible
+    /// providers like DeepSeek-Reasoner and o-series). Rendered separately
+    /// from Assistant so it can carry its own dimmed styling and a
+    /// "✻ Thinking" header instead of being silently glued onto the reply.
+    Reasoning(String),
     Tool(ToolCallEntry),
 }
 
@@ -546,7 +551,7 @@ impl App {
             .blocks
             .iter()
             .map(|b| match b {
-                UIBlock::User(t) | UIBlock::Assistant(t) => t.len(),
+                UIBlock::User(t) | UIBlock::Assistant(t) | UIBlock::Reasoning(t) => t.len(),
                 UIBlock::Tool(e) => {
                     e.arguments.len()
                         + match &e.status {
@@ -621,15 +626,27 @@ impl App {
                 self.stream_chars = 0;
             }
             AgentEvent::TurnStart => {}
-            AgentEvent::MessageStart { .. } => {
-                self.blocks.push(UIBlock::Assistant(String::new()));
+            AgentEvent::MessageStart { message } => {
+                // The agent loop signals "reasoning block" by sending a
+                // MessageStart with `reasoning_content: Some` and `content:
+                // None`. Anything else opens a regular Assistant block.
+                let is_reasoning = message.reasoning_content.is_some() && message.content.is_none();
+                self.blocks.push(if is_reasoning {
+                    UIBlock::Reasoning(String::new())
+                } else {
+                    UIBlock::Assistant(String::new())
+                });
                 self.current_chunk_idx = Some(self.blocks.len() - 1);
             }
             AgentEvent::MessageUpdate { delta } => {
                 self.stream_chars += delta.len();
                 if let Some(i) = self.current_chunk_idx {
-                    if let Some(UIBlock::Assistant(ref mut s)) = self.blocks.get_mut(i) {
-                        s.push_str(&delta);
+                    match self.blocks.get_mut(i) {
+                        Some(UIBlock::Assistant(ref mut s))
+                        | Some(UIBlock::Reasoning(ref mut s)) => {
+                            s.push_str(&delta);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -714,7 +731,9 @@ impl App {
     pub(crate) fn block_done(&self, i: usize) -> bool {
         match self.blocks.get(i) {
             Some(UIBlock::User(_)) => true,
-            Some(UIBlock::Assistant(_)) => self.current_chunk_idx != Some(i),
+            Some(UIBlock::Assistant(_)) | Some(UIBlock::Reasoning(_)) => {
+                self.current_chunk_idx != Some(i)
+            }
             Some(UIBlock::Tool(t)) => !matches!(t.status, ToolStatus::Pending),
             None => false,
         }
@@ -1175,13 +1194,14 @@ impl App {
                     }
                 }
                 "assistant" => {
+                    // Push reasoning first, then the reply — matches the
+                    // streaming order so resumed scrollback looks identical
+                    // to the live turn. Either may be missing or empty.
+                    if let Some(reasoning) = message.reasoning_content.filter(|r| !r.is_empty()) {
+                        self.blocks.push(UIBlock::Reasoning(reasoning));
+                    }
                     if let Some(content) = message.content.filter(|c| !c.is_empty()) {
                         self.blocks.push(UIBlock::Assistant(content));
-                    } else if let Some(reasoning) =
-                        message.reasoning_content.filter(|r| !r.is_empty())
-                    {
-                        self.blocks
-                            .push(UIBlock::Assistant(format!("💭 {reasoning}")));
                     }
                     // Reconstruct tool blocks from this turn's calls; the
                     // following `tool` messages fill in each result by id.
@@ -1984,6 +2004,122 @@ mod tests {
         });
         assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "from-start"));
         assert_eq!(app.history.last().map(|s| s.as_str()), Some("from-start"));
+    }
+
+    #[test]
+    fn message_start_with_reasoning_only_pushes_reasoning_block() {
+        // A MessageStart whose Message carries reasoning_content but no
+        // content is the agent loop's signal "this turn is opening a
+        // thinking block" — the app must mint a Reasoning, not Assistant.
+        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        app.handle_event(AgentEvent::MessageStart {
+            message: crate::Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: Some(String::new()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        });
+        assert!(matches!(app.blocks.last(), Some(UIBlock::Reasoning(s)) if s.is_empty()));
+    }
+
+    #[test]
+    fn message_start_with_content_pushes_assistant_block() {
+        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        app.handle_event(AgentEvent::MessageStart {
+            message: crate::Message {
+                role: "assistant".to_string(),
+                content: Some(String::new()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        });
+        assert!(matches!(app.blocks.last(), Some(UIBlock::Assistant(s)) if s.is_empty()));
+    }
+
+    #[test]
+    fn message_update_appends_to_reasoning_block() {
+        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        app.handle_event(AgentEvent::MessageStart {
+            message: crate::Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: Some(String::new()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        });
+        app.handle_event(AgentEvent::MessageUpdate {
+            delta: "hmm let me think".to_string(),
+        });
+        assert!(
+            matches!(app.blocks.last(), Some(UIBlock::Reasoning(s)) if s == "hmm let me think")
+        );
+    }
+
+    #[test]
+    fn interleaved_reasoning_text_reasoning_yields_three_blocks() {
+        // Streaming order: reasoning₁ → text → reasoning₂. Each kind change
+        // must close the previous block and open a new one — the user should
+        // see three distinct UIBlocks in the order they streamed in, not
+        // glued together.
+        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        let reasoning_start = || AgentEvent::MessageStart {
+            message: crate::Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: Some(String::new()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        };
+        let text_start = || AgentEvent::MessageStart {
+            message: crate::Message {
+                role: "assistant".to_string(),
+                content: Some(String::new()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        };
+        let end = || AgentEvent::MessageEnd {
+            message: crate::Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        };
+
+        app.handle_event(reasoning_start());
+        app.handle_event(AgentEvent::MessageUpdate {
+            delta: "first thought".to_string(),
+        });
+        app.handle_event(end());
+        app.handle_event(text_start());
+        app.handle_event(AgentEvent::MessageUpdate {
+            delta: "the answer".to_string(),
+        });
+        app.handle_event(end());
+        app.handle_event(reasoning_start());
+        app.handle_event(AgentEvent::MessageUpdate {
+            delta: "second thought".to_string(),
+        });
+        app.handle_event(end());
+
+        assert_eq!(app.blocks.len(), 3);
+        assert!(matches!(&app.blocks[0], UIBlock::Reasoning(s) if s == "first thought"));
+        assert!(matches!(&app.blocks[1], UIBlock::Assistant(s) if s == "the answer"));
+        assert!(matches!(&app.blocks[2], UIBlock::Reasoning(s) if s == "second thought"));
     }
 
     #[test]

@@ -54,6 +54,29 @@ pub(crate) fn block_lines(
                 lines.extend(wrap_line(&line, width, indent));
             }
         }
+        UIBlock::Reasoning(text) => {
+            if text.is_empty() {
+                return lines;
+            }
+            lines.push(Line::from(""));
+            // Header row — the marker line that says "this block is the
+            // model's chain-of-thought, not the reply." Dim+italic so it's
+            // visually subordinate to the assistant blocks that follow.
+            lines.push(Line::from(Span::styled(
+                "✻ Thinking",
+                Style::default().fg(TEXT_DIM).add_modifier(Modifier::ITALIC),
+            )));
+            // Body — plain dim text, no markdown. Reasoning streams are
+            // prose-y and rarely contain code fences; rendering them as
+            // markdown would create heading/list noise from natural language.
+            for raw_line in text.lines() {
+                let line = Line::from(Span::styled(
+                    format!("  {}", sanitize(raw_line)),
+                    Style::default().fg(TEXT_DIM),
+                ));
+                lines.extend(wrap_line(&line, width, 2));
+            }
+        }
         UIBlock::Tool(entry) => {
             // The `ask_user` tool has its own purpose-built scrollback line
             // (`inline_picker::trace_lines`); rendering the generic tool block

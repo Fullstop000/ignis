@@ -507,6 +507,43 @@ mod tests {
     }
 
     #[test]
+    fn render_reasoning_shows_header_and_dim_color() {
+        use crate::console::colors::TEXT_DIM;
+
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        app.blocks
+            .push(UIBlock::Reasoning("considering the options".to_string()));
+
+        let term = render_blocks(&app, 80, 24);
+        let content = buffer_content(&term);
+        assert!(
+            content.contains("✻ Thinking"),
+            "reasoning block must render the ✻ Thinking header"
+        );
+        assert!(
+            content.contains("considering the options"),
+            "reasoning body must render"
+        );
+
+        // The header + body should both render in TEXT_DIM; count dim cells
+        // to prove the styling actually applied (the renderer could silently
+        // fall through to default styling without this).
+        let buf = term.backend().buffer();
+        let dim_cells = buf.content.iter().filter(|c| c.fg == TEXT_DIM).count();
+        assert!(
+            dim_cells >= "✻ Thinking".len() + "considering the options".len(),
+            "expected ≥{} dim cells, got {}",
+            "✻ Thinking".len() + "considering the options".len(),
+            dim_cells
+        );
+    }
+
+    #[test]
     fn render_shows_tool_block() {
         let mut app = App::new(
             "test".to_string(),
