@@ -853,6 +853,63 @@ mod tests {
     }
 
     #[test]
+    fn render_footer_omits_update_segment_when_no_notice() {
+        let mut app = App::new(
+            "openai".to_string(),
+            "gpt-4".to_string(),
+            "work".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        // No update_notice set.
+        let mut term = test_terminal(120, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let content = buffer_content(&term);
+        assert!(
+            !content.contains("new version available"),
+            "footer must be clean when update_notice is None"
+        );
+    }
+
+    #[test]
+    fn render_footer_shows_update_segment_when_notice_set() {
+        use crate::cli::upgrade::UpdateNotice;
+        use crate::console::colors::YELLOW;
+
+        let mut app = App::new(
+            "openai".to_string(),
+            "gpt-4".to_string(),
+            "work".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        app.update_notice = Some(UpdateNotice {
+            current: "0.30.0".to_string(),
+            latest_tag: "v0.31.0".to_string(),
+        });
+
+        let mut term = test_terminal(120, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let content = buffer_content(&term);
+        assert!(
+            content.contains("new version available"),
+            "footer must show notice when update_notice is set"
+        );
+        assert!(
+            content.contains("ignis upgrade"),
+            "footer must mention the upgrade command"
+        );
+
+        // Verify the segment is rendered in yellow (not the default dim).
+        let buf = term.backend().buffer();
+        let yellow_cells = buf.content.iter().filter(|c| c.fg == YELLOW).count();
+        assert!(
+            yellow_cells >= "new version available".len(),
+            "expected ≥{} yellow cells for the notice, got {}",
+            "new version available".len(),
+            yellow_cells
+        );
+    }
+
+    #[test]
     fn render_loading_shows_live_token_stats_when_streaming() {
         let mut app = App::new(
             "test".to_string(),

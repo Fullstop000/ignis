@@ -484,6 +484,9 @@ pub(crate) struct App {
     /// (chunk 3) and by the TUI status-badge renderer. `None` only in legacy
     /// tests that construct `App` directly.
     pub(crate) permissions: Option<std::sync::Arc<crate::permissions::runtime::PermissionState>>,
+    /// Auto-update-check result. `None` until the background check resolves;
+    /// once `Some`, the footer renders a "new version available" segment.
+    pub(crate) update_notice: Option<crate::cli::upgrade::UpdateNotice>,
 }
 
 impl App {
@@ -528,6 +531,7 @@ impl App {
             skills: None,
             mcp: None,
             permissions: None,
+            update_notice: None,
         }
     }
 

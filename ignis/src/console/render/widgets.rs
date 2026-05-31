@@ -167,10 +167,26 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Min(0), Constraint::Length(right_w)])
         .split(area);
 
-    let left = Line::from(Span::styled(
+    // Left side: cwd, optionally followed by the update-notice segment in
+    // yellow. We append rather than replace cwd so the user keeps the
+    // always-on directory context; on a narrow terminal the notice gets
+    // truncated by ratatui's normal wrapping, which is the same fate any
+    // long cwd already faces.
+    let cwd_span = Span::styled(
         format!("  {}", app.cwd.display()),
         Style::default().fg(TEXT_DIM),
-    ));
+    );
+    let left = if app.update_notice.is_some() {
+        Line::from(vec![
+            cwd_span,
+            Span::styled(
+                "   ● new version available — run `ignis upgrade`",
+                Style::default().fg(YELLOW),
+            ),
+        ])
+    } else {
+        Line::from(cwd_span)
+    };
     let right = if let Some((label, color)) = badge {
         Line::from(vec![
             Span::styled(

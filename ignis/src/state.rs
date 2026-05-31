@@ -5,6 +5,19 @@
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 
+/// Cached result of the most recent auto-update check. Lets the TUI surface
+/// "new version available" in the footer without firing a network call on
+/// every launch (TTL gate lives in `cli::upgrade::check_for_update_cached`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateCheckState {
+    /// Unix-epoch seconds when the GitHub-Releases fetch last succeeded. A
+    /// missing record (None on State) means "never checked"; a present record
+    /// with `checked_at` older than the TTL means "re-check on next launch."
+    pub checked_at: u64,
+    /// The `tag_name` GitHub returned at `checked_at` (e.g. `v0.31.0`).
+    pub latest_tag: String,
+}
+
 /// Runtime state persisted across restarts. The selection it carries takes
 /// priority over the config's optional default; `config.toml` is never rewritten.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -27,6 +40,10 @@ pub struct State {
     /// `allow` list at launch. Appended when the user picks "Always allow".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permission_grants: Vec<String>,
+    /// Cached auto-update-check result. Missing on first launch and on any
+    /// state file written before this field existed (serde defaults to None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_check: Option<UpdateCheckState>,
 }
 
 fn state_path() -> Result<std::path::PathBuf, anyhow::Error> {
@@ -49,7 +66,21 @@ fn write_state(state: &State) -> Result<(), anyhow::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(state)?)?;
+    // Atomic write: a crash mid-write would leave state.json truncated, and
+    // load_state silently swallows parse failures into State::default — that
+    // would erase the model selection + permission grants. With a background
+    // writer now landing on this file (auto-update check), the corruption
+    // window is also a TOCTOU window worth shrinking. Write to a sibling
+    // tmpfile + rename — atomic on POSIX, so either old or new content is
+    // observable, never a partial.
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("state path has no parent: {}", path.display()))?;
+    let tmp = dir.join(format!(".state.json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_string_pretty(state)?)
+        .map_err(|e| anyhow!("write {}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| anyhow!("atomically replace {}: {}", path.display(), e))?;
     Ok(())
 }
 
@@ -95,6 +126,14 @@ pub fn persist_permission_mode(mode: Option<&str>) -> Result<(), anyhow::Error> 
 pub fn persist_permission_grants(grants: &[String]) -> Result<(), anyhow::Error> {
     let mut state = load_state();
     state.permission_grants = grants.to_vec();
+    write_state(&state)
+}
+
+/// Persist the cached auto-update-check result. `None` clears the cache (the
+/// next launch will re-check). Preserves every other field.
+pub fn persist_update_check(check: Option<UpdateCheckState>) -> Result<(), anyhow::Error> {
+    let mut state = load_state();
+    state.update_check = check;
     write_state(&state)
 }
 
@@ -164,6 +203,7 @@ mod tests {
             disabled_mcp_servers: vec![],
             mode: None,
             permission_grants: vec![],
+            update_check: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -180,6 +220,7 @@ mod tests {
             disabled_mcp_servers: vec![],
             mode: None,
             permission_grants: vec![],
+            update_check: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -203,6 +244,7 @@ mod tests {
             disabled_mcp_servers: vec!["github".to_string(), "fs".to_string()],
             mode: None,
             permission_grants: vec![],
+            update_check: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -250,6 +292,7 @@ mod tests {
                 disabled_mcp_servers: vec![],
                 mode: Some(value.to_string()),
                 permission_grants: vec![],
+                update_check: None,
             };
             let json = serde_json::to_string(&state).unwrap();
             let back: State = serde_json::from_str(&json).unwrap();
@@ -301,6 +344,37 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn update_check_round_trip() {
+        let state = State {
+            update_check: Some(UpdateCheckState {
+                checked_at: 1_717_180_000,
+                latest_tag: "v0.31.0".to_string(),
+            }),
+            ..State::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: State = serde_json::from_str(&json).unwrap();
+        let back_uc = back.update_check.unwrap();
+        assert_eq!(back_uc.checked_at, 1_717_180_000);
+        assert_eq!(back_uc.latest_tag, "v0.31.0");
+    }
+
+    #[test]
+    fn update_check_absent_in_legacy_json_loads_as_none() {
+        // A state file written before update_check existed must still load —
+        // serde(default) handles this; here we just lock the contract in.
+        let legacy = r#"{"model":"openai/gpt-5.5"}"#;
+        let back: State = serde_json::from_str(legacy).unwrap();
+        assert!(back.update_check.is_none());
+    }
+
+    #[test]
+    fn update_check_none_omitted_from_json() {
+        let json = serde_json::to_string(&State::default()).unwrap();
+        assert!(!json.contains("update_check"));
     }
 
     #[test]
