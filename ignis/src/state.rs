@@ -66,7 +66,21 @@ fn write_state(state: &State) -> Result<(), anyhow::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(state)?)?;
+    // Atomic write: a crash mid-write would leave state.json truncated, and
+    // load_state silently swallows parse failures into State::default — that
+    // would erase the model selection + permission grants. With a background
+    // writer now landing on this file (auto-update check), the corruption
+    // window is also a TOCTOU window worth shrinking. Write to a sibling
+    // tmpfile + rename — atomic on POSIX, so either old or new content is
+    // observable, never a partial.
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("state path has no parent: {}", path.display()))?;
+    let tmp = dir.join(format!(".state.json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_string_pretty(state)?)
+        .map_err(|e| anyhow!("write {}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| anyhow!("atomically replace {}: {}", path.display(), e))?;
     Ok(())
 }
 

@@ -318,6 +318,12 @@ fn should_check_inner(env_get: impl Fn(&str) -> Option<String>, stderr_is_tty: b
     {
         return false;
     }
+    // `TERM=dumb` is the historical "I can't render ANSI" signal — Emacs's
+    // shell-mode sets it. Skip rather than render the bullet/yellow it can't
+    // display.
+    if env_get("TERM").as_deref() == Some("dumb") {
+        return false;
+    }
     // stderr-not-TTY catches `ignis 2>logfile`, headless invocations, etc.
     if !stderr_is_tty {
         return false;
@@ -365,7 +371,17 @@ where
 }
 
 fn build_notice(current: &str, latest_tag: &str) -> Option<UpdateNotice> {
-    if version_lt(current, strip_v(latest_tag)) {
+    // parse_semver bottoms out at (0,0,0) for non-numeric components; if the
+    // tag is non-empty but parses to all-zeros it's almost certainly a tag
+    // GitHub or a fork added that we don't understand (nightly-2026-…), and
+    // we'd silently never notify. Leave a breadcrumb so a future bad tag is
+    // debuggable.
+    let stripped = strip_v(latest_tag);
+    if !stripped.is_empty() && parse_semver(stripped) == (0, 0, 0) {
+        log::warn!("update check: unparseable latest tag {latest_tag:?} — no notice emitted");
+        return None;
+    }
+    if version_lt(current, stripped) {
         Some(UpdateNotice {
             current: current.to_string(),
             latest_tag: latest_tag.to_string(),
@@ -388,13 +404,23 @@ pub(crate) fn spawn_update_check() -> tokio::sync::oneshot::Receiver<Option<Upda
             .unwrap_or(0);
         let prior = crate::state::load_state().update_check;
         let (new_state, notice) =
-            check_for_update_cached(prior, current, now, TTL_SECS, fetch_latest_tag).await;
+            check_for_update_cached(prior, current, now, TTL_SECS, fetch_latest_tag_with_timeout)
+                .await;
         // Best-effort persist; a failure here just means the next launch
         // re-fetches — not user-visible.
         let _ = crate::state::persist_update_check(new_state);
         let _ = tx.send(notice);
     });
     rx
+}
+
+/// 3 s-capped fetch for the background auto-check path. `ignis upgrade` keeps
+/// its no-timeout behavior (the user is watching it); the background task
+/// can't hang the runtime shutdown if GitHub's edge stalls.
+async fn fetch_latest_tag_with_timeout() -> Result<String> {
+    tokio::time::timeout(std::time::Duration::from_secs(3), fetch_latest_tag())
+        .await
+        .map_err(|_| anyhow!("fetch_latest_tag timed out after 3s"))?
 }
 
 /// Create a fresh empty directory under `std::env::temp_dir()` with a random
