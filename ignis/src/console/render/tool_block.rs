@@ -14,6 +14,7 @@ use crate::console::{
     format_duration, sanitize, truncate, BORDER, DIFF_ADD_BG, DIFF_DEL_BG, GREEN, RED, SPINNERS,
     TEXT, TEXT_DIM, YELLOW,
 };
+use crate::tools::{CreateFileTool, EditFileTool};
 use unicode_width::UnicodeWidthStr;
 
 /// `inline_picker::trace_lines` so resumed sessions read identically.
@@ -135,7 +136,7 @@ pub(crate) fn render_tool_block(
     };
 
     // Parse tool arguments for a compact display
-    let args_compact = sanitize(&compact_tool_args(&entry.arguments, cwd));
+    let args_compact = sanitize(&compact_tool_args(&entry.name, &entry.arguments, cwd));
 
     lines.push(Line::from(""));
     // Header line: ┌─ ⚙ tool_name(args) [1.2s]
@@ -176,7 +177,7 @@ pub(crate) fn render_tool_block(
             // edit_file returns a git-style diff: render the hunk with solid
             // red/green backgrounds and syntax-highlighted code. Other tools get
             // a compact 3-line preview.
-            let is_diff = entry.name == "edit_file";
+            let is_diff = entry.name == EditFileTool::NAME;
             let max = if is_diff { 30 } else { 3 };
             if is_diff {
                 let ext = diff_file_ext(&entry.arguments);
@@ -285,13 +286,21 @@ fn push_diff_line(
 /// Produce a compact arg summary from JSON, showing **values only** (never the
 /// parameter names): `grep("fn main")`, `read_file(src/main.rs)`. Path-valued
 /// args render bare and relative to `cwd`; other strings keep their quotes.
-pub(crate) fn compact_tool_args(json_str: &str, cwd: &Path) -> String {
+///
+/// `edit_file` and `create_file` carry large `old_string`/`new_string`/`content`
+/// payloads that drown out the path; for those tools we render only `file_path`.
+pub(crate) fn compact_tool_args(tool_name: &str, json_str: &str, cwd: &Path) -> String {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
         return truncate(json_str, 60);
     };
     let Some(obj) = val.as_object() else {
         return truncate(json_str, 60);
     };
+    if matches!(tool_name, EditFileTool::NAME | CreateFileTool::NAME) {
+        if let Some(serde_json::Value::String(p)) = obj.get("file_path") {
+            return truncate(&relativize_path(p, cwd), 60);
+        }
+    }
     let mut parts = Vec::new();
     for (k, v) in obj {
         let s = match v {

@@ -393,18 +393,42 @@ mod tests {
         let cwd = PathBuf::from("/home/u/ignis");
         // Absolute path under cwd -> relative, bare (no key=, no quotes).
         assert_eq!(
-            compact_tool_args(r#"{"path":"/home/u/ignis/src/console/render.rs"}"#, &cwd),
+            compact_tool_args(
+                "read_file",
+                r#"{"path":"/home/u/ignis/src/console/render.rs"}"#,
+                &cwd
+            ),
             "src/console/render.rs"
         );
         // Leading "<cwd-name>/" prefix dropped: ignis/src/main.rs -> src/main.rs.
         assert_eq!(
-            compact_tool_args(r#"{"path":"ignis/src/main.rs"}"#, &cwd),
+            compact_tool_args("read_file", r#"{"path":"ignis/src/main.rs"}"#, &cwd),
             "src/main.rs"
         );
         // Non-path string args show the value only (quoted), never the param name.
         assert_eq!(
-            compact_tool_args(r#"{"pattern":"fn main"}"#, &cwd),
+            compact_tool_args("grep", r#"{"pattern":"fn main"}"#, &cwd),
             "\"fn main\""
+        );
+    }
+
+    #[test]
+    fn compact_tool_args_edit_create_file_show_only_path() {
+        let cwd = PathBuf::from("/home/u/ignis");
+        // edit_file with large old_string/new_string -> only the file_path renders.
+        let edit_args = r#"{"file_path":"ignis/src/console/app.rs",
+            "old_string":"                AgentRequest::ReloadConfigAndRebuildSomething(very long)",
+            "new_string":"                AgentRequest::ReloadConfigAndRebuildSomethingElse(also long)"}"#;
+        assert_eq!(
+            compact_tool_args("edit_file", edit_args, &cwd),
+            "src/console/app.rs"
+        );
+        // create_file with a big content blob -> only the file_path renders.
+        let create_args = r#"{"file_path":"ignis/src/tools/foo.rs",
+            "content":"pub fn foo() { /* lots of text here that would otherwise dominate */ }"}"#;
+        assert_eq!(
+            compact_tool_args("create_file", create_args, &cwd),
+            "src/tools/foo.rs"
         );
     }
 

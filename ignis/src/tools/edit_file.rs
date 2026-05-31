@@ -8,6 +8,8 @@ pub struct EditFileTool {
 }
 
 impl EditFileTool {
+    pub const NAME: &'static str = "edit_file";
+
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
@@ -18,7 +20,7 @@ impl EditFileTool {
 #[async_trait]
 impl AgentTool for EditFileTool {
     fn name(&self) -> &str {
-        "edit_file"
+        Self::NAME
     }
 
     fn description(&self) -> &str {

@@ -8,6 +8,8 @@ pub struct CreateFileTool {
 }
 
 impl CreateFileTool {
+    pub const NAME: &'static str = "create_file";
+
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
@@ -18,7 +20,7 @@ impl CreateFileTool {
 #[async_trait]
 impl AgentTool for CreateFileTool {
     fn name(&self) -> &str {
-        "create_file"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
