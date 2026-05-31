@@ -79,12 +79,13 @@ See [Configure](#configure) for more providers and per-model options.
 - **Built-in tools** — read, write, and edit files; `grep`, `glob`, `list_dir`;
   `bash`; `web_fetch` and `web_search`; `ask_user`; and `agent` to delegate a
   subtask to a one-level sub-agent.
-- **MCP servers** — connect external stdio [MCP](https://modelcontextprotocol.io)
-  servers; their tools appear alongside the built-ins.
-- **Skills** — load reusable `SKILL.md` instruction sets on demand, sharable
-  across Claude Code, Codex, OpenCode, and Kimi.
-- **Permission system** — every tool call passes a gate, with a built-in safety
-  floor and user-declarable allow/ask/deny rules.
+- **[MCP servers](docs/configure/mcp.md)** — connect external stdio
+  [MCP](https://modelcontextprotocol.io) servers; their tools appear alongside
+  the built-ins.
+- **[Skills](docs/configure/skills.md)** — load reusable `SKILL.md` instruction
+  sets on demand, sharable across Claude Code, Codex, OpenCode, and Kimi.
+- **[Permissions](docs/configure/permissions.md)** — every tool call passes a
+  gate, with a built-in safety floor and user-declarable allow/ask/deny rules.
 - **Sessions** — project-scoped history with `--resume`, auto-resume, and
   context compaction; export per-session stats with `ignis sessions export`.
 - **Single binary** — no external runtime dependencies, with built-in
@@ -136,24 +137,10 @@ inline in the normal buffer, so scroll with your terminal/tmux as usual. Type
 `/` for slash-command suggestions — see
 [`docs/usage/commands.md`](docs/usage/commands.md) for the full reference.
 
-## Permissions
+## Docs
 
-Every tool call passes a permission gate before it runs. A built-in **safety
-floor** (the `rm -rf /` family, edits to `.git/**`, `.ignis/**`, and shell init
-files) always asks — and hard-denies under fully-unattended mode. On top of that
-you can declare your own `allow` / `ask` / `deny` rules in config:
-
-```toml
-[permissions]
-allow = ["bash(cargo *)", "edit_file(src/**)"]
-ask   = ["bash(git push *)"]
-deny  = ["read_file(.env)", "read_file(**/secrets/**)"]
-```
-
-Switch modes at runtime with `/afk`: *Hands-free* auto-approves tools but still
-answers `ask_user`; *Fully unattended* auto-approves everything. The TUI footer
-shows the active mode. Full grammar and precedence in
-[`docs/configure/permissions.md`](docs/configure/permissions.md).
+Deep references live in [`docs/`](docs/README.md) — commands, permissions,
+skills, MCP servers, telemetry.
 
 ## Development
 
