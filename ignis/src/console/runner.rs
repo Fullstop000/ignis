@@ -103,6 +103,16 @@ pub async fn run_console(
     let runner_permissions = permissions.clone();
     app.permissions = Some(permissions);
 
+    // Auto-update check: fire-and-forget HTTP GET in the background; the
+    // event loop polls the oneshot via try_recv and sets `app.update_notice`
+    // when it lands. Skip gate (env opt-out, CI, stderr-not-TTY, debug build,
+    // unsupported target) lives in cli::upgrade::should_check_for_update.
+    let mut update_check_rx = if crate::cli::upgrade::should_check_for_update() {
+        Some(crate::cli::upgrade::spawn_update_check())
+    } else {
+        None
+    };
+
     // Background agent runner
     tokio::spawn(async move {
         while let Some(request) = prompt_rx.recv().await {
@@ -283,6 +293,20 @@ pub async fn run_console(
         // Drain any other pending agent events and key input — state only, no draw.
         while let Ok(ev) = agent_rx.try_recv() {
             app.handle_event(ev);
+        }
+        // Poll the auto-update-check oneshot. Resolves once (Ok or Closed),
+        // after which we drop the receiver so the branch goes dormant.
+        if let Some(rx) = &mut update_check_rx {
+            match rx.try_recv() {
+                Ok(notice) => {
+                    app.update_notice = notice;
+                    update_check_rx = None;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    update_check_rx = None;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
         }
         while let Ok(req) = picker_rx.try_recv() {
             if app.inline_picker.is_some() {
