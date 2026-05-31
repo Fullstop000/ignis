@@ -40,6 +40,15 @@ pub struct PickerQuestion {
     /// (the model invites the user to free-text anything). `false` for
     /// permission/AFK prompts where the option set is closed by design.
     pub allow_other: bool,
+    /// Render as a single text-input row instead of a list of options. When
+    /// true, `options` MUST be empty and the picker captures keystrokes into
+    /// a free-text buffer; Enter returns `PickerAnswer::Single(<typed text>)`.
+    /// Used by `/connect`'s API-key step.
+    pub text_input: bool,
+    /// When `text_input` is true, render the typed characters as `●` so the
+    /// API key isn't shoulder-surfable. Has no effect when `text_input` is
+    /// false.
+    pub mask: bool,
 }
 
 /// A request from a tool to the console asking the user to pick. The `reply`

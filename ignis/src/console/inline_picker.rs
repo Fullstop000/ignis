@@ -63,6 +63,18 @@ impl InlinePickerState {
         }
     }
 
+    /// True when the current question is a plain text-input field (used by
+    /// `/connect` for API-key entry). In this mode there are no options to
+    /// navigate — every printable key extends the buffer, Enter submits.
+    pub(crate) fn is_text_input(&self) -> bool {
+        self.current_question().text_input
+    }
+    /// True when the current text-input question wants its content masked
+    /// (`●` glyphs). Only meaningful when `is_text_input()` is true.
+    pub(crate) fn is_masked(&self) -> bool {
+        self.current_question().mask
+    }
+
     pub(crate) fn current_question(&self) -> &PickerQuestion {
         &self.questions[self.current]
     }
@@ -113,6 +125,41 @@ impl InlinePickerState {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return KeyOutcome::Cancel;
         }
+        // Ctrl-D also cancels. The inline picker pre-empts the TUI's global
+        // Ctrl-D handler (which exits ignis), so without this branch the 'd'
+        // ends up swallowed into the picker — particularly visible on the
+        // text-input API-key step, where it would appear as a stray masked
+        // glyph. Cancel + second-Ctrl-D-to-quit matches the shell convention.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('d')) {
+            return KeyOutcome::Cancel;
+        }
+        // Defensive: every Ctrl-modified Char goes through the global TUI
+        // handlers in the same key path (Ctrl-A/E/J/U/W for editing,
+        // Ctrl-S for steer, etc.). Pickers ignore them so users don't see
+        // accidental letters leak into the picker buffer.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(_)) {
+            return KeyOutcome::Continue;
+        }
+        // Text-input mode (e.g. `/connect`'s API-key step): no options to
+        // navigate. Every printable key extends the buffer, Backspace shrinks
+        // it, Enter submits whatever's in the buffer. Length cap matches the
+        // Other-row cap so behaviour is consistent.
+        if self.is_text_input() {
+            return match key.code {
+                KeyCode::Enter => self.try_advance(),
+                KeyCode::Backspace => {
+                    self.other_buf.pop();
+                    KeyOutcome::Continue
+                }
+                KeyCode::Char(c) => {
+                    if !c.is_control() && self.other_buf.len() + c.len_utf8() <= MAX_OTHER_LEN {
+                        self.other_buf.push(c);
+                    }
+                    KeyOutcome::Continue
+                }
+                _ => KeyOutcome::Continue,
+            };
+        }
         let q = self.current_question();
         let opts_n = q.options.len();
         // Last selectable index. When `allow_other` is false the picker has no
@@ -161,6 +208,27 @@ impl InlinePickerState {
     /// next question.
     fn try_advance(&mut self) -> KeyOutcome {
         let q = self.current_question();
+        // Text-input questions are always single-answer: whatever's in the
+        // buffer becomes the answer. Empty submits are rejected so the user
+        // can't accidentally save a blank API key.
+        if q.text_input {
+            let text = self.other_buf.trim();
+            if text.is_empty() {
+                return KeyOutcome::Continue;
+            }
+            let answer = PickerAnswer::Single(text.to_string());
+            self.answers.push(answer);
+            if self.current + 1 >= self.questions.len() {
+                let done = std::mem::take(&mut self.answers);
+                return KeyOutcome::Done(done);
+            }
+            self.current += 1;
+            let next_opts = self.current_question().options.len();
+            self.cursor = 0;
+            self.toggled = vec![false; next_opts];
+            self.other_buf.clear();
+            return KeyOutcome::Continue;
+        }
         let pick: Option<PickerAnswer> = if q.multi_select {
             let mut picks: Vec<String> = q
                 .options
@@ -238,7 +306,9 @@ pub(crate) fn footer_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
     // When Other has focus, space is routed into the free-text buffer (NOT a
     // toggle), so the hint must not advertise a toggle key — Other's
     // inclusion is derived from buffer-non-empty in multi-select mode.
-    let footer = if state.other_focused() {
+    let footer = if state.is_text_input() {
+        "type · ↵ confirm · esc cancel"
+    } else if state.other_focused() {
         "type text · ↵ confirm · esc cancel"
     } else if multi {
         "↑/↓ navigate · space toggle · ↵ confirm · esc cancel"
@@ -251,10 +321,39 @@ pub(crate) fn footer_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
     ]
 }
 
+/// One-line input row for text-input mode. Renders the buffer (masked when
+/// the question opts in) plus a blinking caret. Shared by both render paths
+/// — single-column and split — though text-input never triggers the split.
+fn text_input_row(state: &InlinePickerState) -> Line<'static> {
+    let raw = state.other_buf();
+    let display: String = if state.is_masked() {
+        "●".repeat(raw.chars().count())
+    } else {
+        raw.to_string()
+    };
+    Line::from(vec![
+        Span::styled("> ", Style::default().fg(ACCENT)),
+        Span::styled(display, Style::default().fg(TEXT)),
+        Span::styled(
+            "_",
+            Style::default()
+                .fg(TEXT_DIM)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ),
+    ])
+}
+
 /// Lines for the picker band (used by render::draw when inline_picker is open).
 pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &InlinePickerState) {
     let q = state.current_question();
     lines.extend(header_lines(state));
+
+    // Text-input mode short-circuits: no options, just the input row + footer.
+    if state.is_text_input() {
+        lines.push(text_input_row(state));
+        lines.extend(footer_lines(state));
+        return;
+    }
 
     // Options (CC-style stacked: title row + description row indented).
     // Everything sits flush left to match CC's reference layout — no extra
@@ -562,6 +661,10 @@ pub(crate) fn picker_height(state: &InlinePickerState) -> u16 {
     let q = state.current_question();
     let header_rows: u16 = 3; // blank + header + question
     let footer_rows: u16 = 2; // blank + footer
+    if state.is_text_input() {
+        // Header + one input row + footer. No options, no separator.
+        return header_rows + 1 + footer_rows;
+    }
     if state.has_any_preview() {
         // Split layout: max(left pane, right pane + border) + header + footer.
         // Left pane = N options (1 row each) + separator + Other = N + 2.
@@ -639,6 +742,8 @@ mod tests {
             header: header.to_string(),
             multi_select: multi,
             allow_other: true,
+            text_input: false,
+            mask: false,
             options: labels
                 .iter()
                 .map(|l| PickerOption {
@@ -837,6 +942,103 @@ mod tests {
         let _ = s.on_key(key(KeyCode::Char('\u{007F}')));
         let _ = s.on_key(key(KeyCode::Char('b')));
         assert_eq!(s.other_buf(), "ab");
+    }
+
+    fn text_input_q(question: &str, header: &str, mask: bool) -> PickerQuestion {
+        PickerQuestion {
+            question: question.to_string(),
+            kind: "connect".to_string(),
+            header: header.to_string(),
+            multi_select: false,
+            allow_other: false,
+            text_input: true,
+            mask,
+            options: vec![],
+        }
+    }
+
+    #[test]
+    fn ctrl_d_cancels_inline_picker() {
+        // Pre-empts the global Ctrl-D handler, so without this branch 'd'
+        // leaks into the buffer (caught by /connect dogfood as stray ●●).
+        let (mut s, _rx) = make_request(vec![text_input_q("API key", "API Key", true)]);
+        let ev = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(matches!(s.on_key(ev), KeyOutcome::Cancel));
+        // Buffer stayed empty — 'd' did NOT get pushed.
+        assert_eq!(s.other_buf(), "");
+    }
+
+    #[test]
+    fn ctrl_modified_chars_dont_leak_into_text_input_buffer() {
+        // Ctrl-Anything (other than C/D handled above) is a no-op for the
+        // picker — the global TUI handlers own those bindings.
+        let (mut s, _rx) = make_request(vec![text_input_q("API key", "API Key", true)]);
+        for ch in ['a', 'e', 'j', 'u', 'w', 's'] {
+            let ev = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+            let _ = s.on_key(ev);
+        }
+        assert_eq!(
+            s.other_buf(),
+            "",
+            "Ctrl-modified chars must not push into the picker buffer"
+        );
+    }
+
+    #[test]
+    fn text_input_typing_extends_buffer_enter_returns_done() {
+        let (mut s, _rx) = make_request(vec![text_input_q("API key", "API Key", true)]);
+        for c in "sk-abc".chars() {
+            let _ = s.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(s.other_buf(), "sk-abc");
+        match s.on_key(key(KeyCode::Enter)) {
+            KeyOutcome::Done(ans) => {
+                assert_eq!(ans[0], PickerAnswer::Single("sk-abc".to_string()));
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_input_empty_submit_is_noop() {
+        let (mut s, _rx) = make_request(vec![text_input_q("API key", "API Key", true)]);
+        // No keys typed → Enter does nothing (avoids saving a blank API key).
+        assert!(matches!(
+            s.on_key(key(KeyCode::Enter)),
+            KeyOutcome::Continue
+        ));
+        // Pure whitespace also counts as empty.
+        for _ in 0..3 {
+            let _ = s.on_key(key(KeyCode::Char(' ')));
+        }
+        assert!(matches!(
+            s.on_key(key(KeyCode::Enter)),
+            KeyOutcome::Continue
+        ));
+    }
+
+    #[test]
+    fn text_input_backspace_shrinks_buffer() {
+        let (mut s, _rx) = make_request(vec![text_input_q("API key", "API Key", false)]);
+        for c in "abc".chars() {
+            let _ = s.on_key(key(KeyCode::Char(c)));
+        }
+        let _ = s.on_key(key(KeyCode::Backspace));
+        assert_eq!(s.other_buf(), "ab");
+    }
+
+    #[test]
+    fn text_input_esc_cancels() {
+        let (mut s, _rx) = make_request(vec![text_input_q("API key", "API Key", true)]);
+        let _ = s.on_key(key(KeyCode::Char('x')));
+        assert!(matches!(s.on_key(key(KeyCode::Esc)), KeyOutcome::Cancel));
+    }
+
+    #[test]
+    fn text_input_height_is_smaller_than_options_picker() {
+        let (s_text, _rx) = make_request(vec![text_input_q("API key", "API Key", true)]);
+        let (s_opts, _rx2) = make_request(vec![q("Pick", "h", false, &["a", "b", "c"])]);
+        assert!(picker_height(&s_text) < picker_height(&s_opts));
     }
 
     #[test]
