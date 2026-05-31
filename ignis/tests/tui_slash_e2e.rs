@@ -52,6 +52,10 @@ impl TuiProcess {
         let output_for_thread = Arc::clone(&output);
         let writer_for_thread = Arc::clone(&writer);
 
+        // Pull the harness writer into the scope so it isn't dropped by the
+        // pty reader's lifetime (the alt-screen path no longer needs the DSR
+        // reply, but the reader still expects a live writer handle).
+        let _writer_handle = writer_for_thread.clone();
         std::thread::spawn(move || {
             let mut buf = [0; 4096];
             loop {
@@ -59,15 +63,6 @@ impl TuiProcess {
                     Ok(0) => break,
                     Ok(n) => {
                         let text = String::from_utf8_lossy(&buf[..n]);
-                        // Reply to cursor-position queries (DSR `ESC[6n`) so
-                        // ratatui's inline viewport can initialize: a real terminal
-                        // answers, a bare pty does not.
-                        for _ in 0..text.matches("\u{1b}[6n").count() {
-                            if let Ok(mut w) = writer_for_thread.lock() {
-                                let _ = w.write_all(b"\x1b[1;1R");
-                                let _ = w.flush();
-                            }
-                        }
                         output_for_thread.lock().unwrap().push_str(&text);
                     }
                     Err(_) => break,

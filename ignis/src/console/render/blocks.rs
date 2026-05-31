@@ -1,24 +1,21 @@
 //! Block rendering primitives — convert in-memory transcript blocks
-//! (`UIBlock::User`, `Assistant`, `Tool`) into wrapped `Line`s ready to commit
-//! to scrollback via `terminal.insert_before`. Also hosts the line-wrap +
-//! buffer-render helpers used both by scrollback flushes and tests.
+//! (`UIBlock::User`, `Assistant`, `Tool`) into wrapped `Line`s for the in-app
+//! transcript buffer.
 use ratatui::{
     style::{Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Paragraph, Wrap},
+    text::{Line, Span},
 };
 use std::path::Path;
 use unicode_width::UnicodeWidthChar;
 
 use crate::console::app::{App, UIBlock};
 use crate::console::markdown::render_md_block;
-use crate::console::{sanitize, ACCENT, BG, SUBTEXT, TEXT, TEXT_DIM};
+use crate::console::{sanitize, ACCENT, SUBTEXT, TEXT, TEXT_DIM};
 
 use super::tool_block::{ask_user_resume_trace, render_tool_block};
 
 // Local alias so the wrap_line column-width math reads as `…::width(…)`
 // (the rest of the file uses both Char- and Str-level widths).
-use unicode_width::UnicodeWidthStr;
 
 /// yield no lines.
 pub(crate) fn block_lines(
@@ -201,50 +198,7 @@ fn wrap_line(line: &Line<'static>, width: u16, indent_cols: usize) -> Vec<Line<'
         .map(|r| Line::from(cells_to_spans(&r)))
         .collect()
 }
-/// Wrapped row count of `lines` at `width` — the height to reserve in scrollback.
-pub(crate) fn block_height(lines: &[Line<'static>], width: u16) -> u16 {
-    Paragraph::new(Text::from(lines.to_vec()))
-        .wrap(Wrap { trim: false })
-        .line_count(width.max(1)) as u16
-}
-
-/// Render `lines` into a scrollback buffer slice (used by `insert_before`).
-pub(crate) fn render_block_into(buf: &mut ratatui::buffer::Buffer, lines: &[Line<'static>]) {
-    use ratatui::widgets::Widget;
-    let area = buf.area;
-    Paragraph::new(Text::from(lines.to_vec()))
-        .style(Style::default().bg(BG))
-        .wrap(Wrap { trim: false })
-        .render(area, buf);
-    blank_wide_char_continuations(buf);
-}
-
-/// Empty the cell that follows each double-width glyph (CJK, emoji).
-///
-/// `Terminal::insert_before` flushes *every* buffer cell to the backend — it
-/// skips the `diff` step that, in a normal draw, drops the blank continuation
-/// cell after a wide glyph. The crossterm backend then prints that blank `" "`
-/// at the column the wide glyph already advanced past, leaving a stray space
-/// after every wide char. Clearing the continuation symbol makes the backend
-/// print nothing there, so the glyph keeps its natural two columns.
-fn blank_wide_char_continuations(buf: &mut ratatui::buffer::Buffer) {
-    let area = buf.area;
-    for y in area.top()..area.bottom() {
-        let mut x = area.left();
-        while x < area.right() {
-            let w = UnicodeWidthStr::width(buf.get(x, y).symbol());
-            if w >= 2 {
-                if x + 1 < area.right() {
-                    buf.get_mut(x + 1, y).set_symbol("");
-                }
-                x += 2;
-            } else {
-                x += 1;
-            }
-        }
-    }
-}
-/// The startup banner, committed once to scrollback at launch. When no
+/// The startup banner, committed once to the transcript at launch. When no
 /// provider is configured (first-launch / cleared config), the provider line
 /// is replaced with a one-line hint that points the user at `/connect`.
 pub(crate) fn welcome_lines(app: &App) -> Vec<Line<'static>> {
