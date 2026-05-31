@@ -45,7 +45,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: Cow::Borrowed("/telemetry"),
-        description: Cow::Borrowed("Show OpenTelemetry export status"),
+        description: Cow::Borrowed("Show or toggle OpenTelemetry export status (on/off)"),
     },
     SlashCommand {
         name: Cow::Borrowed("/sessions"),

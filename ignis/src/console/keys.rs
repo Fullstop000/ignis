@@ -411,7 +411,7 @@ pub(crate) async fn handle_key(
                 } else if command == "/afk" && arg_count == 1 {
                     handle_afk_toggle(app, picker_tx).await;
                 } else if command == "/telemetry" && arg_count == 1 {
-                    app.show_telemetry_status();
+                    handle_telemetry_picker(app, picker_tx).await;
                 } else if command == "/sessions" && arg_count == 1 {
                     app.show_sessions_stats();
                 } else if command.starts_with('/')
@@ -536,6 +536,101 @@ pub(crate) async fn handle_key(
         }
         _ => {}
     }
+}
+
+/// `/telemetry` — open a TUI picker to enable or disable OpenTelemetry
+/// export. Writes the choice to `~/.ignis/config.toml` (takes effect on
+/// next restart) and shows the updated status.
+async fn handle_telemetry_picker(
+    app: &mut App,
+    picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
+) {
+    use crate::console::picker::{
+        PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse,
+    };
+    use tokio::sync::oneshot;
+
+    if app.inline_picker.is_some() {
+        app.add_assistant_notice("/telemetry: another picker is open; close it first.".to_string());
+        return;
+    }
+
+    let s = crate::telemetry::state_snapshot();
+    let currently = if s.enabled { "On" } else { "Off" };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let request = PickerRequest {
+        questions: vec![PickerQuestion {
+            question: format!("Telemetry is currently {}. Enable or disable?", currently),
+            kind: "telemetry".to_string(),
+            header: "Telemetry".to_string(),
+            multi_select: false,
+            allow_other: false,
+            options: vec![
+                PickerOption {
+                    label: "On".to_string(),
+                    description: "Enable OpenTelemetry export (default). Spans and metrics are \
+                                  sent to the configured OTLP endpoint."
+                        .to_string(),
+                    preview: None,
+                },
+                PickerOption {
+                    label: "Off".to_string(),
+                    description: "Disable OpenTelemetry export. No telemetry data will be sent."
+                        .to_string(),
+                    preview: None,
+                },
+            ],
+        }],
+        reply: reply_tx,
+    };
+
+    if picker_tx.send(request).await.is_err() {
+        app.add_assistant_notice("/telemetry: picker channel closed".to_string());
+        return;
+    }
+
+    // Spawn so the key handler returns immediately; persist on reply.
+    tokio::spawn(async move {
+        if let Ok(PickerResponse::Answered(answers)) = reply_rx.await {
+            if let Some(PickerAnswer::Single(label)) = answers.first() {
+                let enable = label == "On";
+                persist_telemetry_setting(enable);
+            }
+        }
+    });
+}
+
+/// Write the `[telemetry] enabled` flag to `~/.ignis/config.toml`.
+fn persist_telemetry_setting(enable: bool) {
+    let config_path = match dirs::home_dir() {
+        Some(h) => h.join(".ignis/config.toml"),
+        None => return,
+    };
+
+    let content = if config_path.exists() {
+        match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => return,
+        }
+    } else {
+        String::new()
+    };
+    let mut doc: toml_edit::DocumentMut = match content.parse() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    let telemetry = doc.entry("telemetry").or_insert(toml_edit::table());
+    if let Some(table) = telemetry.as_table_mut() {
+        table.set_implicit(false);
+        table["enabled"] = toml_edit::value(enable);
+    }
+
+    if let Some(parent) = config_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&config_path, doc.to_string());
 }
 
 /// `/afk` toggle handler. When AFK is currently on, flips it off immediately
