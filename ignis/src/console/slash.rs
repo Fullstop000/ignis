@@ -28,6 +28,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: Cow::Borrowed("Copy the last assistant message to clipboard"),
     },
     SlashCommand {
+        name: Cow::Borrowed("/connect"),
+        description: Cow::Borrowed("Connect a provider and pick a default model"),
+    },
+    SlashCommand {
         name: Cow::Borrowed("/model"),
         description: Cow::Borrowed("Switch model and reasoning effort"),
     },
