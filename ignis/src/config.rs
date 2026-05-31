@@ -76,7 +76,7 @@ pub struct PermissionsConfig {
 }
 
 /// OpenTelemetry export. On by default — can be disabled with
-/// `IGNIS_ENABLE_TELEMETRY=0` or `[telemetry] enabled = false` in config. Standard
+/// `[telemetry] enabled = false` in config. Standard
 /// OTEL_* env vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
 /// `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_RESOURCE_ATTRIBUTES`, …) configure the
 /// destination — ignis does not duplicate them in TOML.
