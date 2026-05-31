@@ -29,6 +29,32 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Wall-clock capture time in epoch ms. Not part of the payload sent to
+    /// LLM providers — `#[serde(skip)]` keeps it out — but transcribed to the
+    /// session-JSONL record envelope timestamp by `FileStorage`, and round-trips
+    /// back here through `parse_jsonl_messages` so `/sessions` can render an
+    /// accurate per-turn waterfall.
+    #[serde(skip)]
+    pub created_at_ms: Option<u64>,
+}
+
+impl Message {
+    /// Builder: stamp the message with the current wall-clock time. Use at
+    /// push sites that own a real-time event (user prompts, streamed assistant
+    /// chunks, tool results) so the waterfall shows real durations.
+    pub fn stamp_now(mut self) -> Self {
+        self.created_at_ms = Some(now_ms());
+        self
+    }
+}
+
+/// Wall-clock epoch ms. Public so the agent loop can stamp inline literals
+/// without the `.stamp_now()` builder when constructing inside a `push()` call.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Real token usage for a turn or session, mirroring how Claude/Kimi/Codex

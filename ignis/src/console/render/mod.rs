@@ -1086,6 +1086,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
             crate::Message {
                 role: "assistant".to_string(),
@@ -1101,6 +1102,7 @@ mod tests {
                         arguments: r#"{"path":"."}"#.to_string(),
                     },
                 }]),
+                created_at_ms: None,
             },
             crate::Message {
                 role: "tool".to_string(),
@@ -1110,6 +1112,7 @@ mod tests {
                 name: Some("list_dir".to_string()),
                 tool_call_id: Some("call_1".to_string()),
                 tool_calls: None,
+                created_at_ms: None,
             },
         ];
         app.render_session_history("s".to_string(), messages);
@@ -1179,6 +1182,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
             crate::Message {
                 role: "assistant".to_string(),
@@ -1187,6 +1191,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
         ];
         app.render_session_history("default".to_string(), messages);
@@ -1215,6 +1220,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
             crate::Message {
                 role: "assistant".to_string(),
@@ -1223,6 +1229,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
+                created_at_ms: None,
             },
         ];
         app.render_session_history("default".to_string(), messages);

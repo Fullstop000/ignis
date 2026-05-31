@@ -64,6 +64,7 @@ impl LlmProvider for Ollama {
             name: None,
             tool_call_id: None,
             tool_calls: None,
+            created_at_ms: None,
         }];
         ollama_messages.extend_from_slice(messages);
 
