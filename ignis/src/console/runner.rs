@@ -5,9 +5,11 @@
 use crossterm::{
     event::{self, Event},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
-use ratatui::{backend::CrosstermBackend, Terminal, TerminalOptions, Viewport};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -20,16 +22,12 @@ use crate::console::render::{self, draw};
 use crate::session::SessionManager;
 use crate::{AgentEvent, Message, Session};
 
-/// Create an inline-viewport terminal over stdout. Recreated when the live band
-/// needs to grow/shrink (the inline height is fixed per `Terminal`).
-fn make_inline_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+/// Create a fullscreen (alternate-screen) terminal over stdout. ratatui's
+/// default Viewport::Fullscreen owns the whole frame and reflows on resize
+/// automatically — no per-band height bookkeeping, no rebuild loop.
+fn make_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     let backend = CrosstermBackend::new(io::stdout());
-    Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(height.max(2)),
-        },
-    )
+    Terminal::new(backend)
 }
 #[allow(clippy::too_many_arguments)]
 pub async fn run_console(
@@ -58,22 +56,17 @@ pub async fn run_console(
     app.set_model_options(config.model_options(&catalog), config.active_effort());
     tokio::spawn(crate::llm::catalog::refresh_if_stale());
 
-    // Render inline in the normal buffer (no alternate screen, no mouse capture):
-    // finished transcript blocks are pushed into the terminal's real scrollback
-    // via `insert_before`, so tmux/native scroll can page through history. Only a
-    // small live band (input + status + footer) is repainted.
+    // Render fullscreen in the alternate-screen buffer: the whole terminal is
+    // ours, native scrollback is preserved across the session, and quit/exit
+    // restores whatever was on the user's terminal before launch. Transcript
+    // history lives in `app.transcript` and scrolls in-app.
     enable_raw_mode()?;
-    let term_rows = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
-    let mut cur_vh = render::live_height(&app, term_rows);
-    let mut terminal = make_inline_terminal(cur_vh)?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    let mut terminal = make_terminal()?;
 
-    // Welcome banner: committed once to scrollback.
-    {
-        let w = terminal.size()?.width;
-        let lines = render::welcome_lines(&app);
-        let h = render::block_height(&lines, w).max(1);
-        terminal.insert_before(h, |buf| render::render_block_into(buf, &lines))?;
-    }
+    // Welcome banner: first lines of the in-app transcript. Scrolls with the
+    // conversation rather than being pinned chrome.
+    app.commit_transcript_lines(render::welcome_lines(&app));
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
@@ -83,6 +76,10 @@ pub async fn run_console(
     // (one open at a time); the buffer just decouples send from console drain.
     let (picker_tx, mut picker_rx) = mpsc::channel::<crate::console::picker::PickerRequest>(4);
     let picker_tx_runner = picker_tx.clone();
+    // Picker reply confirmation channel: handlers that run in `tokio::spawn`
+    // (telemetry, AFK) can't reach `app.add_assistant_notice` directly, so
+    // they send the confirm string here and the main loop drains it.
+    let (notice_tx, mut notice_rx) = mpsc::channel::<String>(8);
     let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
     let active_inject_runner = active_inject.clone();
     let session_manager = SessionManager::new(storage_dir.clone());
@@ -294,6 +291,10 @@ pub async fn run_console(
         while let Ok(ev) = agent_rx.try_recv() {
             app.handle_event(ev);
         }
+        // Drain picker-spawn notices into the transcript.
+        while let Ok(msg) = notice_rx.try_recv() {
+            app.add_assistant_notice(msg);
+        }
         // Poll the auto-update-check oneshot. Resolves once (Ok or Closed),
         // after which we drop the receiver so the branch goes dormant.
         if let Some(rx) = &mut update_check_rx {
@@ -343,6 +344,7 @@ pub async fn run_console(
                     &session_manager,
                     &ui_storage_dir,
                     &picker_tx,
+                    &notice_tx,
                 )
                 .await;
             }
@@ -352,27 +354,13 @@ pub async fn run_console(
             break;
         }
 
-        // The inline viewport height is fixed per terminal, so recreate it when
-        // the live band needs to grow/shrink (pickers, slash menu, taller input).
-        let term_rows = terminal.size()?.height;
-        let want_vh = render::live_height(&app, term_rows);
-        if want_vh != cur_vh {
-            // Clear the current live band first: this erases its rows and parks
-            // the cursor at the band's top, so the rebuilt viewport re-anchors
-            // there instead of leaving stale rows or pushing live UI into
-            // scrollback.
-            terminal.clear()?;
-            terminal = make_inline_terminal(want_vh)?;
-            cur_vh = want_vh;
-        }
-
-        // Flush newly-finalized leading blocks into the terminal scrollback.
+        // Fullscreen viewport reflows on resize automatically — no rebuild loop.
+        // Append newly-finalized blocks to the in-app transcript buffer.
         let width = terminal.size()?.width;
         while app.committed < app.blocks.len() && app.block_done(app.committed) {
             let lines = render::block_lines(&app.blocks[app.committed], app.tick, &app.cwd, width);
             if !lines.is_empty() {
-                let h = render::block_height(&lines, width).max(1);
-                terminal.insert_before(h, |buf| render::render_block_into(buf, &lines))?;
+                app.commit_transcript_lines(lines);
             }
             app.committed += 1;
         }
@@ -390,9 +378,9 @@ pub async fn run_console(
         }
     }
 
+    // Restore the user's original terminal buffer.
     disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-    // Drop below the live band so the shell prompt starts on a fresh line.
-    execute!(terminal.backend_mut(), crossterm::style::Print("\n"))?;
     Ok(())
 }

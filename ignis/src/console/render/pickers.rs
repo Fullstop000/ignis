@@ -11,9 +11,13 @@ use crate::console::{
     format_context, truncate, ACCENT, BG, GREEN, MAUVE, RED, SUBTEXT, TEXT, TEXT_DIM,
 };
 
-use super::widgets::slash_window_start;
+use super::widgets::{picker_window, slash_window_start};
 
-pub(crate) fn render_session_picker(lines: &mut Vec<Line<'static>>, picker: &SessionPicker) {
+pub(crate) fn render_session_picker(
+    lines: &mut Vec<Line<'static>>,
+    picker: &SessionPicker,
+    max_rows: usize,
+) {
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled("  ◆ ", Style::default().fg(MAUVE)),
@@ -31,8 +35,17 @@ pub(crate) fn render_session_picker(lines: &mut Vec<Line<'static>>, picker: &Ses
         return;
     }
 
-    for (idx, session) in picker.sessions.iter().enumerate() {
-        let selected = idx == picker.selected;
+    let visible = max_rows.max(1);
+    let (start, end) = picker_window(picker.selected, visible, picker.sessions.len());
+    if start > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↑ {} more above", start),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
+    for (idx, session) in picker.sessions[start..end].iter().enumerate() {
+        let abs_idx = start + idx;
+        let selected = abs_idx == picker.selected;
         let marker = if selected { ">" } else { " " };
         let preview = if session.preview.is_empty() {
             "(no preview)".to_string()
@@ -60,6 +73,13 @@ pub(crate) fn render_session_picker(lines: &mut Vec<Line<'static>>, picker: &Ses
                 style,
             ),
         ]));
+    }
+    let below = picker.sessions.len().saturating_sub(end);
+    if below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↓ {} more below", below),
+            Style::default().fg(TEXT_DIM),
+        )));
     }
 
     lines.push(Line::from(Span::styled(
@@ -189,6 +209,7 @@ pub(crate) fn render_model_picker(
     lines: &mut Vec<Line<'static>>,
     picker: &ModelPicker,
     options: &[crate::llm::ModelOption],
+    max_rows: usize,
 ) {
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -228,8 +249,17 @@ pub(crate) fn render_model_picker(
         lines.push(Line::from(spans));
     }
 
-    for (idx, opt) in options.iter().enumerate() {
-        let selected = idx == picker.selected;
+    let visible = max_rows.max(1);
+    let (start, end) = picker_window(sel, visible, options.len());
+    if start > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↑ {} more above", start),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
+    for (idx, opt) in options[start..end].iter().enumerate() {
+        let abs_idx = start + idx;
+        let selected = abs_idx == picker.selected;
         let marker = if selected { ">" } else { " " };
         let style = if selected {
             Style::default().fg(BG).bg(ACCENT)
@@ -257,6 +287,13 @@ pub(crate) fn render_model_picker(
             ));
         }
         lines.push(Line::from(spans));
+    }
+    let below = options.len().saturating_sub(end);
+    if below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↓ {} more below", below),
+            Style::default().fg(TEXT_DIM),
+        )));
     }
 
     lines.push(Line::from(Span::styled(

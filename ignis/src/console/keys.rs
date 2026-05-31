@@ -126,6 +126,7 @@ pub(crate) async fn handle_key(
     session_manager: &SessionManager,
     storage_dir: &std::path::Path,
     picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
+    notice_tx: &mpsc::Sender<String>,
 ) {
     // Inline (tool-initiated) picker captures ALL keys while open, including
     // ESC and Ctrl+C — must come before global handlers and the busy-mode
@@ -472,9 +473,9 @@ pub(crate) async fn handle_key(
                 } else if command == "/mcp" && arg_count == 1 {
                     app.show_mcp_picker();
                 } else if command == "/afk" && arg_count == 1 {
-                    handle_afk_toggle(app, picker_tx).await;
+                    handle_afk_toggle(app, picker_tx, notice_tx).await;
                 } else if command == "/telemetry" && arg_count == 1 {
-                    handle_telemetry_picker(app, picker_tx).await;
+                    handle_telemetry_picker(app, picker_tx, notice_tx).await;
                 } else if command == "/sessions" && arg_count == 1 {
                     app.show_sessions_stats();
                 } else if command.starts_with('/')
@@ -592,6 +593,12 @@ pub(crate) async fn handle_key(
             app.clear_exit_hint();
             app.move_right();
         }
+        (m, KeyCode::Home) if m.contains(KeyModifiers::CONTROL) => {
+            app.scroll_transcript_to_top();
+        }
+        (m, KeyCode::End) if m.contains(KeyModifiers::CONTROL) => {
+            app.scroll_transcript_to_bottom();
+        }
         (_, KeyCode::Home) => {
             app.clear_exit_hint();
             app.cursor = 0;
@@ -599,6 +606,17 @@ pub(crate) async fn handle_key(
         (_, KeyCode::End) => {
             app.clear_exit_hint();
             app.cursor = app.input.len();
+        }
+        // Scroll the transcript when the input is empty so PgUp/PgDn don't
+        // collide with multi-line editing. 10 lines per press matches CC.
+        (_, KeyCode::PageUp) if app.input.is_empty() => {
+            app.scroll_transcript_up(10);
+        }
+        (_, KeyCode::PageDown) if app.input.is_empty() => {
+            // Approximate visible rows; render_transcript clamps the result.
+            // 10 lines per press matches CC; the renderer auto-snaps to
+            // bottom + re-enables follow when we land at the natural end.
+            app.scroll_transcript_down(10, 10);
         }
         _ => {}
     }
@@ -610,6 +628,7 @@ pub(crate) async fn handle_key(
 async fn handle_telemetry_picker(
     app: &mut App,
     picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
+    notice_tx: &mpsc::Sender<String>,
 ) {
     use crate::console::picker::{
         PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse,
@@ -659,11 +678,15 @@ async fn handle_telemetry_picker(
     }
 
     // Spawn so the key handler returns immediately; persist on reply.
+    let notice_tx_clone = notice_tx.clone();
     tokio::spawn(async move {
         if let Ok(PickerResponse::Answered(answers)) = reply_rx.await {
             if let Some(PickerAnswer::Single(label)) = answers.first() {
                 let enable = label == "On";
                 persist_telemetry_setting(enable);
+                let _ = notice_tx_clone
+                    .send(format!("Telemetry → {}.", if enable { "On" } else { "Off" }))
+                    .await;
             }
         }
     });
@@ -709,6 +732,7 @@ fn persist_telemetry_setting(enable: bool) {
 async fn handle_afk_toggle(
     app: &mut App,
     picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
+    notice_tx: &mpsc::Sender<String>,
 ) {
     use crate::console::picker::{
         PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse,
@@ -775,6 +799,7 @@ async fn handle_afk_toggle(
     }
     // Spawn so the key handler returns immediately; set the chosen mode on reply.
     let perms_for_reply = perms.clone();
+    let notice_tx_clone = notice_tx.clone();
     tokio::spawn(async move {
         if let Ok(PickerResponse::Answered(answers)) = reply_rx.await {
             if let Some(PickerAnswer::Single(label)) = answers.first() {
@@ -786,6 +811,12 @@ async fn handle_afk_toggle(
                 if let Some(mode) = chosen {
                     perms_for_reply.set_mode(mode);
                     let _ = crate::state::persist_permission_mode(Some(mode.as_str()));
+                    let notice = match mode {
+                        Mode::FullyUnattended => "AFK → Fully unattended.",
+                        Mode::HandsFree => "AFK → Hands-free.",
+                        Mode::Off => "AFK disabled.",
+                    };
+                    let _ = notice_tx_clone.send(notice.to_string()).await;
                 }
             }
         }

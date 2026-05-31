@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- TUI runs fullscreen in the alternate-screen buffer; the input band is permanently pinned at the bottom and transcript history lives in an in-app scrollable buffer (`PgUp`/`PgDn`, `Ctrl+Home`/`Ctrl+End`, auto-follow when at the bottom). ([#64](https://github.com/Fullstop000/ignis/issues/64), [#77](https://github.com/Fullstop000/ignis/issues/77))
+
+### Fixed
+- `/sessions`, `/model`, and `ask_user` pickers now window the option list around the selection so long lists don't scroll the highlight off-screen; `↑N more` / `↓N more` markers appear at the window edges. ([#62](https://github.com/Fullstop000/ignis/issues/62), [#71](https://github.com/Fullstop000/ignis/issues/71))
+- `/telemetry` and `/afk` pickers now print a confirmation notice after selection — silent persistence was the spawn-detached reply handler not being able to reach `add_assistant_notice`. ([#69](https://github.com/Fullstop000/ignis/issues/69))
+
 ## [0.32.0] - 2026-05-31
 
 ### Changed
