@@ -115,11 +115,32 @@ git diff origin/master...HEAD | \
 ```
 Any hit → stop, remove it, re-scan. Never push a secret.
 
-### 5. Open PR
+### 5. Open PR (+ screenshots if dogfood produced any)
 ```bash
 git push -u origin HEAD
 gh pr create --base master --title "<concise>" --body "<concise summary + checklist>"
 ```
+
+**If step 3's dogfood produced PNG screenshots showing the feature working** — banners, pickers, footer segments, the resumed conversation view, before/after of a visual change — post them in a PR comment right after `gh pr create`. Reviewers shouldn't have to take "it looks correct" on faith.
+
+Recommended mechanism — public gist (no repo bloat, no commit to the feature branch):
+```bash
+URL=$(gh gist create /tmp/<shot1>.png /tmp/<shot2>.png --public -d "PR #<num> screenshots" | tail -1)
+# Visit $URL to grab the per-file raw URLs (gh gist view <id> --files lists them),
+# then post a comment referencing each shot:
+
+gh pr comment <num> --body "$(cat <<'EOF'
+## Screenshots from dogfood
+
+| Path | Result |
+|---|---|
+| <step-1 label> | ![](<raw-url-1>) |
+| <step-2 label> | ![](<raw-url-2>) |
+EOF
+)"
+```
+
+Pick the **production-ready** shots — the final ones that show the integrated feature, not intermediate debug captures from the dogfood iteration. One shot per user-visible path is enough; resist the urge to dump every PNG. Skip this step entirely when the change is non-visual (CLI flag, internal refactor, doc-only PR).
 
 ### 6. Review (ask the human which reviewer)
 Get a code review of the PR diff before chasing CI. **Ask the human which reviewer
@@ -226,6 +247,7 @@ Report the release URL.
 | Bump silently because "this commit looks like a feat:" | Conventional commits suggest the bump *version*, not the bump *decision* — the user owns the decision |
 | Direct-push CHANGELOG or version edits to master | Everything rides on the feature PR |
 | Auto-merge when CI turns green | Always wait for explicit approval |
+| Dogfood made screenshots that never make it to the PR | After `gh pr create`, post the final dogfood shots as a PR comment so reviewers can see what landed |
 | Tag ≠ `ignis/Cargo.toml` version | Tag is exactly `v<Cargo.toml version>` |
 | Skip `cargo build` after editing `Cargo.toml` | Stale `Cargo.lock` fails the `--locked` release build |
 | Secret-scan false alarm on placeholders | The regex targets real key shapes; `sk-your-…` placeholders are short and won't match |
