@@ -115,11 +115,38 @@ git diff origin/master...HEAD | \
 ```
 Any hit → stop, remove it, re-scan. Never push a secret.
 
-### 5. Open PR
+### 5. Open PR (+ screenshots if dogfood produced any)
 ```bash
 git push -u origin HEAD
 gh pr create --base master --title "<concise>" --body "<concise summary + checklist>"
 ```
+
+**If step 3's dogfood produced PNG screenshots showing the feature working** — banners, pickers, footer segments, the resumed conversation view, before/after of a visual change — post them in a PR comment right after `gh pr create`. Reviewers shouldn't have to take "it looks correct" on faith.
+
+Mechanism — commit the shots into the feature branch under `.github/screenshots/pr-<num>/` and reference them by **commit-SHA** raw URL. (`gh gist create` and `gh api` both refuse binary uploads, so the branch is the most reliable host. SHA URLs survive both the branch deletion at merge time and the eventual master path — they keep working forever as long as GitHub keeps the commit object reachable, which is effectively forever.)
+
+```bash
+mkdir -p .github/screenshots/pr-<num>
+cp /tmp/<shot1>.png /tmp/<shot2>.png .github/screenshots/pr-<num>/
+git add .github/screenshots/pr-<num>/
+git commit -m "docs(pr-<num>): dogfood screenshots"
+git push
+
+SHA=$(git rev-parse HEAD)
+BASE="https://raw.githubusercontent.com/Fullstop000/ignis/${SHA}/.github/screenshots/pr-<num>"
+
+gh pr comment <num> --body "$(cat <<EOF
+## Screenshots from dogfood
+
+| Path | Result |
+|---|---|
+| <step-1 label> | ![](${BASE}/<shot1>.png) |
+| <step-2 label> | ![](${BASE}/<shot2>.png) |
+EOF
+)"
+```
+
+Pick the **production-ready** shots — the final ones that show the integrated feature, not intermediate debug captures from the dogfood iteration. One shot per user-visible path is enough; resist dumping every PNG (the squash-merge carries them into master forever). Skip this step entirely when the change is non-visual (CLI flag, internal refactor, doc-only PR).
 
 ### 6. Review (ask the human which reviewer)
 Get a code review of the PR diff before chasing CI. **Ask the human which reviewer
@@ -226,6 +253,7 @@ Report the release URL.
 | Bump silently because "this commit looks like a feat:" | Conventional commits suggest the bump *version*, not the bump *decision* — the user owns the decision |
 | Direct-push CHANGELOG or version edits to master | Everything rides on the feature PR |
 | Auto-merge when CI turns green | Always wait for explicit approval |
+| Dogfood made screenshots that never make it to the PR | After `gh pr create`, post the final dogfood shots as a PR comment so reviewers can see what landed |
 | Tag ≠ `ignis/Cargo.toml` version | Tag is exactly `v<Cargo.toml version>` |
 | Skip `cargo build` after editing `Cargo.toml` | Stale `Cargo.lock` fails the `--locked` release build |
 | Secret-scan false alarm on placeholders | The regex targets real key shapes; `sk-your-…` placeholders are short and won't match |
