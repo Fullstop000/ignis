@@ -725,7 +725,12 @@ impl Agent {
                             message: msg.clone(),
                         })
                         .await;
-                } else if has_tools || has_reasoning {
+                } else if has_tools {
+                    // No streamed content but the turn produced tool calls
+                    // — synthesize a Start/End pair so the UI's bookkeeping
+                    // matches the persisted message. (`has_reasoning` can't
+                    // reach here: any reasoning chunk would have flipped
+                    // `reasoning_streaming` above.)
                     let _ = tx
                         .send(AgentEvent::MessageStart {
                             message: msg.clone(),

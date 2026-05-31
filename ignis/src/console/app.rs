@@ -627,9 +627,13 @@ impl App {
             }
             AgentEvent::TurnStart => {}
             AgentEvent::MessageStart { message } => {
-                // The agent loop signals "reasoning block" by sending a
-                // MessageStart with `reasoning_content: Some` and `content:
-                // None`. Anything else opens a regular Assistant block.
+                // Contract with the agent loop: `reasoning_content: Some +
+                // content: None` opens a Reasoning block; anything else
+                // (including the degenerate `None`/`None` and `Some`/`Some`
+                // shapes) falls back to a regular Assistant block. Picking a
+                // default rather than rejecting unknown shapes lets future
+                // protocol additions degrade gracefully into the assistant
+                // lane instead of crashing.
                 let is_reasoning = message.reasoning_content.is_some() && message.content.is_none();
                 self.blocks.push(if is_reasoning {
                     UIBlock::Reasoning(String::new())
@@ -646,7 +650,16 @@ impl App {
                         | Some(UIBlock::Reasoning(ref mut s)) => {
                             s.push_str(&delta);
                         }
-                        _ => {}
+                        // current_chunk_idx is set only by MessageStart,
+                        // which always pushes Assistant or Reasoning — so a
+                        // Tool or User block here means the agent loop
+                        // forgot to close the message block before pushing
+                        // something else. Log rather than silently swallow.
+                        _ => log::debug!(
+                            "MessageUpdate dropped: current_chunk_idx={i} doesn't point at \
+                             an Assistant/Reasoning block (delta len={})",
+                            delta.len()
+                        ),
                     }
                 }
             }
@@ -1195,8 +1208,18 @@ impl App {
                 }
                 "assistant" => {
                     // Push reasoning first, then the reply — matches the
-                    // streaming order so resumed scrollback looks identical
-                    // to the live turn. Either may be missing or empty.
+                    // typical streaming order (reasoning chunks fully arrive
+                    // before any text). Either may be missing or empty.
+                    //
+                    // Caveat for interleaved-thinking streams (Anthropic
+                    // protocol via `interleaved-thinking-2025-05-14`): a
+                    // live turn may render as reasoning₁ → text → reasoning₂
+                    // as separate blocks, but the persisted Message
+                    // collapses to one (content, reasoning_content) pair, so
+                    // the resumed view shows one Reasoning + one Assistant.
+                    // Deliberate trade-off — per-block storage records would
+                    // cost every turn for an edge case OpenAI-compatible
+                    // providers don't hit today.
                     if let Some(reasoning) = message.reasoning_content.filter(|r| !r.is_empty()) {
                         self.blocks.push(UIBlock::Reasoning(reasoning));
                     }
