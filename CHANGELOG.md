@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `~/.ignis/config.toml` is now chmod-ed to `0600` on Unix (write + one-time load-time migration) so other local UIDs can't read the API keys it carries. ([#74](https://github.com/Fullstop000/ignis/issues/74))
+
 ### Fixed
 - TUI `edit_file`/`create_file` headers now show only the `file_path` instead of dumping `old_string`/`new_string`/`content` into the header. ([#76](https://github.com/Fullstop000/ignis/issues/76))
 
