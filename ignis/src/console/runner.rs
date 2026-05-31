@@ -124,9 +124,12 @@ pub async fn run_console(
                     // /connect just wrote a fresh `[providers.X] api_key = …`
                     // to disk; re-read it so the next prompt resolves with the
                     // new key. A read failure leaves the in-memory config as
-                    // it was (best-effort); the user can /connect again.
-                    if let Ok(reloaded) = crate::config::load_config() {
-                        agent_config = reloaded;
+                    // it was — but log loudly: the user will hit a stale-config
+                    // error on their next prompt and the log is the only
+                    // breadcrumb explaining why.
+                    match crate::config::load_config() {
+                        Ok(reloaded) => agent_config = reloaded,
+                        Err(e) => log::error!("ReloadConfig: failed to re-read config.toml: {e}"),
                     }
                     continue;
                 }

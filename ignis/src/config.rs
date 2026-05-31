@@ -402,8 +402,19 @@ pub fn write_provider_key(provider_id: &str, api_key: &str) -> Result<PathBuf, a
         .ok_or_else(|| anyhow!("`providers.{provider_id}` is not a table"))?;
     entry["api_key"] = toml_edit::value(api_key);
 
-    std::fs::write(&path, doc.to_string())
-        .map_err(|e| anyhow!("Failed to write {}: {}", path.display(), e))?;
+    // Atomic write: a crash mid-write on `config.toml` would leave a truncated
+    // file and the next launch can't recover (a parse failure halts startup).
+    // Write to a sibling tmpfile on the same filesystem, then rename — rename
+    // is atomic on POSIX, so either the old or new content is observable, never
+    // a partial.
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("Config path has no parent directory: {}", path.display()))?;
+    let tmp = dir.join(format!(".config.toml.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, doc.to_string())
+        .map_err(|e| anyhow!("Failed to write {}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| anyhow!("Failed to atomically replace {}: {}", path.display(), e))?;
     Ok(path)
 }
 

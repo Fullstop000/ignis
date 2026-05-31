@@ -184,7 +184,7 @@ pub(crate) enum ConnectStep {
     PickModel,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ConnectDraft {
     pub(crate) step: ConnectStep,
     /// Provider id (the `SPECS` key, e.g. "openai"). Set after step 1.
@@ -197,6 +197,21 @@ pub(crate) struct ConnectDraft {
     pub(crate) api_key: Option<String>,
     /// Selected model name (e.g. "gpt-5.5"). Set after step 3.
     pub(crate) model: Option<String>,
+}
+
+// Manual `Debug` that redacts `api_key` — a derived impl would print the
+// plaintext key the moment something `dbg!(&draft)`s or a tracing span captures
+// `App` state. Keep the redaction; never derive Debug on this struct.
+impl std::fmt::Debug for ConnectDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectDraft")
+            .field("step", &self.step)
+            .field("provider_id", &self.provider_id)
+            .field("provider_display", &self.provider_display)
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .field("model", &self.model)
+            .finish()
+    }
 }
 
 /// What `advance_connect` tells the caller (`keys.rs`) to do next.
@@ -1568,6 +1583,26 @@ mod connect_tests {
         let draft = app.connect_draft.as_ref().unwrap();
         assert_eq!(draft.step, ConnectStep::PickModel);
         assert_eq!(draft.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn connect_draft_debug_redacts_api_key() {
+        // The api_key must never appear in `Debug` output — `dbg!` or a
+        // tracing span capturing `App` state would otherwise leak it.
+        let mut app = fresh_app();
+        let _ = app.start_connect().unwrap();
+        let _ = app.advance_connect(vec![PickerAnswer::Single("DeepSeek".into())]);
+        let _ = app.advance_connect(vec![PickerAnswer::Single("sk-supersecret".into())]);
+        let draft = app.connect_draft.as_ref().unwrap();
+        let dbg = format!("{:?}", draft);
+        assert!(
+            !dbg.contains("sk-supersecret"),
+            "Debug leaked api_key: {dbg}"
+        );
+        assert!(
+            dbg.contains("***"),
+            "Debug must show a redaction marker: {dbg}"
+        );
     }
 
     #[test]

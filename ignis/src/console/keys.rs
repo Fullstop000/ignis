@@ -166,8 +166,12 @@ pub(crate) async fn handle_key(
                             // The agent loop's in-memory config is stale —
                             // it doesn't know about the api_key we just
                             // wrote. Reload from disk so the next prompt
-                            // resolves with the new credentials.
-                            let _ = prompt_tx.try_send(AgentRequest::ReloadConfig);
+                            // resolves with the new credentials. `send` over
+                            // `try_send`: a full prompt queue should backpressure
+                            // here, not silently drop the reload (the user would
+                            // see a misleading "✓ Connected" followed by a
+                            // stale-config error on their next prompt).
+                            let _ = prompt_tx.send(AgentRequest::ReloadConfig).await;
                         }
                         ConnectAdvance::Failed => {}
                     }
