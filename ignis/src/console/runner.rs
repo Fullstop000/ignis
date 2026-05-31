@@ -120,6 +120,16 @@ pub async fn run_console(
                     agent_config.reasoning_effort = effort;
                     continue;
                 }
+                AgentRequest::ReloadConfig => {
+                    // /connect just wrote a fresh `[providers.X] api_key = …`
+                    // to disk; re-read it so the next prompt resolves with the
+                    // new key. A read failure leaves the in-memory config as
+                    // it was (best-effort); the user can /connect again.
+                    if let Ok(reloaded) = crate::config::load_config() {
+                        agent_config = reloaded;
+                    }
+                    continue;
+                }
             };
             let provider = match crate::config::build_provider(&agent_config) {
                 Ok(p) => p,

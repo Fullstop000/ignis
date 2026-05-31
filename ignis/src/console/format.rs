@@ -23,6 +23,10 @@ pub(crate) enum AgentRequest {
         model: String,
         effort: Option<String>,
     },
+    /// Re-read `~/.ignis/config.toml` and replace the agent loop's in-memory
+    /// `Config`. Used after `/connect` writes a fresh provider so the next
+    /// prompt picks up the new `api_key` without a restart.
+    ReloadConfig,
 }
 
 pub(crate) fn format_duration(ms: u128) -> String {
