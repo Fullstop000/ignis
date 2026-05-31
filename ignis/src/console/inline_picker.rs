@@ -272,9 +272,24 @@ impl InlinePickerState {
 
 // ---------- renderer ----------
 
-/// Blank + header strip + question. Used by both layouts (single-column and
-/// split-with-preview) so they share an identical top section.
-pub(crate) fn header_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
+/// Horizontal separator that spans the full render width. Used above the
+/// picker (to break it off from committed scrollback) and between the regular
+/// options and the Other row. Caller passes the area width so the divider
+/// resizes with the terminal — a fixed length would wrap on narrow terminals
+/// and leave a stub on wide ones.
+fn divider_line(width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width as usize),
+        Style::default().fg(BORDER_DIM),
+    ))
+}
+
+/// Divider + blank + header strip + question. Used by both layouts (single-
+/// column and split-with-preview) so they share an identical top section. The
+/// leading divider is what visually breaks the picker off from the previous
+/// scrollback line — without it the `◆ Question` row sits flush against
+/// whatever rendered last.
+pub(crate) fn header_lines(state: &InlinePickerState, width: u16) -> Vec<Line<'static>> {
     let q = state.current_question();
     let progress = if state.total() > 1 {
         format!(" · {}/{}", state.current_index() + 1, state.total())
@@ -282,6 +297,7 @@ pub(crate) fn header_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
         String::new()
     };
     vec![
+        divider_line(width),
         Line::from(""),
         Line::from(vec![
             Span::styled("◆ ", Style::default().fg(MAUVE)),
@@ -344,9 +360,13 @@ fn text_input_row(state: &InlinePickerState) -> Line<'static> {
 }
 
 /// Lines for the picker band (used by render::draw when inline_picker is open).
-pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &InlinePickerState) {
+pub(crate) fn render_inline_picker(
+    lines: &mut Vec<Line<'static>>,
+    state: &InlinePickerState,
+    width: u16,
+) {
     let q = state.current_question();
-    lines.extend(header_lines(state));
+    lines.extend(header_lines(state, width));
 
     // Text-input mode short-circuits: no options, just the input row + footer.
     if state.is_text_input() {
@@ -417,10 +437,7 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
 
     // Horizontal separator between the regular options and the "Other" row,
     // matching the CC pattern (image 2).
-    lines.push(Line::from(Span::styled(
-        "─".repeat(42),
-        Style::default().fg(BORDER_DIM),
-    )));
+    lines.push(divider_line(width));
 
     // Other row — always single-line, no description.
     let other_selected = cursor == opts_n;
@@ -441,15 +458,14 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
         other_spans.push(Span::styled(cb, Style::default().fg(TEXT_DIM)));
     }
     if other_selected {
-        // Focused Other shows label + live buffer + blinking caret.
-        other_spans.push(Span::styled(
-            OTHER_LABEL,
-            Style::default()
-                .fg(other_color)
-                .add_modifier(Modifier::ITALIC),
-        ));
-        if !other_buf.is_empty() {
-            other_spans.push(Span::styled("  ", Style::default()));
+        // Focused Other: dim placeholder when empty, typed buffer once the
+        // user starts typing — never both at once. Caret always trails.
+        if other_buf.is_empty() {
+            other_spans.push(Span::styled(
+                OTHER_LABEL,
+                Style::default().fg(TEXT_DIM).add_modifier(Modifier::ITALIC),
+            ));
+        } else {
             other_spans.push(Span::styled(
                 other_buf.to_string(),
                 Style::default().fg(TEXT),
@@ -484,7 +500,7 @@ pub(crate) fn render_inline_picker(lines: &mut Vec<Line<'static>>, state: &Inlin
 /// Left-pane lines for the SPLIT layout (when at least one option has a
 /// `preview`). Descriptions move to the right pane to keep the option list
 /// compact — the focused option's full detail shows there.
-pub(crate) fn options_pane_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
+pub(crate) fn options_pane_lines(state: &InlinePickerState, width: u16) -> Vec<Line<'static>> {
     let q = state.current_question();
     let mut out: Vec<Line<'static>> = Vec::new();
     let opts_n = q.options.len();
@@ -522,10 +538,7 @@ pub(crate) fn options_pane_lines(state: &InlinePickerState) -> Vec<Line<'static>
         out.push(Line::from(spans));
     }
     // Separator + Other row (single-line, no description in split mode either).
-    out.push(Line::from(Span::styled(
-        "─".repeat(30),
-        Style::default().fg(BORDER_DIM),
-    )));
+    out.push(divider_line(width));
     let other_selected = cursor == opts_n;
     let other_cursor = if other_selected { "> " } else { "  " };
     let other_number = format!("{:>w$}. ", opts_n + 1, w = max_number_width);
@@ -544,14 +557,14 @@ pub(crate) fn options_pane_lines(state: &InlinePickerState) -> Vec<Line<'static>
         other_spans.push(Span::styled(cb, Style::default().fg(TEXT_DIM)));
     }
     if other_selected {
-        other_spans.push(Span::styled(
-            OTHER_LABEL,
-            Style::default()
-                .fg(other_color)
-                .add_modifier(Modifier::ITALIC),
-        ));
-        if !other_buf.is_empty() {
-            other_spans.push(Span::styled("  ", Style::default()));
+        // Focused Other: dim placeholder when empty, typed buffer once the
+        // user starts typing — never both at once. Caret always trails.
+        if other_buf.is_empty() {
+            other_spans.push(Span::styled(
+                OTHER_LABEL,
+                Style::default().fg(TEXT_DIM).add_modifier(Modifier::ITALIC),
+            ));
+        } else {
             other_spans.push(Span::styled(
                 other_buf.to_string(),
                 Style::default().fg(TEXT),
@@ -659,7 +672,7 @@ fn recommended_badge() -> Vec<Span<'static>> {
 /// `render::live_height` so the inline viewport recreates at the right size.
 pub(crate) fn picker_height(state: &InlinePickerState) -> u16 {
     let q = state.current_question();
-    let header_rows: u16 = 3; // blank + header + question
+    let header_rows: u16 = 4; // divider + blank + header + question
     let footer_rows: u16 = 2; // blank + footer
     if state.is_text_input() {
         // Header + one input row + footer. No options, no separator.
@@ -1063,6 +1076,66 @@ mod tests {
         assert_eq!(
             super::split_recommended("plain"),
             ("plain".to_string(), false)
+        );
+    }
+
+    /// Concatenate the literal text of a `Line`'s spans (drops styling) for
+    /// content assertions in render-shape tests.
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn picker_header_starts_with_full_width_divider() {
+        let (s, _rx) = make_request(vec![q("Q?", "h", false, &["a", "b"])]);
+        let width: u16 = 80;
+        let lines = super::header_lines(&s, width);
+        assert_eq!(line_text(&lines[0]), "─".repeat(width as usize));
+        // A second render at a different width must follow the new width —
+        // i.e. the divider resizes with the terminal.
+        let narrow = super::header_lines(&s, 30);
+        assert_eq!(line_text(&narrow[0]), "─".repeat(30));
+    }
+
+    #[test]
+    fn focused_other_shows_placeholder_when_buffer_empty() {
+        let (mut s, _rx) = make_request(vec![q("Q?", "h", false, &["a", "b"])]);
+        // Move cursor to Other (last row).
+        let _ = s.on_key(key(KeyCode::Down));
+        let _ = s.on_key(key(KeyCode::Down));
+        assert!(s.other_focused());
+        assert!(s.other_buf().is_empty());
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        super::render_inline_picker(&mut lines, &s, 80);
+        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains(super::OTHER_LABEL),
+            "placeholder must show while Other is focused with an empty buffer"
+        );
+    }
+
+    #[test]
+    fn focused_other_replaces_placeholder_when_typing() {
+        let (mut s, _rx) = make_request(vec![q("Q?", "h", false, &["a", "b"])]);
+        let _ = s.on_key(key(KeyCode::Down));
+        let _ = s.on_key(key(KeyCode::Down));
+        for c in "hello".chars() {
+            let _ = s.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(s.other_buf(), "hello");
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        super::render_inline_picker(&mut lines, &s, 80);
+        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("hello"),
+            "typed text must render on the Other row"
+        );
+        assert!(
+            !joined.contains(super::OTHER_LABEL),
+            "placeholder must disappear once the user types — found stale `{}` next to user input",
+            super::OTHER_LABEL,
         );
     }
 }

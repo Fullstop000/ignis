@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - TUI `edit_file`/`create_file` headers now show only the `file_path` instead of dumping `old_string`/`new_string`/`content` into the header. ([#76](https://github.com/Fullstop000/ignis/issues/76))
+- `ask_user` picker now sits behind a horizontal divider that spans the full terminal width, and the `Other` row's placeholder disappears once you start typing instead of rendering next to the user's text. ([#66](https://github.com/Fullstop000/ignis/issues/66))
 
 ### Security
 - `~/.ignis/config.toml` is now chmod-ed to `0600` on Unix (write + one-time load-time migration) so other local UIDs can't read the API keys it carries. ([#74](https://github.com/Fullstop000/ignis/issues/74))

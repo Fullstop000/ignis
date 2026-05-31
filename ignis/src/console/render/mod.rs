@@ -96,7 +96,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     {
         let mut lines: Vec<Line> = Vec::new();
         if let Some(picker) = &app.inline_picker {
-            super::inline_picker::render_inline_picker(&mut lines, picker);
+            super::inline_picker::render_inline_picker(&mut lines, picker, size.width);
         } else if let Some(picker) = &app.model_picker {
             render_model_picker(&mut lines, picker, &app.model_options);
         } else if let Some(picker) = &app.session_picker {
@@ -164,14 +164,14 @@ fn render_inline_picker_split(
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header section
+            Constraint::Length(4), // header section: divider + blank + title + question
             Constraint::Min(4),    // middle (split)
             Constraint::Length(2), // footer section
         ])
         .split(size);
 
     // Header section (full width)
-    let header_lines = super::inline_picker::header_lines(picker);
+    let header_lines = super::inline_picker::header_lines(picker, outer[0].width);
     f.render_widget(
         Paragraph::new(Text::from(header_lines))
             .style(Style::default().bg(BG))
@@ -185,7 +185,7 @@ fn render_inline_picker_split(
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(outer[1]);
 
-    let left_lines = super::inline_picker::options_pane_lines(picker);
+    let left_lines = super::inline_picker::options_pane_lines(picker, middle[0].width);
     f.render_widget(
         Paragraph::new(Text::from(left_lines))
             .style(Style::default().bg(BG))
