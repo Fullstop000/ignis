@@ -85,6 +85,257 @@ struct UsageFile {
     cache_write_tokens: u64,
 }
 
+/// One event inside a turn, in chronological order. LLM durations are
+/// approximate: assistant_ts − max(prior_user_ts, prior_tool_ts) — JSONL only
+/// records message-finalized timestamps, not stream start. Tool durations are
+/// exact: result_ts − assistant_with_tool_calls_ts.
+#[derive(Debug, Clone)]
+pub enum TurnEvent {
+    LlmCall {
+        approx_ms: u64,
+    },
+    ToolCall {
+        name: String,
+        duration_ms: u64,
+        success: bool,
+    },
+}
+
+/// One user prompt and everything that runs in response to it, until the next
+/// user prompt. `total_ms` is end-minus-start of the turn window; `events` are
+/// in the order they happened so a waterfall can render them.
+#[derive(Debug, Clone)]
+pub struct TurnSummary {
+    pub turn_idx: usize,
+    pub started_at_ms: u64,
+    pub total_ms: u64,
+    pub events: Vec<TurnEvent>,
+}
+
+impl TurnSummary {
+    pub fn llm_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|e| matches!(e, TurnEvent::LlmCall { .. }))
+            .count()
+    }
+    pub fn tool_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|e| matches!(e, TurnEvent::ToolCall { .. }))
+            .count()
+    }
+    pub fn any_tool_failed(&self) -> bool {
+        self.events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::ToolCall { success: false, .. }))
+    }
+}
+
+/// Full per-session detail for the `/sessions` Miller-column drill-in.
+/// Composes the existing `SessionRecord` aggregates with per-turn timing
+/// derived from the JSONL event stream.
+#[derive(Debug, Clone)]
+pub struct SessionDetail {
+    pub record: SessionRecord,
+    pub turns: Vec<TurnSummary>,
+}
+
+/// Parse JSONL into per-turn timing. A turn opens at each `role=user` message
+/// and closes at the next user message (or the last event). Tool durations are
+/// exact (result_ts − assistant_with_tool_calls_ts). LLM durations are
+/// approximate: assistant_ts − max(prior_user_ts, prior_tool_ts).
+pub fn extract_turns(jsonl: &str) -> Vec<TurnSummary> {
+    enum Event {
+        User {
+            ts: u64,
+        },
+        Assistant {
+            ts: u64,
+        },
+        Tool {
+            ts: u64,
+            call_id: String,
+            success: bool,
+        },
+    }
+
+    let mut events: Vec<Event> = Vec::new();
+    for line in jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let kind = record.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if kind != "message" {
+            continue;
+        }
+        let ts = record
+            .get("timestamp")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let payload = match record.get("payload") {
+            Some(p) => p,
+            None => continue,
+        };
+        let role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        match role {
+            "user" => events.push(Event::User { ts }),
+            "assistant" => {
+                events.push(Event::Assistant { ts });
+            }
+            "tool" => {
+                let call_id = payload
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let success = payload
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .and_then(|c| serde_json::from_str::<Value>(c).ok())
+                    .and_then(|p| p.get("is_error").and_then(|v| v.as_bool()))
+                    .map(|err| !err)
+                    .unwrap_or(true);
+                events.push(Event::Tool {
+                    ts,
+                    call_id,
+                    success,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Index assistant tool-call emissions by call_id so we can join tool results
+    // back to their originating call to compute exact durations.
+    let mut assistant_emit_ts: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    let mut assistant_emit_tool_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for line in jsonl.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if record.get("type").and_then(|v| v.as_str()) != Some("message") {
+            continue;
+        }
+        let ts = record
+            .get("timestamp")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let payload = match record.get("payload") {
+            Some(p) => p,
+            None => continue,
+        };
+        if payload.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(tcs) = payload.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in tcs {
+                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                    assistant_emit_ts.insert(id.to_string(), ts);
+                    if let Some(name) = tc
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                    {
+                        assistant_emit_tool_name.insert(id.to_string(), name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Split events into turn windows. Each window starts at a user message and
+    // ends just before the next one (or at the final event).
+    let user_indices: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| matches!(e, Event::User { .. }).then_some(i))
+        .collect();
+
+    let mut turns = Vec::new();
+    for (turn_idx, &start) in user_indices.iter().enumerate() {
+        let end = user_indices
+            .get(turn_idx + 1)
+            .copied()
+            .unwrap_or(events.len());
+        let started_at_ms = match &events[start] {
+            Event::User { ts } => *ts,
+            _ => 0,
+        };
+        let end_ms = if end == events.len() {
+            match events.last() {
+                Some(Event::User { ts })
+                | Some(Event::Assistant { ts, .. })
+                | Some(Event::Tool { ts, .. }) => *ts,
+                None => started_at_ms,
+            }
+        } else {
+            match &events[end] {
+                Event::User { ts } => *ts,
+                _ => started_at_ms,
+            }
+        };
+        let total_ms = end_ms.saturating_sub(started_at_ms);
+
+        let mut prior_ts = started_at_ms;
+        let mut turn_events: Vec<TurnEvent> = Vec::new();
+        for ev in &events[start + 1..end] {
+            match ev {
+                Event::Assistant { ts } => {
+                    turn_events.push(TurnEvent::LlmCall {
+                        approx_ms: ts.saturating_sub(prior_ts),
+                    });
+                    prior_ts = *ts;
+                }
+                Event::Tool {
+                    ts,
+                    call_id,
+                    success,
+                } => {
+                    let emit_ts = assistant_emit_ts.get(call_id).copied().unwrap_or(prior_ts);
+                    let name = assistant_emit_tool_name
+                        .get(call_id)
+                        .cloned()
+                        .unwrap_or_else(|| "?".to_string());
+                    turn_events.push(TurnEvent::ToolCall {
+                        name,
+                        duration_ms: ts.saturating_sub(emit_ts),
+                        success: *success,
+                    });
+                    prior_ts = *ts;
+                }
+                Event::User { .. } => {}
+            }
+        }
+
+        turns.push(TurnSummary {
+            turn_idx,
+            started_at_ms,
+            total_ms,
+            events: turn_events,
+        });
+    }
+    turns
+}
+
+/// Compose `parse_session` + `extract_turns` for the picker drill-in. Pure data.
+pub fn session_detail(
+    session_id: &str,
+    project_slug: &str,
+    jsonl: &str,
+    usage_json: Option<&str>,
+) -> Result<SessionDetail> {
+    let record = parse_session(session_id, project_slug, jsonl, usage_json)?;
+    let turns = extract_turns(jsonl);
+    Ok(SessionDetail { record, turns })
+}
+
 pub fn parse_session(
     session_id: &str,
     project_slug: &str,
@@ -171,6 +422,24 @@ pub fn parse_session(
     }
 
     Ok(rec)
+}
+
+/// Load the per-session detail for one session by id, from disk. Returns
+/// `None` if the JSONL file isn't found (e.g., session not yet persisted).
+pub fn load_session_detail(
+    projects_dir: &Path,
+    project_slug: &str,
+    session_id: &str,
+) -> Option<SessionDetail> {
+    let dir = projects_dir.join(project_slug);
+    let jsonl_path = dir.join(format!("{session_id}.jsonl"));
+    let jsonl = std::fs::read_to_string(&jsonl_path).ok()?;
+    if jsonl.trim().is_empty() {
+        return None;
+    }
+    let usage_path = dir.join(format!("{session_id}.usage.json"));
+    let usage_raw = std::fs::read_to_string(&usage_path).ok();
+    session_detail(session_id, project_slug, &jsonl, usage_raw.as_deref()).ok()
 }
 
 pub fn walk_sessions(projects_dir: &Path, scope: Scope, cwd: &Path) -> Result<Vec<SessionRecord>> {
@@ -464,141 +733,6 @@ pub fn render_html(records: &[SessionRecord], scope: Scope, generated_at: u64) -
     format!("{}{}{}", header, body, footer)
 }
 
-/// Human-friendly token count (`120` → `120`, `1500` → `1.5k`, `1_234_000` →
-/// `1.2M`). Kept local so this module doesn't pull in `crate::console`.
-fn fmt_tokens(n: u64) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else if n < 1_000_000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
-}
-
-/// Truncate a session id for inline display: keep the first N chars + `…`.
-fn truncate_id(id: &str) -> String {
-    const KEEP: usize = 15;
-    let chars: Vec<char> = id.chars().collect();
-    if chars.len() <= KEEP {
-        id.to_string()
-    } else {
-        format!("{}…", chars.into_iter().take(KEEP).collect::<String>())
-    }
-}
-
-/// Render a compact stats block for the TUI `/sessions` slash command. Plain
-/// (non-fenced) text — markdown renderer preserves multi-space runs within a
-/// span, and a fenced block would draw a stray "code" label. Shows the top-N
-/// most recently modified sessions plus an "N older" hint, marks the current
-/// session with `▸ ` in a 2-char gutter when it's in the visible page, and
-/// always surfaces the current session in a "You are here" line above the
-/// table (covers the case where it's not in the top-N).
-pub fn render_sessions_inline(
-    records: &[SessionRecord],
-    project_name: &str,
-    current_session_id: Option<&str>,
-) -> String {
-    const TOP_N: usize = 5;
-
-    let n = records.len();
-    let total_tokens: u64 = records
-        .iter()
-        .map(|r| r.input_tokens + r.output_tokens)
-        .sum();
-    let total_tools: u64 = records.iter().map(|r| r.tool_call_count).sum();
-    let total_errors: u64 = records.iter().map(|r| r.tool_error_count).sum();
-
-    let summary = format!(
-        "{} · {} session{} · {} tokens · {} tool calls · {} error{}",
-        project_name,
-        n,
-        if n == 1 { "" } else { "s" },
-        fmt_tokens(total_tokens),
-        total_tools,
-        total_errors,
-        if total_errors == 1 { "" } else { "s" },
-    );
-
-    let mut out = String::new();
-    out.push_str("**Sessions stats**\n\n");
-    out.push_str(&summary);
-    out.push_str("\n\n");
-
-    if records.is_empty() {
-        out.push_str(
-            "No sessions found in this project.\n\
-             → Run `ignis sessions export --html --scope all` to see other projects.",
-        );
-        return out;
-    }
-
-    // Always-on current-session line (covers the case where the current
-    // session isn't in the top-N rows, where the `▸` marker would hide).
-    if let Some(cur_id) = current_session_id {
-        let line = match records.iter().find(|r| r.session_id == cur_id) {
-            Some(r) => {
-                let started = r
-                    .started_at
-                    .map(format_timestamp_short)
-                    .unwrap_or_else(|| "?".to_string());
-                format!(
-                    "You are here · {} · started {} · {} msgs / {} turn{}",
-                    truncate_id(&r.session_id),
-                    started,
-                    r.agent_messages,
-                    r.user_queries,
-                    if r.user_queries == 1 { "" } else { "s" },
-                )
-            }
-            None => format!(
-                "You are here · {} · no messages persisted yet",
-                truncate_id(cur_id)
-            ),
-        };
-        out.push_str(&line);
-        out.push_str("\n\n");
-    }
-
-    let mut sorted: Vec<&SessionRecord> = records.iter().collect();
-    sorted.sort_by_key(|r| std::cmp::Reverse(r.last_modified.unwrap_or(0)));
-    let visible = sorted.iter().take(TOP_N);
-    let older = sorted.len().saturating_sub(TOP_N);
-
-    // 2-char leftmost gutter holds the current-row marker; header + non-current
-    // rows pad with two spaces to keep the column grid aligned.
-    out.push_str(&format!(
-        "  {:<17}{:>6}{:>8}{:>9}{:>8}\n",
-        "STARTED", "MSGS", "TURNS", "TOK", "TOOLS"
-    ));
-    for r in visible {
-        let marker = if current_session_id == Some(r.session_id.as_str()) {
-            "▸ "
-        } else {
-            "  "
-        };
-        let started = r
-            .started_at
-            .map(format_timestamp_short)
-            .unwrap_or_else(|| "?".to_string());
-        let tokens = fmt_tokens(r.input_tokens + r.output_tokens);
-        out.push_str(&format!(
-            "{}{:<17}{:>6}{:>8}{:>9}{:>8}\n",
-            marker, started, r.agent_messages, r.user_queries, tokens, r.tool_call_count
-        ));
-    }
-    if older > 0 {
-        out.push_str(&format!(
-            "  ─ {} older session{} ─\n",
-            older,
-            if older == 1 { "" } else { "s" }
-        ));
-    }
-    out.push('\n');
-    out.push_str("→ Run `ignis sessions export --html` for the full sortable report.");
-    out
-}
-
 /// Inner, IO-mockable variant for tests. `is_tty` is the caller's view of
 /// whether stdin is interactive.
 fn resolve_scope_inner(flag: Option<Scope>, is_tty: bool) -> Result<Scope> {
@@ -834,105 +968,119 @@ mod tests {
     }
 
     #[test]
-    fn fmt_tokens_buckets_correctly() {
-        assert_eq!(fmt_tokens(0), "0");
-        assert_eq!(fmt_tokens(999), "999");
-        assert_eq!(fmt_tokens(1500), "1.5k");
-        assert_eq!(fmt_tokens(120_000), "120.0k");
-        assert_eq!(fmt_tokens(1_234_000), "1.2M");
+    fn extract_turns_empty_input_returns_no_turns() {
+        assert!(extract_turns("").is_empty());
     }
 
-    fn record_with(started: u64, agent: u64, user: u64, in_tok: u64, tools: u64) -> SessionRecord {
-        SessionRecord {
-            session_id: format!("sess-{started}"),
-            project_slug: "p".to_string(),
-            started_at: Some(started),
-            last_modified: Some(started),
-            agent_messages: agent,
-            user_queries: user,
-            input_tokens: in_tok,
-            tool_call_count: tools,
-            ..Default::default()
+    #[test]
+    fn extract_turns_one_turn_with_one_llm_call_no_tools() {
+        let jsonl = [
+            r#"{"type":"session_meta","timestamp":1000,"payload":{"id":"s","start_dir":"/p"}}"#,
+            r#"{"type":"message","timestamp":1500,"payload":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"message","timestamp":2500,"payload":{"role":"assistant","content":"hello"}}"#,
+        ]
+        .join("\n");
+        let turns = extract_turns(&jsonl);
+        assert_eq!(turns.len(), 1);
+        let t = &turns[0];
+        assert_eq!(t.turn_idx, 0);
+        assert_eq!(t.started_at_ms, 1500);
+        assert_eq!(t.total_ms, 1000);
+        assert_eq!(t.llm_count(), 1);
+        assert_eq!(t.tool_count(), 0);
+        // First (and only) event is the assistant LLM reply.
+        match &t.events[0] {
+            TurnEvent::LlmCall { approx_ms } => assert_eq!(*approx_ms, 1000),
+            other => panic!("expected LlmCall, got {other:?}"),
         }
     }
 
     #[test]
-    fn render_sessions_inline_shows_summary_and_pointer() {
-        let recs = vec![record_with(1735787045, 38, 4, 18_000, 67)];
-        let s = render_sessions_inline(&recs, "ignis", None);
-        assert!(s.contains("**Sessions stats**"));
-        assert!(s.contains("ignis · 1 session ·"));
-        assert!(s.contains("18.0k tokens"));
-        assert!(s.contains("67 tool calls"));
-        assert!(s.contains("ignis sessions export --html"));
-    }
-
-    #[test]
-    fn render_sessions_inline_caps_at_top_n_and_emits_older_hint() {
-        let recs: Vec<SessionRecord> = (0..7)
-            .map(|i| record_with(1_735_787_045 + i * 86_400, 10, 1, 1000, 5))
+    fn extract_turns_tool_duration_is_exact_join_by_call_id() {
+        let jsonl = [
+            r#"{"type":"message","timestamp":1000,"payload":{"role":"user","content":"do x"}}"#,
+            r#"{"type":"message","timestamp":1200,"payload":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]}}"#,
+            r#"{"type":"message","timestamp":1800,"payload":{"role":"tool","tool_call_id":"c1","content":"{\"is_error\":false}"}}"#,
+            r#"{"type":"message","timestamp":2000,"payload":{"role":"assistant","content":"ok"}}"#,
+        ]
+        .join("\n");
+        let turns = extract_turns(&jsonl);
+        assert_eq!(turns.len(), 1);
+        let t = &turns[0];
+        assert_eq!(t.tool_count(), 1);
+        assert_eq!(t.llm_count(), 2, "tool-call message + final reply");
+        // Order: assistant(tool_calls) → tool result → assistant(text).
+        let names: Vec<&str> = t
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TurnEvent::ToolCall { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
             .collect();
-        let s = render_sessions_inline(&recs, "ignis", None);
-        // 5 rendered rows, 2 older.
-        assert_eq!(s.matches("2025-").count(), 5, "rendered = {s}");
-        assert!(s.contains("─ 2 older sessions ─"));
+        assert_eq!(names, vec!["bash"]);
+        match &t.events[1] {
+            TurnEvent::ToolCall {
+                duration_ms,
+                success,
+                ..
+            } => {
+                // Exact: result_ts (1800) − assistant_emit_ts (1200) = 600
+                assert_eq!(*duration_ms, 600);
+                assert!(*success);
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
     }
 
     #[test]
-    fn render_sessions_inline_empty_shows_notice() {
-        let s = render_sessions_inline(&[], "ignis", None);
-        assert!(s.contains("ignis · 0 sessions"));
-        assert!(s.contains("No sessions found"));
+    fn extract_turns_tool_failure_records_success_false() {
+        let jsonl = [
+            r#"{"type":"message","timestamp":1000,"payload":{"role":"user","content":"x"}}"#,
+            r#"{"type":"message","timestamp":1100,"payload":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]}}"#,
+            r#"{"type":"message","timestamp":1500,"payload":{"role":"tool","tool_call_id":"c1","content":"{\"is_error\":true}"}}"#,
+        ]
+        .join("\n");
+        let turns = extract_turns(&jsonl);
+        assert_eq!(turns[0].tool_count(), 1);
+        assert!(turns[0].any_tool_failed());
     }
 
     #[test]
-    fn truncate_id_keeps_short_unchanged_and_clips_long() {
-        assert_eq!(truncate_id("sess-abc"), "sess-abc");
-        assert_eq!(
-            truncate_id("session-1779599272-9d2f16cd"),
-            "session-1779599…"
-        );
+    fn extract_turns_splits_at_each_user_message() {
+        let jsonl = [
+            r#"{"type":"message","timestamp":1000,"payload":{"role":"user","content":"q1"}}"#,
+            r#"{"type":"message","timestamp":1200,"payload":{"role":"assistant","content":"a1"}}"#,
+            r#"{"type":"message","timestamp":2000,"payload":{"role":"user","content":"q2"}}"#,
+            r#"{"type":"message","timestamp":2300,"payload":{"role":"assistant","content":"a2"}}"#,
+        ]
+        .join("\n");
+        let turns = extract_turns(&jsonl);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].started_at_ms, 1000);
+        assert_eq!(turns[0].total_ms, 1000);
+        assert_eq!(turns[1].started_at_ms, 2000);
+        assert_eq!(turns[1].total_ms, 300);
     }
 
     #[test]
-    fn render_sessions_inline_marks_current_row_when_in_top_n() {
-        let recs = vec![record_with(1_735_787_045 + 86_400, 38, 4, 18_000, 67)];
-        let s = render_sessions_inline(&recs, "ignis", Some("sess-1735873445"));
-        // "You are here" line + ▸ marker on the matching row.
-        assert!(
-            s.contains("You are here · sess-1735873445"),
-            "missing You are here line: {s}"
-        );
-        assert!(s.contains("▸ 2025-"), "missing ▸ on current row: {s}");
-        // Header still gets the 2-char gutter so columns stay aligned.
-        assert!(
-            s.contains("  STARTED"),
-            "header lost its leading gutter: {s}"
-        );
-    }
-
-    #[test]
-    fn render_sessions_inline_you_are_here_when_current_not_in_top_n() {
-        // 7 records, current is the 6th-newest → falls in the "older" bucket
-        // so the ▸ marker can't render. The "You are here" line must.
-        let recs: Vec<SessionRecord> = (0..7)
-            .map(|i| record_with(1_735_787_045 + i * 86_400, 10, 1, 1000, 5))
+    fn session_detail_composes_record_and_turns() {
+        let jsonl = fixture_jsonl();
+        let detail =
+            session_detail("sess-abc", "proj-slug", &jsonl, Some(fixture_usage())).unwrap();
+        assert_eq!(detail.record.session_id, "sess-abc");
+        assert_eq!(detail.turns.len(), 1);
+        assert_eq!(detail.turns[0].tool_count(), 2);
+        let names: Vec<&str> = detail.turns[0]
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TurnEvent::ToolCall { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
             .collect();
-        let cur = recs[1].session_id.clone(); // second-oldest, sorted-newest-first goes to bottom
-        let s = render_sessions_inline(&recs, "ignis", Some(&cur));
-        assert!(s.contains(&format!("You are here · {}", cur)), "{s}");
-        // No marker row in the visible top-5.
-        assert!(!s.contains("▸ "), "marker leaked into off-page row: {s}");
-    }
-
-    #[test]
-    fn render_sessions_inline_falls_back_when_current_id_unknown() {
-        let recs = vec![record_with(1_735_787_045, 10, 1, 1000, 5)];
-        let s = render_sessions_inline(&recs, "ignis", Some("sess-not-yet-persisted"));
-        assert!(
-            s.contains("You are here · sess-not-yet-pe… · no messages persisted yet"),
-            "fallback line missing or wrong: {s}"
-        );
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"bash"));
     }
 
     #[test]

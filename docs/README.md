@@ -8,10 +8,10 @@ feature list — these pages go deeper.
 
 How to drive ignis day to day.
 
-- [Commands](usage/commands.md) — every built-in TUI slash command (`/resume`,
+- [Commands](usage/commands.md) — every built-in TUI slash command (`/sessions`,
   `/clear`, `/compact`, `/copy`, `/model`, `/skills`, `/mcp`, `/afk`,
-  `/telemetry`, `/sessions`) plus the `/<skill-name>` force-load form, with a
-  global keybindings table.
+  `/telemetry`) plus the `/<skill-name>` force-load form, with a global
+  keybindings table.
 
 ## Configure
 

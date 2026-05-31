@@ -234,27 +234,89 @@ pub(crate) enum ConnectAdvance {
     Failed,
 }
 
+/// List = the session table; Detail = drill-in for one session showing turn
+/// waterfall + token/tool rollups. Right pushes List→Detail; Left/Esc pops back.
+#[derive(Debug, Clone)]
+pub(crate) enum SessionPickerMode {
+    List,
+    // Boxed because SessionDetail is ~232 B vs the bare List variant — clippy
+    // flags the size mismatch.
+    Detail(Box<crate::cli::sessions::SessionDetail>),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SessionPicker {
-    pub(crate) sessions: Vec<crate::session::SessionMeta>,
+    pub(crate) sessions: Vec<crate::cli::sessions::SessionRecord>,
     pub(crate) selected: usize,
+    pub(crate) mode: SessionPickerMode,
+    pub(crate) current_session_id: String,
+    pub(crate) projects_dir: std::path::PathBuf,
 }
 
 impl SessionPicker {
-    pub(crate) fn new(sessions: Vec<crate::session::SessionMeta>) -> Self {
+    pub(crate) fn new(
+        sessions: Vec<crate::cli::sessions::SessionRecord>,
+        current_session_id: String,
+        projects_dir: std::path::PathBuf,
+    ) -> Self {
         Self {
             sessions,
             selected: 0,
+            mode: SessionPickerMode::List,
+            current_session_id,
+            projects_dir,
         }
     }
 
     pub(crate) fn select(&mut self, direction: SelectionDirection) {
+        // Navigation only applies to the list view; in Detail the keys are owned
+        // by the detail panel (scroll later if needed).
+        if !matches!(self.mode, SessionPickerMode::List) {
+            return;
+        }
         // `next_selection` no-ops on empty — no extra guard needed.
         self.selected = next_selection(self.selected, self.sessions.len(), direction);
     }
 
     pub(crate) fn selected_id(&self) -> Option<String> {
-        self.sessions.get(self.selected).map(|s| s.id.clone())
+        self.sessions
+            .get(self.selected)
+            .map(|s| s.session_id.clone())
+    }
+
+    pub(crate) fn is_detail(&self) -> bool {
+        matches!(self.mode, SessionPickerMode::Detail(_))
+    }
+
+    /// Push from List → Detail. Loads the highlighted session's per-turn
+    /// detail from disk; if there's no persisted JSONL (synthetic current row,
+    /// freshly started session), falls back to a synthetic `SessionDetail` so
+    /// the panel still opens — empty rather than silently no-op.
+    pub(crate) fn enter_detail(&mut self) {
+        if self.is_detail() {
+            return;
+        }
+        let Some(record) = self.sessions.get(self.selected) else {
+            return;
+        };
+        let detail = crate::cli::sessions::load_session_detail(
+            &self.projects_dir,
+            &record.project_slug,
+            &record.session_id,
+        )
+        .unwrap_or_else(|| crate::cli::sessions::SessionDetail {
+            record: record.clone(),
+            turns: Vec::new(),
+        });
+        self.mode = SessionPickerMode::Detail(Box::new(detail));
+    }
+
+    /// Pop from Detail → List. No-op if already in List (the keys.rs branch
+    /// then closes the picker entirely instead).
+    pub(crate) fn exit_detail(&mut self) {
+        if self.is_detail() {
+            self.mode = SessionPickerMode::List;
+        }
     }
 }
 
@@ -856,41 +918,6 @@ impl App {
         self.blocks.push(UIBlock::Assistant(text));
     }
 
-    /// `/sessions` — walk this project's session store and render a compact
-    /// stats block inline. The full sortable view stays in `ignis sessions
-    /// export --html`.
-    pub(crate) fn show_sessions_stats(&mut self) {
-        let projects_dir = match dirs::home_dir() {
-            Some(h) => h.join(".ignis/projects"),
-            None => {
-                self.add_assistant_notice("Could not locate home directory.".to_string());
-                return;
-            }
-        };
-        let records = match crate::cli::sessions::walk_sessions(
-            &projects_dir,
-            crate::cli::sessions::Scope::Current,
-            &self.cwd,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                self.add_assistant_notice(format!("Failed to load sessions: {e}"));
-                return;
-            }
-        };
-        let project_name = self
-            .cwd
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("project");
-        let block = crate::cli::sessions::render_sessions_inline(
-            &records,
-            project_name,
-            Some(&self.session_id),
-        );
-        self.add_assistant_notice(block);
-    }
-
     pub(crate) fn start_new_session(&mut self, session_id: String) {
         self.exit_pending = false;
         self.session_id = session_id;
@@ -903,9 +930,17 @@ impl App {
         self.add_assistant_notice(format!("Started new session `{}`.", self.session_id));
     }
 
-    pub(crate) fn show_session_picker(&mut self, sessions: Vec<crate::session::SessionMeta>) {
+    pub(crate) fn show_session_picker(
+        &mut self,
+        sessions: Vec<crate::cli::sessions::SessionRecord>,
+        projects_dir: std::path::PathBuf,
+    ) {
         self.exit_pending = false;
-        self.session_picker = Some(SessionPicker::new(sessions));
+        self.session_picker = Some(SessionPicker::new(
+            sessions,
+            self.session_id.clone(),
+            projects_dir,
+        ));
     }
 
     pub(crate) fn select_session_picker(&mut self, direction: SelectionDirection) {
@@ -1699,7 +1734,7 @@ mod tests {
                 .map(|command| command.name.as_ref())
                 .collect::<Vec<_>>(),
             vec![
-                "/resume",
+                "/sessions",
                 "/clear",
                 "/compact",
                 "/copy",
@@ -1709,15 +1744,22 @@ mod tests {
                 "/mcp",
                 "/afk",
                 "/telemetry",
-                "/sessions",
             ]
         );
     }
 
     #[test]
     fn slash_suggestions_filter_by_command_name_or_description() {
-        assert_eq!(slash_suggestions("/res", None)[0].name.as_ref(), "/resume");
-        assert_eq!(slash_suggestions("/list", None)[0].name.as_ref(), "/resume");
+        // `/res` and `/list` both surface /sessions — name prefix and
+        // description match, respectively.
+        assert_eq!(
+            slash_suggestions("/sess", None)[0].name.as_ref(),
+            "/sessions"
+        );
+        assert_eq!(
+            slash_suggestions("/list", None)[0].name.as_ref(),
+            "/sessions"
+        );
         // `/new` is merged into `/clear`: typing it still surfaces /clear via
         // its description ("Start a new session").
         assert_eq!(slash_suggestions("/new", None)[0].name.as_ref(), "/clear");
@@ -1726,7 +1768,7 @@ mod tests {
 
     #[test]
     fn slash_suggestions_stop_after_first_argument() {
-        assert!(slash_suggestions("/resume default", None).is_empty());
+        assert!(slash_suggestions("/sessions default", None).is_empty());
     }
 
     fn test_app() -> App {

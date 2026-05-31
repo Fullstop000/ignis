@@ -185,11 +185,11 @@ fn slash_autocomplete_can_run_resume_and_render_selected_history() {
     tui.wait_for("Your AI coding agent");
 
     tui.send("/");
-    tui.wait_for("/resume");
+    tui.wait_for("/sessions");
     tui.wait_for("/clear");
     tui.wait_for("/compact");
 
-    // First item (/resume) is already selected, just press Enter
+    // First suggestion (/sessions) is already selected, just press Enter
     tui.send("\r");
     tui.wait_for("Sessions");
     tui.wait_for("beta");
@@ -201,7 +201,7 @@ fn slash_autocomplete_can_run_resume_and_render_selected_history() {
 }
 
 #[test]
-fn resume_command_lists_sessions_and_enter_resumes_selection() {
+fn sessions_command_lists_sessions_and_enter_resumes_selection() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     seed_session(
@@ -215,10 +215,10 @@ fn resume_command_lists_sessions_and_enter_resumes_selection() {
     let mut tui = TuiProcess::spawn(home.path(), project.path());
     tui.wait_for("Your AI coding agent");
 
-    tui.send("/resume\r");
+    tui.send("/sessions\r");
     tui.wait_for("Sessions");
     tui.wait_for("alpha");
-    tui.wait_for("Use Up/Down to choose, Enter to resume.");
+    tui.wait_for("resume");
 
     // Move down to select alpha (first item is the current in-memory session)
     tui.send("\x1b[B\r");
