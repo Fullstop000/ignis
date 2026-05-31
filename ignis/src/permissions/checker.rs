@@ -97,6 +97,8 @@ impl PermissionChecker {
             header,
             multi_select: false,
             allow_other: false,
+            text_input: false,
+            mask: false,
             options: vec![
                 PickerOption {
                     label: APPROVE_ONCE.to_string(),

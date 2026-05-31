@@ -260,6 +260,8 @@ pub(crate) fn parse_questions(args: &Value) -> Result<Vec<PickerQuestion>, Strin
             multi_select,
             options,
             allow_other: true,
+            text_input: false,
+            mask: false,
         });
     }
     Ok(out)

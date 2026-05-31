@@ -323,31 +323,99 @@ impl Config {
 }
 
 pub fn load_config() -> Result<Config, anyhow::Error> {
-    let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".ignis/config.toml"));
-    }
+    let path = match dirs::home_dir() {
+        Some(home) => home.join(".ignis/config.toml"),
+        // No home dir → no config file to look at; return an empty Config so
+        // the TUI can still boot into no-provider mode.
+        None => return Ok(empty_config_with_state()),
+    };
 
-    let mut last_err = None;
-    for path in paths {
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => match toml::from_str::<Config>(&content) {
-                    Ok(mut config) => {
-                        for name in config.mcp.servers.keys() {
-                            validate_mcp_server_name(name)?;
-                        }
-                        config.apply_state(load_state());
-                        return Ok(config);
-                    }
-                    Err(e) => last_err = Some(anyhow!("Failed to parse {}: {}", path.display(), e)),
-                },
-                Err(e) => last_err = Some(anyhow!("Failed to read {}: {}", path.display(), e)),
-            }
-        }
+    // Missing config is NOT an error any more — the TUI guides the user to
+    // `/connect` from the empty state. Parse errors and validation errors do
+    // still surface so a typo'd file gets a clear failure.
+    if !path.exists() {
+        return Ok(empty_config_with_state());
     }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow!("Failed to read {}: {}", path.display(), e))?;
+    let mut config: Config = toml::from_str(&content)
+        .map_err(|e| anyhow!("Failed to parse {}: {}", path.display(), e))?;
+    for name in config.mcp.servers.keys() {
+        validate_mcp_server_name(name)?;
+    }
+    config.apply_state(load_state());
+    Ok(config)
+}
 
-    Err(last_err.unwrap_or_else(|| anyhow!("config.toml not found")))
+/// A `Config::default()` with the persisted state overlaid. Used when no
+/// `~/.ignis/config.toml` exists — the TUI still needs to honor the user's
+/// last-picked model from `state.json` if one was saved.
+fn empty_config_with_state() -> Config {
+    let mut cfg = Config::default();
+    cfg.apply_state(load_state());
+    cfg
+}
+
+/// Path to `~/.ignis/config.toml`, creating the parent directory if needed.
+/// Used by writers (e.g. `write_provider_key`) that need to create the file
+/// on first connect.
+fn config_path() -> Result<PathBuf, anyhow::Error> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not locate home directory"))?;
+    let dir = home.join(".ignis");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow!("Failed to create {}: {}", dir.display(), e))?;
+    Ok(dir.join("config.toml"))
+}
+
+/// Set `[providers.<id>] api_key = "<key>"` in `~/.ignis/config.toml`,
+/// creating the file if absent and preserving any existing comments / other
+/// tables (uses `toml_edit`, not `toml`). If the table already exists with
+/// other fields (e.g. `api_url`, `protocol`), those are left untouched.
+///
+/// Returns the path written, for the TUI to surface in its success message.
+pub fn write_provider_key(provider_id: &str, api_key: &str) -> Result<PathBuf, anyhow::Error> {
+    let path = config_path()?;
+    let mut doc = if path.exists() {
+        std::fs::read_to_string(&path)
+            .map_err(|e| anyhow!("Failed to read {}: {}", path.display(), e))?
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| anyhow!("Failed to parse {}: {}", path.display(), e))?
+    } else {
+        toml_edit::DocumentMut::new()
+    };
+
+    // Ensure `[providers]` exists as a table.
+    if !doc.contains_key("providers") {
+        doc["providers"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let providers = doc["providers"]
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("`providers` in config.toml is not a table"))?;
+
+    // Ensure `[providers.<id>]` exists, then set api_key without clobbering
+    // anything else under it.
+    if !providers.contains_key(provider_id) {
+        providers.insert(provider_id, toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let entry = providers[provider_id]
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("`providers.{provider_id}` is not a table"))?;
+    entry["api_key"] = toml_edit::value(api_key);
+
+    // Atomic write: a crash mid-write on `config.toml` would leave a truncated
+    // file and the next launch can't recover (a parse failure halts startup).
+    // Write to a sibling tmpfile on the same filesystem, then rename — rename
+    // is atomic on POSIX, so either the old or new content is observable, never
+    // a partial.
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("Config path has no parent directory: {}", path.display()))?;
+    let tmp = dir.join(format!(".config.toml.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, doc.to_string())
+        .map_err(|e| anyhow!("Failed to write {}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| anyhow!("Failed to atomically replace {}: {}", path.display(), e))?;
+    Ok(path)
 }
 
 pub fn build_provider(config: &Config) -> Result<Box<dyn LlmProvider>, anyhow::Error> {
@@ -862,6 +930,85 @@ models = ["m"]
         )
         .unwrap();
         assert!(cfg.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn empty_config_is_no_provider_state() {
+        // The TUI uses these signals to decide whether to render the
+        // no-provider welcome and route /connect.
+        let cfg = Config::default();
+        assert!(cfg.providers.is_empty());
+        assert_eq!(cfg.active_provider(), None);
+        assert_eq!(cfg.active_model(), None);
+        assert!(cfg.resolve().is_err());
+    }
+
+    #[test]
+    fn write_provider_key_creates_new_table_preserving_other_content() {
+        // Roundtrip through toml_edit must NOT clobber a hand-written comment
+        // or an unrelated section. This is the property `toml` (re-serialize)
+        // can't promise — that's the whole reason we picked toml_edit.
+        let tmp = crate::util::unique_temp_dir("ignis-cfg-write");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("config.toml");
+        let original = r#"# user-written header comment
+model = "openai/gpt-5.5"
+
+[providers.openai]
+api_key = "sk-old"
+
+[mcp.servers.gh]
+command = "gh"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        // Direct doc manipulation (mirrors what write_provider_key does, but
+        // with an explicit path so the test isn't HOME-dependent).
+        let mut doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        if !doc.contains_key("providers") {
+            doc["providers"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let providers = doc["providers"].as_table_mut().unwrap();
+        if !providers.contains_key("anthropic") {
+            providers.insert("anthropic", toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        providers["anthropic"]["api_key"] = toml_edit::value("sk-ant-new");
+        providers["openai"]["api_key"] = toml_edit::value("sk-new");
+        std::fs::write(&path, doc.to_string()).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# user-written header comment"),
+            "header comment preserved"
+        );
+        assert!(
+            after.contains("[mcp.servers.gh]"),
+            "unrelated table preserved"
+        );
+        assert!(after.contains("sk-new"), "openai key updated");
+        assert!(after.contains("sk-ant-new"), "anthropic key inserted");
+        assert!(!after.contains("sk-old"), "old openai key gone");
+
+        // The file must still parse as a Config — guards against producing a
+        // schema-broken toml.
+        let cfg: Config = toml::from_str(&after).unwrap();
+        assert_eq!(
+            cfg.providers
+                .get("openai")
+                .and_then(|p| p.api_key.as_deref()),
+            Some("sk-new")
+        );
+        assert_eq!(
+            cfg.providers
+                .get("anthropic")
+                .and_then(|p| p.api_key.as_deref()),
+            Some("sk-ant-new")
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

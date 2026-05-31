@@ -19,6 +19,32 @@ use crate::storage::{FileStorage, SessionStorage};
 pub(crate) type ActiveInject =
     std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<String>>>>;
 
+/// Hint shown when the user tries to do anything that needs a provider in
+/// no-provider mode. Kept short because the welcome banner already explains
+/// the situation — this just says what to type next.
+const NO_PROVIDER_HINT: &str = "Run /connect first.";
+
+/// Built-in commands that route work to the LLM and therefore need an active
+/// provider. New provider-needing commands go here (one place to update).
+/// `/connect` itself is NOT here — it's the way out of no-provider mode.
+const PROVIDER_REQUIRED_BUILTINS: &[&str] = &["/compact", "/copy", "/model"];
+
+/// `true` iff submitting `command` in no-provider mode should be blocked
+/// with [`NO_PROVIDER_HINT`]. Covers: plain prompts to the agent (no slash),
+/// the built-in LLM commands above, and any `/skill-name` registered in the
+/// skill registry (skill commands run the agent with an injected prompt).
+fn requires_provider(app: &App, command: &str) -> bool {
+    if !command.starts_with('/') {
+        return true;
+    }
+    if PROVIDER_REQUIRED_BUILTINS.contains(&command) {
+        return true;
+    }
+    app.skills
+        .as_deref()
+        .is_some_and(|r| r.all().iter().any(|s| format!("/{}", s.name) == command))
+}
+
 /// Returns true if the key was consumed.
 fn apply_edit_key(app: &mut App, key: KeyEvent) -> bool {
     match (key.modifiers, key.code) {
@@ -105,6 +131,7 @@ pub(crate) async fn handle_key(
     // ESC and Ctrl+C — must come before global handlers and the busy-mode
     // gate, because the picker is the only thing the user is interacting with.
     if let Some(state) = app.inline_picker.as_mut() {
+        use crate::console::app::ConnectAdvance;
         use crate::console::picker::PickerResponse;
         use inline_picker::KeyOutcome;
         let outcome = state.on_key(key);
@@ -116,11 +143,37 @@ pub(crate) async fn handle_key(
                         let _ = reply.send(PickerResponse::Cancelled);
                     }
                 }
+                // If the user cancelled mid-`/connect`, drop the draft so the
+                // next /connect starts clean. Tool-initiated cancels (no
+                // draft) are no-ops here.
+                app.cancel_connect();
             }
             KeyOutcome::Done(answers) => {
                 if let Some(mut picker) = app.inline_picker.take() {
                     if let Some(reply) = picker.reply.take() {
-                        let _ = reply.send(PickerResponse::Answered(answers));
+                        let _ = reply.send(PickerResponse::Answered(answers.clone()));
+                    }
+                }
+                // Multi-step `/connect`: route the answer back into the draft
+                // state machine. The advance returns the next picker to open
+                // (steps 1 and 2) or signals success (step 3 persisted).
+                if app.connect_draft.is_some() {
+                    match app.advance_connect(answers) {
+                        ConnectAdvance::NextPicker(req) => {
+                            let _ = picker_tx.send(req).await;
+                        }
+                        ConnectAdvance::Saved => {
+                            // The agent loop's in-memory config is stale —
+                            // it doesn't know about the api_key we just
+                            // wrote. Reload from disk so the next prompt
+                            // resolves with the new credentials. `send` over
+                            // `try_send`: a full prompt queue should backpressure
+                            // here, not silently drop the reload (the user would
+                            // see a misleading "✓ Connected" followed by a
+                            // stale-config error on their next prompt).
+                            let _ = prompt_tx.send(AgentRequest::ReloadConfig).await;
+                        }
+                        ConnectAdvance::Failed => {}
                     }
                 }
             }
@@ -393,6 +446,16 @@ pub(crate) async fn handle_key(
                     let storage = crate::storage::FileStorage::new(storage_dir.to_path_buf());
                     let _ = storage.save_session(&new_id, &[], None).await;
                     app.start_new_session(new_id);
+                } else if command == "/connect" && arg_count == 1 {
+                    if let Some(req) = app.start_connect() {
+                        let _ = picker_tx.send(req).await;
+                    }
+                } else if app.provider.is_empty() && requires_provider(app, command) {
+                    // Single guard for every command (and the agent prompt
+                    // path) that needs a live provider. Anything benign in
+                    // no-provider mode — /skills, /mcp, /sessions, /afk,
+                    // /telemetry, /clear, /resume — falls through unchanged.
+                    app.add_assistant_notice(NO_PROVIDER_HINT.to_string());
                 } else if command == "/compact" && arg_count == 1 {
                     app.turn_in_flight = true;
                     let _ = prompt_tx
@@ -447,6 +510,9 @@ pub(crate) async fn handle_key(
                 } else if text.starts_with('/') {
                     app.add_assistant_notice(format!("Unknown command `{}`.", command));
                 } else {
+                    // The early `requires_provider` guard already short-
+                    // circuited the empty-provider case; here we know
+                    // there's a provider to send the prompt to.
                     app.turn_in_flight = true;
                     let _ = prompt_tx
                         .send(AgentRequest::Prompt {
@@ -566,6 +632,8 @@ async fn handle_telemetry_picker(
             header: "Telemetry".to_string(),
             multi_select: false,
             allow_other: false,
+            text_input: false,
+            mask: false,
             options: vec![
                 PickerOption {
                     label: "On".to_string(),
@@ -675,6 +743,8 @@ async fn handle_afk_toggle(
             header: "AFK".to_string(),
             multi_select: false,
             allow_other: false,
+            text_input: false,
+            mask: false,
             options: vec![
                 PickerOption {
                     label: FULLY_UNATTENDED.to_string(),

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-05-31
+
+### Added
+- `/connect` — interactive 3-step setup to pick a provider, paste an API key, and pick a model; first launch with no `config.toml` now opens straight into it. ([#75](https://github.com/Fullstop000/ignis/pull/75))
+- `/telemetry` — TUI picker to toggle OpenTelemetry export on/off. ([#65](https://github.com/Fullstop000/ignis/pull/65))
+
 ## [0.29.0] - 2026-05-30
 
 ### Added

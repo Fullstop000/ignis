@@ -106,14 +106,16 @@ async fn main() -> Result<(), anyhow::Error> {
         state.disabled_mcp_servers.iter().cloned().collect();
     let mcp_registry = ignis::mcp::McpRegistry::spawn_all(&config.mcp.servers, disabled_mcp).await;
 
-    let active_provider = config
-        .active_provider()
-        .unwrap_or_else(|| "default".to_string());
-    let active_model = config
-        .active_model()
-        .unwrap_or_else(|| "default".to_string());
+    // When no provider is configured, hand the TUI empty strings; it renders
+    // the no-provider welcome and routes the user through `/connect`. The
+    // one-shot CLI path still hard-errors below — there's no interactive way
+    // to recover from "no provider" in a single-shot invocation.
+    let active_provider = config.active_provider().unwrap_or_default();
+    let active_model = config.active_model().unwrap_or_default();
 
-    ignis::telemetry::record_session_start(&active_provider, &active_model);
+    if !active_provider.is_empty() {
+        ignis::telemetry::record_session_start(&active_provider, &active_model);
+    }
 
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {
@@ -136,7 +138,12 @@ async fn main() -> Result<(), anyhow::Error> {
         return res;
     }
 
-    // Route: One-shot CLI mode (ignis "do something")
+    // Route: One-shot CLI mode (ignis "do something") — needs a real provider.
+    if active_provider.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No provider configured. Launch the TUI (run `ignis` with no args) and run /connect."
+        ));
+    }
     println!("=== Ignis (one-shot) ===");
     println!("Provider: {}/{}", active_provider, active_model);
     println!("Session: {}", session_request.session_id);

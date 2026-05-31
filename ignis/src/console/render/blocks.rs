@@ -221,21 +221,38 @@ fn blank_wide_char_continuations(buf: &mut ratatui::buffer::Buffer) {
         }
     }
 }
-/// The startup banner, committed once to scrollback at launch.
+/// The startup banner, committed once to scrollback at launch. When no
+/// provider is configured (first-launch / cleared config), the provider line
+/// is replaced with a one-line hint that points the user at `/connect`.
 pub(crate) fn welcome_lines(app: &App) -> Vec<Line<'static>> {
-    vec![
-        Line::from(""),
+    let title = Line::from(vec![
+        Span::styled("🔥 ", Style::default()),
+        Span::styled(
+            "ignis",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  Your AI coding agent, right in the terminal.",
+            Style::default().fg(SUBTEXT),
+        ),
+    ]);
+    let info_line = if app.provider.is_empty() {
+        // First-launch / no-provider mode. Tell the user the one thing they
+        // need to do next; don't show a fake provider value.
         Line::from(vec![
-            Span::styled("🔥 ", Style::default()),
+            Span::styled("  ", Style::default()),
+            Span::styled("No provider configured. ", Style::default().fg(TEXT_DIM)),
+            Span::styled("Type ", Style::default().fg(TEXT_DIM)),
             Span::styled(
-                "ignis",
+                "/connect",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "  Your AI coding agent, right in the terminal.",
-                Style::default().fg(SUBTEXT),
+                " to pick one and paste your API key.",
+                Style::default().fg(TEXT_DIM),
             ),
-        ]),
+        ])
+    } else {
         Line::from(vec![
             Span::styled("  Provider  ", Style::default().fg(TEXT_DIM)),
             Span::styled(
@@ -244,7 +261,7 @@ pub(crate) fn welcome_lines(app: &App) -> Vec<Line<'static>> {
             ),
             Span::styled("   Directory  ", Style::default().fg(TEXT_DIM)),
             Span::styled(format!("{}", app.cwd.display()), Style::default().fg(TEXT)),
-        ]),
-        Line::from(""),
-    ]
+        ])
+    };
+    vec![Line::from(""), title, info_line, Line::from("")]
 }
