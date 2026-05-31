@@ -463,9 +463,7 @@ pub(crate) fn render_inline_picker(
         if other_buf.is_empty() {
             other_spans.push(Span::styled(
                 OTHER_LABEL,
-                Style::default()
-                    .fg(TEXT_DIM)
-                    .add_modifier(Modifier::ITALIC),
+                Style::default().fg(TEXT_DIM).add_modifier(Modifier::ITALIC),
             ));
         } else {
             other_spans.push(Span::styled(
@@ -564,9 +562,7 @@ pub(crate) fn options_pane_lines(state: &InlinePickerState, width: u16) -> Vec<L
         if other_buf.is_empty() {
             other_spans.push(Span::styled(
                 OTHER_LABEL,
-                Style::default()
-                    .fg(TEXT_DIM)
-                    .add_modifier(Modifier::ITALIC),
+                Style::default().fg(TEXT_DIM).add_modifier(Modifier::ITALIC),
             ));
         } else {
             other_spans.push(Span::styled(
