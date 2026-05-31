@@ -133,13 +133,8 @@ the active selection at runtime, saving it to `~/.ignis/state.json` — your
 
 In the TUI: `Enter` sends, `↑/↓` walk history, `Ctrl+D` exits. Output renders
 inline in the normal buffer, so scroll with your terminal/tmux as usual. Type
-`/` for slash-command suggestions:
-
-`/model` · `/afk` · `/resume` · `/clear` · `/compact` · `/copy` · `/skills` · `/mcp` · `/telemetry`
-
-> `/copy` uses a built-in platform clipboard tool: `pbcopy` (macOS), `clip` /
-> `clip.exe` (Windows/WSL). On a Linux desktop, install `wl-clipboard` or
-> `xclip`.
+`/` for slash-command suggestions — see
+[`docs/commands.md`](docs/commands.md) for the full reference.
 
 ## Permissions
 
