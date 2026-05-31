@@ -5,7 +5,7 @@ use crate::state::{load_state, State};
 use anyhow::anyhow;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Web search backend configuration. `provider` selects the backend
 /// (default "brave"); `api_key` is the credential for that backend.
@@ -336,6 +336,10 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
     if !path.exists() {
         return Ok(empty_config_with_state());
     }
+    // One-time migration: pre-0.31 ignis wrote `config.toml` with the umask
+    // default (often `0644`, world-readable). Silently tighten to `0600` —
+    // best effort; a failure here must not block startup.
+    let _ = tighten_secrets_mode(&path);
     let content = std::fs::read_to_string(&path)
         .map_err(|e| anyhow!("Failed to read {}: {}", path.display(), e))?;
     let mut config: Config = toml::from_str(&content)
@@ -345,6 +349,22 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
     }
     config.apply_state(load_state());
     Ok(config)
+}
+
+/// Set `0600` on a file that holds secrets (currently `~/.ignis/config.toml`,
+/// which carries provider API keys). No-op on Windows. Idempotent.
+#[cfg(unix)]
+fn tighten_secrets_mode(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::metadata(path)?.permissions();
+    if perms.mode() & 0o777 != 0o600 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn tighten_secrets_mode(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// A `Config::default()` with the persisted state overlaid. Used when no
@@ -413,6 +433,10 @@ pub fn write_provider_key(provider_id: &str, api_key: &str) -> Result<PathBuf, a
     let tmp = dir.join(format!(".config.toml.{}.tmp", std::process::id()));
     std::fs::write(&tmp, doc.to_string())
         .map_err(|e| anyhow!("Failed to write {}: {}", tmp.display(), e))?;
+    // Tighten to `0600` before the rename so the file is never observable at
+    // the umask default (often `0644`) while it carries an API key.
+    tighten_secrets_mode(&tmp)
+        .map_err(|e| anyhow!("Failed to chmod 0600 {}: {}", tmp.display(), e))?;
     std::fs::rename(&tmp, &path)
         .map_err(|e| anyhow!("Failed to atomically replace {}: {}", path.display(), e))?;
     Ok(path)
@@ -1033,5 +1057,28 @@ api_key = "x"
         });
         assert_eq!(cfg.active_model().as_deref(), Some("gpt-4o"));
         assert_eq!(cfg.active_effort(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tighten_secrets_mode_migrates_0644_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::util::unique_temp_dir("ignis-cfg-perm");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("config.toml");
+        std::fs::write(&path, "model = \"x/y\"\n").unwrap();
+        // Simulate a pre-fix file written at the umask default.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::tighten_secrets_mode(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "file must end at 0600");
+
+        // Idempotent: a second call doesn't widen or error.
+        super::tighten_secrets_mode(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
