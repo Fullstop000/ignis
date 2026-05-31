@@ -1,6 +1,6 @@
 use crate::agent::Agent;
 use crate::config::CompactionConfig;
-use crate::provider::LlmProvider;
+use crate::llm::LlmProvider;
 use crate::storage::SessionStorage;
 use crate::tools::tool::{AgentTool, ToolHooks};
 use crate::{AgentEvent, Message};

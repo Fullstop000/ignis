@@ -1,53 +1,77 @@
-# Ignis configuration — copy to ~/.ignis/config.toml and fill in your keys.
-# ========================================================================
+# Ignis configuration — copy to ~/.ignis/config.toml and fill in your key.
+# ======================================================================
+#
+# Pick a provider and drop in your API key — that's it. Each provider's
+# endpoint(s), model list, context windows, and reasoning levels are built into
+# ignis, so you normally only need `api_key`. `/model` switches the active model
+# at runtime (saved to ~/.ignis/state.json, which ignis owns and you may edit).
 
-# Active selection as "provider/model" (an optional default). `/model` switches
-# it at runtime, saving the choice to ~/.ignis/state.json — this file is yours
-# to edit and is never auto-written.
-model = "kimi-code/kimi-for-coding"
+# Active selection as "provider/model".
+model = "minimax-token-plan/MiniMax-M2.7"
 auto_resume_last_session = false
 
-[providers."kimi-code"]
-api_key = "sk-your-kimi-key"
-api_url = "https://api.kimi.com/coding/v1"
-# models.dev doesn't know this alias, so declare its window here (256K = 262144).
-models  = [{ name = "kimi-for-coding", context = 262144 }]
+# MiniMax Token Plan — serves the same models over both an OpenAI- and an
+# Anthropic-compatible endpoint. ignis auto-selects the Anthropic one (MiniMax
+# recommends it); set `protocol = "openai"` to use the OpenAI endpoint instead.
+[providers.minimax-token-plan]
+api_key = "sk-cp-your-key"
+# protocol = "openai"
 
-# Each provider lists the models it offers in `models`; the active one is the
-# top-level `model` above. A model entry is either a bare name or an inline table
-# with per-model metadata, all in one place:
-#   - `reasoning`: effort levels (the picker shows the control only for these).
-#   - `context`:   context window in tokens. Optional — windows are looked up from
-#                  models.dev by name (cached at ~/.ignis/models.json); set this
-#                  only to override or for a model models.dev doesn't know.
+# ─ Other built-in providers — uncomment one and add your key ──────────────────
 #
 # [providers.openai]
 # api_key = "sk-your-openai-key"
-# api_url = "https://api.openai.com/v1"
-# models  = [
-#   "gpt-4o",
-#   { name = "o3", reasoning = ["low", "medium", "high"] },
-# ]
-#
-# [providers.deepseek]
-# api_key = "sk-your-deepseek-key"
-# api_url = "https://api.deepseek.com/v1"
-# models  = [
-#   "deepseek-v4-flash",
-#   { name = "deepseek-v4-pro", reasoning = ["high", "max"], context = 128000 },
-# ]
 #
 # [providers.anthropic]
 # api_key = "your-anthropic-key"
-# models  = ["claude-sonnet-4-20250514"]
 #
-# [providers.gemini]
-# api_key = "your-gemini-key"
-# models  = ["gemini-2.5-pro"]
+# [providers.deepseek]
+# api_key = "sk-your-deepseek-key"
 #
-# [providers.ollama]
-# api_url = "http://localhost:11434"
-# models  = ["llama3"]
+#
+# [providers."kimi-code"]
+# api_key = "sk-your-kimi-key"
+#
+# [providers."moonshot-platform-cn"]
+# api_key = "sk-your-moonshot-key"
+#
+# [providers.ollama]                 # local; no API key needed
+
+# ─ Optional provider overrides ────────────────────────────────────────────────
+# Built-in providers already know their URL, protocol(s), models, context
+# windows, and reasoning levels. Keep provider blocks to `api_key` unless you
+# intentionally need one of these overrides:
+#
+#   api_url    replaces the selected endpoint URL only. Use it for a proxy,
+#              gateway, or regional endpoint.
+#
+#   protocol   selects one of the provider's built-in protocols when it offers
+#              more than one. Today this is mainly MiniMax: "anthropic" (default)
+#              or "openai".
+#
+#   user_agent replaces a baked User-Agent header for provider plans that require
+#              one. You usually should not set this.
+#
+#   models     merges with the built-in model list. A bare string adds an extra
+#              model. An inline table with the same name as a built-in model
+#              overrides that model's `reasoning` levels and/or `context`.
+#
+# Example: add one proxy-only model and override metadata for one built-in model.
+# [providers.deepseek]
+# api_key = "sk-your-deepseek-key"
+# api_url = "https://your-proxy.example/v1"
+# models = [
+#   "proxy-only-model",
+#   { name = "deepseek-v4-pro", reasoning = ["high", "max"], context = 1000000 },
+# ]
+
+# ─ Custom OpenAI-compatible endpoint (self-hosted, vLLM, any gateway) ──────────
+# The `custom` provider is different: it bakes in no endpoint or models, so both
+# `api_url` and `models` are required.
+# [providers.custom]
+# api_key = "your-key"
+# api_url = "https://your-host/v1"
+# models  = ["your-model"]
 
 # Web search tool (optional). Switch backends via `provider`.
 # See docs/web-search.md for details.

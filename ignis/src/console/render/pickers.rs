@@ -188,7 +188,7 @@ pub(crate) fn render_mcp_picker(
 pub(crate) fn render_model_picker(
     lines: &mut Vec<Line<'static>>,
     picker: &ModelPicker,
-    options: &[crate::models::ModelOption],
+    options: &[crate::llm::ModelOption],
 ) {
     lines.push(Line::from(""));
     lines.push(Line::from(vec![

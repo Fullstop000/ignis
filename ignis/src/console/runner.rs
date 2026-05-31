@@ -47,7 +47,7 @@ pub async fn run_console(
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
     // Context windows: config override → cached models.dev → compaction threshold.
     // The cache loads instantly; refresh runs in the background for next launch.
-    let catalog = crate::models::catalog::load();
+    let catalog = crate::llm::catalog::load();
     app.fallback_context_window = config.compaction.threshold_tokens;
     app.set_context_window(
         config
@@ -56,7 +56,7 @@ pub async fn run_console(
             .unwrap_or(config.compaction.threshold_tokens),
     );
     app.set_model_options(config.model_options(&catalog), config.active_effort());
-    tokio::spawn(crate::models::catalog::refresh_if_stale());
+    tokio::spawn(crate::llm::catalog::refresh_if_stale());
 
     // Render inline in the normal buffer (no alternate screen, no mouse capture):
     // finished transcript blocks are pushed into the terminal's real scrollback

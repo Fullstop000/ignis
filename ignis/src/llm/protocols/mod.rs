@@ -40,16 +40,66 @@ pub trait LlmProvider: Send + Sync + 'static {
 }
 
 mod anthropic;
-mod deepseek;
-mod gemini;
 mod ollama;
 mod openai;
 
-pub use anthropic::AnthropicProvider;
-pub use deepseek::DeepSeekProvider;
-pub use gemini::GeminiProvider;
-pub use ollama::OllamaProvider;
-pub use openai::OpenAiProvider;
+/// Wire protocol — selects the concrete protocol client in [`build`] and gates
+/// tool support (only `Ollama` lacks it). Deserialized directly from a config
+/// `protocol = "..."` override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[serde(alias = "openai-compatible")]
+    OpenAi,
+    Anthropic,
+    Ollama,
+}
+
+impl Protocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Protocol::OpenAi => "openai",
+            Protocol::Anthropic => "anthropic",
+            Protocol::Ollama => "ollama",
+        }
+    }
+}
+
+/// How the API key is attached. Decoupled from [`Protocol`]: MiniMax's Anthropic
+/// endpoint uses `Bearer`, while real Anthropic uses `XApiKey`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Auth {
+    /// `Authorization: Bearer <key>`
+    Bearer,
+    /// `x-api-key: <key>` (Anthropic)
+    XApiKey,
+    /// No credential (Ollama)
+    None,
+}
+
+/// A fully-resolved active selection: provider metadata merged with config
+/// overrides, with one endpoint chosen. [`build`] turns it into a concrete
+/// [`LlmProvider`].
+pub struct Resolved {
+    pub provider_id: String,
+    pub protocol: Protocol,
+    pub base_url: String,
+    pub auth: Auth,
+    pub api_key: Option<String>,
+    pub model: String,
+    pub request_headers: Vec<(String, String)>,
+    pub reasoning_effort: Option<String>,
+}
+
+/// Construct the concrete protocol client for a [`Resolved`] selection. The single
+/// `match` on `protocol` lives here (build time) — never inside `chat_stream`.
+pub fn build(r: Resolved) -> Box<dyn LlmProvider> {
+    match r.protocol {
+        Protocol::OpenAi => Box::new(openai::OpenAiCompatible::new(r)),
+        Protocol::Anthropic => Box::new(anthropic::AnthropicCompatible::new(r)),
+        Protocol::Ollama => Box::new(ollama::Ollama::new(r)),
+    }
+}
 
 // ==========================================
 // OpenAI-compatible request/response types
@@ -254,9 +304,10 @@ pub(crate) fn parse_sse_line(line: &str) -> Option<LlmResponseDelta> {
 }
 
 /// Stream a chat completion from an OpenAI-compatible endpoint. The only
-/// provider-specific knob is `user_agent`: `Some` sets the header (OpenAI/Kimi/
-/// Moonshot), `None` omits it (DeepSeek). All response parsing is shared via
-/// `parse_sse_line`, so a streaming-parser change happens in exactly one place.
+/// provider-specific knob is `request_headers`: built-in provider declarations
+/// can add headers such as Kimi's whitelisted `User-Agent`. All response parsing
+/// is shared via `parse_sse_line`, so a streaming-parser change happens in
+/// exactly one place.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn openai_compatible_chat_stream(
     client: &reqwest::Client,
@@ -264,7 +315,7 @@ pub(crate) async fn openai_compatible_chat_stream(
     api_key: &str,
     model: &str,
     reasoning_effort: Option<&str>,
-    user_agent: Option<&str>,
+    request_headers: &[(String, String)],
     system_prompt: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
@@ -300,8 +351,8 @@ pub(crate) async fn openai_compatible_chat_stream(
         .post(&endpoint)
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&req_body);
-    if let Some(ua) = user_agent {
-        req = req.header("User-Agent", ua);
+    for (name, value) in request_headers {
+        req = req.header(name.as_str(), value.as_str());
     }
     let res = req.send().await?;
 

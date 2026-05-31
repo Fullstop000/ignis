@@ -1,4 +1,4 @@
-use super::{bytes_to_lines, LlmProvider, LlmResponseDelta};
+use super::{bytes_to_lines, Auth, LlmProvider, LlmResponseDelta, Resolved};
 use crate::Message;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -6,21 +6,37 @@ use futures_util::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub struct AnthropicProvider {
+/// Any Anthropic-Messages-compatible endpoint — real Anthropic (`x-api-key`) or
+/// MiniMax's `/anthropic` endpoint (`Bearer`). The base URL is the API root; we
+/// append `/v1/messages`, and the auth header is chosen from [`Auth`].
+pub struct AnthropicCompatible {
     client: reqwest::Client,
+    provider_id: String,
     api_key: String,
+    base_url: String,
+    auth: Auth,
     model: String,
 }
 
-impl AnthropicProvider {
-    pub fn new(api_key: String, model: String) -> Self {
+impl AnthropicCompatible {
+    pub fn new(r: Resolved) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key,
-            model,
+            provider_id: r.provider_id,
+            api_key: r.api_key.unwrap_or_default(),
+            base_url: r.base_url,
+            auth: r.auth,
+            model: r.model,
         }
     }
 }
+
+/// Output-token cap sent on every request. Anthropic's Messages API requires
+/// `max_tokens`; the value is a ceiling (the model stops earlier when it's
+/// done), so we pick a value safely under every supported model's max output
+/// (Sonnet 4.6 / Haiku 4.5 / Opus 4.6+ all allow ≥ 64k; MiniMax M2.7 accepts
+/// the same range).
+const DEFAULT_MAX_TOKENS: u64 = 32_768;
 
 #[derive(Serialize)]
 struct AnthropicMessagesRequest {
@@ -30,6 +46,7 @@ struct AnthropicMessagesRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<serde_json::Value>,
     stream: bool,
+    max_tokens: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -70,13 +87,13 @@ enum AnthropicDelta {
 }
 
 #[async_trait]
-impl LlmProvider for AnthropicProvider {
+impl LlmProvider for AnthropicCompatible {
     fn model_id(&self) -> &str {
         &self.model
     }
 
     fn provider_name(&self) -> &str {
-        "anthropic"
+        &self.provider_id
     }
 
     async fn chat_stream(
@@ -160,16 +177,19 @@ impl LlmProvider for AnthropicProvider {
             messages: anthropic_messages,
             tools: anthropic_tools,
             stream: true,
+            max_tokens: DEFAULT_MAX_TOKENS,
         };
 
-        let res = self
+        let endpoint = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let mut req = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&req_body)
-            .send()
-            .await?;
+            .post(&endpoint)
+            .header("anthropic-version", "2023-06-01");
+        req = match self.auth {
+            Auth::XApiKey => req.header("x-api-key", self.api_key.clone()),
+            _ => req.header("Authorization", format!("Bearer {}", self.api_key)),
+        };
+        let res = req.json(&req_body).send().await?;
 
         if !res.status().is_success() {
             let error_text = res
@@ -264,5 +284,27 @@ impl LlmProvider for AnthropicProvider {
         });
 
         Ok(delta_stream.boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_body_includes_max_tokens() {
+        // Anthropic's POST /v1/messages requires `max_tokens`; without it the
+        // API rejects the request before streaming. Guards against the field
+        // being dropped from `AnthropicMessagesRequest` in future refactors.
+        let body = AnthropicMessagesRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            stream: true,
+            max_tokens: DEFAULT_MAX_TOKENS,
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["max_tokens"], serde_json::json!(DEFAULT_MAX_TOKENS));
     }
 }
