@@ -29,7 +29,7 @@ pub struct McpCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
-    /// Add a stdio MCP server to ~/.ignis/config.toml.
+    /// Add an MCP server (stdio or HTTP) to ~/.ignis/config.toml.
     Add(AddArgs),
     /// List configured MCP servers and their status.
     List(ListArgs),
@@ -43,16 +43,41 @@ pub enum Cmd {
     Disable { name: String },
 }
 
+/// Add a server. Pass either `--url <URL>` (Streamable HTTP) or `-- <command>
+/// [args...]` (stdio). The clap `ArgGroup` makes them mutually exclusive and
+/// requires exactly one.
 #[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("transport")
+        .required(true)
+        .args(["url", "command"]),
+))]
 pub struct AddArgs {
     /// Server name (config key). Must match [a-zA-Z0-9_-]{1,40}.
     pub name: String,
+
+    // -- HTTP transport --
+    /// HTTP MCP server endpoint, e.g. `https://mcp.stripe.com`.
+    #[arg(long)]
+    pub url: Option<String>,
+    /// Repeatable: `--header "Name: value"`. Non-secret values only — for
+    /// secrets prefer `--bearer-token-env-var`.
+    #[arg(long = "header", value_parser = parse_header, value_name = "NAME:VALUE")]
+    pub headers: Vec<(String, String)>,
+    /// Env var name holding a bearer token. ignis reads it at connect time and
+    /// sends `Authorization: Bearer <value>`.
+    #[arg(long, value_name = "ENV_VAR")]
+    pub bearer_token_env_var: Option<String>,
+
+    // -- stdio transport --
     /// Environment variables for the child process, repeatable: `-e KEY=VALUE`.
     #[arg(short = 'e', long = "env", value_parser = parse_key_val, value_name = "KEY=VALUE")]
     pub env: Vec<(String, String)>,
     /// Working directory for the child process.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
+
+    // -- shared --
     /// Initialize handshake timeout (seconds). Default 30.
     #[arg(long)]
     pub startup_timeout_secs: Option<u64>,
@@ -62,8 +87,10 @@ pub struct AddArgs {
     /// Overwrite an existing entry with the same name.
     #[arg(long)]
     pub force: bool,
-    /// The command and its arguments. Everything after `--` is captured here.
-    #[arg(last = true, required = true, num_args = 1.., value_name = "COMMAND")]
+
+    /// The command and its arguments (stdio). Everything after `--` is captured
+    /// here. Omit when using `--url`.
+    #[arg(last = true, num_args = 0.., value_name = "COMMAND")]
     pub command: Vec<String>,
 }
 
@@ -81,6 +108,20 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .ok_or_else(|| format!("expected KEY=VALUE, got `{s}`"))
+}
+
+/// Parse `--header "Name: value"`. Splits on the FIRST `:` and trims one
+/// optional space after it (matches HTTP convention).
+fn parse_header(s: &str) -> Result<(String, String), String> {
+    let (name, value) = s
+        .split_once(':')
+        .ok_or_else(|| format!("expected `Name: value`, got `{s}`"))?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(format!("header name is empty in `{s}`"));
+    }
+    let value = value.strip_prefix(' ').unwrap_or(value).to_string();
+    Ok((name, value))
 }
 
 /// Entry point. `cmd` is the already-parsed `McpCmd` from the parent `Cli`.
@@ -133,29 +174,60 @@ fn cmd_add(args: AddArgs) -> Result<()> {
             path.display()
         ));
     }
-    let (command, rest) = args
-        .command
-        .split_first()
-        .ok_or_else(|| anyhow!("missing command after --"))?;
     let mut block = Table::new();
     block.set_implicit(false);
-    block["command"] = value(command);
-    if !rest.is_empty() {
-        let mut arr = Array::new();
-        for a in rest {
-            arr.push(a.clone());
+    if let Some(url) = &args.url {
+        // HTTP path. clap's ArgGroup has already guaranteed --url xor command,
+        // and these stdio-only flags would silently no-op otherwise — reject
+        // explicitly so the user notices the typo.
+        if !args.command.is_empty() {
+            return Err(anyhow!("`--url` is mutually exclusive with `-- <command>`"));
         }
-        block["args"] = value(arr);
-    }
-    if !args.env.is_empty() {
-        let mut env = InlineTable::new();
-        for (k, v) in &args.env {
-            env.insert(k, v.into());
+        if !args.env.is_empty() || args.cwd.is_some() {
+            return Err(anyhow!(
+                "`--env` and `--cwd` are stdio-only; drop them when using `--url`"
+            ));
         }
-        block["env"] = value(env);
-    }
-    if let Some(cwd) = &args.cwd {
-        block["cwd"] = value(cwd.to_string_lossy().to_string());
+        block["url"] = value(url);
+        if let Some(ev) = &args.bearer_token_env_var {
+            block["bearer_token_env_var"] = value(ev);
+        }
+        if !args.headers.is_empty() {
+            let mut hdrs = InlineTable::new();
+            for (k, v) in &args.headers {
+                hdrs.insert(k, v.into());
+            }
+            block["headers"] = value(hdrs);
+        }
+    } else {
+        // stdio path. ArgGroup guarantees command is non-empty.
+        if !args.headers.is_empty() || args.bearer_token_env_var.is_some() {
+            return Err(anyhow!(
+                "`--header` and `--bearer-token-env-var` are HTTP-only; drop them when using a `-- <command>`"
+            ));
+        }
+        let (command, rest) = args
+            .command
+            .split_first()
+            .ok_or_else(|| anyhow!("missing command after --"))?;
+        block["command"] = value(command);
+        if !rest.is_empty() {
+            let mut arr = Array::new();
+            for a in rest {
+                arr.push(a.clone());
+            }
+            block["args"] = value(arr);
+        }
+        if !args.env.is_empty() {
+            let mut env = InlineTable::new();
+            for (k, v) in &args.env {
+                env.insert(k, v.into());
+            }
+            block["env"] = value(env);
+        }
+        if let Some(cwd) = &args.cwd {
+            block["cwd"] = value(cwd.to_string_lossy().to_string());
+        }
     }
     if let Some(t) = args.startup_timeout_secs {
         block["startup_timeout_secs"] = value(t as i64);
@@ -247,13 +319,14 @@ async fn cmd_list(args: ListArgs) -> Result<()> {
             .into_iter()
             .map(|name| Row {
                 name: name.clone(),
+                transport: cfg.mcp.servers[name].transport(),
                 status: if disabled.contains(name) {
                     "disabled".to_string()
                 } else {
                     "(not connected — --no-connect)".to_string()
                 },
                 tools: 0,
-                command: command_line(&cfg.mcp.servers[name]),
+                target: target_line(&cfg.mcp.servers[name]),
             })
             .collect()
     } else {
@@ -267,9 +340,10 @@ async fn cmd_list(args: ListArgs) -> Result<()> {
                 };
                 Row {
                     name: e.name.clone(),
+                    transport: cfg.mcp.servers[&e.name].transport(),
                     status: e.status.label(),
                     tools,
-                    command: command_line(&cfg.mcp.servers[&e.name]),
+                    target: target_line(&cfg.mcp.servers[&e.name]),
                 }
             })
             .collect()
@@ -282,9 +356,10 @@ async fn cmd_list(args: ListArgs) -> Result<()> {
             .map(|r| {
                 serde_json::json!({
                     "name": r.name,
+                    "transport": r.transport,
                     "status": r.status,
                     "tools": r.tools,
-                    "command": r.command,
+                    "target": r.target,
                 })
             })
             .collect();
@@ -311,15 +386,36 @@ async fn cmd_get(name: String) -> Result<()> {
     let is_disabled = disabled.contains(&name);
 
     println!("name: {name}");
-    println!("command: {}", command_line(&server_cfg));
-    if !server_cfg.env.is_empty() {
-        println!("env:");
-        for (k, v) in &server_cfg.env {
-            println!("  {k}={v}");
+    println!("transport: {}", server_cfg.transport());
+    match server_cfg.transport() {
+        "stdio" => {
+            println!("command: {}", target_line(&server_cfg));
+            if !server_cfg.env.is_empty() {
+                println!("env:");
+                for (k, v) in &server_cfg.env {
+                    println!("  {k}={v}");
+                }
+            }
+            if let Some(cwd) = &server_cfg.cwd {
+                println!("cwd: {}", cwd.display());
+            }
         }
-    }
-    if let Some(cwd) = &server_cfg.cwd {
-        println!("cwd: {}", cwd.display());
+        "http" => {
+            println!("url: {}", server_cfg.url.as_deref().unwrap_or(""));
+            if let Some(ev) = &server_cfg.bearer_token_env_var {
+                println!("bearer_token_env_var: {ev}");
+            }
+            if !server_cfg.headers.is_empty() {
+                println!("headers:");
+                // Print keys only; never print values (secrets-in-terminal hazard).
+                let mut keys: Vec<&String> = server_cfg.headers.keys().collect();
+                keys.sort();
+                for k in keys {
+                    println!("  {k}: <set>");
+                }
+            }
+        }
+        _ => unreachable!("transport() returns only stdio/http"),
     }
     println!("startup_timeout_secs: {}", server_cfg.startup_timeout_secs);
     println!("tool_timeout_secs: {}", server_cfg.tool_timeout_secs);
@@ -369,21 +465,34 @@ async fn cmd_get(name: String) -> Result<()> {
 
 struct Row {
     name: String,
+    transport: &'static str,
     status: String,
     tools: usize,
-    command: String,
+    target: String,
 }
 
-fn command_line(cfg: &McpServerConfig) -> String {
+/// Render the connection target for table display: command + args for stdio,
+/// the URL for HTTP. Validation has already ensured exactly one is set.
+fn target_line(cfg: &McpServerConfig) -> String {
+    if let Some(url) = &cfg.url {
+        return url.clone();
+    }
+    let cmd = cfg.command.as_deref().unwrap_or("");
     if cfg.args.is_empty() {
-        cfg.command.clone()
+        cmd.to_string()
     } else {
-        format!("{} {}", cfg.command, cfg.args.join(" "))
+        format!("{} {}", cmd, cfg.args.join(" "))
     }
 }
 
 fn print_table(rows: &[Row]) {
     let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
+    let tx_w = rows
+        .iter()
+        .map(|r| r.transport.len())
+        .max()
+        .unwrap_or(9)
+        .max(9);
     let status_w = rows
         .iter()
         .map(|r| r.status.len())
@@ -397,22 +506,26 @@ fn print_table(rows: &[Row]) {
         .unwrap_or(5)
         .max(5);
     println!(
-        "{:<name_w$}  {:<status_w$}  {:>tools_w$}  COMMAND",
+        "{:<name_w$}  {:<tx_w$}  {:<status_w$}  {:>tools_w$}  TARGET",
         "NAME",
+        "TRANSPORT",
         "STATUS",
         "TOOLS",
         name_w = name_w,
+        tx_w = tx_w,
         status_w = status_w,
         tools_w = tools_w,
     );
     for r in rows {
         println!(
-            "{:<name_w$}  {:<status_w$}  {:>tools_w$}  {}",
+            "{:<name_w$}  {:<tx_w$}  {:<status_w$}  {:>tools_w$}  {}",
             r.name,
+            r.transport,
             r.status,
             r.tools,
-            r.command,
+            r.target,
             name_w = name_w,
+            tx_w = tx_w,
             status_w = status_w,
             tools_w = tools_w,
         );

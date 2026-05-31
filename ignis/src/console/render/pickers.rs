@@ -149,7 +149,16 @@ pub(crate) fn render_mcp_picker(
     let visible = max_rows.max(1);
     let start = slash_window_start(sel, visible, entries.len());
     let end = (start + visible).min(entries.len());
+    // Row budget so that a server with many tools doesn't push later entries
+    // off-screen. We stop adding rows past `visible`; the selected server is
+    // guaranteed visible because `slash_window_start` puts it at-or-after
+    // `start`. Tools near the bottom of the band may get truncated — fine,
+    // `ignis mcp get <name>` has the full listing.
+    let mut rows_used: usize = 0;
     for (idx, entry) in entries.iter().enumerate().take(end).skip(start) {
+        if rows_used >= visible {
+            break;
+        }
         let selected = idx == sel;
         let marker = if selected { ">" } else { " " };
         let check = match entry.status {
@@ -166,6 +175,9 @@ pub(crate) fn render_mcp_picker(
             crate::mcp::McpStatus::Disabled => style.fg(if selected { BG } else { TEXT_DIM }),
             _ => style.fg(if selected { BG } else { GREEN }),
         };
+        // `(stdio)` and `(http)` both fit in 7 chars — pad to 7 so the status
+        // column aligns regardless of which transport this row uses.
+        let tag = format!("({})", entry.transport);
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {marker} {check} "),
@@ -175,8 +187,43 @@ pub(crate) fn render_mcp_picker(
                 format!("{:<14}", truncate(&entry.name, 14)),
                 style.add_modifier(Modifier::BOLD),
             ),
+            Span::styled(
+                format!(" {tag:<7}"),
+                style.fg(if selected { BG } else { TEXT_DIM }),
+            ),
             Span::styled(format!(" {}", entry.status.label()), status_style),
         ]));
+        rows_used += 1;
+
+        // For connected servers, list the tools indented underneath. Cap at
+        // TOOL_PREVIEW_MAX so a single 23-tool server (e.g. GitHub) doesn't
+        // monopolise the band; `ignis mcp get <name>` shows the full list.
+        if matches!(entry.status, crate::mcp::McpStatus::Connected { .. }) {
+            const TOOL_PREVIEW_MAX: usize = 8;
+            let tools = reg.mcp_tool_list(&entry.name);
+            let show = tools.len().min(TOOL_PREVIEW_MAX);
+            for tool in tools.iter().take(show) {
+                if rows_used >= visible {
+                    break;
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("        · {tool}"),
+                    Style::default().fg(SUBTEXT),
+                )));
+                rows_used += 1;
+            }
+            if tools.len() > show && rows_used < visible {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "        … +{n} more (see `ignis mcp get {name}`)",
+                        n = tools.len() - show,
+                        name = entry.name
+                    ),
+                    Style::default().fg(TEXT_DIM),
+                )));
+                rows_used += 1;
+            }
+        }
     }
 
     lines.push(Line::from(Span::styled(

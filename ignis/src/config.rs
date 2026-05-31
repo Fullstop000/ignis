@@ -105,18 +105,36 @@ pub struct McpConfig {
     pub servers: HashMap<String, McpServerConfig>,
 }
 
-/// One MCP server entry. `command` is required; everything else has a default.
-/// `startup_timeout_secs` bounds the `initialize` handshake; `tool_timeout_secs`
-/// bounds each individual `tools/call`.
-#[derive(Debug, Deserialize, Clone)]
+/// One MCP server entry. Exactly one of `command` (stdio) and `url` (HTTP)
+/// must be set; the rest of the fields apply to one or the other.
+/// `startup_timeout_secs` bounds the `initialize` handshake;
+/// `tool_timeout_secs` bounds each individual `tools/call`. Validation lives
+/// in [`McpServerConfig::validate`], called from [`load_config`].
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct McpServerConfig {
-    pub command: String,
+    // -- stdio (omit when `url` is set) --
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+
+    // -- HTTP (Streamable HTTP; omit when `command` is set) --
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Literal non-secret headers (e.g. `X-Tenant`). For secrets put them in
+    /// `bearer_token_env_var` — never embed a token here.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Convenience for `Authorization: Bearer <env-value>`. Mutually exclusive
+    /// with a literal `headers["Authorization"]`.
+    #[serde(default)]
+    pub bearer_token_env_var: Option<String>,
+
+    // -- shared --
     #[serde(default = "default_startup_timeout_secs")]
     pub startup_timeout_secs: u64,
     #[serde(default = "default_tool_timeout_secs")]
@@ -128,6 +146,70 @@ fn default_startup_timeout_secs() -> u64 {
 }
 fn default_tool_timeout_secs() -> u64 {
     120
+}
+
+impl McpServerConfig {
+    /// `"stdio"` or `"http"`. Assumes `validate()` already passed (so exactly
+    /// one of `command` / `url` is set); falls back to `"stdio"` for an empty
+    /// shell — the wrong-but-safe choice.
+    pub fn transport(&self) -> &'static str {
+        if self.url.is_some() {
+            "http"
+        } else {
+            "stdio"
+        }
+    }
+
+    /// Enforce the stdio-vs-HTTP exclusivity rules. Failures abort config load.
+    pub fn validate(&self, name: &str) -> Result<(), anyhow::Error> {
+        let has_command = self.command.as_deref().is_some_and(|s| !s.is_empty());
+        let has_url = self.url.as_deref().is_some_and(|s| !s.is_empty());
+        match (has_command, has_url) {
+            (false, false) => {
+                return Err(anyhow!(
+                    "MCP server '{name}': exactly one of `command` or `url` must be set"
+                ));
+            }
+            (true, true) => {
+                return Err(anyhow!(
+                    "MCP server '{name}': `command` and `url` are mutually exclusive"
+                ));
+            }
+            _ => {}
+        }
+        if has_url {
+            let url = self.url.as_deref().unwrap();
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(anyhow!(
+                    "MCP server '{name}': `url` must start with `http://` or `https://` (got {url:?})"
+                ));
+            }
+            // stdio-only fields cannot accompany url
+            if !self.args.is_empty() || !self.env.is_empty() || self.cwd.is_some() {
+                return Err(anyhow!(
+                    "MCP server '{name}': `args`, `env`, and `cwd` are stdio-only — drop them when `url` is set"
+                ));
+            }
+            // bearer cannot collide with explicit Authorization header
+            let has_authz_header = self
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("authorization"));
+            if self.bearer_token_env_var.is_some() && has_authz_header {
+                return Err(anyhow!(
+                    "MCP server '{name}': set either `bearer_token_env_var` OR `headers.Authorization`, not both"
+                ));
+            }
+        } else {
+            // stdio path — HTTP-only fields cannot accompany command
+            if !self.headers.is_empty() || self.bearer_token_env_var.is_some() {
+                return Err(anyhow!(
+                    "MCP server '{name}': `headers` and `bearer_token_env_var` are HTTP-only — drop them when `command` is set"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Validate that an MCP server name is safe to embed in `mcp__<name>__<tool>`
@@ -344,8 +426,9 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
         .map_err(|e| anyhow!("Failed to read {}: {}", path.display(), e))?;
     let mut config: Config = toml::from_str(&content)
         .map_err(|e| anyhow!("Failed to parse {}: {}", path.display(), e))?;
-    for name in config.mcp.servers.keys() {
+    for (name, srv) in &config.mcp.servers {
         validate_mcp_server_name(name)?;
+        srv.validate(name)?;
     }
     config.apply_state(load_state());
     Ok(config)
@@ -881,12 +964,17 @@ args = ["mcp"]
         )
         .unwrap();
         let s = cfg.mcp.servers.get("github").unwrap();
-        assert_eq!(s.command, "gh");
+        assert_eq!(s.command.as_deref(), Some("gh"));
         assert_eq!(s.args, vec!["mcp"]);
         assert!(s.env.is_empty());
         assert_eq!(s.cwd, None);
+        assert_eq!(s.url, None);
+        assert!(s.headers.is_empty());
+        assert_eq!(s.bearer_token_env_var, None);
+        assert_eq!(s.transport(), "stdio");
         assert_eq!(s.startup_timeout_secs, 30);
         assert_eq!(s.tool_timeout_secs, 120);
+        s.validate("github").unwrap();
     }
 
     #[test]
@@ -908,7 +996,7 @@ tool_timeout_secs = 60
         )
         .unwrap();
         let s = cfg.mcp.servers.get("fs").unwrap();
-        assert_eq!(s.command, "npx");
+        assert_eq!(s.command.as_deref(), Some("npx"));
         assert_eq!(s.args.len(), 3);
         assert_eq!(
             s.env.get("NODE_OPTIONS").map(String::as_str),
