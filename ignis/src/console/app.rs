@@ -632,44 +632,6 @@ impl App {
         self.blocks.push(UIBlock::Assistant(text));
     }
 
-    /// `/telemetry` — render a multi-line system notice with the current OTel
-    /// export state (enabled, endpoint, protocol, privacy flags). Read-only.
-    pub(crate) fn show_telemetry_status(&mut self) {
-        let s = crate::telemetry::state_snapshot();
-        let mut lines = vec!["Telemetry status".to_string()];
-
-        if !s.feature_compiled {
-            lines.push(String::from(
-                "  • compiled without the `telemetry` feature — rebuild with --features telemetry to enable",
-            ));
-        } else if !s.enabled {
-            lines.push(String::from(
-                "  • disabled (set IGNIS_ENABLE_TELEMETRY=1 or [telemetry] enabled=true in ~/.ignis/config.toml)",
-            ));
-        } else {
-            lines.push(String::from("  • enabled ✓"));
-            if let Some(ep) = &s.endpoint {
-                lines.push(format!("  • OTLP endpoint: {}", ep));
-            }
-            if let Some(proto) = &s.protocol {
-                lines.push(format!("  • protocol: {}", proto));
-            }
-            lines.push(
-                "  • signals: `ignis.session`, `ignis.turn`, `ignis.llm_request`, `ignis.tool.execution` spans + `ignis.*` / `gen_ai.*` metrics".to_string()
-            );
-        }
-        lines.push(format!(
-            "  • IGNIS_LOG_USER_PROMPTS: {}",
-            if s.log_user_prompts { "on" } else { "off" }
-        ));
-        lines.push(format!(
-            "  • IGNIS_LOG_TOOL_DETAILS: {}",
-            if s.log_tool_details { "on" } else { "off" }
-        ));
-
-        self.add_assistant_notice(lines.join("\n"));
-    }
-
     /// `/sessions` — walk this project's session store and render a compact
     /// stats block inline. The full sortable view stays in `ignis sessions
     /// export --html`.

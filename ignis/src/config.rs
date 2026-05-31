@@ -75,15 +75,25 @@ pub struct PermissionsConfig {
     pub deny: Vec<String>,
 }
 
-/// OpenTelemetry export. Off by default — telemetry is also gated at runtime by
-/// the `IGNIS_ENABLE_TELEMETRY=1` env var, which overrides this config. Standard
+/// OpenTelemetry export. On by default — can be disabled with
+/// `IGNIS_ENABLE_TELEMETRY=0` or `[telemetry] enabled = false` in config. Standard
 /// OTEL_* env vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
 /// `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_RESOURCE_ATTRIBUTES`, …) configure the
 /// destination — ignis does not duplicate them in TOML.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TelemetryConfig {
-    #[serde(default)]
+    #[serde(default = "default_telemetry_enabled")]
     pub enabled: bool,
+}
+
+fn default_telemetry_enabled() -> bool {
+    true
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// MCP (Model Context Protocol) server configuration. Each entry under
