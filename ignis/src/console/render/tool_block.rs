@@ -14,6 +14,7 @@ use crate::console::{
     format_duration, sanitize, truncate, BORDER, DIFF_ADD_BG, DIFF_DEL_BG, GREEN, RED, SPINNERS,
     TEXT, TEXT_DIM, YELLOW,
 };
+use crate::tools::{CreateFileTool, EditFileTool};
 use unicode_width::UnicodeWidthStr;
 
 /// `inline_picker::trace_lines` so resumed sessions read identically.
@@ -176,7 +177,7 @@ pub(crate) fn render_tool_block(
             // edit_file returns a git-style diff: render the hunk with solid
             // red/green backgrounds and syntax-highlighted code. Other tools get
             // a compact 3-line preview.
-            let is_diff = entry.name == "edit_file";
+            let is_diff = entry.name == EditFileTool::NAME;
             let max = if is_diff { 30 } else { 3 };
             if is_diff {
                 let ext = diff_file_ext(&entry.arguments);
@@ -295,7 +296,7 @@ pub(crate) fn compact_tool_args(tool_name: &str, json_str: &str, cwd: &Path) -> 
     let Some(obj) = val.as_object() else {
         return truncate(json_str, 60);
     };
-    if matches!(tool_name, "edit_file" | "create_file") {
+    if matches!(tool_name, EditFileTool::NAME | CreateFileTool::NAME) {
         if let Some(serde_json::Value::String(p)) = obj.get("file_path") {
             return truncate(&relativize_path(p, cwd), 60);
         }
