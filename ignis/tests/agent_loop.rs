@@ -345,8 +345,10 @@ async fn agent_reasoning_content_is_preserved() {
 
 #[tokio::test]
 async fn agent_streams_reasoning_deltas_incrementally() {
-    // Reasoning-only turn: the UI must see MessageStart + 💭 + each delta,
-    // not a single bulk dump at the end (issue #16).
+    // Reasoning-only turn: the UI must see MessageStart + each delta in
+    // order, not a single bulk dump at the end (issue #16). The "✻ Thinking"
+    // header is attached by the renderer to UIBlock::Reasoning, NOT emitted
+    // here as an in-band MessageUpdate.
     let provider = MockProvider::new(vec![vec![
         LlmResponseDelta::Reasoning("step one. ".to_string()),
         LlmResponseDelta::Reasoning("step two.".to_string()),
@@ -381,8 +383,8 @@ async fn agent_streams_reasoning_deltas_incrementally() {
         .collect();
     assert_eq!(
         updates,
-        vec!["💭 ", "step one. ", "step two."],
-        "expected 💭 prefix + each reasoning delta streamed in order"
+        vec!["step one. ", "step two."],
+        "each reasoning delta streamed in order, no in-band header prefix"
     );
 }
 
@@ -407,7 +409,9 @@ async fn agent_streams_reasoning_then_text_as_two_blocks() {
     session.prompt("ask", tx).await.unwrap();
     let events = collect_events(&mut rx).await;
 
-    // Sequence on Message* events: reasoning Start, 💭, hmm, End, text Start, Answer, End.
+    // Sequence on Message* events: reasoning Start, "hmm", End, text Start,
+    // "Answer", End (6 events). The "✻ Thinking" header is the renderer's
+    // job, not an in-band MessageUpdate, so no header delta.
     let msg_events: Vec<&AgentEvent> = events
         .iter()
         .filter(|e| {
@@ -419,24 +423,30 @@ async fn agent_streams_reasoning_then_text_as_two_blocks() {
             )
         })
         .collect();
-    // Exact sequence: Start, 💭, hmm, End, Start, Answer, End (7 events).
-    assert_eq!(msg_events.len(), 7, "events: {msg_events:?}");
-    assert!(matches!(msg_events[0], AgentEvent::MessageStart { .. }));
+    assert_eq!(msg_events.len(), 6, "events: {msg_events:?}");
+    // First block: reasoning (MessageStart carries reasoning_content: Some,
+    // content: None — the renderer's signal to mint a Reasoning UIBlock).
+    if let AgentEvent::MessageStart { message } = msg_events[0] {
+        assert!(message.reasoning_content.is_some() && message.content.is_none());
+    } else {
+        panic!("expected MessageStart first, got {:?}", msg_events[0]);
+    }
     assert!(matches!(
         msg_events[1],
-        AgentEvent::MessageUpdate { delta } if delta == "💭 "
-    ));
-    assert!(matches!(
-        msg_events[2],
         AgentEvent::MessageUpdate { delta } if delta == "hmm"
     ));
-    assert!(matches!(msg_events[3], AgentEvent::MessageEnd { .. }));
-    assert!(matches!(msg_events[4], AgentEvent::MessageStart { .. }));
+    assert!(matches!(msg_events[2], AgentEvent::MessageEnd { .. }));
+    // Second block: text answer.
+    if let AgentEvent::MessageStart { message } = msg_events[3] {
+        assert!(message.content.is_some() && message.reasoning_content.is_none());
+    } else {
+        panic!("expected text MessageStart, got {:?}", msg_events[3]);
+    }
     assert!(matches!(
-        msg_events[5],
+        msg_events[4],
         AgentEvent::MessageUpdate { delta } if delta == "Answer"
     ));
-    assert!(matches!(msg_events[6], AgentEvent::MessageEnd { .. }));
+    assert!(matches!(msg_events[5], AgentEvent::MessageEnd { .. }));
 }
 
 #[tokio::test]
