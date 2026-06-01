@@ -187,19 +187,34 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
+    // Decide the hint markers FIRST so we can subtract their rows from the
+    // content slice — otherwise the markers eat a content row each (codex
+    // P1: the newest line would get clipped off the bottom when both
+    // markers ride along).
     let start = app.scroll_offset.min(total);
-    let end = (start + visible).min(total);
-    let mut slice: Vec<Line> = Vec::with_capacity(end - start + 2);
+    let show_top_hint = start > 0;
+    // Reserve a row for the top hint up front so the content slice shrinks
+    // accordingly. The bottom hint is conditional on `end < total`, which is
+    // itself a function of `content_rows` — pick `content_rows` first
+    // assuming both hints are needed, then drop the bottom reservation if
+    // it turns out we're already at the natural end.
+    let provisional = visible.saturating_sub(if show_top_hint { 1 } else { 0 });
+    let content_rows_assuming_both = provisional.saturating_sub(1).max(1);
+    let provisional_end = (start + content_rows_assuming_both).min(total);
+    let show_bottom_hint = provisional_end < total;
+    let content_rows = provisional
+        .saturating_sub(if show_bottom_hint { 1 } else { 0 })
+        .max(1);
+    let end = (start + content_rows).min(total);
 
-    // `↑N more` when content above the window.
-    if start > 0 {
+    let mut slice: Vec<Line> = Vec::with_capacity(end - start + 2);
+    if show_top_hint {
         slice.push(Line::from(ratatui::text::Span::styled(
             format!("  ↑ {} more lines above", start),
             Style::default().fg(TEXT_DIM),
         )));
     }
     slice.extend(app.transcript[start..end].iter().cloned());
-    // `↓N more` when content below the window.
     let below = total.saturating_sub(end);
     if below > 0 {
         slice.push(Line::from(ratatui::text::Span::styled(
@@ -344,7 +359,7 @@ mod queue_render_tests {
     }
 
     #[test]
-    fn scroll_up_disables_auto_follow_and_clamps_to_zero() {
+    fn scroll_up_disables_auto_follow_when_offset_moves() {
         let mut a = app();
         for i in 0..30 {
             a.commit_transcript_lines(vec![Line::from(format!("line {i}"))]);
@@ -352,11 +367,46 @@ mod queue_render_tests {
         a.scroll_offset = 20;
         a.scroll_transcript_up(8);
         assert_eq!(a.scroll_offset, 12);
-        assert!(!a.auto_follow, "manual scroll must release auto-follow");
+        assert!(!a.auto_follow, "real scroll must release auto-follow");
         // Walking further up clamps at 0, never underflows.
         a.scroll_transcript_up(100);
         assert_eq!(a.scroll_offset, 0);
         assert!(!a.auto_follow);
+    }
+
+    #[test]
+    fn scroll_up_at_top_preserves_auto_follow() {
+        // codex P2: PgUp at offset 0 (already at the top, or before the
+        // transcript grew past the viewport) is a no-op; it must NOT silently
+        // flip auto_follow off — that would un-pin the view from the bottom
+        // when later content arrives.
+        let mut a = app();
+        a.commit_transcript_lines(vec![Line::from("a"), Line::from("b")]);
+        assert_eq!(a.scroll_offset, 0);
+        assert!(a.auto_follow);
+        a.scroll_transcript_up(10);
+        assert_eq!(a.scroll_offset, 0);
+        assert!(a.auto_follow, "no-move PgUp must keep follow on");
+    }
+
+    #[test]
+    fn new_session_clears_transcript_and_resets_scroll() {
+        // codex P3: switching sessions used to leave the previous session's
+        // rendered lines in `transcript`, since only `blocks`/`committed`
+        // got reset. New session output then appeared *below* the stale tail.
+        let mut a = app();
+        a.commit_transcript_lines(vec![Line::from("old line 1"), Line::from("old line 2")]);
+        a.scroll_offset = 1;
+        a.auto_follow = false;
+
+        a.start_new_session("sess-new".to_string());
+
+        // Only the "Started new session" notice is in `blocks` — `transcript`
+        // is reset until the runner flushes the new session's blocks.
+        assert!(a.transcript.is_empty());
+        assert_eq!(a.scroll_offset, 0);
+        assert!(a.auto_follow);
+        assert_eq!(a.session_id, "sess-new");
     }
 
     #[test]

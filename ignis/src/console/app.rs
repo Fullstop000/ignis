@@ -636,12 +636,17 @@ impl App {
         // `auto_follow` + the visible area; nothing to do here.
     }
 
-    /// Scroll the transcript up by `rows` lines and disable auto-follow so
-    /// new content doesn't yank the view back to the bottom. No-op when
-    /// already at the top.
+    /// Scroll the transcript up by `rows` lines. Releases auto-follow only
+    /// when the offset actually decreased — PgUp at the top (or before the
+    /// transcript is taller than the viewport) is a no-op and must NOT
+    /// silently disable auto-follow, else later content stops pinning to
+    /// the bottom (codex P2).
     pub(crate) fn scroll_transcript_up(&mut self, rows: usize) {
-        self.auto_follow = false;
-        self.scroll_offset = self.scroll_offset.saturating_sub(rows);
+        let next = self.scroll_offset.saturating_sub(rows);
+        if next < self.scroll_offset {
+            self.scroll_offset = next;
+            self.auto_follow = false;
+        }
     }
 
     /// Scroll the transcript down by `rows` lines. If the new offset lands
@@ -990,11 +995,21 @@ impl App {
         self.session_id = session_id;
         self.blocks.clear();
         self.committed = 0;
+        self.reset_transcript_view();
         self.current_chunk_idx = None;
         self.history_idx = None;
         self.last_usage = None;
         self.session_picker = None;
         self.add_assistant_notice(format!("Started new session `{}`.", self.session_id));
+    }
+
+    /// Drop the in-app transcript buffer and reset scroll state. Used on
+    /// session reset paths (`/clear`, `/resume`) so the new session doesn't
+    /// inherit the previous session's rendered lines (codex P3).
+    fn reset_transcript_view(&mut self) {
+        self.transcript.clear();
+        self.scroll_offset = 0;
+        self.auto_follow = true;
     }
 
     pub(crate) fn show_session_picker(
@@ -1292,6 +1307,7 @@ impl App {
         self.session_id = session_id.clone();
         self.blocks.clear();
         self.committed = 0;
+        self.reset_transcript_view();
         self.current_chunk_idx = None;
         self.session_picker = None;
         self.last_usage = None;
