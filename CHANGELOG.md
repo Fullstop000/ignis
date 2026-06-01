@@ -12,18 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `/sessions` opens an interactive picker with a per-turn timing waterfall (token usage, tool rollup, start-offset bars, per-turn user-prompt preview); `/resume` removed — use `/sessions`. ([#84](https://github.com/Fullstop000/ignis/pull/84))
-- TUI runs fullscreen in the alternate-screen buffer; the input band is permanently pinned at the bottom and transcript history lives in an in-app scrollable buffer (`PgUp`/`PgDn`, `Ctrl+Home`/`Ctrl+End`, auto-follow when at the bottom). ([#64](https://github.com/Fullstop000/ignis/issues/64), [#77](https://github.com/Fullstop000/ignis/issues/77))
-
-### Fixed
-- `/sessions`, `/model`, and `ask_user` pickers now window the option list around the selection so long lists don't scroll the highlight off-screen; `↑N more` / `↓N more` markers appear at the window edges. ([#62](https://github.com/Fullstop000/ignis/issues/62), [#71](https://github.com/Fullstop000/ignis/issues/71))
-- `/telemetry` and `/afk` pickers now print a confirmation notice after selection — silent persistence was the spawn-detached reply handler not being able to reach `add_assistant_notice`. ([#69](https://github.com/Fullstop000/ignis/issues/69))
-
-## [0.32.0] - 2026-05-31
-
-### Changed
+- TUI runs fullscreen in the alternate-screen buffer; the input band is permanently pinned at the bottom and transcript history lives in an in-app scrollable buffer (`PgUp`/`PgDn`, `Ctrl+Home`/`Ctrl+End`, auto-follow when at the bottom). ([#89](https://github.com/Fullstop000/ignis/pull/89))
 - Reasoning content now renders as its own dim `✻ Thinking` block instead of a `💭`-prefixed reply, and keeps streaming even when reasoning arrives after text starts. ([#83](https://github.com/Fullstop000/ignis/pull/83))
 
 ### Fixed
+- `/sessions`, `/model`, and `ask_user` pickers now window the option list around the selection so long lists don't scroll the highlight off-screen; `↑N more` / `↓N more` markers appear at the window edges. ([#89](https://github.com/Fullstop000/ignis/pull/89))
+- `/telemetry` and `/afk` pickers now print a confirmation notice after selection. ([#89](https://github.com/Fullstop000/ignis/pull/89))
 - `ask_user` picker: full-width divider + placeholder gating. ([#82](https://github.com/Fullstop000/ignis/pull/82))
 
 ## [0.31.0] - 2026-05-31
