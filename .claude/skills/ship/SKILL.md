@@ -83,29 +83,26 @@ git push -u origin HEAD
 gh pr create --base master --title "<concise>" --body "<concise summary + checklist>"
 ```
 
-**If dogfood produced production-ready PNGs**, attach them as a PR comment. Reviewers shouldn't take "looks right" on faith. (`gh gist create` rejects binaries; commit-to-branch is the reliable host.)
+**If dogfood produced production-ready PNGs**, post them as PR comments — reviewers shouldn't take "looks right" on faith. **Do not commit screenshots to the repo.** Inline images live in the comment itself, not as repo paths.
 
-```bash
-mkdir -p .github/screenshots/pr-<num>
-cp /tmp/<shot>.png .github/screenshots/pr-<num>/
-git add .github/screenshots/pr-<num>/
-git commit -m "docs(pr-<num>): dogfood screenshots"
-git push
+Mechanism — drag-and-drop in the GitHub web UI uploads each image to `user-attachments.githubusercontent.com` and embeds the URL. There is no clean `gh` CLI for binary uploads (`gh gist create`, the issue-attachments API, and `gh api` all refuse PNGs).
 
-SHA=$(git rev-parse HEAD)
-BASE="https://raw.githubusercontent.com/Fullstop000/ignis/${SHA}/.github/screenshots/pr-<num>"
+Flow:
 
-gh pr comment <num> --body "$(cat <<EOF
+1. Open the PR page in your browser: `gh pr view <num> --web`
+2. In the *Add a comment* box, drag-and-drop the relevant `/tmp/<shot>.png` files. GitHub uploads each, replaces the drop with `![image](https://github.com/user-attachments/...)`, and renders inline on submit.
+3. Format the comment as a table when there's more than one shot:
+
+```markdown
 ## Screenshots from dogfood
 
 | Path | Result |
 |---|---|
-| <label> | ![](${BASE}/<shot>.png) |
-EOF
-)"
+| <label-1> | <paste-1> |
+| <label-2> | <paste-2> |
 ```
 
-Commit-SHA URLs (not branch URLs) so they survive branch deletion. One shot per user-visible path; skip for non-visual changes.
+Pick the **production-ready** shots — the final ones that show the integrated feature, not intermediate debug captures. One shot per user-visible path. Skip the whole step for non-visual changes (CLI flag, internal refactor, doc-only PR).
 
 ### 6. Review — ask the user which reviewer
 - **Subagent** — `Agent(subagent_type: "general-purpose")` with: *"Review `git diff origin/master...HEAD` for bugs, regressions, risky changes. file:line + severity; skip style nits."*
@@ -187,8 +184,8 @@ Report the release URL.
 | Bump silently because the commit is `feat:` | Conventional commits suggest the *version*, not the *decision* |
 | Direct-push CHANGELOG or version edits to master | Everything rides the feature PR |
 | Auto-merge when CI turns green | Always wait for explicit approval |
-| Dogfood shots stuck in `/tmp` | Post them as a PR comment via the snippet above |
-| Branch-URL screenshots that 404 after merge | Use the commit SHA, not the branch name |
+| Dogfood shots stuck in `/tmp` | Post them as a PR comment via web-UI drag-and-drop |
+| Committing PNGs to `.github/screenshots/` or anywhere in the repo | Repo stays binary-free; screenshots live in comments only |
 | Tag ≠ `Cargo.toml` version | Tag is exactly `v<Cargo.toml version>` |
 | Skip `cargo build` after editing `Cargo.toml` | Stale `Cargo.lock` fails the `--locked` release build |
 | Secret-scan false alarm on placeholders | The regex targets real key shapes; `sk-your-…` is too short to match |
