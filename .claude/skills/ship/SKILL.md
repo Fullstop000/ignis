@@ -1,6 +1,6 @@
 ---
 name: ship
-description: Use when shipping or releasing the ignis project — landing a change to master and cutting a tagged cross-platform release. Triggers include "ship", "ship it", "release", "cut a release", "make a release", "deploy ignis".
+description: Ship ignis — land a PR on master, optionally bump+tag for cross-platform release. Triggers: "ship", "release", "cut a release", "deploy ignis".
 ---
 
 # Ship (ignis)
