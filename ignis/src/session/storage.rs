@@ -146,10 +146,18 @@ impl FileStorage {
         out.push_str(&serde_json::to_string(&meta)?);
         out.push('\n');
 
+        // Per-message timestamps: prefer the wall-clock capture time stamped at
+        // the agent loop / session push site; fall back to the save-time for
+        // unstamped messages (older sessions before this change, or test
+        // fixtures). Without this, every record gets the same `timestamp`,
+        // collapsing the `/sessions` waterfall to zero-duration ticks.
         for message in messages {
             let record = SessionRecord {
                 record_type: Self::message_record_type(message),
-                timestamp,
+                timestamp: message
+                    .created_at_ms
+                    .map(|ms| ms as u128)
+                    .unwrap_or(timestamp),
                 payload: serde_json::to_value(message)?,
             };
             out.push_str(&serde_json::to_string(&record)?);
@@ -254,5 +262,93 @@ impl SessionStorage for FileStorage {
             Ok(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
             Err(_) => Ok(Usage::default()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// Per-message timestamps from `Message::stamp_now()` must survive the
+    /// JSONL round-trip — otherwise the `/sessions` waterfall collapses to
+    /// zero-duration ticks on real persisted sessions. This was caught in
+    /// PR #84 review after dogfood missed it (the fixture used a single
+    /// hand-crafted timestamp per event, hiding the bug).
+    #[tokio::test]
+    async fn per_message_timestamps_round_trip_through_save_and_load() {
+        let tmp = crate::util::unique_temp_dir("ignis-storage-ts");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let storage = FileStorage::new(tmp.clone());
+
+        let m1 = Message {
+            role: "user".to_string(),
+            content: Some("hi".to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: Some(1_000_000),
+        };
+        let m2 = Message {
+            role: "assistant".to_string(),
+            content: Some("hello".to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: Some(1_002_500),
+        };
+        let m3 = Message {
+            role: "tool".to_string(),
+            content: Some("{\"is_error\":false}".to_string()),
+            reasoning_content: None,
+            name: Some("bash".to_string()),
+            tool_call_id: Some("c1".to_string()),
+            tool_calls: None,
+            created_at_ms: Some(1_003_700),
+        };
+
+        storage
+            .save_session("sess-ts", &[m1, m2, m3], Some("/proj"))
+            .await
+            .unwrap();
+
+        // Round trip via load_session — Message-level created_at_ms preserved.
+        let loaded = storage.load_session("sess-ts").await.unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].created_at_ms, Some(1_000_000));
+        assert_eq!(loaded[1].created_at_ms, Some(1_002_500));
+        assert_eq!(loaded[2].created_at_ms, Some(1_003_700));
+
+        // Verify on-disk JSONL has per-record envelope timestamps (not all
+        // equal to save-time). This is the bug the codex review caught.
+        let raw = std::fs::read_to_string(tmp.join("sess-ts.jsonl")).unwrap();
+        let records: Vec<u64> = raw
+            .lines()
+            .skip(1) // skip session_meta
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|v| v.get("timestamp").and_then(|t| t.as_u64()))
+            .collect();
+        assert_eq!(records, vec![1_000_000, 1_002_500, 1_003_700]);
+
+        // Verify the `tool_result` record type lands so extract_turns can
+        // join it back to its call.
+        let kinds: Vec<String> = raw
+            .lines()
+            .skip(1)
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "message".to_string(),
+                "message".to_string(),
+                "tool_result".to_string()
+            ]
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

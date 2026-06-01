@@ -91,6 +91,7 @@ impl AgentTool for SubagentTool {
             name: None,
             tool_call_id: None,
             tool_calls: None,
+            created_at_ms: None,
         }];
 
         // Drain the event stream concurrently so `run` never blocks on a full

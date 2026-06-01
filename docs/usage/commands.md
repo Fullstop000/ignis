@@ -10,14 +10,23 @@ See [skills](#skills) for management.
 
 ---
 
-### `/resume`
+### `/sessions`
 
-List previously saved sessions for this project and open one. Selecting a row
-swaps the live session for the chosen one; the current session is kept and
-shows up at the top of the list if it isn't already there.
+Open the **sessions picker** — a list of every persisted session in this
+project, with a drill-in detail panel. The current session is marked with `▸`.
+
+- `↑`/`↓` — move between rows.
+- `→` — push the highlighted row into a detail panel showing token usage,
+  tool rollup, and a per-turn waterfall. Each turn's bar is broken down into
+  the LLM round-trips (approximate, from message-finalized timestamps) and
+  individual tool calls (exact, color-coded green/red by success).
+- `←` / `Esc` — pop the detail panel back to the list; from the list, close
+  the picker.
+- `Enter` — resume the highlighted session in place. The TUI swaps to the
+  chosen session and replays its full message history so you can scroll back.
 
 ```
-/resume
+/sessions
 ```
 
 ---
@@ -126,17 +135,6 @@ sample run-time counters) as an assistant notice. Read-only.
 ```
 
 See [configure/telemetry.md](../configure/telemetry.md) for setup.
-
----
-
-### `/sessions`
-
-Print a one-shot summary of this project's stored sessions (count, total
-message count, on-disk size) as an assistant notice. Read-only.
-
-```
-/sessions
-```
 
 ---
 

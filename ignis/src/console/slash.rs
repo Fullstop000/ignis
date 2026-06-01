@@ -12,8 +12,8 @@ pub(crate) struct SlashCommand {
 
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
-        name: Cow::Borrowed("/resume"),
-        description: Cow::Borrowed("List and resume sessions"),
+        name: Cow::Borrowed("/sessions"),
+        description: Cow::Borrowed("List sessions; → for details, Enter to resume"),
     },
     SlashCommand {
         name: Cow::Borrowed("/clear"),
@@ -50,10 +50,6 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: Cow::Borrowed("/telemetry"),
         description: Cow::Borrowed("Show or toggle OpenTelemetry export status (on/off)"),
-    },
-    SlashCommand {
-        name: Cow::Borrowed("/sessions"),
-        description: Cow::Borrowed("Show session stats for this project"),
     },
 ];
 
