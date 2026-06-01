@@ -198,6 +198,11 @@ static SPECS: &[ProviderSpec] = &[
         request_headers: &[],
         models: &[
             ModelSpec {
+                name: "MiniMax-M3",
+                context: None,
+                reasoning_effort: &[],
+            },
+            ModelSpec {
                 name: "MiniMax-M2.7",
                 context: None,
                 reasoning_effort: &[],
