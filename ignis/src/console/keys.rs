@@ -721,7 +721,10 @@ async fn handle_telemetry_picker(
                 let enable = label == "On";
                 persist_telemetry_setting(enable);
                 let _ = notice_tx_clone
-                    .send(format!("Telemetry → {}.", if enable { "On" } else { "Off" }))
+                    .send(format!(
+                        "Telemetry → {}.",
+                        if enable { "On" } else { "Off" }
+                    ))
                     .await;
             }
         }

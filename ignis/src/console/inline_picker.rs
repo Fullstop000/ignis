@@ -551,11 +551,8 @@ pub(crate) fn options_pane_lines(
     // Reserve: divider + Other row + 2-line ↑/↓ slack.
     const CHROME_RESERVE: usize = 1 + 1 + 2;
     let opts_budget = max_rows.saturating_sub(CHROME_RESERVE).max(1);
-    let (start, end) = crate::console::render::widgets::picker_window(
-        cursor.min(opts_n),
-        opts_budget,
-        opts_n,
-    );
+    let (start, end) =
+        crate::console::render::widgets::picker_window(cursor.min(opts_n), opts_budget, opts_n);
     if start > 0 {
         out.push(Line::from(Span::styled(
             format!("  ↑ {} more above", start),
