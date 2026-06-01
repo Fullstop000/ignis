@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-06-01
+
 ### Added
 - MiniMax Token Plan: `MiniMax-M3` model now in the catalog (Anthropic-first, same dual-endpoint shape as M2.7). ([#94](https://github.com/Fullstop000/ignis/pull/94))
 - MCP HTTP transport (Streamable HTTP). `[mcp.servers.X] url = "https://…"` or `ignis mcp add X --url … [--bearer-token-env-var ENV] [--header "K: V"]`; `/mcp` picker shows transport tag and per-server tool list. ([#86](https://github.com/Fullstop000/ignis/pull/86))
@@ -17,9 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reasoning content now renders as its own dim `✻ Thinking` block instead of a `💭`-prefixed reply, and keeps streaming even when reasoning arrives after text starts. ([#83](https://github.com/Fullstop000/ignis/pull/83))
 
 ### Fixed
+- `ignis -v` / `--version` now print the version instead of erroring; `-V` is no longer accepted. ([#95](https://github.com/Fullstop000/ignis/pull/95))
 - `/sessions`, `/model`, and `ask_user` pickers now window the option list around the selection so long lists don't scroll the highlight off-screen; `↑N more` / `↓N more` markers appear at the window edges. ([#89](https://github.com/Fullstop000/ignis/pull/89))
 - `/telemetry` and `/afk` pickers now print a confirmation notice after selection. ([#89](https://github.com/Fullstop000/ignis/pull/89))
 - `ask_user` picker: full-width divider + placeholder gating. ([#82](https://github.com/Fullstop000/ignis/pull/82))
+
+### Breaking
+- `ignis upgrade --version <TAG>` renamed to `ignis upgrade --tag <TAG>` so it no longer collides with the root `--version`. ([#95](https://github.com/Fullstop000/ignis/pull/95))
 
 ## [0.31.0] - 2026-05-31
 
