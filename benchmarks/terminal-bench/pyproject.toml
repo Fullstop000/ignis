@@ -1,7 +1,7 @@
 [project]
 name = "ignis-harbor-agent"
 version = "0.1.0"
-description = "Harbor (Terminal-Bench 2.0) adapter that runs ignis inside the sandbox."
+description = "Harbor (Terminal-Bench 2.1) adapter that runs ignis inside the sandbox."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
