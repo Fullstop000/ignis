@@ -42,7 +42,7 @@ pub const TARGET: Option<&str> = if cfg!(all(target_os = "linux", target_arch = 
 pub struct UpgradeCmd {
     /// Install a specific tag (e.g. `v0.14.1`) instead of the latest.
     #[arg(long)]
-    pub version: Option<String>,
+    pub tag: Option<String>,
     /// Reinstall even when already at the target version.
     #[arg(long)]
     pub force: bool,
@@ -62,8 +62,8 @@ pub async fn run(cmd: UpgradeCmd) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
 
     // Only hit the GitHub releases API when we actually need the latest tag —
-    // `--version vX.Y.Z` should work even when the API is rate-limited or down.
-    let needs_latest = cmd.check || cmd.version.is_none();
+    // `--tag vX.Y.Z` should work even when the API is rate-limited or down.
+    let needs_latest = cmd.check || cmd.tag.is_none();
     let latest_tag = if needs_latest {
         Some(fetch_latest_tag().await?)
     } else {
@@ -81,9 +81,9 @@ pub async fn run(cmd: UpgradeCmd) -> Result<()> {
     }
 
     let desired_tag = cmd
-        .version
+        .tag
         .clone()
-        .unwrap_or_else(|| latest_tag.expect("latest_tag fetched when --version is unset"));
+        .unwrap_or_else(|| latest_tag.expect("latest_tag fetched when --tag is unset"));
     let desired_ver = strip_v(&desired_tag).to_string();
 
     if !cmd.force && desired_ver == current {
@@ -708,14 +708,14 @@ mod tests {
 
     #[test]
     fn upgrade_cmd_parses_flags() {
-        let cmd = UpgradeCmd::try_parse_from(["ignis upgrade", "--version", "v0.14.1", "--force"])
-            .unwrap();
-        assert_eq!(cmd.version.as_deref(), Some("v0.14.1"));
+        let cmd =
+            UpgradeCmd::try_parse_from(["ignis upgrade", "--tag", "v0.14.1", "--force"]).unwrap();
+        assert_eq!(cmd.tag.as_deref(), Some("v0.14.1"));
         assert!(cmd.force);
         assert!(!cmd.check);
 
         let cmd = UpgradeCmd::try_parse_from(["ignis upgrade", "--check"]).unwrap();
         assert!(cmd.check);
-        assert!(cmd.version.is_none());
+        assert!(cmd.tag.is_none());
     }
 }

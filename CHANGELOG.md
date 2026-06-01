@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/telemetry` and `/afk` pickers now print a confirmation notice after selection. ([#89](https://github.com/Fullstop000/ignis/pull/89))
 - `ask_user` picker: full-width divider + placeholder gating. ([#82](https://github.com/Fullstop000/ignis/pull/82))
 
+### Breaking
+- `ignis upgrade --version <TAG>` renamed to `ignis upgrade --tag <TAG>` so it no longer collides with the root `--version`. ([#95](https://github.com/Fullstop000/ignis/pull/95))
+
 ## [0.31.0] - 2026-05-31
 
 ### Added
