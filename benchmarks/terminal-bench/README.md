@@ -2,7 +2,7 @@
 
 Runs [ignis](https://github.com/Fullstop000/ignis) as a custom agent inside the
 [Harbor](https://www.harborframework.com) harness — the official runner for
-Terminal-Bench 2.0.
+Terminal-Bench. Defaults to **TB 2.1**; TB 2.0 still selectable.
 
 ```
 benchmarks/terminal-bench/
@@ -62,7 +62,7 @@ uv venv
 uv pip install -e .          # pulls harbor and registers ignis_agent
 
 # 2. Sanity-check the harness against the oracle (no model needed).
-uv run harbor run -d terminal-bench/terminal-bench-2 -a oracle
+uv run harbor run -d terminal-bench/terminal-bench-2-1 -a oracle
 ```
 
 Docker must be installed and running.
@@ -74,17 +74,25 @@ and aggregates nothing on its own (run the `scripts/` afterward). Keys never
 print.
 
 ```bash
-./run.sh                                   # deepseek/deepseek-v4-flash@max on Daytona
-MODEL=anthropic/claude-haiku-4-5 ./run.sh  # any wired provider
-ENV=docker  ./run.sh                       # local, no cloud quota
-ENV=novita  ./run.sh                       # cheapest cloud, roomy disk
+./run.sh                                   # interactive: pick benchmark/model/env, confirm, run
+MODEL=anthropic/claude-haiku-4-5 ./run.sh  # skip the model prompt
+ENV=docker  ./run.sh                       # skip the env prompt; local, no cloud quota
+ENV=novita  ./run.sh                       # skip the env prompt; cheapest cloud
+DRY_RUN=1   ./run.sh                       # show the plan, don't invoke harbor
+NO_PROMPT=1 ./run.sh                       # take all defaults silently (for CI)
 ```
+
+On a TTY with nothing pre-set in env, the script prompts for **benchmark**
+(TB 2.1 / TB 2.0 / custom slug), **model** (curated list of wired providers,
+plus a custom option), and **sandbox env** (daytona / novita / docker), prints
+a summary, and asks once before launching `harbor run`. Any value pre-set in
+env skips that prompt — so `MODEL=… ./run.sh` only asks about the rest.
 
 It sets `--max-retries 2` (a transient cloud blip retries the trial instead of
 crashing the whole job) and `--agent-timeout-multiplier 2.0` (compute-heavy
 tasks — builds, ML training — need more than the stock budget). Override any
 default via env: `MODEL`, `ENV`, `DATASET`, `NCONC`, `STORAGE_MB`,
-`TIMEOUT_MULT`, `MAX_RETRIES`.
+`TIMEOUT_MULT`, `MAX_RETRIES`, `JOB_NAME`.
 
 ### Disk vs concurrency (the one real tradeoff)
 

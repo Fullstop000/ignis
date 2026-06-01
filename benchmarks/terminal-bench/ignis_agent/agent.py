@@ -2,7 +2,7 @@
 Harbor adapter that runs ignis inside the sandbox to solve a Terminal-Bench task.
 
 Wire-up:
-    harbor run -d terminal-bench/terminal-bench-2 \\
+    harbor run -d terminal-bench/terminal-bench-2-1 \\
         -m anthropic/claude-haiku-4-5 \\
         --agent-import-path ignis_agent.agent:IgnisAgent
 
