@@ -510,10 +510,27 @@ pub(crate) struct App {
     /// Real token usage from the most recent completed turn (provider-reported).
     pub(crate) last_usage: Option<crate::Usage>,
 
-    /// Number of leading blocks already flushed to the terminal's scrollback
-    /// (committed via `insert_before`). The rest live in the in-memory transcript
-    /// and are flushed once finalized.
+    /// Number of leading blocks already appended to `transcript` as
+    /// finalized output. The rest are still mutating; they render live in the
+    /// transcript region via `block_lines` and only get committed (and frozen)
+    /// once `block_done(idx)` is true.
     pub(crate) committed: usize,
+
+    /// Frozen transcript lines — the in-app scrollable history rendered
+    /// above the input band in fullscreen mode. Grows monotonically; the
+    /// transcript widget renders a windowed slice of this each frame.
+    pub(crate) transcript: Vec<ratatui::text::Line<'static>>,
+    /// First line of `transcript` currently visible. `auto_follow == true`
+    /// means the view tracks the bottom; `false` means the user scrolled up
+    /// and we should stay put even as new content arrives.
+    pub(crate) scroll_offset: usize,
+    /// View follows the latest content when true (default). Flipped to false
+    /// when the user scrolls up; flipped back when they jump to bottom.
+    pub(crate) auto_follow: bool,
+    /// Last-rendered transcript-area row count, set by `render_transcript`
+    /// each frame. PgDn reads this so it can correctly detect "I'm now at
+    /// the natural bottom — re-enable auto-follow" even on tall terminals.
+    pub(crate) transcript_visible_rows: usize,
 
     pub(crate) should_quit: bool,
     pub(crate) error_flash: Option<(String, Instant)>,
@@ -599,7 +616,62 @@ impl App {
             mcp: None,
             permissions: None,
             update_notice: None,
+            transcript: Vec::new(),
+            scroll_offset: 0,
+            auto_follow: true,
+            transcript_visible_rows: 0,
         }
+    }
+
+    /// Append a chunk of finalized lines (welcome banner, a committed block,
+    /// etc.) to the in-app transcript. Auto-follow keeps the view stuck to
+    /// the bottom; if the user has scrolled up, their position is preserved
+    /// and they'll see a `↓N more` hint until they return.
+    pub(crate) fn commit_transcript_lines(&mut self, lines: Vec<ratatui::text::Line<'static>>) {
+        if lines.is_empty() {
+            return;
+        }
+        self.transcript.extend(lines);
+        // scroll_offset is recomputed by the renderer each frame from
+        // `auto_follow` + the visible area; nothing to do here.
+    }
+
+    /// Scroll the transcript up by `rows` lines. Releases auto-follow only
+    /// when the offset actually decreased — PgUp at the top (or before the
+    /// transcript is taller than the viewport) is a no-op and must NOT
+    /// silently disable auto-follow, else later content stops pinning to
+    /// the bottom (codex P2).
+    pub(crate) fn scroll_transcript_up(&mut self, rows: usize) {
+        let next = self.scroll_offset.saturating_sub(rows);
+        if next < self.scroll_offset {
+            self.scroll_offset = next;
+            self.auto_follow = false;
+        }
+    }
+
+    /// Scroll the transcript down by `rows` lines. If the new offset lands
+    /// at or past the natural bottom, re-enable auto-follow.
+    pub(crate) fn scroll_transcript_down(&mut self, rows: usize, visible: usize) {
+        let max_offset = self.transcript.len().saturating_sub(visible.max(1));
+        let next = self.scroll_offset.saturating_add(rows);
+        if next >= max_offset {
+            self.scroll_offset = max_offset;
+            self.auto_follow = true;
+        } else {
+            self.scroll_offset = next;
+        }
+    }
+
+    /// Jump to the top of the transcript. Disables auto-follow.
+    pub(crate) fn scroll_transcript_to_top(&mut self) {
+        self.auto_follow = false;
+        self.scroll_offset = 0;
+    }
+
+    /// Jump to the bottom and re-enable auto-follow.
+    pub(crate) fn scroll_transcript_to_bottom(&mut self) {
+        self.auto_follow = true;
+        // Renderer recomputes the exact offset from `auto_follow`.
     }
 
     pub(crate) fn set_context_window(&mut self, window: usize) {
@@ -923,11 +995,21 @@ impl App {
         self.session_id = session_id;
         self.blocks.clear();
         self.committed = 0;
+        self.reset_transcript_view();
         self.current_chunk_idx = None;
         self.history_idx = None;
         self.last_usage = None;
         self.session_picker = None;
         self.add_assistant_notice(format!("Started new session `{}`.", self.session_id));
+    }
+
+    /// Drop the in-app transcript buffer and reset scroll state. Used on
+    /// session reset paths (`/clear`, `/resume`) so the new session doesn't
+    /// inherit the previous session's rendered lines (codex P3).
+    fn reset_transcript_view(&mut self) {
+        self.transcript.clear();
+        self.scroll_offset = 0;
+        self.auto_follow = true;
     }
 
     pub(crate) fn show_session_picker(
@@ -1225,6 +1307,7 @@ impl App {
         self.session_id = session_id.clone();
         self.blocks.clear();
         self.committed = 0;
+        self.reset_transcript_view();
         self.current_chunk_idx = None;
         self.session_picker = None;
         self.last_usage = None;

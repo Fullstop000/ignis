@@ -1,7 +1,8 @@
 //! Console rendering — entry point. Owns the top-level frame `draw`,
-//! the inline viewport sizing (`live_height`), and the split-pane render
-//! path for `ask_user` pickers that carry previews. Everything else is
-//! delegated to one of the submodules below.
+//! the band-height calculation (`band_height`), the in-app transcript
+//! scroller, and the split-pane render path for `ask_user` pickers that
+//! carry previews. Everything else is delegated to one of the submodules
+//! below.
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -20,7 +21,7 @@ pub(crate) mod widgets;
 
 // Re-export per-frame primitives callers still reference by their old
 // `console::render::*` path so this split is a pure file move from outside.
-pub(crate) use blocks::{block_height, block_lines, render_block_into, welcome_lines};
+pub(crate) use blocks::{block_lines, welcome_lines};
 pub(crate) use pickers::{
     render_mcp_picker, render_model_picker, render_session_picker, render_skill_picker,
 };
@@ -29,38 +30,10 @@ pub(crate) use widgets::{
     queued_region_height, MAX_SLASH_ROWS,
 };
 
-/// Live-region height (rows) the inline viewport needs for the current state.
-/// Finalized transcript blocks live in the terminal's own scrollback; only this
-/// band is repainted. The band grows for the multi-line input, slash
-/// suggestions, and the modal pickers, and collapses to a tidy strip at rest.
-pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
+/// Height (rows) of the bottom band — status line + queued strip + slash
+/// suggestions + input box + footer. Independent of the transcript above it.
+pub(crate) fn band_height(app: &App, term_rows: u16) -> u16 {
     let cap = term_rows.saturating_sub(1).max(3);
-    // `ask_user` runs while busy and owns the whole live band, same as the
-    // slash pickers.
-    if let Some(p) = &app.inline_picker {
-        return super::inline_picker::picker_height(p).clamp(4, cap);
-    }
-    if app.model_picker.is_some() {
-        let rows = app.model_options.len() as u16 + 4;
-        return rows.clamp(4, cap);
-    }
-    if let Some(p) = &app.session_picker {
-        // Detail view is dense (header, tokens bar, tool rollup, up to ~10
-        // turn bars, footer). Give it the full band so nothing clips.
-        if p.is_detail() {
-            return cap;
-        }
-        let rows = p.sessions.len().max(1) as u16 + 4;
-        return rows.clamp(4, cap);
-    }
-    if let Some(_p) = &app.skill_picker {
-        let rows = app.skills.as_deref().map(|r| r.all().len()).unwrap_or(0) as u16 + 4;
-        return rows.clamp(4, cap);
-    }
-    if app.mcp_picker.is_some() {
-        let rows = app.mcp.as_deref().map(|r| r.len()).unwrap_or(0) as u16 + 4;
-        return rows.clamp(4, cap);
-    }
     let input_h = input_height(app, cap);
     let sugg = app.slash_suggestions();
     let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
@@ -69,7 +42,7 @@ pub(crate) fn live_height(app: &App, term_rows: u16) -> u16 {
         0
     };
     let queued_h = queued_region_height(app);
-    (1 + queued_h + sugg_h + input_h + 1).min(cap) // status + queued + suggestions + input + footer
+    (1 + queued_h + sugg_h + input_h + 1).min(cap)
 }
 
 /// Input box height (incl. borders), growing with newline-separated lines.
@@ -82,77 +55,180 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let size = f.size();
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
-    // Inline (`ask_user`) picker with at least one option carrying a preview
-    // gets its own split layout — option list left, bordered Preview pane
-    // right. The other pickers fall through to the single-paragraph path.
+    // Fullscreen layout: transcript (or whatever picker has taken the area)
+    // fills the top; the input band sits permanently at the bottom.
+    let band_h = band_height(app, size.height);
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(band_h)])
+        .split(size);
+    let body_area = outer[0];
+    let band_area = outer[1];
+
+    // Body area: pickers replace the transcript when one is open; otherwise
+    // the in-app transcript renders here.
     if let Some(picker) = &app.inline_picker {
         if picker.has_any_preview() {
-            render_inline_picker_split(f, size, picker);
-            return;
+            render_inline_picker_split(f, body_area, picker);
+        } else {
+            let mut lines: Vec<Line> = Vec::new();
+            super::inline_picker::render_inline_picker(
+                &mut lines,
+                picker,
+                body_area.width,
+                body_area.height as usize,
+            );
+            f.render_widget(
+                Paragraph::new(Text::from(lines))
+                    .style(Style::default().bg(BG))
+                    .wrap(Wrap { trim: false }),
+                body_area,
+            );
         }
-    }
-
-    // Modal pickers own the whole live band.
-    if app.model_picker.is_some()
-        || app.session_picker.is_some()
-        || app.skill_picker.is_some()
-        || app.mcp_picker.is_some()
-        || app.inline_picker.is_some()
-    {
+    } else if let Some(picker) = &app.model_picker {
+        let max_rows = (body_area.height as usize).saturating_sub(4).max(1);
         let mut lines: Vec<Line> = Vec::new();
-        if let Some(picker) = &app.inline_picker {
-            super::inline_picker::render_inline_picker(&mut lines, picker, size.width);
-        } else if let Some(picker) = &app.model_picker {
-            render_model_picker(&mut lines, picker, &app.model_options);
-        } else if let Some(picker) = &app.session_picker {
-            render_session_picker(&mut lines, picker);
-        } else if let Some(picker) = &app.skill_picker {
-            // Rows available for skill items = band minus header (2) + footer (1).
-            let max_rows = (size.height as usize).saturating_sub(3).max(1);
-            render_skill_picker(&mut lines, picker, app.skills.as_deref(), max_rows);
-        } else if let Some(picker) = &app.mcp_picker {
-            let max_rows = (size.height as usize).saturating_sub(3).max(1);
-            render_mcp_picker(&mut lines, picker, app.mcp.as_deref(), max_rows);
-        }
+        render_model_picker(&mut lines, picker, &app.model_options, max_rows);
         f.render_widget(
             Paragraph::new(Text::from(lines))
                 .style(Style::default().bg(BG))
                 .wrap(Wrap { trim: false }),
-            size,
+            body_area,
         );
-        return;
+    } else if let Some(picker) = &app.session_picker {
+        let max_rows = (body_area.height as usize).saturating_sub(3).max(1);
+        let mut lines: Vec<Line> = Vec::new();
+        render_session_picker(&mut lines, picker, max_rows);
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().bg(BG))
+                .wrap(Wrap { trim: false }),
+            body_area,
+        );
+    } else if let Some(picker) = &app.skill_picker {
+        let max_rows = (body_area.height as usize).saturating_sub(3).max(1);
+        let mut lines: Vec<Line> = Vec::new();
+        render_skill_picker(&mut lines, picker, app.skills.as_deref(), max_rows);
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().bg(BG))
+                .wrap(Wrap { trim: false }),
+            body_area,
+        );
+    } else if let Some(picker) = &app.mcp_picker {
+        let max_rows = (body_area.height as usize).saturating_sub(3).max(1);
+        let mut lines: Vec<Line> = Vec::new();
+        render_mcp_picker(&mut lines, picker, app.mcp.as_deref(), max_rows);
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().bg(BG))
+                .wrap(Wrap { trim: false }),
+            body_area,
+        );
+    } else {
+        render_transcript(f, body_area, app);
     }
 
-    let input_h = input_height(app, size.height);
+    // Band: laid out from the top of `band_area` down. Order is the same as
+    // the legacy inline band — status, queued, slash, input, footer.
+    let input_h = input_height(app, band_area.height);
     let sugg = app.slash_suggestions();
     let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
-        size.height
+        band_area
+            .height
             .saturating_sub(input_h + 2)
             .min((sugg.len() as u16).min(MAX_SLASH_ROWS))
     } else {
         0
     };
     let queued_h = queued_region_height(app);
-    let layout = Layout::default()
+    let band_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),        // loading / status
-            Constraint::Length(queued_h), // queued rows + hint (0 when idle/clean)
-            Constraint::Length(sugg_h),   // slash suggestions (0 when none)
-            Constraint::Length(input_h),  // input
-            Constraint::Length(1),        // footer
+            Constraint::Length(1),
+            Constraint::Length(queued_h),
+            Constraint::Length(sugg_h),
+            Constraint::Length(input_h),
+            Constraint::Length(1),
         ])
-        .split(size);
+        .split(band_area);
 
-    draw_loading(f, layout[0], app);
+    draw_loading(f, band_layout[0], app);
     if queued_h > 0 {
-        draw_queued(f, layout[1], app);
+        draw_queued(f, band_layout[1], app);
     }
     if sugg_h > 0 {
-        draw_slash_suggestions(f, layout[2], app);
+        draw_slash_suggestions(f, band_layout[2], app);
     }
-    draw_input(f, layout[3], app);
-    draw_footer(f, layout[4], app);
+    draw_input(f, band_layout[3], app);
+    draw_footer(f, band_layout[4], app);
+}
+
+/// Render the in-app transcript into `area`. Honors `app.auto_follow`
+/// (recomputes scroll_offset to the natural bottom) and `app.scroll_offset`
+/// (sticky position when the user has scrolled up). Renders a `↑N more` /
+/// `↓N more` hint at the edges when content extends beyond the window.
+fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.height == 0 {
+        return;
+    }
+    let total = app.transcript.len();
+    let visible = area.height as usize;
+    // Make the real visible-row count visible to PgDn so it can correctly
+    // detect "at the natural bottom" and re-enable auto-follow.
+    app.transcript_visible_rows = visible;
+    let max_offset = total.saturating_sub(visible);
+    // Auto-follow recomputes offset each frame; manual scroll keeps the
+    // user's offset, clamped to the current max in case content shrunk.
+    if app.auto_follow || app.scroll_offset > max_offset {
+        app.scroll_offset = max_offset;
+    }
+    if total == 0 {
+        return;
+    }
+
+    // Decide the hint markers FIRST so we can subtract their rows from the
+    // content slice — otherwise the markers eat a content row each (codex
+    // P1: the newest line would get clipped off the bottom when both
+    // markers ride along).
+    let start = app.scroll_offset.min(total);
+    let show_top_hint = start > 0;
+    // Reserve a row for the top hint up front so the content slice shrinks
+    // accordingly. The bottom hint is conditional on `end < total`, which is
+    // itself a function of `content_rows` — pick `content_rows` first
+    // assuming both hints are needed, then drop the bottom reservation if
+    // it turns out we're already at the natural end.
+    let provisional = visible.saturating_sub(if show_top_hint { 1 } else { 0 });
+    let content_rows_assuming_both = provisional.saturating_sub(1).max(1);
+    let provisional_end = (start + content_rows_assuming_both).min(total);
+    let show_bottom_hint = provisional_end < total;
+    let content_rows = provisional
+        .saturating_sub(if show_bottom_hint { 1 } else { 0 })
+        .max(1);
+    let end = (start + content_rows).min(total);
+
+    let mut slice: Vec<Line> = Vec::with_capacity(end - start + 2);
+    if show_top_hint {
+        slice.push(Line::from(ratatui::text::Span::styled(
+            format!("  ↑ {} more lines above", start),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
+    slice.extend(app.transcript[start..end].iter().cloned());
+    let below = total.saturating_sub(end);
+    if below > 0 {
+        slice.push(Line::from(ratatui::text::Span::styled(
+            format!("  ↓ {} more lines below (End to follow)", below),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(slice))
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 /// Split-layout render for the `ask_user` picker when at least one option
 /// carries a `preview`. The band is divided:
@@ -190,7 +266,11 @@ fn render_inline_picker_split(
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(outer[1]);
 
-    let left_lines = super::inline_picker::options_pane_lines(picker, middle[0].width);
+    let left_lines = super::inline_picker::options_pane_lines(
+        picker,
+        middle[0].width,
+        middle[0].height as usize,
+    );
     f.render_widget(
         Paragraph::new(Text::from(left_lines))
             .style(Style::default().bg(BG))
@@ -248,6 +328,103 @@ mod queue_render_tests {
     }
 
     #[test]
+    fn picker_window_returns_start_end_around_selection() {
+        use crate::console::render::widgets::picker_window;
+        // sel sits past the window → start moves up so sel is the last row.
+        assert_eq!(picker_window(9, 5, 20), (5, 10));
+        // sel near the top → start stays at 0, end clamps to visible.
+        assert_eq!(picker_window(2, 5, 20), (0, 5));
+        // fewer items than visible → (0, len) — no scrolling needed.
+        assert_eq!(picker_window(2, 8, 5), (0, 5));
+        // empty list returns an empty window.
+        assert_eq!(picker_window(0, 5, 0), (0, 0));
+    }
+
+    #[test]
+    fn auto_follow_pins_view_to_bottom() {
+        // App starts with auto_follow=true, scroll_offset=0. After several
+        // lines are committed, the renderer should pin scroll_offset to the
+        // natural bottom (total - visible).
+        let mut a = app();
+        for i in 0..20 {
+            a.commit_transcript_lines(vec![Line::from(format!("line {i}"))]);
+        }
+        // Simulate a render: max_offset = 20 - 5 = 15. auto_follow → 15.
+        let max_offset = a.transcript.len().saturating_sub(5);
+        if a.auto_follow {
+            a.scroll_offset = max_offset;
+        }
+        assert_eq!(a.scroll_offset, 15);
+        assert!(a.auto_follow);
+    }
+
+    #[test]
+    fn scroll_up_disables_auto_follow_when_offset_moves() {
+        let mut a = app();
+        for i in 0..30 {
+            a.commit_transcript_lines(vec![Line::from(format!("line {i}"))]);
+        }
+        a.scroll_offset = 20;
+        a.scroll_transcript_up(8);
+        assert_eq!(a.scroll_offset, 12);
+        assert!(!a.auto_follow, "real scroll must release auto-follow");
+        // Walking further up clamps at 0, never underflows.
+        a.scroll_transcript_up(100);
+        assert_eq!(a.scroll_offset, 0);
+        assert!(!a.auto_follow);
+    }
+
+    #[test]
+    fn scroll_up_at_top_preserves_auto_follow() {
+        // codex P2: PgUp at offset 0 (already at the top, or before the
+        // transcript grew past the viewport) is a no-op; it must NOT silently
+        // flip auto_follow off — that would un-pin the view from the bottom
+        // when later content arrives.
+        let mut a = app();
+        a.commit_transcript_lines(vec![Line::from("a"), Line::from("b")]);
+        assert_eq!(a.scroll_offset, 0);
+        assert!(a.auto_follow);
+        a.scroll_transcript_up(10);
+        assert_eq!(a.scroll_offset, 0);
+        assert!(a.auto_follow, "no-move PgUp must keep follow on");
+    }
+
+    #[test]
+    fn new_session_clears_transcript_and_resets_scroll() {
+        // codex P3: switching sessions used to leave the previous session's
+        // rendered lines in `transcript`, since only `blocks`/`committed`
+        // got reset. New session output then appeared *below* the stale tail.
+        let mut a = app();
+        a.commit_transcript_lines(vec![Line::from("old line 1"), Line::from("old line 2")]);
+        a.scroll_offset = 1;
+        a.auto_follow = false;
+
+        a.start_new_session("sess-new".to_string());
+
+        // Only the "Started new session" notice is in `blocks` — `transcript`
+        // is reset until the runner flushes the new session's blocks.
+        assert!(a.transcript.is_empty());
+        assert_eq!(a.scroll_offset, 0);
+        assert!(a.auto_follow);
+        assert_eq!(a.session_id, "sess-new");
+    }
+
+    #[test]
+    fn scroll_down_to_bottom_resumes_auto_follow() {
+        let mut a = app();
+        for i in 0..30 {
+            a.commit_transcript_lines(vec![Line::from(format!("line {i}"))]);
+        }
+        a.scroll_offset = 5;
+        a.auto_follow = false;
+        // visible=10 → max_offset = 30 - 10 = 20. Scrolling down 18 lands at
+        // 23 which exceeds max, so we snap to 20 and re-enable auto_follow.
+        a.scroll_transcript_down(18, 10);
+        assert_eq!(a.scroll_offset, 20);
+        assert!(a.auto_follow);
+    }
+
+    #[test]
     fn hint_is_none_when_idle_or_clean_busy() {
         let mut a = app();
         a.mode = Mode::Idle;
@@ -270,23 +447,6 @@ mod queue_render_tests {
             queued_hint(&a).as_deref(),
             Some("↑ edit last · Enter queue · Ctrl+S send now")
         );
-    }
-
-    #[test]
-    fn render_block_blanks_wide_char_continuations() {
-        // Regression: `insert_before` flushes every cell, so the blank cell after
-        // a double-width glyph would print as a stray space in scrollback. We
-        // empty it. "ab的cd" → 的 occupies cells 2-3; cell 3 must be "".
-        use ratatui::{buffer::Buffer, layout::Rect, text::Line};
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-        render_block_into(&mut buf, &[Line::from("ab的cd")]);
-        assert_eq!(buf.get(2, 0).symbol(), "的");
-        assert_eq!(
-            buf.get(3, 0).symbol(),
-            "",
-            "wide-char continuation must be emptied"
-        );
-        assert_eq!(buf.get(4, 0).symbol(), "c");
     }
 
     #[test]

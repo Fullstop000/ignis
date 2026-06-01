@@ -360,10 +360,14 @@ fn text_input_row(state: &InlinePickerState) -> Line<'static> {
 }
 
 /// Lines for the picker band (used by render::draw when inline_picker is open).
+/// `max_rows` is the total rows available to the picker (the area height).
+/// We reserve a fixed budget for header + Other + footer chrome and window
+/// the options list inside what's left so the cursor stays visible.
 pub(crate) fn render_inline_picker(
     lines: &mut Vec<Line<'static>>,
     state: &InlinePickerState,
     width: u16,
+    max_rows: usize,
 ) {
     let q = state.current_question();
     lines.extend(header_lines(state, width));
@@ -385,7 +389,31 @@ pub(crate) fn render_inline_picker(
     let desc_indent = 2 /*cursor col*/ + max_number_width + 2 /*". "*/;
     let desc_indent_str = " ".repeat(desc_indent);
 
-    for (idx, opt) in q.options.iter().enumerate() {
+    // Budget for the option list. Header is 4 rows (divider+blank+title+
+    // question); footer is 2 (blank+hint); the ↑/↓ hint markers eat 2 more
+    // when the window is non-zero. Divider+Other adds another 2 — but only
+    // when the question opts into the Other row (permission/AFK pickers do
+    // not). Min 1 keeps at least one option visible on tiny terminals.
+    let header_rows: usize = 4;
+    let footer_rows: usize = 2;
+    let hint_slack: usize = 2;
+    let other_rows: usize = if q.allow_other { 2 } else { 0 };
+    let chrome = header_rows + footer_rows + hint_slack + other_rows;
+    let opts_budget = max_rows.saturating_sub(chrome).max(1);
+    // Each option takes 2 rows when it has a description, else 1.
+    // Window over the option *list* (not row count) keeping cursor in view —
+    // the row-count slop is small enough to ignore in practice.
+    let (opts_start, opts_end) =
+        crate::console::render::widgets::picker_window(cursor.min(opts_n), opts_budget, opts_n);
+    if opts_start > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↑ {} more above", opts_start),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
+
+    for (offset, opt) in q.options[opts_start..opts_end].iter().enumerate() {
+        let idx = opts_start + offset;
         let selected = idx == cursor;
         let (clean_label, recommended) = split_recommended(&opt.label);
         let cursor_glyph = if selected { "> " } else { "  " };
@@ -424,6 +452,13 @@ pub(crate) fn render_inline_picker(
                 Style::default().fg(TEXT_DIM),
             )));
         }
+    }
+    let opts_below = opts_n.saturating_sub(opts_end);
+    if opts_below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↓ {} more below", opts_below),
+            Style::default().fg(TEXT_DIM),
+        )));
     }
 
     // The separator + Other row only render when the question opts in. The
@@ -499,15 +534,33 @@ pub(crate) fn render_inline_picker(
 
 /// Left-pane lines for the SPLIT layout (when at least one option has a
 /// `preview`). Descriptions move to the right pane to keep the option list
-/// compact — the focused option's full detail shows there.
-pub(crate) fn options_pane_lines(state: &InlinePickerState, width: u16) -> Vec<Line<'static>> {
+/// compact — the focused option's full detail shows there. `max_rows` is
+/// the pane height; options window around the cursor so it stays visible
+/// when the list is taller than the pane.
+pub(crate) fn options_pane_lines(
+    state: &InlinePickerState,
+    width: u16,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
     let q = state.current_question();
     let mut out: Vec<Line<'static>> = Vec::new();
     let opts_n = q.options.len();
     let cursor = state.cursor();
     let multi = state.is_multi();
     let max_number_width = (opts_n + 1).to_string().len();
-    for (idx, opt) in q.options.iter().enumerate() {
+    // Reserve: divider + Other row + 2-line ↑/↓ slack.
+    const CHROME_RESERVE: usize = 1 + 1 + 2;
+    let opts_budget = max_rows.saturating_sub(CHROME_RESERVE).max(1);
+    let (start, end) =
+        crate::console::render::widgets::picker_window(cursor.min(opts_n), opts_budget, opts_n);
+    if start > 0 {
+        out.push(Line::from(Span::styled(
+            format!("  ↑ {} more above", start),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
+    for (offset, opt) in q.options[start..end].iter().enumerate() {
+        let idx = start + offset;
         let selected = idx == cursor;
         let (clean_label, recommended) = split_recommended(&opt.label);
         let cursor_glyph = if selected { "> " } else { "  " };
@@ -536,6 +589,13 @@ pub(crate) fn options_pane_lines(state: &InlinePickerState, width: u16) -> Vec<L
             spans.extend(recommended_badge());
         }
         out.push(Line::from(spans));
+    }
+    let below = opts_n.saturating_sub(end);
+    if below > 0 {
+        out.push(Line::from(Span::styled(
+            format!("  ↓ {} more below", below),
+            Style::default().fg(TEXT_DIM),
+        )));
     }
     // Separator + Other row (single-line, no description in split mode either).
     out.push(divider_line(width));
@@ -668,8 +728,10 @@ fn recommended_badge() -> Vec<Span<'static>> {
     ]
 }
 
-/// Height (rows) the picker needs given its current state. Used by
-/// `render::live_height` so the inline viewport recreates at the right size.
+/// Height (rows) the picker wants for its current state, ignoring any cap.
+/// Phase C uses this to decide when windowing kicks in (`picker_height >
+/// available_rows` → window the option list).
+#[allow(dead_code)]
 pub(crate) fn picker_height(state: &InlinePickerState) -> u16 {
     let q = state.current_question();
     let header_rows: u16 = 4; // divider + blank + header + question
@@ -1107,7 +1169,7 @@ mod tests {
         assert!(s.other_buf().is_empty());
 
         let mut lines: Vec<Line<'static>> = Vec::new();
-        super::render_inline_picker(&mut lines, &s, 80);
+        super::render_inline_picker(&mut lines, &s, 80, 50);
         let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(
             joined.contains(super::OTHER_LABEL),
@@ -1126,7 +1188,7 @@ mod tests {
         assert_eq!(s.other_buf(), "hello");
 
         let mut lines: Vec<Line<'static>> = Vec::new();
-        super::render_inline_picker(&mut lines, &s, 80);
+        super::render_inline_picker(&mut lines, &s, 80, 50);
         let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(
             joined.contains("hello"),

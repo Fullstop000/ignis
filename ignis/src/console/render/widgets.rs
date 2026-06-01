@@ -1,7 +1,8 @@
-//! Live-band widgets — the status / queue / footer / input / slash-suggestions
-//! strip that the inline viewport repaints every frame. Each `draw_*` fn
-//! takes a ratatui `Rect` and paints into it. The `queued_*` helpers compute
-//! the height the queue strip needs so `live_height` can size the band.
+//! Bottom-band widgets — the status / queue / footer / input / slash-
+//! suggestions strip pinned at the bottom of the fullscreen frame, repainted
+//! every tick. Each `draw_*` fn takes a ratatui `Rect` and paints into it.
+//! The `queued_*` helpers compute the rows the queue strip needs so
+//! `band_height` can size the band.
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -275,6 +276,19 @@ pub(crate) fn slash_window_start(sel: usize, visible: usize, len: usize) -> usiz
     } else {
         0
     }
+}
+
+/// Window `[start, end)` over a list of `len` items so that `sel` stays in
+/// view in at most `visible` rows. Same rule as `slash_window_start` but
+/// returns both ends — callers building a paginated picker can slice
+/// directly and emit `↑/↓ N more` hints from the bounds.
+pub(crate) fn picker_window(sel: usize, visible: usize, len: usize) -> (usize, usize) {
+    if len == 0 {
+        return (0, 0);
+    }
+    let start = slash_window_start(sel, visible, len);
+    let end = (start + visible.max(1)).min(len);
+    (start, end)
 }
 
 pub(crate) fn draw_slash_suggestions(f: &mut Frame, area: Rect, app: &App) {
