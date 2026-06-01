@@ -1,7 +1,8 @@
 //! Console rendering — entry point. Owns the top-level frame `draw`,
-//! the inline viewport sizing (`live_height`), and the split-pane render
-//! path for `ask_user` pickers that carry previews. Everything else is
-//! delegated to one of the submodules below.
+//! the band-height calculation (`band_height`), the in-app transcript
+//! scroller, and the split-pane render path for `ask_user` pickers that
+//! carry previews. Everything else is delegated to one of the submodules
+//! below.
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -173,6 +174,9 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
     }
     let total = app.transcript.len();
     let visible = area.height as usize;
+    // Make the real visible-row count visible to PgDn so it can correctly
+    // detect "at the natural bottom" and re-enable auto-follow.
+    app.transcript_visible_rows = visible;
     let max_offset = total.saturating_sub(visible);
     // Auto-follow recomputes offset each frame; manual scroll keeps the
     // user's offset, clamped to the current max in case content shrunk.

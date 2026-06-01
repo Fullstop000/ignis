@@ -52,10 +52,9 @@ impl TuiProcess {
         let output_for_thread = Arc::clone(&output);
         let writer_for_thread = Arc::clone(&writer);
 
-        // Pull the harness writer into the scope so it isn't dropped by the
-        // pty reader's lifetime (the alt-screen path no longer needs the DSR
-        // reply, but the reader still expects a live writer handle).
-        let _writer_handle = writer_for_thread.clone();
+        // Fullscreen viewport doesn't query cursor position; the reader just
+        // drains pty output into `output` for later assertions.
+        let _ = writer_for_thread; // master writer kept alive via `self.writer`
         std::thread::spawn(move || {
             let mut buf = [0; 4096];
             loop {

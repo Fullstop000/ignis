@@ -28,6 +28,36 @@ fn make_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     let backend = CrosstermBackend::new(io::stdout());
     Terminal::new(backend)
 }
+
+/// RAII guard for the alternate-screen + raw-mode pair. On drop (Err-bubble,
+/// panic, or clean exit) it restores the user's prior terminal state.
+/// Without this, any `?` after `EnterAlternateScreen` would strand the user
+/// in an empty alt screen with no way back to their shell prompt.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn install() -> io::Result<Self> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        // Panic hook: a panic inside ratatui / the main loop would otherwise
+        // print its message into the alt-screen the user can't see. Restore
+        // the terminal first, then chain through to the prior hook.
+        let prior_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            prior_hook(info);
+        }));
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
 #[allow(clippy::too_many_arguments)]
 pub async fn run_console(
     provider_name: String,
@@ -58,9 +88,9 @@ pub async fn run_console(
     // Render fullscreen in the alternate-screen buffer: the whole terminal is
     // ours, native scrollback is preserved across the session, and quit/exit
     // restores whatever was on the user's terminal before launch. Transcript
-    // history lives in `app.transcript` and scrolls in-app.
-    enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    // history lives in `app.transcript` and scrolls in-app. `_term_guard`
+    // restores the user's terminal on early-return or panic.
+    let _term_guard = TerminalGuard::install()?;
     let mut terminal = make_terminal()?;
 
     // Welcome banner: first lines of the in-app transcript. Scrolls with the
@@ -376,9 +406,11 @@ pub async fn run_console(
         }
     }
 
-    // Restore the user's original terminal buffer.
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    // The terminal cursor was hidden by ratatui at construction; restore it
+    // before the guard drops so it's visible after exit. `_term_guard`
+    // (TerminalGuard::install above) then runs LeaveAlternateScreen +
+    // disable_raw_mode on the way out, covering this clean-exit path, all
+    // `?`-bubbled Err returns, and panics in the main loop.
     terminal.show_cursor()?;
     Ok(())
 }

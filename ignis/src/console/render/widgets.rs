@@ -1,7 +1,8 @@
-//! Live-band widgets — the status / queue / footer / input / slash-suggestions
-//! strip that the inline viewport repaints every frame. Each `draw_*` fn
-//! takes a ratatui `Rect` and paints into it. The `queued_*` helpers compute
-//! the height the queue strip needs so `live_height` can size the band.
+//! Bottom-band widgets — the status / queue / footer / input / slash-
+//! suggestions strip pinned at the bottom of the fullscreen frame, repainted
+//! every tick. Each `draw_*` fn takes a ratatui `Rect` and paints into it.
+//! The `queued_*` helpers compute the rows the queue strip needs so
+//! `band_height` can size the band.
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},

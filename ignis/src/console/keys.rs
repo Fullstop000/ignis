@@ -647,10 +647,12 @@ pub(crate) async fn handle_key(
             app.scroll_transcript_up(10);
         }
         (_, KeyCode::PageDown) if app.input.is_empty() => {
-            // Approximate visible rows; render_transcript clamps the result.
-            // 10 lines per press matches CC; the renderer auto-snaps to
-            // bottom + re-enables follow when we land at the natural end.
-            app.scroll_transcript_down(10, 10);
+            // 10 lines per press matches CC. Pass the real visible-row count
+            // (last-recorded by render_transcript) so the "at natural bottom"
+            // detection in scroll_transcript_down re-enables auto-follow
+            // correctly on tall terminals.
+            let visible = app.transcript_visible_rows.max(1);
+            app.scroll_transcript_down(10, visible);
         }
         _ => {}
     }

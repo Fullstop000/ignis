@@ -516,9 +516,9 @@ pub(crate) struct App {
     /// once `block_done(idx)` is true.
     pub(crate) committed: usize,
 
-    /// Frozen transcript lines — the in-app replacement for the native scrollback
-    /// the inline viewport used to push to via `insert_before`. Grows
-    /// monotonically. The transcript widget renders a windowed slice of this.
+    /// Frozen transcript lines — the in-app scrollable history rendered
+    /// above the input band in fullscreen mode. Grows monotonically; the
+    /// transcript widget renders a windowed slice of this each frame.
     pub(crate) transcript: Vec<ratatui::text::Line<'static>>,
     /// First line of `transcript` currently visible. `auto_follow == true`
     /// means the view tracks the bottom; `false` means the user scrolled up
@@ -527,6 +527,10 @@ pub(crate) struct App {
     /// View follows the latest content when true (default). Flipped to false
     /// when the user scrolls up; flipped back when they jump to bottom.
     pub(crate) auto_follow: bool,
+    /// Last-rendered transcript-area row count, set by `render_transcript`
+    /// each frame. PgDn reads this so it can correctly detect "I'm now at
+    /// the natural bottom — re-enable auto-follow" even on tall terminals.
+    pub(crate) transcript_visible_rows: usize,
 
     pub(crate) should_quit: bool,
     pub(crate) error_flash: Option<(String, Instant)>,
@@ -615,6 +619,7 @@ impl App {
             transcript: Vec::new(),
             scroll_offset: 0,
             auto_follow: true,
+            transcript_visible_rows: 0,
         }
     }
 

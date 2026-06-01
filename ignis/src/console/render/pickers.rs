@@ -12,7 +12,7 @@ use crate::console::{
     format_context, truncate, ACCENT, BG, GREEN, MAUVE, RED, SUBTEXT, TEXT, TEXT_DIM,
 };
 
-use super::widgets::{picker_window, slash_window_start};
+use super::widgets::picker_window;
 
 pub(crate) fn render_session_picker(
     lines: &mut Vec<Line<'static>>,
@@ -504,12 +504,16 @@ pub(crate) fn render_skill_picker(
 
     let Some(reg) = registry else { return };
     let skills = reg.all();
-    // Scroll the window so the selected row stays visible when there are more
-    // skills than fit in the band.
+    // Window the selection so it stays visible when the list overflows.
     let sel = picker.selected.min(skills.len().saturating_sub(1));
     let visible = max_rows.max(1);
-    let start = slash_window_start(sel, visible, skills.len());
-    let end = (start + visible).min(skills.len());
+    let (start, end) = picker_window(sel, visible, skills.len());
+    if start > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↑ {} more above", start),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
     for (idx, skill) in skills.iter().enumerate().take(end).skip(start) {
         let selected = idx == sel;
         let marker = if selected { ">" } else { " " };
@@ -540,6 +544,13 @@ pub(crate) fn render_skill_picker(
             Span::styled(format!(" {}  ({scope})", truncate(&desc, 40)), style),
         ]));
     }
+    let below = skills.len().saturating_sub(end);
+    if below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↓ {} more below", below),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
 
     lines.push(Line::from(Span::styled(
         "  Up/Down to move, Space/Enter to toggle, Esc to close.",
@@ -566,8 +577,13 @@ pub(crate) fn render_mcp_picker(
     let entries = reg.entries();
     let sel = picker.selected.min(entries.len().saturating_sub(1));
     let visible = max_rows.max(1);
-    let start = slash_window_start(sel, visible, entries.len());
-    let end = (start + visible).min(entries.len());
+    let (start, end) = picker_window(sel, visible, entries.len());
+    if start > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↑ {} more above", start),
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
     // Row budget so a many-tool server doesn't push later entries off-screen.
     // Each iteration reserves one row per remaining-in-window server *before*
     // adding tool sub-rows for the current one, so the selected entry (always
@@ -651,6 +667,13 @@ pub(crate) fn render_mcp_picker(
                 rows_used += 1;
             }
         }
+    }
+    let below = entries.len().saturating_sub(end);
+    if below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↓ {} more below", below),
+            Style::default().fg(TEXT_DIM),
+        )));
     }
 
     lines.push(Line::from(Span::styled(

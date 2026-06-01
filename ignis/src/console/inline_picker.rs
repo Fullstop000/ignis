@@ -389,11 +389,17 @@ pub(crate) fn render_inline_picker(
     let desc_indent = 2 /*cursor col*/ + max_number_width + 2 /*". "*/;
     let desc_indent_str = " ".repeat(desc_indent);
 
-    // Budget for the option list: total area minus header (4) + Other section
-    // (3: divider + Other + nothing) + footer (2) + an ↑/↓ hint slot each
-    // side. Min 1 to keep at least one option visible on tiny terminals.
-    const CHROME_RESERVE: usize = 4 + 3 + 2 + 2;
-    let opts_budget = max_rows.saturating_sub(CHROME_RESERVE).max(1);
+    // Budget for the option list. Header is 4 rows (divider+blank+title+
+    // question); footer is 2 (blank+hint); the ↑/↓ hint markers eat 2 more
+    // when the window is non-zero. Divider+Other adds another 2 — but only
+    // when the question opts into the Other row (permission/AFK pickers do
+    // not). Min 1 keeps at least one option visible on tiny terminals.
+    let header_rows: usize = 4;
+    let footer_rows: usize = 2;
+    let hint_slack: usize = 2;
+    let other_rows: usize = if q.allow_other { 2 } else { 0 };
+    let chrome = header_rows + footer_rows + hint_slack + other_rows;
+    let opts_budget = max_rows.saturating_sub(chrome).max(1);
     // Each option takes 2 rows when it has a description, else 1.
     // Window over the option *list* (not row count) keeping cursor in view —
     // the row-count slop is small enough to ignore in practice.
