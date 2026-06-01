@@ -59,11 +59,11 @@ _pick() {
         echo "  c) custom"
         echo "     (* = default; press Enter to accept)"
     } >&2
-    local sel; read -rp "> " sel
+    local sel; read -rp "> " sel || sel=""
     if [ -z "$sel" ]; then
         echo "$default_key"
     elif [ "$sel" = c ] || [ "$sel" = C ]; then
-        local v; read -rp "value: " v
+        local v; read -rp "value: " v || v=""
         echo "${v:-$default_key}"
     elif [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le ${#choices[@]} ]; then
         local picked="${choices[$((sel-1))]}"
@@ -172,7 +172,7 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
 fi
 
 if _interactive; then
-    read -rp "start? [Y/n] " ok
+    read -rp "start? [Y/n] " ok || ok="n"  # treat EOF (Ctrl-D) as abort, not a silent set -e exit
     case "$ok" in
         ""|y|Y|yes|YES) ;;
         *) echo "aborted." >&2; exit 0 ;;
