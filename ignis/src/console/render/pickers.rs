@@ -300,8 +300,8 @@ fn render_session_picker_detail(
                 ),
             ]));
 
-            // User prompt preview — without this, rows of identical-looking
-            // timing bars are indistinguishable when scrolling a long session.
+            // User prompt preview — without this, identical-looking timing
+            // bars are indistinguishable when scrolling a long session.
             if let Some(prompt) = t.user_prompt.as_deref() {
                 let mut line = " ".repeat(PREFIX_W);
                 line.push('"');
