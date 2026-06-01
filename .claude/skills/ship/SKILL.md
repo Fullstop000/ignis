@@ -5,115 +5,77 @@ description: Use when shipping or releasing the ignis project — landing a chan
 
 # Ship (ignis)
 
-Land the current branch on `master` through a reviewed PR, then cut a tag that the
-`Release` workflow turns into cross-platform binaries.
+Land the branch on `master` via PR; if the user picks "bump", cut a tag that the Release workflow turns into binaries.
 
-**Version source of truth: the `[package] version` in `ignis/Cargo.toml`.** The git
-tag is `v<that version>`. There is no separate VERSION file.
+Version source of truth: `[package] version` in `ignis/Cargo.toml`. Tag is `v<that version>`. No VERSION file.
 
 ## Iron rules
 
-- **Never push a diff that contains a secret.** Scan first; abort on any hit.
-- **Never squash-merge without explicit human approval.** Prepare everything, then stop and ask.
-- **Before touching the CHANGELOG, ask the user**: add this change to `## [Unreleased]`, or bump to `vX.Y.Z` and cut a release? The answer decides what step 8 writes — but it all stays in **one** PR (no separate bump PR).
-- **Never edit `Cargo.toml`/`Cargo.lock` versions or rename `## [Unreleased]` without that answer.** A bump that wasn't asked for is a process violation.
-- Every gate must pass. On failure: stop, show the output, fix, re-run. No skipping.
+- No secrets in any pushed diff. Scan first; abort on hit.
+- No squash-merge without explicit human approval.
+- Step 8 always starts with the bump-or-`[Unreleased]` question. **Never** edit `Cargo.toml`/`Cargo.lock` or rename `## [Unreleased]` without that answer.
+- Everything lands in **one** PR — no separate bump PR.
+- Every gate must pass. Failure → stop, fix, re-run. No skipping.
 
 ```dot
 digraph ship {
-    "Secrets in diff?" [shape=diamond];
-    "Abort, remove secret" [shape=box];
-    "CI green?" [shape=diamond];
-    "Read failure, fix, push" [shape=box];
-    "Ask: bump or [Unreleased]?" [shape=diamond];
-    "Edit CHANGELOG [Unreleased]" [shape=box];
-    "Bump Cargo.toml + rename [Unreleased]" [shape=box];
-    "Human approved merge?" [shape=diamond];
-    "Wait — do not merge" [shape=box];
+    "Secrets?" [shape=diamond]; "Abort" [shape=box];
+    "CI green?" [shape=diamond]; "Fix, push" [shape=box];
+    "Bump or hold?" [shape=diamond];
+    "Add to [Unreleased]" [shape=box];
+    "Bump + rename" [shape=box];
+    "Approved?" [shape=diamond]; "Wait" [shape=box];
     "Squash-merge" [shape=box];
-    "Bump chosen?" [shape=diamond];
-    "Done — entry holds in [Unreleased]" [shape=box];
-    "Tag, await release" [shape=box];
+    "Bump branch?" [shape=diamond];
+    "Done" [shape=box]; "Tag + release" [shape=box];
 
-    "Secrets in diff?" -> "Abort, remove secret" [label="yes"];
-    "Secrets in diff?" -> "CI green?" [label="no"];
-    "CI green?" -> "Read failure, fix, push" [label="no"];
-    "Read failure, fix, push" -> "CI green?";
-    "CI green?" -> "Ask: bump or [Unreleased]?" [label="yes"];
-    "Ask: bump or [Unreleased]?" -> "Edit CHANGELOG [Unreleased]" [label="hold"];
-    "Ask: bump or [Unreleased]?" -> "Bump Cargo.toml + rename [Unreleased]" [label="bump"];
-    "Edit CHANGELOG [Unreleased]" -> "Human approved merge?";
-    "Bump Cargo.toml + rename [Unreleased]" -> "Human approved merge?";
-    "Human approved merge?" -> "Wait — do not merge" [label="no"];
-    "Human approved merge?" -> "Squash-merge" [label="yes"];
-    "Squash-merge" -> "Bump chosen?";
-    "Bump chosen?" -> "Done — entry holds in [Unreleased]" [label="no"];
-    "Bump chosen?" -> "Tag, await release" [label="yes"];
+    "Secrets?" -> "Abort" [label="yes"];
+    "Secrets?" -> "CI green?" [label="no"];
+    "CI green?" -> "Fix, push" [label="no"];
+    "Fix, push" -> "CI green?";
+    "CI green?" -> "Bump or hold?" [label="yes"];
+    "Bump or hold?" -> "Add to [Unreleased]" [label="hold"];
+    "Bump or hold?" -> "Bump + rename" [label="bump"];
+    "Add to [Unreleased]" -> "Approved?";
+    "Bump + rename" -> "Approved?";
+    "Approved?" -> "Wait" [label="no"];
+    "Approved?" -> "Squash-merge" [label="yes"];
+    "Squash-merge" -> "Bump branch?";
+    "Bump branch?" -> "Done" [label="hold"];
+    "Bump branch?" -> "Tag + release" [label="bump"];
 }
 ```
 
 ## Process
 
 ### 0. Preflight
-- Working tree clean (`git status`); commit or stash first.
+- `git status` clean; commit or stash first.
 - Not on `master` — if you are: `git switch -c <type>/<slug>`.
-- Sync: `git fetch origin && git rebase origin/master` (resolve conflicts before continuing).
+- `git fetch origin && git rebase origin/master` (resolve conflicts).
 
-### 1. Gate — must all pass
+### 1. Gate — all must pass
 ```bash
-cargo fmt --all -- --check        # if it fails: cargo fmt --all, then recommit
+cargo fmt --all -- --check        # fail → cargo fmt --all, recommit
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace            # unit + integration + pty TUI e2e
+cargo test --workspace
 ```
-New behavior must have tests.
+New behavior needs tests.
 
 ### 2. Smoke
 ```bash
 cargo build --release
 ```
 
-### 3. Dogfood (ask the human if it's needed)
-**Ask the human whether this change needs dogfooding before shipping** — don't
-decide silently. Dogfooding means using the built binary the way a real user
-would, to catch what unit tests miss (TUI layout, real provider behavior, the
-exact path you changed). Skip only with their OK (e.g. docs/CI-only changes).
+### 3. Dogfood — ask the user
+Ask if this change needs dogfooding (running the real binary as a user). Skip only with their OK. Cover every user-visible path (slash flow, CLI flag, restart-restore, every toggle), not just the change set. Visual changes require a PNG via `dogfood/tui_shot.py` — you can't judge colors from tool text. See `.claude/skills/dogfood/SKILL.md`.
 
-**Cover every user-visible path of the feature, not just the change set.**
-Unit tests prove the mechanism (decision logic, picker question shape); only
-the real binary proves the *integrated path* (tool call → hook fires →
-channel ferries to TUI → renderer reads state → reply travels back → mode
-persists → next launch reads it). The classes of bug only dogfood catches:
-
-- Wrong picker / view tags on shared infrastructure (a hardcoded label that
-  was right for one caller and wrong for a later one)
-- Stale CLI flags / state fields that look fine in unit tests but break the
-  user-visible flow
-- Wiring gaps between subsystems (footer doesn't read the new state, slash
-  command doesn't persist, restart loses the setting)
-- Visual: any color, alignment, or layout claim — tool output is plain text,
-  you cannot judge colors from it, you must look at a PNG
-
-Before opening the PR, list every user-visible path of the feature (the
-slash command flow, the picker variants, the CLI flag, the state-restore on
-restart, every observable behavior toggle). Drive each one against the real
-binary. Skipping a path requires either (a) unit-test coverage that proves
-the integration boundary the path would exercise is unreachable, or (b)
-explicit human sign-off (e.g. `rm -rf /` family — the dogfood would put the
-host at risk, accept unit-test coverage + sandbox follow-up).
-
-Use the **`dogfood`** skill (`.claude/skills/dogfood/`) for how — it covers
-both behavioral checks (one-shot CLI / state) and **visual** checks. For
-anything visual (TUI), you can't judge colors or layout from tool output:
-screenshot the real TUI to a PNG with `dogfood/tui_shot.py` and actually
-`Read` it. Report exactly which paths you exercised and the result of each.
-
-### 4. Secret scan — must be clean
+### 4. Secret scan
 ```bash
 git diff origin/master...HEAD | \
   grep -nE 'sk-[A-Za-z0-9-]{24,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|BSA[A-Za-z0-9]{20,}' \
-  && echo 'SECRET FOUND — abort' || echo clean
+  && echo SECRET || echo clean
 ```
-Any hit → stop, remove it, re-scan. Never push a secret.
+Hit → stop, remove, re-scan.
 
 ### 5. Open PR (+ screenshots if dogfood produced any)
 ```bash
@@ -121,13 +83,11 @@ git push -u origin HEAD
 gh pr create --base master --title "<concise>" --body "<concise summary + checklist>"
 ```
 
-**If step 3's dogfood produced PNG screenshots showing the feature working** — banners, pickers, footer segments, the resumed conversation view, before/after of a visual change — post them in a PR comment right after `gh pr create`. Reviewers shouldn't have to take "it looks correct" on faith.
-
-Mechanism — commit the shots into the feature branch under `.github/screenshots/pr-<num>/` and reference them by **commit-SHA** raw URL. (`gh gist create` and `gh api` both refuse binary uploads, so the branch is the most reliable host. SHA URLs survive both the branch deletion at merge time and the eventual master path — they keep working forever as long as GitHub keeps the commit object reachable, which is effectively forever.)
+**If dogfood produced production-ready PNGs**, attach them as a PR comment. Reviewers shouldn't take "looks right" on faith. (`gh gist create` rejects binaries; commit-to-branch is the reliable host.)
 
 ```bash
 mkdir -p .github/screenshots/pr-<num>
-cp /tmp/<shot1>.png /tmp/<shot2>.png .github/screenshots/pr-<num>/
+cp /tmp/<shot>.png .github/screenshots/pr-<num>/
 git add .github/screenshots/pr-<num>/
 git commit -m "docs(pr-<num>): dogfood screenshots"
 git push
@@ -140,120 +100,95 @@ gh pr comment <num> --body "$(cat <<EOF
 
 | Path | Result |
 |---|---|
-| <step-1 label> | ![](${BASE}/<shot1>.png) |
-| <step-2 label> | ![](${BASE}/<shot2>.png) |
+| <label> | ![](${BASE}/<shot>.png) |
 EOF
 )"
 ```
 
-Pick the **production-ready** shots — the final ones that show the integrated feature, not intermediate debug captures from the dogfood iteration. One shot per user-visible path is enough; resist dumping every PNG (the squash-merge carries them into master forever). Skip this step entirely when the change is non-visual (CLI flag, internal refactor, doc-only PR).
+Commit-SHA URLs (not branch URLs) so they survive branch deletion. One shot per user-visible path; skip for non-visual changes.
 
-### 6. Review (ask the human which reviewer)
-Get a code review of the PR diff before chasing CI. **Ask the human which reviewer
-to use — don't pick silently:**
-
-- **Subagent** — dispatch one Claude review agent over the branch diff:
-  `Agent(subagent_type: "general-purpose")` with: *"Review `git diff
-  origin/master...HEAD` in this repo for bugs, regressions, and risky changes.
-  Report only real issues as file:line + severity; skip style nits."*
+### 6. Review — ask the user which reviewer
+- **Subagent** — `Agent(subagent_type: "general-purpose")` with: *"Review `git diff origin/master...HEAD` for bugs, regressions, risky changes. file:line + severity; skip style nits."*
 - **Codex** — `codex exec review --base master`
-- **Gemini** — `git diff origin/master...HEAD | gemini -p "Review this diff for
-  bugs, regressions, and risky changes. List only real issues as file:line +
-  severity; be concise."`
+- **Gemini** — `git diff origin/master...HEAD | gemini -p "Review for bugs/regressions/risk. file:line + severity; concise."`
 
-Then read the findings, **fix real issues and push**, and note any dismissed
-finding with a one-line rationale. An *intended* breaking change is triaged
-(documented in the CHANGELOG), not patched with compat code — see CLAUDE.md.
-Proceed only when the diff is clean or every finding is triaged.
+Fix real findings; one-line rationale on dismissed ones. Intended breaking changes → CHANGELOG `### Breaking`, not compat shims.
 
-### 7. Make CI pass
+### 7. CI
 ```bash
 gh pr checks --watch
 ```
-If red: open the failing job, root-cause, fix, push, re-watch. Proceed only when every check is green.
+Red → root-cause, fix, push, re-watch.
 
-### 8. Ask the user — bump or `[Unreleased]`? — then write the CHANGELOG
-**Before editing anything in `CHANGELOG.md` or `Cargo.toml`, ask the user explicitly:**
-
-> "This PR is ready to land. Add the entry to `[Unreleased]`, or bump to `vX.Y.Z` (suggested from commits since the last tag) and cut a release after merge?"
-
-Compute the suggested version from commits since the last tag — `feat:` → minor, `fix:`/`chore:`/`docs:` → patch, `!`/`BREAKING CHANGE` → major. No prior tag → initial release; keep current version. Quote the suggested version in the question.
-
+### 8. Ask: bump or `[Unreleased]`?
+Compute the suggested version from commits since last tag:
 ```bash
 git log "$(git describe --tags --abbrev=0 2>/dev/null || echo)"..HEAD --pretty=%s
 ```
+`feat:` → minor, `fix:`/`chore:`/`docs:` → patch, `!`/`BREAKING CHANGE` → major. No prior tag → keep current.
 
-Whichever the user picks, all the edits land **in this same PR** — never split into a separate bump PR.
+Ask the user, quoting the suggested version:
+> "PR ready. Add to `[Unreleased]`, or bump to `vX.Y.Z` and cut a release after merge?"
 
-#### CHANGELOG entry rules (apply to both branches)
+#### CHANGELOG entry rules (both branches)
+One-line user-facing summary. No internals, trade-offs, parentheticals.
+Every entry ends with `([#NNN](https://github.com/Fullstop000/ignis/pull/NNN))`.
+Section: `### Added` / `### Changed` / `### Fixed` / `### Security` / `### Breaking`.
 
-**Entries are one-line summaries only.** State *what changed* for a user, nothing more. No detail, no how-it-works, no implementation list, no rationale or trade-offs, no parentheticals enumerating internals. One short line per change.
+- ✓ `` - `/copy` — copy the last assistant reply to the system clipboard. ([#42](…)) ``
+- ✗ No PR link
+- ✗ Verbose / internals
 
-**Every entry ends with a PR reference** `([#NNN](https://github.com/Fullstop000/ignis/pull/NNN))` so readers can jump to the diff and discussion. Group commits by the PR that landed them; one entry per PR is the norm.
-- Good: `` - `/copy` — copy the last assistant reply to the system clipboard. ([#42](https://github.com/Fullstop000/ignis/pull/42)) ``
-- Bad (no PR link): `` - `/copy` — copy the last assistant reply to the system clipboard. ``
-- Bad (verbose): `` - `/copy` slash command — copies the last reply via a platform CLI tool (`pbcopy`/`clip`/`clip.exe`/…); 1 MiB cap, no native-clipboard dependency. ``
-
-Section heading (`### Added` / `### Changed` / `### Fixed` / `### Security` / `### Breaking`) matches the change kind.
-
-#### Branch A — user picked "hold under `[Unreleased]`"
-Edit only `CHANGELOG.md`:
-- Add the one-line entry under `## [Unreleased]`, in the right section heading.
-- Do **not** touch `Cargo.toml`, `Cargo.lock`, or rename `[Unreleased]`.
-
+#### Branch A — hold
+Edit only `CHANGELOG.md`. Add the line under `## [Unreleased]`. Don't touch `Cargo.toml`/`Cargo.lock`.
 ```bash
 git commit -am "docs(changelog): add #<N> under [Unreleased]"
 git push
 ```
+Skip step 10.
 
-Skip step 10 entirely at merge time — no tag this round.
-
-#### Branch B — user picked "bump to `vX.Y.Z`"
-Edit all three in one commit:
-1. `ignis/Cargo.toml`: `version = "X.Y.Z"`
-2. `Cargo.lock`: refresh via `cargo build`
-3. `CHANGELOG.md`: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` (carrying over any existing entries plus this PR's new line), then add a fresh empty `## [Unreleased]` above it.
-
+#### Branch B — bump
+One commit, three files:
+1. `ignis/Cargo.toml` → `version = "X.Y.Z"`
+2. `Cargo.lock` → `cargo build` to refresh
+3. `CHANGELOG.md` → rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add empty `## [Unreleased]` above
 ```bash
-cargo build                                # refresh Cargo.lock
+cargo build
 git commit -am "chore(release): vX.Y.Z"
 git push
 ```
+Re-confirm CI green.
 
-Re-confirm CI green on the new commit.
+### 9. Squash-merge — only after approval
+Tell the user the exact state:
+- A: "PR `<url>` green, entry under `[Unreleased]` — approve squash-merge?"
+- B: "PR `<url>` green, bumped to `vX.Y.Z` — approve squash-merge?"
 
-### 9. Squash-merge (only after approval)
-**STOP.** Tell the user the exact state:
-- Branch A: "PR `<url>` is green, entry added under `[Unreleased]` — approve squash-merge?"
-- Branch B: "PR `<url>` is green, bumped to `vX.Y.Z` — approve squash-merge?"
-
-Wait for an explicit yes.
+Wait for explicit yes.
 ```bash
 gh pr merge <num> --squash --delete-branch
 git switch master && git pull --ff-only
 ```
 
-### 10. Tag + await release (Branch B only)
-If the user picked **hold** at step 8, stop here — the entry is on master under `[Unreleased]`, no tag this round.
-
-If the user picked **bump**:
+### 10. Tag + release — Branch B only
 ```bash
-git tag vX.Y.Z && git push origin vX.Y.Z      # triggers the Release workflow
+git tag vX.Y.Z && git push origin vX.Y.Z
 gh run watch "$(gh run list --workflow Release --limit 1 --json databaseId -q '.[0].databaseId')"
-gh release view vX.Y.Z                         # confirm binaries are attached
+gh release view vX.Y.Z
 ```
 Report the release URL.
 
 ## Common mistakes
 
 | Mistake | Do instead |
-|---------|-----------|
-| Edit `Cargo.toml` or rename `[Unreleased]` without asking | Step 8 always starts with the bump-vs-hold question |
-| Split the bump into a second PR | One PR carries the entry, the bump (if any), AND the feature work |
-| Bump silently because "this commit looks like a feat:" | Conventional commits suggest the bump *version*, not the bump *decision* — the user owns the decision |
-| Direct-push CHANGELOG or version edits to master | Everything rides on the feature PR |
+|---|---|
+| Edit `Cargo.toml` or rename `[Unreleased]` without asking | Step 8 starts with the question |
+| Split the bump into a second PR | One PR for entry + bump (if any) + feature |
+| Bump silently because the commit is `feat:` | Conventional commits suggest the *version*, not the *decision* |
+| Direct-push CHANGELOG or version edits to master | Everything rides the feature PR |
 | Auto-merge when CI turns green | Always wait for explicit approval |
-| Dogfood made screenshots that never make it to the PR | After `gh pr create`, post the final dogfood shots as a PR comment so reviewers can see what landed |
-| Tag ≠ `ignis/Cargo.toml` version | Tag is exactly `v<Cargo.toml version>` |
+| Dogfood shots stuck in `/tmp` | Post them as a PR comment via the snippet above |
+| Branch-URL screenshots that 404 after merge | Use the commit SHA, not the branch name |
+| Tag ≠ `Cargo.toml` version | Tag is exactly `v<Cargo.toml version>` |
 | Skip `cargo build` after editing `Cargo.toml` | Stale `Cargo.lock` fails the `--locked` release build |
-| Secret-scan false alarm on placeholders | The regex targets real key shapes; `sk-your-…` placeholders are short and won't match |
+| Secret-scan false alarm on placeholders | The regex targets real key shapes; `sk-your-…` is too short to match |
