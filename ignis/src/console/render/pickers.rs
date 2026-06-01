@@ -300,6 +300,16 @@ fn render_session_picker_detail(
                 ),
             ]));
 
+            // User prompt preview — without this, rows of identical-looking
+            // timing bars are indistinguishable when scrolling a long session.
+            if let Some(prompt) = t.user_prompt.as_deref() {
+                let mut line = " ".repeat(PREFIX_W);
+                line.push('"');
+                line.push_str(prompt);
+                line.push('"');
+                lines.push(Line::from(Span::styled(line, Style::default().fg(TEXT))));
+            }
+
             // Inner per-event bars. Width-and-position both proportional to
             // `max_total`. `cum_ms` tracks the start offset; in our model
             // events run sequentially so cumulative duration IS the offset.

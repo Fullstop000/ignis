@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP HTTP transport (Streamable HTTP). `[mcp.servers.X] url = "https://…"` or `ignis mcp add X --url … [--bearer-token-env-var ENV] [--header "K: V"]`; `/mcp` picker shows transport tag and per-server tool list. ([#86](https://github.com/Fullstop000/ignis/pull/86))
 
 ### Changed
+- `/sessions` opens an interactive picker with a per-turn timing waterfall (token usage, tool rollup, start-offset bars, per-turn user-prompt preview); `/resume` removed — use `/sessions`. ([#84](https://github.com/Fullstop000/ignis/pull/84))
 - Reasoning content now renders as its own dim `✻ Thinking` block instead of a `💭`-prefixed reply, and keeps streaming even when reasoning arrives after text starts. ([#83](https://github.com/Fullstop000/ignis/pull/83))
 
 ### Fixed

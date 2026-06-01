@@ -110,6 +110,11 @@ pub struct TurnSummary {
     pub started_at_ms: u64,
     pub total_ms: u64,
     pub events: Vec<TurnEvent>,
+    /// One-line preview of the user message that opened this turn, so the
+    /// detail view can distinguish "fix the bug" from "add a test" instead
+    /// of showing identical-looking timing bars. `None` when the opening
+    /// message has no text content.
+    pub user_prompt: Option<String>,
 }
 
 impl TurnSummary {
@@ -141,6 +146,37 @@ pub struct SessionDetail {
     pub turns: Vec<TurnSummary>,
 }
 
+/// Collapse a user message into a single-line preview (~60 chars). Returns
+/// `None` for whitespace-only payloads so the detail view stays uncluttered.
+fn preview_one_line(s: &str) -> Option<String> {
+    const MAX: usize = 60;
+    let mut buf = String::with_capacity(s.len().min(MAX * 2));
+    let mut prev_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_ws && !buf.is_empty() {
+                buf.push(' ');
+            }
+            prev_ws = true;
+        } else {
+            buf.push(ch);
+            prev_ws = false;
+        }
+    }
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    Some(if chars.len() > MAX {
+        let mut out: String = chars.into_iter().take(MAX - 1).collect();
+        out.push('…');
+        out
+    } else {
+        trimmed.to_string()
+    })
+}
+
 /// Parse JSONL into per-turn timing. A turn opens at each `role=user` message
 /// and closes at the next user message (or the last event). Tool durations are
 /// exact (result_ts − assistant_with_tool_calls_ts). LLM durations are
@@ -149,6 +185,7 @@ pub fn extract_turns(jsonl: &str) -> Vec<TurnSummary> {
     enum Event {
         User {
             ts: u64,
+            content: Option<String>,
         },
         Assistant {
             ts: u64,
@@ -186,7 +223,13 @@ pub fn extract_turns(jsonl: &str) -> Vec<TurnSummary> {
         };
         let role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
         match role {
-            "user" => events.push(Event::User { ts }),
+            "user" => {
+                let content = payload
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                events.push(Event::User { ts, content });
+            }
             "assistant" => {
                 events.push(Event::Assistant { ts });
             }
@@ -268,20 +311,20 @@ pub fn extract_turns(jsonl: &str) -> Vec<TurnSummary> {
             .get(turn_idx + 1)
             .copied()
             .unwrap_or(events.len());
-        let started_at_ms = match &events[start] {
-            Event::User { ts } => *ts,
-            _ => 0,
+        let (started_at_ms, user_prompt) = match &events[start] {
+            Event::User { ts, content } => (*ts, content.as_deref().and_then(preview_one_line)),
+            _ => (0, None),
         };
         let end_ms = if end == events.len() {
             match events.last() {
-                Some(Event::User { ts })
+                Some(Event::User { ts, .. })
                 | Some(Event::Assistant { ts, .. })
                 | Some(Event::Tool { ts, .. }) => *ts,
                 None => started_at_ms,
             }
         } else {
             match &events[end] {
-                Event::User { ts } => *ts,
+                Event::User { ts, .. } => *ts,
                 _ => started_at_ms,
             }
         };
@@ -323,6 +366,7 @@ pub fn extract_turns(jsonl: &str) -> Vec<TurnSummary> {
             started_at_ms,
             total_ms,
             events: turn_events,
+            user_prompt,
         });
     }
     turns
@@ -1115,6 +1159,50 @@ mod tests {
             .collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"bash"));
+    }
+
+    #[test]
+    fn extract_turns_captures_user_prompt_preview() {
+        let jsonl = [
+            r#"{"type":"message","timestamp":1000,"payload":{"role":"user","content":"add a test for parse_jsonl_messages"}}"#,
+            r#"{"type":"message","timestamp":2000,"payload":{"role":"assistant","content":"ok"}}"#,
+        ]
+        .join("\n");
+        let turns = extract_turns(&jsonl);
+        assert_eq!(
+            turns[0].user_prompt.as_deref(),
+            Some("add a test for parse_jsonl_messages")
+        );
+    }
+
+    #[test]
+    fn extract_turns_collapses_whitespace_runs_in_preview() {
+        let jsonl = r#"{"type":"message","timestamp":1000,"payload":{"role":"user","content":"line one\nline two\n  indented"}}"#;
+        let turns = extract_turns(jsonl);
+        assert_eq!(
+            turns[0].user_prompt.as_deref(),
+            Some("line one line two indented")
+        );
+    }
+
+    #[test]
+    fn extract_turns_truncates_long_prompt_to_60_chars() {
+        let long = "x".repeat(200);
+        let jsonl = format!(
+            r#"{{"type":"message","timestamp":1000,"payload":{{"role":"user","content":"{long}"}}}}"#
+        );
+        let turns = extract_turns(&jsonl);
+        let preview = turns[0].user_prompt.as_deref().unwrap();
+        assert_eq!(preview.chars().count(), 60);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn extract_turns_returns_none_for_empty_user_message() {
+        let jsonl =
+            r#"{"type":"message","timestamp":1000,"payload":{"role":"user","content":"   "}}"#;
+        let turns = extract_turns(jsonl);
+        assert!(turns[0].user_prompt.is_none());
     }
 
     #[test]
