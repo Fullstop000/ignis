@@ -20,9 +20,14 @@ pub mod upgrade;
     long_about = "With no prompt, launches the interactive TUI; with a prompt, runs one-shot to stdout.",
     after_help = "Repo: https://github.com/Fullstop000/ignis",
     disable_help_subcommand = true,
+    disable_version_flag = true,
     arg_required_else_help = false
 )]
 pub struct Cli {
+    /// Print version
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    pub version: (),
+
     /// Resume the latest session, or the given session id.
     #[arg(long, num_args = 0..=1, value_name = "ID")]
     pub resume: Option<Option<String>>,
