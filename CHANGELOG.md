@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- MiniMax Token Plan: `MiniMax-M3` model now in the catalog (Anthropic-first, same dual-endpoint shape as M2.7). ([#94](https://github.com/Fullstop000/ignis/pull/94))
 - MCP HTTP transport (Streamable HTTP). `[mcp.servers.X] url = "https://…"` or `ignis mcp add X --url … [--bearer-token-env-var ENV] [--header "K: V"]`; `/mcp` picker shows transport tag and per-server tool list. ([#86](https://github.com/Fullstop000/ignis/pull/86))
 
 ### Changed
