@@ -65,24 +65,57 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let body_area = outer[0];
     let band_area = outer[1];
 
-    // Body area: pickers replace the transcript when one is open; otherwise
-    // the in-app transcript renders here.
-    if let Some(picker) = &app.inline_picker {
+    // Body area: tool-initiated pickers (ask_user / permission / connect /
+    // afk) anchor to the BOTTOM of the body — same convention Claude Code
+    // and Codex use — with the transcript still visible above. Sized to the
+    // picker's natural height, capped at 70% so context behind it stays in
+    // view. Slash-command pickers (model/session/skill/mcp) continue to take
+    // the full body since they're entered intentionally and benefit from the
+    // room.
+    if app.inline_picker.is_some() {
+        // Compute the bottom picker slice in a scope holding only an
+        // immutable borrow, so render_transcript can take `&mut app` after.
+        // The picker is sized to its natural height, but we always keep at
+        // least a few rows visible above for transcript context (3 rows on
+        // anything wider than 12 rows; otherwise half the body). That way an
+        // 8-option /connect list can grow without the footer hint clipping,
+        // while a 2-option permission picker leaves most of the body for
+        // conversation.
+        let (picker_area, above) = {
+            let picker = app.inline_picker.as_ref().expect("checked above");
+            let desired = super::inline_picker::picker_height(picker, body_area.width);
+            let reserve_above = if body_area.height >= 12 {
+                3
+            } else {
+                body_area.height / 2
+            };
+            let max_picker = body_area.height.saturating_sub(reserve_above).max(1);
+            let h = desired.min(max_picker).min(body_area.height).max(1);
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(h)])
+                .split(body_area);
+            (split[1], split[0])
+        };
+        if above.height > 0 {
+            render_transcript(f, above, app);
+        }
+        let picker = app.inline_picker.as_ref().expect("still set");
         if picker.has_any_preview() {
-            render_inline_picker_split(f, body_area, picker);
+            render_inline_picker_split(f, picker_area, picker);
         } else {
             let mut lines: Vec<Line> = Vec::new();
             super::inline_picker::render_inline_picker(
                 &mut lines,
                 picker,
-                body_area.width,
-                body_area.height as usize,
+                picker_area.width,
+                picker_area.height as usize,
             );
             f.render_widget(
                 Paragraph::new(Text::from(lines))
                     .style(Style::default().bg(BG))
                     .wrap(Wrap { trim: false }),
-                body_area,
+                picker_area,
             );
         }
     } else if let Some(picker) = &app.model_picker {
@@ -1361,6 +1394,75 @@ mod tests {
         assert!(
             content.contains("hi there"),
             "should show assistant message"
+        );
+    }
+
+    #[test]
+    fn inline_picker_anchors_to_bottom_with_transcript_above() {
+        use crate::console::picker::{PickerOption, PickerQuestion};
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        // Fill scrollback so something is pinned just above the picker via
+        // auto-follow — that's the regression we're guarding: tool-initiated
+        // pickers used to wipe the transcript and take the full body.
+        for i in 0..40 {
+            app.commit_transcript_lines(vec![Line::from(format!("FILLER_{i}"))]);
+        }
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        app.inline_picker = Some(crate::console::inline_picker::InlinePickerState::new(
+            crate::console::picker::PickerRequest {
+                questions: vec![PickerQuestion {
+                    question: "PICKER_QUESTION".into(),
+                    kind: "permission".into(),
+                    header: "Allow?".into(),
+                    multi_select: false,
+                    allow_other: false,
+                    text_input: false,
+                    mask: false,
+                    options: vec![
+                        PickerOption {
+                            label: "Approve once".into(),
+                            description: "Run this command and continue.".into(),
+                            preview: None,
+                        },
+                        PickerOption {
+                            label: "Deny".into(),
+                            description: "Reject this tool call.".into(),
+                            preview: None,
+                        },
+                    ],
+                }],
+                reply: tx,
+            },
+        ));
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let w = buf.area.width as usize;
+        let h = buf.area.height as usize;
+        let row_text = |y: usize| -> String {
+            buf.content[y * w..(y + 1) * w]
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+        let picker_row = (0..h)
+            .find(|y| row_text(*y).contains("PICKER_QUESTION"))
+            .expect("picker question must render");
+        let filler_row = (0..h)
+            .find(|y| row_text(*y).contains("FILLER_"))
+            .expect("transcript must still be visible above the picker");
+        assert!(
+            filler_row < picker_row,
+            "transcript row {filler_row} should sit ABOVE picker row {picker_row}",
+        );
+        assert!(
+            picker_row >= h / 3,
+            "picker should anchor toward bottom (question at row {picker_row} of {h})",
         );
     }
 
