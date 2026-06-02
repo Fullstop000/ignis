@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `MiniMax-M3` now declares its 1M-token context window so `/model` and the context bar show the correct size instead of falling back to the default. ([#103](https://github.com/Fullstop000/ignis/pull/103))
 - Tool-block headers and permission prompts on Anthropic-compatible streams (Anthropic, MiniMax `/anthropic`) showed the tool name duplicated — `bashbashbash("…")` — because the SSE parser re-sent `name` on every `input_json_delta` chunk; now emitted only on `content_block_start`. ([#104](https://github.com/Fullstop000/ignis/pull/104))
 
 ## [0.33.0] - 2026-06-02
