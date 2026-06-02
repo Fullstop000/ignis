@@ -587,15 +587,6 @@ pub struct Agent {
     /// Project instructions (from `AGENTS.md`) prepended to each request as a
     /// synthetic first user turn. Not stored in `history`.
     project_instructions: Option<String>,
-    /// External-subprocess hook registry used to run inject (Ctrl+S
-    /// steer) text through the `UserPromptSubmit` chain before pushing
-    /// to history — so a bilingual-translation hook sees every user
-    /// turn, not only the initial one. `None` on subagents and tests
-    /// that don't install a registry.
-    prompt_hooks: Option<crate::hooks::HookRegistry>,
-    /// Hook context paired with `prompt_hooks` — supplies session_id +
-    /// cwd to the envelope. Set together via `set_prompt_hooks`.
-    prompt_hook_ctx: Option<crate::hooks::OwnedHookContext>,
 }
 
 struct AccumulatingToolCall {
@@ -614,23 +605,7 @@ impl Agent {
             skills: None,
             mcp: None,
             project_instructions: None,
-            prompt_hooks: None,
-            prompt_hook_ctx: None,
         }
-    }
-
-    /// Install the `UserPromptSubmit` hook registry used to filter
-    /// inject (steer) messages. Paired with the context (`session_id`,
-    /// `cwd`) that goes into each envelope. `Session::open` wires this
-    /// after loading `~/.ignis/hooks.json`.
-    pub fn set_prompt_hooks(
-        &mut self,
-        hooks: crate::hooks::HookRegistry,
-        session_id: String,
-        cwd: String,
-    ) {
-        self.prompt_hooks = Some(hooks);
-        self.prompt_hook_ctx = Some(crate::hooks::OwnedHookContext { session_id, cwd });
     }
 
     /// Set the `AGENTS.md` project instructions prepended to each model request.
@@ -699,6 +674,8 @@ impl Agent {
         history: &mut Vec<Message>,
         tx: tokio::sync::mpsc::Sender<AgentEvent>,
         mut inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+        prompt_hooks: Option<&crate::hooks::HookRegistry>,
+        hook_ctx: Option<crate::hooks::HookContext<'_>>,
     ) -> Result<Usage, anyhow::Error> {
         let _ = tx.send(AgentEvent::AgentStart).await;
         let mut total_usage = Usage::default();
@@ -723,8 +700,6 @@ impl Agent {
             })
             .collect();
 
-        let prompt_hooks = self.prompt_hooks.as_ref();
-        let hook_ctx = self.prompt_hook_ctx.as_ref().map(|ctx| ctx.as_ref());
         loop {
             drain_injected(
                 inject_rx.as_deref_mut(),

@@ -67,12 +67,10 @@ impl Session {
             Some(home) => HookRegistry::from_config_dir(&home)?,
             None => HookRegistry::empty(),
         };
-        // Plumb the registry onto the agent so the inject (Ctrl+S
-        // steer) path runs each steering message through the
-        // UserPromptSubmit chain, matching the initial-prompt path. The
-        // registry is an Arc<RwLock<…>>, so cloning is cheap; both
-        // handles see the same /hooks reload swap.
-        agent.set_prompt_hooks(hooks.clone(), id.clone(), start_dir.clone());
+        // The registry is plumbed into each `agent.run` call in
+        // `Session::prompt` rather than stored on the Agent; that keeps a
+        // single source of truth (the Session's `hooks` field) and makes
+        // `/hooks reload` a simple field swap.
         Ok(Self {
             id,
             history,
@@ -139,11 +137,7 @@ impl Session {
     /// Replace the hook registry — used by the console runner so
     /// `/hooks reload` reaches the live registry instance, and by tests
     /// so they don't have to touch the real `~/.ignis/hooks.json`.
-    /// Propagates the new handle to the agent so the inject path runs
-    /// under the same registry.
     pub fn set_hook_registry(&mut self, registry: HookRegistry) {
-        self.agent
-            .set_prompt_hooks(registry.clone(), self.id.clone(), self.start_dir.clone());
         self.hooks = registry;
     }
 
@@ -232,7 +226,16 @@ impl Session {
         );
         let turn_usage = self
             .agent
-            .run(&mut self.history, tx, self.inject_rx.as_mut())
+            .run(
+                &mut self.history,
+                tx,
+                self.inject_rx.as_mut(),
+                Some(&self.hooks),
+                Some(HookContext {
+                    session_id: &self.id,
+                    cwd: &self.start_dir,
+                }),
+            )
             .await?;
         if !turn_usage.is_zero() {
             self.usage.add(&turn_usage);

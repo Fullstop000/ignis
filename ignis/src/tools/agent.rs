@@ -98,7 +98,7 @@ impl AgentTool for SubagentTool {
         // channel; the sub-agent's events aren't surfaced in the UI (yet).
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let run = agent.run(&mut history, tx, None).await;
+        let run = agent.run(&mut history, tx, None, None, None).await;
         let _ = drain.await;
 
         if let Err(e) = run {
