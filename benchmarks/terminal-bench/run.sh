@@ -110,6 +110,7 @@ case "$provider" in
     gemini)    key_env=GEMINI_API_KEY ;;
     deepseek)  key_env=DEEPSEEK_API_KEY ;;
     kimi-code) key_env=KIMI_CODE_API_KEY ;;
+    minimax-token-plan) key_env=MINIMAX_TOKEN_PLAN_API_KEY ;;
     *) echo "run.sh: unknown provider '$provider' in MODEL=$MODEL" >&2; exit 2 ;;
 esac
 _toml_key() { # $1 = section header (e.g. [web_search]); reads api_key under it.
@@ -143,7 +144,7 @@ export DAYTONA_API_KEY="${DAYTONA_API_KEY:-${DAYTONA_KEY_IGNIS_TB2:-}}"
 
 # ---------- env preset: disk vs concurrency -----------------------------------
 case "$ENV" in
-    daytona) NCONC="${NCONC:-3}";  STORAGE_MB="${STORAGE_MB:-16000}"; storage=(--override-storage-mb "$STORAGE_MB") ;;
+    daytona) NCONC="${NCONC:-3}";  STORAGE_MB="${STORAGE_MB:-10000}"; storage=(--override-storage-mb "$STORAGE_MB") ;;  # Daytona caps per-sandbox disk at 10 GB
     novita)  NCONC="${NCONC:-8}";  STORAGE_MB="${STORAGE_MB:-20000}"; storage=(--override-storage-mb "$STORAGE_MB") ;;
     docker)  NCONC="${NCONC:-4}";  storage=() ;;  # local disk; no sandbox quota override
     *) echo "run.sh: ENV must be daytona|docker|novita (got '$ENV')" >&2; exit 2 ;;
