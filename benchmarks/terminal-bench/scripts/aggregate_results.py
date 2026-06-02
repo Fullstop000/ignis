@@ -80,16 +80,65 @@ def _sum_usage(usage_dir: Path) -> tuple[int, int, int]:
     return in_t, out_t, cache_t
 
 
-def classify(reward: float | None, exc: dict | None, rate_limited: bool) -> str:
+def classify(
+    reward: float | None,
+    exc: dict | None,
+    rate_limited: bool,
+    stream_dropped: bool,
+) -> str:
     if reward == 1.0:
         return "passed"
-    if exc:
+    # `errored` = anything that prevented the verifier from getting a fair-shot
+    # solution: harness-level exception OR the model stream silently dropped
+    # mid-turn (provider closed the connection, etc.). The TB 2.1 / MiniMax-M3
+    # baseline surfaced 16 such trials that were previously bucketed as model
+    # misses; they are not — the agent never got a clean turn through.
+    if exc or stream_dropped:
         return "errored"
     if rate_limited:
         return "quota"
     if reward == 0.0:
-        return "failed"
+        return "failed"  # benchmark gate ran and rejected the agent's solution
     return "unknown"
+
+
+# Markers in the agent's stdout that indicate a provider-side stream drop —
+# the model API closed the connection mid-response, so the agent never got a
+# complete turn. The bare "[Error in stream:" catches our own retry-loop's
+# final-attempt error too (when MAX_STREAM_RETRIES is hit). Kept narrow on
+# purpose: false positives reclassify real model misses as infra errors and
+# inflate the resolved% metric.
+_STREAM_DROP_MARKERS = (
+    "connection closed before message completed",
+    "error sending request",
+    "[Error in stream:",
+)
+
+
+def _agent_log_indicates_stream_drop(path: Path) -> bool:
+    """Stream-scan the agent log for any stream-drop marker; tolerant of multi-GB logs."""
+    if not path.exists():
+        return False
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    chunk = 1 << 20
+    needles = [m.encode() for m in _STREAM_DROP_MARKERS]
+    carry_len = max(len(n) for n in needles)
+    try:
+        with path.open("rb") as fh:
+            carry = b""
+            while True:
+                buf = fh.read(chunk)
+                if not buf:
+                    return False
+                window = carry + buf
+                if any(n in window for n in needles):
+                    return True
+                carry = window[-carry_len:]
+    except OSError:
+        return False
 
 
 def walk_trials(job_dir: Path) -> list[dict[str, Any]]:
@@ -112,16 +161,27 @@ def walk_trials(job_dir: Path) -> list[dict[str, Any]]:
             agent_log.exists()
             and "rate_limit_reached_error" in agent_log.read_text(errors="ignore")
         )
+        stream_dropped = _agent_log_indicates_stream_drop(agent_log)
 
         n_in, n_out, n_cache = _sum_usage(trial_dir / "agent" / "ignis-projects")
         cache_rate = round(n_cache / n_in, 3) if n_in else ""
 
+        # `exception` column: harness exception type wins; otherwise stamp
+        # `ConnectionDropped` so a reader can see why the row is `errored`
+        # without diffing the log.
+        if exc:
+            exception_label = (exc or {}).get("exception_type", "")
+        elif stream_dropped and reward != 1.0:
+            exception_label = "ConnectionDropped"
+        else:
+            exception_label = ""
+
         rows.append({
             "task": task,
             "trial": trial_dir.name,
-            "bucket": classify(reward, exc, rate_limited),
+            "bucket": classify(reward, exc, rate_limited, stream_dropped and reward != 1.0),
             "reward": "" if reward is None else reward,
-            "exception": (exc or {}).get("exception_type", "") if exc else "",
+            "exception": exception_label,
             "rate_limited": "true" if rate_limited else "false",
             "duration_seconds": _wall_seconds(result.get("started_at"), result.get("finished_at")) or "",
             "n_input_tokens": n_in or "",

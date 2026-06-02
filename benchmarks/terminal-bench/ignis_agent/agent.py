@@ -36,6 +36,10 @@ _PROVIDERS: dict[str, tuple[str, str | None]] = {
     # ignis hardcodes https://api.kimi.com/coding/v1 and the KimiCLI User-Agent
     # the Kimi Coding Plan requires; we only need to forward the key.
     "kimi-code": ("KIMI_CODE_API_KEY", None),
+    # MiniMax Token Plan ships MiniMax-M3 / M2.7 over both Anthropic and OpenAI
+    # protocols; ignis hardcodes both endpoints (api.minimaxi.com/anthropic
+    # first, recommended for prompt-cache hits). Only forward the key.
+    "minimax-token-plan": ("MINIMAX_TOKEN_PLAN_API_KEY", None),
 }
 
 
@@ -158,6 +162,15 @@ class IgnisAgent(BaseInstalledAgent):
         config_lines.append(f'api_key = "{api_key}"')
         if api_url:
             config_lines.append(f'api_url = "{api_url}"')
+        if provider == "minimax-token-plan":
+            # MiniMax Token Plan defaults to Anthropic protocol in ignis (per
+            # provider spec, recommended for prompt caching). Observed against
+            # MiniMax's Anthropic-compat layer: streamed tool-name deltas
+            # concatenate (bash → bashbash → bashbashbash) so every tool call
+            # fails with "Tool not found" and the model can't make progress.
+            # Force OpenAI protocol until ignis's streaming parser is fixed
+            # for that endpoint.
+            config_lines.append('protocol = "openai"')
         if effort:
             config_lines.append(
                 f'models = [{{ name = "{model}", reasoning = ["{effort}"] }}]'
