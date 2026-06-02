@@ -1,4 +1,4 @@
-use crate::{AgentTool, ExecutionMode, ToolResult};
+use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,32 @@ impl ListDirTool {
         Self {
             cwd: cwd.to_path_buf(),
         }
+    }
+
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome {
+        let path = args.require_str("path")?;
+        let resolved = crate::util::resolve_path(&self.cwd, path);
+        let mut entries = tokio::fs::read_dir(&resolved)
+            .await
+            .map_err(|e| format!("Failed to read directory: {e}"))?;
+
+        let mut lines = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            match entry.metadata().await {
+                Ok(meta) => {
+                    let kind = if meta.is_dir() { "dir" } else { "file" };
+                    let size = meta.len();
+                    lines.push(format!("{kind}\t{size}\t{name}"));
+                }
+                Err(_) => {
+                    lines.push(format!("?\t?\t{name}"));
+                }
+            }
+        }
+
+        lines.sort();
+        Ok(lines.join("\n"))
     }
 }
 
@@ -40,34 +66,7 @@ impl AgentTool for ListDirTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> ToolResult {
-        let path = match args["path"].as_str() {
-            Some(p) => p,
-            None => return ToolResult::error("Missing required parameter: path".to_string()),
-        };
-
-        let resolved = crate::util::resolve_path(&self.cwd, path);
-        let mut entries = match tokio::fs::read_dir(&resolved).await {
-            Ok(e) => e,
-            Err(e) => return ToolResult::error(format!("Failed to read directory: {e}")),
-        };
-
-        let mut lines = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            match entry.metadata().await {
-                Ok(meta) => {
-                    let kind = if meta.is_dir() { "dir" } else { "file" };
-                    let size = meta.len();
-                    lines.push(format!("{kind}\t{size}\t{name}"));
-                }
-                Err(_) => {
-                    lines.push(format!("?\t?\t{name}"));
-                }
-            }
-        }
-
-        lines.sort();
-        ToolResult::ok(lines.join("\n"))
+        self.run(args).await.into_tool_result()
     }
 }
 

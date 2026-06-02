@@ -1,4 +1,4 @@
-use crate::{AgentTool, ExecutionMode, ToolResult};
+use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,55 @@ impl BashTool {
         Self {
             cwd: cwd.to_path_buf(),
         }
+    }
+
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome {
+        let command = args.require_str("command")?;
+        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(60);
+
+        let child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&self.cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn command: {e}"))?;
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            child.wait_with_output(),
+        )
+        .await
+        .map_err(|_| "Command timed out".to_string())?
+        .map_err(|e| format!("Command failed: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        let mut combined = String::new();
+        if !stdout.is_empty() {
+            combined.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str("[stderr]\n");
+            combined.push_str(&stderr);
+        }
+
+        if combined.len() > BASH_OUTPUT_LIMIT {
+            truncate_on_char_boundary(&mut combined, BASH_OUTPUT_LIMIT);
+            combined.push_str("\n... [truncated]");
+        }
+
+        if !output.status.success() {
+            combined.push_str(&format!("\n[exit code: {exit_code}]"));
+            return Err(combined);
+        }
+        Ok(combined)
     }
 }
 
@@ -58,64 +107,7 @@ impl AgentTool for BashTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> ToolResult {
-        let command = match args["command"].as_str() {
-            Some(c) => c,
-            None => return ToolResult::error("Missing required parameter: command".to_string()),
-        };
-        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(60);
-
-        let child = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .current_dir(&self.cwd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-
-        let child = match child {
-            Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("Failed to spawn command: {e}")),
-        };
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await;
-
-        match result {
-            Err(_) => ToolResult::error("Command timed out".to_string()),
-            Ok(Err(e)) => ToolResult::error(format!("Command failed: {e}")),
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let exit_code = output.status.code().unwrap_or(-1);
-
-                let mut combined = String::new();
-                if !stdout.is_empty() {
-                    combined.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    if !combined.is_empty() {
-                        combined.push('\n');
-                    }
-                    combined.push_str("[stderr]\n");
-                    combined.push_str(&stderr);
-                }
-
-                if combined.len() > BASH_OUTPUT_LIMIT {
-                    truncate_on_char_boundary(&mut combined, BASH_OUTPUT_LIMIT);
-                    combined.push_str("\n... [truncated]");
-                }
-
-                if !output.status.success() {
-                    combined.push_str(&format!("\n[exit code: {exit_code}]"));
-                    ToolResult::error(combined)
-                } else {
-                    ToolResult::ok(combined)
-                }
-            }
-        }
+        self.run(args).await.into_tool_result()
     }
 }
 

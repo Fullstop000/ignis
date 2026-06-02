@@ -1,4 +1,4 @@
-use crate::{AgentTool, ExecutionMode, ToolResult};
+use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use regex::Regex;
@@ -21,6 +21,66 @@ impl GrepTool {
         Self {
             cwd: cwd.to_path_buf(),
         }
+    }
+
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome {
+        let pattern = args.require_str("pattern")?;
+        let re = Regex::new(pattern).map_err(|e| format!("Invalid regex: {e}"))?;
+        let base = match args["path"].as_str() {
+            Some(p) => crate::util::resolve_path(&self.cwd, p),
+            None => self.cwd.clone(),
+        };
+        let matcher = match args["glob"].as_str() {
+            Some(g) => Some(
+                globset::Glob::new(g)
+                    .map_err(|e| format!("Invalid glob: {e}"))?
+                    .compile_matcher(),
+            ),
+            None => None,
+        };
+
+        let cwd = self.cwd.clone();
+        let (mut lines, truncated) = tokio::task::spawn_blocking(move || {
+            let mut out: Vec<String> = Vec::new();
+            let mut truncated = false;
+            'walk: for entry in WalkBuilder::new(&base).build().flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if let Some(m) = &matcher {
+                    if !m.is_match(path) {
+                        continue;
+                    }
+                }
+                // Skip non-UTF-8 / binary files silently.
+                let Ok(content) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                let rel = path.strip_prefix(&cwd).unwrap_or(path);
+                for (i, line) in content.lines().enumerate() {
+                    if re.is_match(line) {
+                        let shown: String = line.trim_end().chars().take(MAX_LINE_CHARS).collect();
+                        out.push(format!("{}:{}:{}", rel.display(), i + 1, shown));
+                        if out.len() >= MAX_MATCHES {
+                            truncated = true;
+                            break 'walk;
+                        }
+                    }
+                }
+            }
+            (out, truncated)
+        })
+        .await
+        .map_err(|e| format!("grep failed: {e}"))?;
+
+        if lines.is_empty() {
+            return Ok("No matches.".to_string());
+        }
+        if truncated {
+            lines.push(format!("… (truncated at {MAX_MATCHES} matches)"));
+        }
+        Ok(lines.join("\n"))
     }
 }
 
@@ -52,70 +112,7 @@ impl AgentTool for GrepTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> ToolResult {
-        let Some(pattern) = args["pattern"].as_str() else {
-            return ToolResult::error("Missing required parameter: pattern".to_string());
-        };
-        let re = match Regex::new(pattern) {
-            Ok(r) => r,
-            Err(e) => return ToolResult::error(format!("Invalid regex: {e}")),
-        };
-        let base = match args["path"].as_str() {
-            Some(p) => crate::util::resolve_path(&self.cwd, p),
-            None => self.cwd.clone(),
-        };
-        let matcher = match args["glob"].as_str() {
-            Some(g) => match globset::Glob::new(g) {
-                Ok(glob) => Some(glob.compile_matcher()),
-                Err(e) => return ToolResult::error(format!("Invalid glob: {e}")),
-            },
-            None => None,
-        };
-
-        let cwd = self.cwd.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let mut out: Vec<String> = Vec::new();
-            let mut truncated = false;
-            'walk: for entry in WalkBuilder::new(&base).build().flatten() {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                if let Some(m) = &matcher {
-                    if !m.is_match(path) {
-                        continue;
-                    }
-                }
-                // Skip non-UTF-8 / binary files silently.
-                let Ok(content) = std::fs::read_to_string(path) else {
-                    continue;
-                };
-                let rel = path.strip_prefix(&cwd).unwrap_or(path);
-                for (i, line) in content.lines().enumerate() {
-                    if re.is_match(line) {
-                        let shown: String = line.trim_end().chars().take(MAX_LINE_CHARS).collect();
-                        out.push(format!("{}:{}:{}", rel.display(), i + 1, shown));
-                        if out.len() >= MAX_MATCHES {
-                            truncated = true;
-                            break 'walk;
-                        }
-                    }
-                }
-            }
-            (out, truncated)
-        })
-        .await;
-
-        let (mut lines, truncated) = match result {
-            Ok(v) => v,
-            Err(e) => return ToolResult::error(format!("grep failed: {e}")),
-        };
-        if lines.is_empty() {
-            return ToolResult::ok("No matches.".to_string());
-        }
-        if truncated {
-            lines.push(format!("… (truncated at {MAX_MATCHES} matches)"));
-        }
-        ToolResult::ok(lines.join("\n"))
+        self.run(args).await.into_tool_result()
     }
 }
 

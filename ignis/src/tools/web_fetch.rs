@@ -1,4 +1,4 @@
-use crate::{AgentTool, ExecutionMode, ToolResult};
+use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::time::Duration;
@@ -26,6 +26,51 @@ impl WebFetchTool {
             .build()
             .unwrap_or_default();
         Self { client }
+    }
+
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome {
+        let url = args.require_str("url")?;
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err("url must start with http:// or https://".to_string());
+        }
+
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("HTTP {status} fetching {url}"));
+        }
+        let is_html = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.contains("html"))
+            .unwrap_or(false);
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read body: {e}"))?;
+
+        let text = if is_html || looks_like_html(&body) {
+            html_to_text(&body)
+        } else {
+            body
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok("(empty response)".to_string());
+        }
+        let out: String = text.chars().take(MAX_OUTPUT_CHARS).collect();
+        let suffix = if text.chars().count() > MAX_OUTPUT_CHARS {
+            "\n… (truncated)"
+        } else {
+            ""
+        };
+        Ok(format!("{out}{suffix}"))
     }
 }
 
@@ -55,48 +100,7 @@ impl AgentTool for WebFetchTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> ToolResult {
-        let Some(url) = args["url"].as_str() else {
-            return ToolResult::error("Missing required parameter: url".to_string());
-        };
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return ToolResult::error("url must start with http:// or https://".to_string());
-        }
-
-        let resp = match self.client.get(url).send().await {
-            Ok(r) => r,
-            Err(e) => return ToolResult::error(format!("Request failed: {e}")),
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            return ToolResult::error(format!("HTTP {status} fetching {url}"));
-        }
-        let is_html = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|ct| ct.contains("html"))
-            .unwrap_or(false);
-        let body = match resp.text().await {
-            Ok(b) => b,
-            Err(e) => return ToolResult::error(format!("Failed to read body: {e}")),
-        };
-
-        let text = if is_html || looks_like_html(&body) {
-            html_to_text(&body)
-        } else {
-            body
-        };
-        let text = text.trim();
-        if text.is_empty() {
-            return ToolResult::ok("(empty response)".to_string());
-        }
-        let out: String = text.chars().take(MAX_OUTPUT_CHARS).collect();
-        let suffix = if text.chars().count() > MAX_OUTPUT_CHARS {
-            "\n… (truncated)"
-        } else {
-            ""
-        };
-        ToolResult::ok(format!("{out}{suffix}"))
+        self.run(args).await.into_tool_result()
     }
 }
 

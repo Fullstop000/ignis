@@ -1,4 +1,4 @@
-use crate::{AgentTool, ExecutionMode, ToolResult};
+use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,27 @@ impl EditFileTool {
         Self {
             cwd: cwd.to_path_buf(),
         }
+    }
+
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome {
+        let path = args.require_str("path")?;
+        let old_text = args.require_str("old_text")?;
+        let new_text = args.require_str("new_text")?;
+
+        let resolved = crate::util::resolve_path(&self.cwd, path);
+        let content = tokio::fs::read_to_string(&resolved)
+            .await
+            .map_err(|e| format!("Failed to read file: {e}"))?;
+
+        if !content.contains(old_text) {
+            return Err("old_text not found in file".to_string());
+        }
+
+        let new_content = content.replacen(old_text, new_text, 1);
+        tokio::fs::write(&resolved, &new_content)
+            .await
+            .map_err(|e| format!("Failed to write file: {e}"))?;
+        Ok(render_edit_diff(old_text, new_text))
     }
 }
 
@@ -44,34 +65,7 @@ impl AgentTool for EditFileTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> ToolResult {
-        let path = match args["path"].as_str() {
-            Some(p) => p,
-            None => return ToolResult::error("Missing required parameter: path".to_string()),
-        };
-        let old_text = match args["old_text"].as_str() {
-            Some(t) => t,
-            None => return ToolResult::error("Missing required parameter: old_text".to_string()),
-        };
-        let new_text = match args["new_text"].as_str() {
-            Some(t) => t,
-            None => return ToolResult::error("Missing required parameter: new_text".to_string()),
-        };
-
-        let resolved = crate::util::resolve_path(&self.cwd, path);
-        let content = match tokio::fs::read_to_string(&resolved).await {
-            Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("Failed to read file: {e}")),
-        };
-
-        if !content.contains(old_text) {
-            return ToolResult::error("old_text not found in file".to_string());
-        }
-
-        let new_content = content.replacen(old_text, new_text, 1);
-        match tokio::fs::write(&resolved, &new_content).await {
-            Ok(()) => ToolResult::ok(render_edit_diff(old_text, new_text)),
-            Err(e) => ToolResult::error(format!("Failed to write file: {e}")),
-        }
+        self.run(args).await.into_tool_result()
     }
 }
 

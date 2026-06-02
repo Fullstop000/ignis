@@ -1,4 +1,4 @@
-use crate::{AgentTool, ExecutionMode, ToolResult};
+use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -89,6 +89,47 @@ impl WebSearchTool {
             .map_err(|e| format!("Failed to parse response: {e}"))?;
         Ok(parse_tavily(&json))
     }
+
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome {
+        let query = args.require_str("query")?;
+        if query.trim().is_empty() {
+            return Err("Missing required parameter: query".to_string());
+        }
+
+        let backend = Backend::from_name(&self.provider).ok_or_else(|| {
+            format!(
+                "Unknown web_search provider '{}' (supported: brave, tavily)",
+                self.provider
+            )
+        })?;
+        let key = match &self.api_key {
+            Some(k) if !k.is_empty() => k.as_str(),
+            _ => {
+                return Err(format!(
+                    "web_search provider '{}' requires an API key (set web_search.api_key in config.toml)",
+                    self.provider
+                ))
+            }
+        };
+
+        let results = match backend {
+            Backend::Brave => self.search_brave(query, key).await,
+            Backend::Tavily => self.search_tavily(query, key).await,
+        };
+
+        match results {
+            Err(e) => Err(e),
+            Ok(items) if items.is_empty() => Ok("No results found.".to_string()),
+            Ok(items) => {
+                let formatted: Vec<String> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| format!("{}. {} - {}\n   {}", i + 1, r.title, r.url, r.snippet))
+                    .collect();
+                Ok(formatted.join("\n"))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -116,48 +157,7 @@ impl AgentTool for WebSearchTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> ToolResult {
-        let query = match args["query"].as_str() {
-            Some(q) if !q.trim().is_empty() => q,
-            _ => return ToolResult::error("Missing required parameter: query".to_string()),
-        };
-
-        let backend = match Backend::from_name(&self.provider) {
-            Some(b) => b,
-            None => {
-                return ToolResult::error(format!(
-                    "Unknown web_search provider '{}' (supported: brave, tavily)",
-                    self.provider
-                ))
-            }
-        };
-
-        let key = match &self.api_key {
-            Some(k) if !k.is_empty() => k.as_str(),
-            _ => {
-                return ToolResult::error(format!(
-                    "web_search provider '{}' requires an API key (set web_search.api_key in config.toml)",
-                    self.provider
-                ))
-            }
-        };
-
-        let results = match backend {
-            Backend::Brave => self.search_brave(query, key).await,
-            Backend::Tavily => self.search_tavily(query, key).await,
-        };
-
-        match results {
-            Err(e) => ToolResult::error(e),
-            Ok(items) if items.is_empty() => ToolResult::ok("No results found.".to_string()),
-            Ok(items) => {
-                let formatted: Vec<String> = items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| format!("{}. {} - {}\n   {}", i + 1, r.title, r.url, r.snippet))
-                    .collect();
-                ToolResult::ok(formatted.join("\n"))
-            }
-        }
+        self.run(args).await.into_tool_result()
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::{AgentTool, ExecutionMode, ToolResult};
+use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use globset::Glob;
 use ignore::WalkBuilder;
@@ -19,6 +19,51 @@ impl GlobTool {
         Self {
             cwd: cwd.to_path_buf(),
         }
+    }
+
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome {
+        let pattern = args.require_str("pattern")?;
+        let matcher = Glob::new(pattern)
+            .map_err(|e| format!("Invalid glob: {e}"))?
+            .compile_matcher();
+        let base = match args["path"].as_str() {
+            Some(p) => crate::util::resolve_path(&self.cwd, p),
+            None => self.cwd.clone(),
+        };
+
+        let cwd = self.cwd.clone();
+        let (mut paths, truncated) = tokio::task::spawn_blocking(move || {
+            let mut paths: Vec<String> = Vec::new();
+            let mut truncated = false;
+            for entry in WalkBuilder::new(&base).build().flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                // Match the glob against the path relative to the search base.
+                let rel_to_base = path.strip_prefix(&base).unwrap_or(path);
+                if matcher.is_match(rel_to_base) {
+                    let rel = path.strip_prefix(&cwd).unwrap_or(path);
+                    paths.push(rel.display().to_string());
+                    if paths.len() >= MAX_PATHS {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+            paths.sort();
+            (paths, truncated)
+        })
+        .await
+        .map_err(|e| format!("glob failed: {e}"))?;
+
+        if paths.is_empty() {
+            return Ok("No files matched.".to_string());
+        }
+        if truncated {
+            paths.push(format!("… (truncated at {MAX_PATHS} files)"));
+        }
+        Ok(paths.join("\n"))
     }
 }
 
@@ -49,54 +94,7 @@ impl AgentTool for GlobTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> ToolResult {
-        let Some(pattern) = args["pattern"].as_str() else {
-            return ToolResult::error("Missing required parameter: pattern".to_string());
-        };
-        let matcher = match Glob::new(pattern) {
-            Ok(g) => g.compile_matcher(),
-            Err(e) => return ToolResult::error(format!("Invalid glob: {e}")),
-        };
-        let base = match args["path"].as_str() {
-            Some(p) => crate::util::resolve_path(&self.cwd, p),
-            None => self.cwd.clone(),
-        };
-
-        let cwd = self.cwd.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let mut paths: Vec<String> = Vec::new();
-            let mut truncated = false;
-            for entry in WalkBuilder::new(&base).build().flatten() {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                // Match the glob against the path relative to the search base.
-                let rel_to_base = path.strip_prefix(&base).unwrap_or(path);
-                if matcher.is_match(rel_to_base) {
-                    let rel = path.strip_prefix(&cwd).unwrap_or(path);
-                    paths.push(rel.display().to_string());
-                    if paths.len() >= MAX_PATHS {
-                        truncated = true;
-                        break;
-                    }
-                }
-            }
-            paths.sort();
-            (paths, truncated)
-        })
-        .await;
-
-        let (mut paths, truncated) = match result {
-            Ok(v) => v,
-            Err(e) => return ToolResult::error(format!("glob failed: {e}")),
-        };
-        if paths.is_empty() {
-            return ToolResult::ok("No files matched.".to_string());
-        }
-        if truncated {
-            paths.push(format!("… (truncated at {MAX_PATHS} files)"));
-        }
-        ToolResult::ok(paths.join("\n"))
+        self.run(args).await.into_tool_result()
     }
 }
 

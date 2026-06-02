@@ -1,4 +1,4 @@
-use crate::{AgentTool, ExecutionMode, ToolResult};
+use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,22 @@ impl CreateFileTool {
         Self {
             cwd: cwd.to_path_buf(),
         }
+    }
+
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome {
+        let path = args.require_str("path")?;
+        let content = args.require_str("content")?;
+
+        let resolved = crate::util::resolve_path(&self.cwd, path);
+        if let Some(parent) = resolved.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Failed to create directories: {e}"))?;
+        }
+        tokio::fs::write(&resolved, content)
+            .await
+            .map_err(|e| format!("Failed to write file: {e}"))?;
+        Ok(format!("Created file: {}", resolved.display()))
     }
 }
 
@@ -43,26 +59,7 @@ impl AgentTool for CreateFileTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> ToolResult {
-        let path = match args["path"].as_str() {
-            Some(p) => p,
-            None => return ToolResult::error("Missing required parameter: path".to_string()),
-        };
-        let content = match args["content"].as_str() {
-            Some(c) => c,
-            None => return ToolResult::error("Missing required parameter: content".to_string()),
-        };
-
-        let resolved = crate::util::resolve_path(&self.cwd, path);
-        if let Some(parent) = resolved.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return ToolResult::error(format!("Failed to create directories: {e}"));
-            }
-        }
-
-        match tokio::fs::write(&resolved, content).await {
-            Ok(()) => ToolResult::ok(format!("Created file: {}", resolved.display())),
-            Err(e) => ToolResult::error(format!("Failed to write file: {e}")),
-        }
+        self.run(args).await.into_tool_result()
     }
 }
 

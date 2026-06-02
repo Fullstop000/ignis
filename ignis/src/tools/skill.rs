@@ -1,5 +1,5 @@
 use crate::skills::SkillRegistry;
-use crate::tools::tool::{AgentTool, ToolResult};
+use crate::tools::tool::{AgentTool, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -21,6 +21,28 @@ impl SkillTool {
             .map(|(n, _)| n)
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    fn run(&self, args: serde_json::Value) -> ToolOutcome {
+        let name = args.require_str("name")?;
+        match self.registry.get_enabled(name) {
+            // The body is the skill's instructions — emitted verbatim, not
+            // XML-escaped (unlike the catalog's metadata), so code samples and
+            // markdown in it survive intact. `name` is validated to a safe
+            // charset, so the wrapper tag is well-formed. The directory + file
+            // list is appended only when the skill actually bundles files (see
+            // `resources_note`), so pure-instruction skills stay clean.
+            Some(skill) => Ok(format!(
+                "<skill name=\"{}\">\n{}{}\n</skill>",
+                skill.name,
+                skill.body,
+                skill.resources_note().unwrap_or_default()
+            )),
+            None => Err(format!(
+                "Skill '{name}' not found or disabled. Available: [{}]",
+                self.available()
+            )),
+        }
     }
 }
 
@@ -47,27 +69,7 @@ impl AgentTool for SkillTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> ToolResult {
-        let Some(name) = args["name"].as_str() else {
-            return ToolResult::error("Missing required parameter: name".to_string());
-        };
-        match self.registry.get_enabled(name) {
-            // The body is the skill's instructions — emitted verbatim, not
-            // XML-escaped (unlike the catalog's metadata), so code samples and
-            // markdown in it survive intact. `name` is validated to a safe
-            // charset, so the wrapper tag is well-formed. The directory + file
-            // list is appended only when the skill actually bundles files (see
-            // `resources_note`), so pure-instruction skills stay clean.
-            Some(skill) => ToolResult::ok(format!(
-                "<skill name=\"{}\">\n{}{}\n</skill>",
-                skill.name,
-                skill.body,
-                skill.resources_note().unwrap_or_default()
-            )),
-            None => ToolResult::error(format!(
-                "Skill '{name}' not found or disabled. Available: [{}]",
-                self.available()
-            )),
-        }
+        self.run(args).into_tool_result()
     }
 }
 

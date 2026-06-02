@@ -1,7 +1,7 @@
 use crate::agent::Agent;
 use crate::config::Config;
 use crate::mcp::McpRegistry;
-use crate::{AgentTool, Message, ToolResult};
+use crate::{AgentTool, IntoToolResult, Message, ToolArgs, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -37,40 +37,12 @@ impl SubagentTool {
         self.mcp = Some(mcp);
         self
     }
-}
 
-#[async_trait]
-impl AgentTool for SubagentTool {
-    fn name(&self) -> &str {
-        "agent"
-    }
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome {
+        let prompt = args.require_str("prompt")?;
 
-    fn description(&self) -> &str {
-        "Delegate a focused, self-contained task to a sub-agent that has the file/search/web \
-         tools. Returns its final answer. Use for multi-step research or lookups to keep the \
-         main thread uncluttered. The sub-agent cannot spawn further sub-agents."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "prompt": { "type": "string", "description": "The task for the sub-agent, self-contained with all needed context" },
-                "description": { "type": "string", "description": "Optional short label for the task" }
-            },
-            "required": ["prompt"]
-        })
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        let Some(prompt) = args["prompt"].as_str() else {
-            return ToolResult::error("Missing required parameter: prompt".to_string());
-        };
-
-        let provider = match crate::config::build_provider(&self.config) {
-            Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Could not build provider: {e}")),
-        };
+        let provider = crate::config::build_provider(&self.config)
+            .map_err(|e| format!("Could not build provider: {e}"))?;
         let mut agent = Agent::new(SUBAGENT_SYSTEM_PROMPT.to_string(), provider);
         // Same toolset as the main agent, minus `agent` itself — no recursion.
         for tool in super::native_tools(&self.cwd, self.config.web_search.clone()) {
@@ -98,12 +70,9 @@ impl AgentTool for SubagentTool {
         // channel; the sub-agent's events aren't surfaced in the UI (yet).
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let run = agent.run(&mut history, tx, None, None, None).await;
+        let outcome = agent.run(&mut history, tx, None, None, None).await;
         let _ = drain.await;
-
-        if let Err(e) = run {
-            return ToolResult::error(format!("Sub-agent failed: {e}"));
-        }
+        outcome.map_err(|e| format!("Sub-agent failed: {e}"))?;
 
         let answer = history
             .iter()
@@ -117,10 +86,35 @@ impl AgentTool for SubagentTool {
             })
             .and_then(|m| m.content.clone());
 
-        match answer {
-            Some(a) => ToolResult::ok(a),
-            None => ToolResult::ok("(sub-agent produced no text answer)".to_string()),
-        }
+        Ok(answer.unwrap_or_else(|| "(sub-agent produced no text answer)".to_string()))
+    }
+}
+
+#[async_trait]
+impl AgentTool for SubagentTool {
+    fn name(&self) -> &str {
+        "agent"
+    }
+
+    fn description(&self) -> &str {
+        "Delegate a focused, self-contained task to a sub-agent that has the file/search/web \
+         tools. Returns its final answer. Use for multi-step research or lookups to keep the \
+         main thread uncluttered. The sub-agent cannot spawn further sub-agents."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "prompt": { "type": "string", "description": "The task for the sub-agent, self-contained with all needed context" },
+                "description": { "type": "string", "description": "Optional short label for the task" }
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    async fn call(&self, args: serde_json::Value) -> ToolResult {
+        self.run(args).await.into_tool_result()
     }
 }
 
