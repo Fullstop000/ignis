@@ -7,13 +7,18 @@ per-trial **CSV** for each run is committed under
 column — **this table plus those CSVs are the canonical history**. One row per
 completed run; newest first.
 
+Bucket taxonomy (`passed` / `failed` / `errored` — no other top-level buckets):
+- **passed** — `reward == 1.0`. A trial that hit a transient error mid-turn but recovered stays here.
+- **failed** — `reward == 0.0` *and no other markers*. The verifier ran and rejected the agent's completed solution. The only "real model miss" bucket.
+- **errored** — everything else. The agent never got a fair, complete attempt. Sub-type in the Exception column: `AgentTimeoutError` / `VerifierTimeoutError` / `NonZeroAgentExitCodeError` (harness exception types), `ConnectionDropped` (provider stream drop), `RateLimited` (provider rate-limit), `Unknown` (missing reward, no other marker).
+
 Columns:
 - **Benchmark** — suite + size (task count).
-- **Score** — `passed / total · pass%` (counts errored trials as not-solved).
-- **Resolved%** — pass rate excluding errored trials (no verifier verdict).
-- **Errored** — trials that raised an exception (agent/verifier timeout, crash, infra).
+- **Score** — `passed / total · pass%` (errored counts as not-solved).
+- **Resolved%** — `passed / (passed + failed)`; excludes errored so the rate reflects how the model does *when it gets a clean attempt*.
+- **Errored** — count of errored trials. Notes column breaks down by sub-type when interesting.
 - **Cache hit** — cache-read tokens ÷ input tokens.
-- **Report** — committed per-trial CSV for the run (the full HTML report stays local).
+- **Report** — committed per-trial CSV in `terminal-bench/history/` + the rendered HTML on the Vercel host.
 
 | Date | Benchmark | Model @ effort | ignis | Score | Resolved% | Errored | Input tok | Output tok | Cache hit | Report | Notes |
 |------|-----------|----------------|-------|-------|----------:|--------:|----------:|-----------:|----------:|--------|-------|

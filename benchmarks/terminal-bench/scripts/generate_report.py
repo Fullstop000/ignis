@@ -66,18 +66,19 @@ def _classify(
     rate_limited: bool,
     stream_dropped: bool,
 ) -> str:
+    """Bucket a trial into passed / failed / errored.
+
+    Mirrors `aggregate_results.classify` — keep both in sync. `failed` is
+    reserved for the narrow case where the verifier actually ran and rejected
+    the agent's completed work; every other not-passed outcome (harness
+    exception, stream drop, rate-limit cutoff, missing reward) is `errored`,
+    with the subtype carried in the Exception column.
+    """
     if reward == 1.0:
         return "passed"
-    # `errored` covers both harness-raised exceptions and provider-side stream
-    # drops where the model API closed the connection mid-turn. Only `failed`
-    # means the benchmark gate ran and rejected a complete attempt.
-    if exc or stream_dropped:
-        return "errored"
-    if rate_limited:
-        return "quota"
-    if reward == 0.0:
+    if reward == 0.0 and not (exc or stream_dropped or rate_limited):
         return "failed"
-    return "unknown"
+    return "errored"
 
 
 # Same marker list as aggregate_results.py — keep in sync if either side moves.
@@ -249,21 +250,26 @@ def walk_trials(job_dir: Path) -> list[Trial]:
             _tail_lines(verifier_test_p.read_text(errors="ignore"), 30) if verifier_test_p.exists() else ""
         )
 
-        # Exception column: harness exception type wins; otherwise stamp
-        # `ConnectionDropped` so the bucketing reason is visible without
-        # diffing the agent log.
-        if exc:
+        # Exception column carries the *why* for errored rows. Order mirrors
+        # `_classify`: harness exception > stream drop > rate-limit > unknown
+        # (no reward and no other marker). Non-errored rows leave it blank.
+        bucket = _classify(reward, exc, rate_limited, bucket_stream_drop)
+        if bucket != "errored":
+            exception_label = ""
+        elif exc:
             exception_label = (exc or {}).get("exception_type", "")
         elif bucket_stream_drop:
             exception_label = "ConnectionDropped"
+        elif rate_limited:
+            exception_label = "RateLimited"
         else:
-            exception_label = ""
+            exception_label = "Unknown"
 
         trials.append(
             Trial(
                 task=task,
                 trial=trial_dir.name,
-                bucket=_classify(reward, exc, rate_limited, bucket_stream_drop),
+                bucket=bucket,
                 reward=reward,
                 exception=exception_label,
                 rate_limited=rate_limited,
@@ -303,7 +309,6 @@ h3 { margin: 1.5rem 0 0.5rem; font-size: 0.95rem; color: #444; }
 .bar .passed  { background: #2e8b57; }
 .bar .failed  { background: #c66; }
 .bar .errored { background: #d99650; }
-.bar .quota   { background: #888; }
 table { width: 100%; border-collapse: collapse; background: white; border-radius: 4px; overflow: hidden; border: 1px solid #e6e6e6; font-size: 13px; }
 th, td { padding: 0.4rem 0.6rem; text-align: left; border-bottom: 1px solid #efefef; }
 th { background: #f4f4f4; cursor: pointer; user-select: none; white-space: nowrap; }
@@ -312,12 +317,10 @@ th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 tr.passed { background: #f0f9f3; }
 tr.failed { background: #fdf3f3; }
 tr.errored { background: #fef6ec; }
-tr.quota { background: #f4f4f4; color: #777; }
 .bucket-tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.7rem; font-weight: 600; color: white; }
 .bucket-passed  { background: #2e8b57; }
 .bucket-failed  { background: #c66; }
 .bucket-errored { background: #d99650; }
-.bucket-quota   { background: #888; }
 details { background: #fafbfc; border-top: 1px solid #efefef; padding: 0.5rem 1rem; }
 details summary { cursor: pointer; color: #4a90d9; font-size: 0.85rem; }
 details[open] summary { font-weight: 600; }
@@ -416,7 +419,7 @@ def _render_trial_drilldown(t: Trial) -> str:
 def _render_main_table(trials: list[Trial]) -> str:
     rows = []
     # Default sort: by bucket (passed first), then duration descending.
-    bucket_order = {"passed": 0, "failed": 1, "errored": 2, "quota": 3, "unknown": 4}
+    bucket_order = {"passed": 0, "failed": 1, "errored": 2}
     sorted_trials = sorted(
         trials, key=lambda t: (bucket_order.get(t.bucket, 9), -(t.duration_seconds or 0))
     )
@@ -488,10 +491,12 @@ def render(trials: list[Trial], job_dir: Path) -> str:
     cache_pct = (total_cache / total_in * 100) if total_in else 0.0
     suite = _suite_label(trials, job_dir)
 
-    # Stacked bar segments (passed, failed, errored, quota)
+    # Stacked bar segments (passed, failed, errored). Only three buckets now
+    # — rate-limit and unknown previously had their own top-level entries but
+    # are now sub-types of errored, visible in the Exception column.
     bar_segs = []
     total = sum(bucket_counts.values()) or 1
-    for b in ("passed", "failed", "errored", "quota"):
+    for b in ("passed", "failed", "errored"):
         c = bucket_counts.get(b, 0)
         if c:
             bar_segs.append(f'<span class="{b}" style="flex:{c}">{c} {b}</span>')
