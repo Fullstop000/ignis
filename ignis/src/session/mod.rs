@@ -237,18 +237,20 @@ impl Session {
         // rename step (after the temp-file write) would never run, leaving
         // disk state stale and the next prompt's `Session::open` blind to
         // the turn that was cancelled. Dispatch the write into a detached
-        // `tokio::spawn` so it survives the parent future being dropped.
-        // Errors are logged, not fatal — a flaky disk shouldn't block the
-        // model call.
-        let storage = Arc::clone(&self.storage);
-        let id = self.id.clone();
-        let snapshot = self.history.clone();
-        let start_dir = self.start_dir.clone();
-        tokio::spawn(async move {
-            if let Err(e) = storage.save_session(&id, &snapshot, Some(&start_dir)).await {
-                log::error!("session checkpoint after user push failed: {e}");
-            }
-        });
+        // `tokio::spawn` so it survives the parent future being dropped:
+        // dropping a `JoinHandle` detaches, it does not abort. Errors are
+        // logged, not fatal — a flaky disk shouldn't block the model call.
+        let checkpoint = {
+            let storage = Arc::clone(&self.storage);
+            let id = self.id.clone();
+            let snapshot = self.history.clone();
+            let start_dir = self.start_dir.clone();
+            tokio::spawn(async move {
+                if let Err(e) = storage.save_session(&id, &snapshot, Some(&start_dir)).await {
+                    log::error!("session checkpoint after user push failed: {e}");
+                }
+            })
+        };
         let turn_usage = self
             .agent
             .run(
@@ -266,6 +268,12 @@ impl Session {
             self.usage.add(&turn_usage);
             let _ = self.storage.save_usage(&self.id, &self.usage).await;
         }
+        // Order the checkpoint write before the final persist. Without this
+        // join, the spawned task could be scheduled AFTER `self.persist()`
+        // and stomp the full final history with the user-only snapshot. On
+        // the cancel path this join is never reached (the future is dropped
+        // first), so the spawn detaches and still writes the user message.
+        let _ = checkpoint.await;
         self.persist().await
     }
 
