@@ -528,6 +528,13 @@ pub(crate) async fn handle_key(
         (m, KeyCode::End) if m.contains(KeyModifiers::CONTROL) => {
             app.scroll_transcript_to_bottom();
         }
+        // Empty input → End follows the transcript to the bottom (matches the
+        // "(End to follow)" hint in `render_transcript`); PgUp/PgDn-when-empty
+        // uses the same idea. Falls through to cursor-end when the user is
+        // editing input.
+        (_, KeyCode::End) if app.input.is_empty() => {
+            app.scroll_transcript_to_bottom();
+        }
         (_, KeyCode::Home) => {
             app.clear_exit_hint();
             app.cursor = 0;

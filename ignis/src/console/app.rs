@@ -656,7 +656,7 @@ impl App {
     /// Scroll the transcript down by `rows` lines. If the new offset lands
     /// at or past the natural bottom, re-enable auto-follow.
     pub(crate) fn scroll_transcript_down(&mut self, rows: usize, visible: usize) {
-        let max_offset = self.transcript.len().saturating_sub(visible.max(1));
+        let max_offset = crate::console::render::natural_max_offset(self.transcript.len(), visible);
         let next = self.scroll_offset.saturating_add(rows);
         if next >= max_offset {
             self.scroll_offset = max_offset;

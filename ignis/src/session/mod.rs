@@ -19,7 +19,13 @@ pub const DEFAULT_SESSION_ID: &str = "default";
 pub struct Session {
     id: String,
     history: Vec<Message>,
-    storage: Box<dyn SessionStorage>,
+    /// Storage handle. Held as `Arc` so the per-prompt checkpoint can be
+    /// dispatched into a detached `tokio::spawn` that survives a Ctrl+C
+    /// cancel of the parent `session.prompt` future (the runner wraps prompt
+    /// in `tokio::select!`; the cancel branch drops the future, and an
+    /// awaited persist inside it would never complete). `Session::open` still
+    /// accepts `Box<dyn SessionStorage>` for caller ergonomics.
+    storage: Arc<dyn SessionStorage>,
     start_dir: String,
     agent: Agent,
     compaction: CompactionConfig,
@@ -74,7 +80,7 @@ impl Session {
         Ok(Self {
             id,
             history,
-            storage,
+            storage: Arc::from(storage),
             start_dir,
             agent,
             compaction: CompactionConfig::default(),
@@ -224,6 +230,27 @@ impl Session {
             }
             .stamp_now(),
         );
+        // Checkpoint the user message to disk BEFORE running the model.
+        //
+        // The runner wraps `session.prompt` in `tokio::select!` against
+        // Ctrl+C. Awaiting the persist here would be cancellable — the
+        // rename step (after the temp-file write) would never run, leaving
+        // disk state stale and the next prompt's `Session::open` blind to
+        // the turn that was cancelled. Dispatch the write into a detached
+        // `tokio::spawn` so it survives the parent future being dropped:
+        // dropping a `JoinHandle` detaches, it does not abort. Errors are
+        // logged, not fatal — a flaky disk shouldn't block the model call.
+        let checkpoint = {
+            let storage = Arc::clone(&self.storage);
+            let id = self.id.clone();
+            let snapshot = self.history.clone();
+            let start_dir = self.start_dir.clone();
+            tokio::spawn(async move {
+                if let Err(e) = storage.save_session(&id, &snapshot, Some(&start_dir)).await {
+                    log::error!("session checkpoint after user push failed: {e}");
+                }
+            })
+        };
         let turn_usage = self
             .agent
             .run(
@@ -241,6 +268,12 @@ impl Session {
             self.usage.add(&turn_usage);
             let _ = self.storage.save_usage(&self.id, &self.usage).await;
         }
+        // Order the checkpoint write before the final persist. Without this
+        // join, the spawned task could be scheduled AFTER `self.persist()`
+        // and stomp the full final history with the user-only snapshot. On
+        // the cancel path this join is never reached (the future is dropped
+        // first), so the spawn detaches and still writes the user message.
+        let _ = checkpoint.await;
         self.persist().await
     }
 
