@@ -68,14 +68,16 @@ def _classify(
 ) -> str:
     """Bucket a trial into passed / failed / errored.
 
-    Mirrors `aggregate_results.classify` — keep both in sync. `failed` is
-    reserved for the narrow case where the verifier actually ran and rejected
-    the agent's completed work; every other not-passed outcome (harness
-    exception, stream drop, rate-limit cutoff, missing reward) is `errored`,
-    with the subtype carried in the Exception column.
+    Mirrors `aggregate_results.classify` — keep both in sync. `failed` covers
+    real model misses: either the verifier ran and rejected the work, or the
+    agent burned through its full timeout budget (`AgentTimeoutError`).
+    Everything else (other harness exception, stream drop, rate-limit, missing
+    reward) is `errored`, with the subtype carried in the Exception column.
     """
     if reward == 1.0:
         return "passed"
+    if (exc or {}).get("exception_type") == "AgentTimeoutError":
+        return "failed"
     if reward == 0.0 and not (exc or stream_dropped or rate_limited):
         return "failed"
     return "errored"
@@ -251,14 +253,18 @@ def walk_trials(job_dir: Path) -> list[Trial]:
             _tail_lines(verifier_test_p.read_text(errors="ignore"), 30) if verifier_test_p.exists() else ""
         )
 
-        # Exception column carries the *why* for errored rows. Order mirrors
-        # `_classify`: harness exception > stream drop > rate-limit > unknown
-        # (no reward and no other marker). Non-errored rows leave it blank.
+        # Exception column carries the *why*. For `failed`, `TimedOut`
+        # distinguishes "agent burned its budget" from "verifier rejected"
+        # (blank). For `errored`, order mirrors `_classify`: harness exception
+        # > stream drop > rate-limit > unknown. `passed` is always blank.
+        exc_type = (exc or {}).get("exception_type", "")
         bucket = _classify(reward, exc, rate_limited, bucket_stream_drop)
-        if bucket != "errored":
+        if bucket == "passed":
             exception_label = ""
+        elif bucket == "failed":
+            exception_label = "TimedOut" if exc_type == "AgentTimeoutError" else ""
         elif exc:
-            exception_label = (exc or {}).get("exception_type", "")
+            exception_label = exc_type
         elif bucket_stream_drop:
             exception_label = "ConnectionDropped"
         elif rate_limited:
