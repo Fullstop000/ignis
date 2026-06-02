@@ -157,27 +157,58 @@ fn get_current_date() -> String {
         .unwrap_or_else(|_| "Unknown Date".to_string())
 }
 
-/// Drain any pending inject messages into `history` as user turns, emitting a
-/// `UserInjected` event for each. Returns how many were drained.
+/// Drain any pending inject messages, run them through the
+/// `UserPromptSubmit` hook chain when a registry is installed, push the
+/// effective text to `history`, and emit a `UserInjected` event for
+/// each. Returns how many were drained.
+///
+/// Block semantics match `Session::prompt`: a `Blocked` outcome drops
+/// the inject (no history push, no `UserInjected` event) — the chain
+/// already emitted a Warning. Without this, a steer message reaches
+/// the model untranslated / unfiltered, which is the bilingual hook's
+/// primary use case.
 async fn drain_injected(
     inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     history: &mut Vec<Message>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    prompt_hooks: Option<&crate::hooks::HookRegistry>,
+    hook_ctx: Option<(&str, &str)>,
 ) -> usize {
     let mut n = 0;
     if let Some(rx) = inject_rx {
         while let Ok(text) = rx.try_recv() {
-            history.push(Message {
-                role: "user".to_string(),
-                content: Some(text.clone()),
-                reasoning_content: None,
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-                created_at_ms: Some(now_ms()),
-            });
-            let _ = tx.send(AgentEvent::UserInjected { text }).await;
-            n += 1;
+            let effective = match (prompt_hooks, hook_ctx) {
+                (Some(reg), Some((session_id, cwd))) => {
+                    match reg
+                        .run_user_prompt_submit(
+                            &text,
+                            crate::hooks::HookContext { session_id, cwd },
+                            tx,
+                        )
+                        .await
+                    {
+                        crate::hooks::PromptHookResult::Continue(t) => Some(t),
+                        // Block: warning already emitted on `tx`; drop
+                        // the inject entirely — same posture as
+                        // Session::prompt's short-circuit.
+                        crate::hooks::PromptHookResult::Blocked { .. } => None,
+                    }
+                }
+                _ => Some(text),
+            };
+            if let Some(effective) = effective {
+                history.push(Message {
+                    role: "user".to_string(),
+                    content: Some(effective.clone()),
+                    reasoning_content: None,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                    created_at_ms: Some(now_ms()),
+                });
+                let _ = tx.send(AgentEvent::UserInjected { text: effective }).await;
+                n += 1;
+            }
         }
     }
     n
@@ -563,6 +594,15 @@ pub struct Agent {
     /// Project instructions (from `AGENTS.md`) prepended to each request as a
     /// synthetic first user turn. Not stored in `history`.
     project_instructions: Option<String>,
+    /// External-subprocess hook registry used to run inject (Ctrl+S
+    /// steer) text through the `UserPromptSubmit` chain before pushing
+    /// to history — so a bilingual-translation hook sees every user
+    /// turn, not only the initial one. `None` on subagents and tests
+    /// that don't install a registry.
+    prompt_hooks: Option<crate::hooks::HookRegistry>,
+    /// Hook context paired with `prompt_hooks` — supplies session_id +
+    /// cwd to the envelope. Set together via `set_prompt_hooks`.
+    prompt_hook_ctx: Option<(String, String)>,
 }
 
 struct AccumulatingToolCall {
@@ -581,7 +621,23 @@ impl Agent {
             skills: None,
             mcp: None,
             project_instructions: None,
+            prompt_hooks: None,
+            prompt_hook_ctx: None,
         }
+    }
+
+    /// Install the `UserPromptSubmit` hook registry used to filter
+    /// inject (steer) messages. Paired with the context (`session_id`,
+    /// `cwd`) that goes into each envelope. `Session::open` wires this
+    /// after loading `~/.ignis/hooks.json`.
+    pub fn set_prompt_hooks(
+        &mut self,
+        hooks: crate::hooks::HookRegistry,
+        session_id: String,
+        cwd: String,
+    ) {
+        self.prompt_hooks = Some(hooks);
+        self.prompt_hook_ctx = Some((session_id, cwd));
     }
 
     /// Set the `AGENTS.md` project instructions prepended to each model request.
@@ -674,8 +730,20 @@ impl Agent {
             })
             .collect();
 
+        let prompt_hooks = self.prompt_hooks.as_ref();
+        let hook_ctx = self
+            .prompt_hook_ctx
+            .as_ref()
+            .map(|(s, c)| (s.as_str(), c.as_str()));
         loop {
-            drain_injected(inject_rx.as_deref_mut(), history, &tx).await;
+            drain_injected(
+                inject_rx.as_deref_mut(),
+                history,
+                &tx,
+                prompt_hooks,
+                hook_ctx,
+            )
+            .await;
             let _ = tx.send(AgentEvent::TurnStart).await;
 
             // LLM request span. Captures wall-clock via construct→drop; final
@@ -931,7 +999,14 @@ impl Agent {
                 // No tools: this round would end the turn. But if a steering
                 // message arrived, fold it in and run one more round so the model
                 // actually responds to it (keep-the-turn-alive).
-                let injected = drain_injected(inject_rx.as_deref_mut(), history, &tx).await;
+                let injected = drain_injected(
+                    inject_rx.as_deref_mut(),
+                    history,
+                    &tx,
+                    prompt_hooks,
+                    hook_ctx,
+                )
+                .await;
                 let _ = tx.send(AgentEvent::TurnEnd).await;
                 if injected == 0 {
                     break;

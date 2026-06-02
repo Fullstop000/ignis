@@ -137,3 +137,99 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"FROM_DISK"}}'
         .await;
     assert_eq!(out, PromptHookResult::Continue("FROM_DISK".to_string()));
 }
+
+/// Inject (Ctrl+S steer) text must run through the UserPromptSubmit
+/// chain — otherwise a bilingual hook only translates the initial
+/// prompt and every steer message reaches the model untranslated.
+/// Drives Session::prompt with one stub hook that uppercases the text
+/// + an inject preloaded on the channel, then inspects storage.
+#[tokio::test]
+async fn inject_runs_through_user_prompt_submit_hook_chain() {
+    use async_trait::async_trait;
+    use futures_util::stream::{self, BoxStream, StreamExt};
+    use ignis::llm::{LlmProvider, LlmResponseDelta};
+    use ignis::storage::{InMemoryStorage, SessionStorage};
+    use ignis::{AgentEvent, Message, Session};
+
+    // Minimal mock provider — returns one empty response per call so
+    // both turn rounds complete.
+    struct EmptyProvider;
+    #[async_trait]
+    impl LlmProvider for EmptyProvider {
+        fn model_id(&self) -> &str { "mock" }
+        fn provider_name(&self) -> &str { "mock" }
+        async fn chat_stream(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _tools: &[serde_json::Value],
+        ) -> Result<
+            BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
+            anyhow::Error,
+        > {
+            // One token so the round produces a message and exits cleanly.
+            Ok(stream::iter(vec![Ok(LlmResponseDelta::Text("ok".to_string()))]).boxed())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    // Upper-case translator: reads the prompt out of the stdin envelope
+    // via `jq`-free awk-ish slicing, ignores it for simplicity, and emits
+    // a fixed rewrite. The inject test only needs to prove the chain
+    // runs — the post-hook text differs from the pre-hook text.
+    let upper = write_executable(
+        dir.path(),
+        "upper.sh",
+        r#"#!/bin/sh
+# Drain stdin so the writer doesn't see EPIPE.
+RAW=$(cat)
+# Crude: pull the inject body and uppercase it. Avoids a jq dependency
+# in the integration test; the protocol round-trip is covered elsewhere.
+PROMPT=$(printf '%s' "$RAW" | sed -E 's/.*"prompt":"([^"]*)".*/\1/' )
+UPPER=$(printf '%s' "$PROMPT" | tr '[:lower:]' '[:upper:]')
+printf '{"hookSpecificOutput":{"updatedInput":"%s"}}' "$UPPER"
+"#,
+    );
+
+    let storage = InMemoryStorage::new();
+    let mut session = Session::open(
+        "inj-hook".to_string(),
+        "system".to_string(),
+        Box::new(EmptyProvider),
+        Box::new(storage.clone()),
+        "/tmp".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let cfg = HooksConfig {
+        user_prompt_submit: vec![HookSpec {
+            program: upper,
+            args: vec![],
+            timeout_ms: 5_000,
+        }],
+        assistant_message_render: vec![],
+    };
+    session.set_hook_registry(HookRegistry::from_config(cfg));
+
+    // Preload one steer message before calling prompt — it lands on the
+    // inject channel and drain_injected picks it up between rounds.
+    let (inj_tx, inj_rx) = tokio::sync::mpsc::channel::<String>(8);
+    inj_tx.try_send("steer me".to_string()).unwrap();
+    session.set_inject_source(inj_rx);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
+    session.prompt("hi there", tx).await.unwrap();
+    // Drain events so the channel closes.
+    while rx.recv().await.is_some() {}
+
+    let hist = storage.load_session("inj-hook").await.unwrap();
+    let user_msgs: Vec<&str> = hist
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .collect();
+    // Both messages — the original prompt AND the inject — were
+    // upper-cased by the hook before reaching history.
+    assert_eq!(user_msgs, vec!["HI THERE", "STEER ME"]);
+}
