@@ -17,6 +17,7 @@
 pub mod config;
 pub mod dispatch;
 pub mod protocol;
+pub mod sandbox;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use crate::AgentEvent;
 pub use config::{HookSpec, HooksConfig, DEFAULT_TIMEOUT_MS};
 pub use dispatch::{DispatchContext, HookOutcome};
 pub use protocol::{HookEvent, HookInput, HookOutput, HookSpecificOutput};
+pub use sandbox::SandboxStatus;
 
 /// Context the registry needs at every dispatch call. Borrowed strings so
 /// callers don't have to allocate per turn.
@@ -74,11 +76,17 @@ impl HookRegistry {
 
     /// Rebuild the registry from disk in place. Returns the new hook count
     /// for the `/hooks reload` confirmation line.
+    ///
+    /// Also clears the dispatcher's per-session "Landlock unavailable"
+    /// suppression set: a freshly-edited hook gets a fresh degradation
+    /// notice instead of being silently swallowed because an earlier
+    /// invocation of the same name already warned once.
     pub async fn reload(&self, home: &Path) -> anyhow::Result<usize> {
         let cfg = HooksConfig::from_home(home)?;
         let total = cfg.total_len();
         let mut guard = self.inner.write().await;
         *guard = cfg;
+        dispatch::reset_sandbox_warnings();
         Ok(total)
     }
 
@@ -168,7 +176,7 @@ impl HookRegistry {
 
         let mut current = initial.to_string();
         for spec in &specs {
-            let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx).await;
+            let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx, Some(tx)).await;
             match outcome {
                 HookOutcome::Mutated(next) => current = next,
                 HookOutcome::PassThrough => {}
@@ -220,7 +228,7 @@ impl HookRegistry {
 
         let mut current = initial.to_string();
         for spec in &specs {
-            let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx).await;
+            let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx, Some(tx)).await;
             match outcome {
                 HookOutcome::Mutated(next) => current = next,
                 HookOutcome::PassThrough => {}
@@ -407,11 +415,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: s1,
                     args: vec![],
                     timeout_ms: 5_000,
+                    ..HookSpec::default()
                 },
                 HookSpec {
                     program: s2,
                     args: vec![],
                     timeout_ms: 5_000,
+                    ..HookSpec::default()
                 },
             ],
             assistant_message_render: vec![],
@@ -445,11 +455,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: good,
                     args: vec![],
                     timeout_ms: 5_000,
+                    ..HookSpec::default()
                 },
                 HookSpec {
                     program: bad,
                     args: vec![],
                     timeout_ms: 5_000,
+                    ..HookSpec::default()
                 },
             ],
             assistant_message_render: vec![],
@@ -488,6 +500,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: blocker,
                 args: vec![],
                 timeout_ms: 5_000,
+                ..HookSpec::default()
             }],
             assistant_message_render: vec![],
         };
@@ -528,6 +541,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: blocker,
                 args: vec![],
                 timeout_ms: 5_000,
+                ..HookSpec::default()
             }],
         };
         let reg = HookRegistry::from_config(cfg);

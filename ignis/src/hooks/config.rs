@@ -17,7 +17,12 @@ use super::protocol::HookEvent;
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
 /// One declared hook: how to spawn it, and how long to wait.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Default::default()` exists so test fixtures and call sites that only
+/// care about a subset of fields can use `..HookSpec::default()` without
+/// re-listing every knob. The default program is the empty path — useless
+/// in production, fine for tests that always set it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HookSpec {
     /// Executable path (post-`~` expansion).
     pub program: PathBuf,
@@ -25,6 +30,15 @@ pub struct HookSpec {
     /// interpolation).
     pub args: Vec<String>,
     pub timeout_ms: u64,
+    /// Extra env var names ignis passes through into the hook process on top
+    /// of the universal allowlist (`PATH HOME USER LANG LC_ALL TZ`). Default
+    /// empty — hooks see no credentials unless they declare them here.
+    pub env: Vec<String>,
+    /// Apply the Linux Landlock filesystem sandbox to this hook. Default
+    /// `true`; set `false` per-hook to opt out (e.g. a project-indexer hook
+    /// that legitimately needs broad read access). On non-Linux platforms
+    /// the flag has no effect — see `super::sandbox`.
+    pub sandbox: bool,
 }
 
 impl HookSpec {
@@ -108,6 +122,11 @@ impl HooksConfig {
 
 fn parse_entry(entry: HookJsonEntry, home: &Path) -> Result<HookSpec> {
     let timeout_ms = entry.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    // v2 additions: `env` carries extra allowlisted env var names; `sandbox`
+    // is the per-hook Landlock opt-out. Both default to "secure" (no extra
+    // env, sandbox on).
+    let env = entry.env.unwrap_or_default();
+    let sandbox = entry.sandbox.unwrap_or(true);
     // Mutual exclusion: pick exactly one of `command` (single string,
     // whitespace-split — simple default) or `argv` (pre-tokenised, supports
     // paths-with-spaces — escape hatch).
@@ -131,6 +150,8 @@ fn parse_entry(entry: HookJsonEntry, home: &Path) -> Result<HookSpec> {
                 program,
                 args,
                 timeout_ms,
+                env,
+                sandbox,
             })
         }
         (None, Some(argv)) => {
@@ -147,6 +168,8 @@ fn parse_entry(entry: HookJsonEntry, home: &Path) -> Result<HookSpec> {
                 program,
                 args,
                 timeout_ms,
+                env,
+                sandbox,
             })
         }
     }
@@ -183,6 +206,17 @@ struct HookJsonEntry {
     argv: Option<Vec<String>>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// v2: extra env var names allowlisted into the hook process. Each
+    /// listed name is looked up in ignis's own env and, if present, set
+    /// in the child. Defaults to `[]` — the universal allowlist
+    /// (`PATH HOME USER LANG LC_ALL TZ`) is unconditional.
+    #[serde(default)]
+    env: Option<Vec<String>>,
+    /// v2: per-hook Landlock filesystem sandbox toggle. Default `true`.
+    /// `false` disables sandboxing for this hook on Linux; non-Linux
+    /// platforms ignore it.
+    #[serde(default)]
+    sandbox: Option<bool>,
 }
 
 #[cfg(test)]
@@ -328,9 +362,48 @@ mod tests {
     fn display_name_strips_directory_and_extension() {
         let spec = HookSpec {
             program: PathBuf::from("/home/me/.ignis/hooks/translate-en/run.py"),
-            args: vec![],
-            timeout_ms: 1,
+            ..HookSpec::default()
         };
         assert_eq!(spec.display_name(), "run");
+    }
+
+    #[test]
+    fn defaults_env_empty_and_sandbox_on() {
+        // Spec invariant: omitting `env` and `sandbox` means "no extra env
+        // pass-through, sandbox engaged". Without this, the security default
+        // would silently flip back to v1 behaviour for any old hooks.json.
+        let home = PathBuf::from("/h");
+        let raw = r#"{"hooks": {"UserPromptSubmit": [{"command": "/bin/true"}]}}"#;
+        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let spec = &cfg.user_prompt_submit[0];
+        assert!(spec.env.is_empty());
+        assert!(spec.sandbox);
+    }
+
+    #[test]
+    fn env_list_is_preserved_in_declared_order() {
+        let home = PathBuf::from("/h");
+        let raw = r#"{"hooks": {"UserPromptSubmit": [
+            {"command": "/bin/true", "env": ["ANTHROPIC_API_KEY", "IGNIS_TRANSLATE_TO"]}
+        ]}}"#;
+        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let spec = &cfg.user_prompt_submit[0];
+        assert_eq!(
+            spec.env,
+            vec![
+                "ANTHROPIC_API_KEY".to_string(),
+                "IGNIS_TRANSLATE_TO".to_string()
+            ]
+        );
+        assert!(spec.sandbox);
+    }
+
+    #[test]
+    fn sandbox_false_is_an_explicit_opt_out() {
+        let home = PathBuf::from("/h");
+        let raw =
+            r#"{"hooks": {"UserPromptSubmit": [{"command": "/bin/true", "sandbox": false}]}}"#;
+        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        assert!(!cfg.user_prompt_submit[0].sandbox);
     }
 }

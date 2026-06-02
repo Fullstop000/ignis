@@ -815,6 +815,7 @@ async fn user_prompt_submit_block_short_circuits_turn() {
             program: hook_path,
             args: vec![],
             timeout_ms: 5_000,
+            ..HookSpec::default()
         }],
         assistant_message_render: vec![],
     }));
