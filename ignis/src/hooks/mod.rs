@@ -38,6 +38,25 @@ pub struct HookContext<'a> {
     pub cwd: &'a str,
 }
 
+/// Owned variant of [`HookContext`] for storage on long-lived structs
+/// (e.g. a `Session` holds one across many turns). Borrow back via
+/// [`OwnedHookContext::as_ref`] at dispatch time.
+#[derive(Debug, Clone)]
+pub struct OwnedHookContext {
+    pub session_id: String,
+    pub cwd: String,
+}
+
+impl OwnedHookContext {
+    /// Borrow as a [`HookContext`] for one dispatch call.
+    pub fn as_ref(&self) -> HookContext<'_> {
+        HookContext {
+            session_id: &self.session_id,
+            cwd: &self.cwd,
+        }
+    }
+}
+
 /// Sender for `AgentEvent::Warning` lines. The registry owns no channel of
 /// its own — every dispatch path takes the channel the caller already has.
 pub type EventSender = mpsc::Sender<AgentEvent>;

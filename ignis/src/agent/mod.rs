@@ -172,21 +172,14 @@ async fn drain_injected(
     history: &mut Vec<Message>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
     prompt_hooks: Option<&crate::hooks::HookRegistry>,
-    hook_ctx: Option<(&str, &str)>,
+    hook_ctx: Option<crate::hooks::HookContext<'_>>,
 ) -> usize {
     let mut n = 0;
     if let Some(rx) = inject_rx {
         while let Ok(text) = rx.try_recv() {
             let effective = match (prompt_hooks, hook_ctx) {
-                (Some(reg), Some((session_id, cwd))) => {
-                    match reg
-                        .run_user_prompt_submit(
-                            &text,
-                            crate::hooks::HookContext { session_id, cwd },
-                            tx,
-                        )
-                        .await
-                    {
+                (Some(reg), Some(ctx)) => {
+                    match reg.run_user_prompt_submit(&text, ctx, tx).await {
                         crate::hooks::PromptHookResult::Continue(t) => Some(t),
                         // Block: warning already emitted on `tx`; drop
                         // the inject entirely — same posture as
@@ -602,7 +595,7 @@ pub struct Agent {
     prompt_hooks: Option<crate::hooks::HookRegistry>,
     /// Hook context paired with `prompt_hooks` — supplies session_id +
     /// cwd to the envelope. Set together via `set_prompt_hooks`.
-    prompt_hook_ctx: Option<(String, String)>,
+    prompt_hook_ctx: Option<crate::hooks::OwnedHookContext>,
 }
 
 struct AccumulatingToolCall {
@@ -637,7 +630,7 @@ impl Agent {
         cwd: String,
     ) {
         self.prompt_hooks = Some(hooks);
-        self.prompt_hook_ctx = Some((session_id, cwd));
+        self.prompt_hook_ctx = Some(crate::hooks::OwnedHookContext { session_id, cwd });
     }
 
     /// Set the `AGENTS.md` project instructions prepended to each model request.
@@ -731,10 +724,7 @@ impl Agent {
             .collect();
 
         let prompt_hooks = self.prompt_hooks.as_ref();
-        let hook_ctx = self
-            .prompt_hook_ctx
-            .as_ref()
-            .map(|(s, c)| (s.as_str(), c.as_str()));
+        let hook_ctx = self.prompt_hook_ctx.as_ref().map(|ctx| ctx.as_ref());
         loop {
             drain_injected(
                 inject_rx.as_deref_mut(),
