@@ -122,18 +122,28 @@ pub async fn run_hook(
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(&stdin_bytes).await {
-            // The child may have exited before reading; we still continue
-            // and collect its output below so a fast hook that did its work
-            // and closed stdin doesn't get marked failed here.
-            tracing::debug!(error = %e, "hook stdin write failed (child may have exited)");
-        }
-        drop(stdin);
-    }
-
     let timeout = Duration::from_millis(spec.timeout_ms);
-    let wait = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    // CRITICAL: the timeout must arm BEFORE the stdin write. A hook that
+    // doesn't read stdin will block the write forever once the pipe buffer
+    // fills (~64 KiB on Linux); if we waited until after the write to start
+    // the timer, a misbehaving hook would hang the agent loop indefinitely.
+    // Wrap the whole interaction (write + close + wait_with_output) in one
+    // timeout so a non-reading hook still times out cleanly.
+    let stdin = child.stdin.take();
+    let interaction = async move {
+        if let Some(mut stdin) = stdin {
+            if let Err(e) = stdin.write_all(&stdin_bytes).await {
+                // The child may have exited before reading; we still
+                // continue and collect its output below so a fast hook
+                // that did its work and closed stdin doesn't get marked
+                // failed here.
+                tracing::debug!(error = %e, "hook stdin write failed (child may have exited)");
+            }
+            drop(stdin);
+        }
+        child.wait_with_output().await
+    };
+    let wait = tokio::time::timeout(timeout, interaction).await;
 
     let output = match wait {
         Ok(Ok(o)) => o,
@@ -147,14 +157,9 @@ pub async fn run_hook(
             );
         }
         Err(_) => {
-            // Already kill_on_drop, but be explicit: drop child to fire
-            // SIGTERM (kill_on_drop sends SIGKILL on tokio < 1.something
-            // depending on platform — we accept that "TERM then KILL"
-            // is approximated by drop + a brief settle window).
-            // Tokio's `kill_on_drop` sends SIGKILL on Unix when the
-            // ChildDropGuard fires. To emulate "TERM then KILL after 1s
-            // grace" without unstable APIs, we don't have a clean primitive,
-            // and the spec accepts kill_on_drop as the practical equivalent.
+            // kill_on_drop fires SIGKILL when the dropped `interaction`
+            // future drops `child`. v1 is SIGKILL-only; v2 will add a
+            // SIGTERM grace window (see docs/usage/hooks.md).
             return record(
                 &span,
                 started,
@@ -354,6 +359,45 @@ mod tests {
             HookOutcome::SoftFailed { reason } => assert!(reason.contains("timed out")),
             other => panic!("expected SoftFailed, got {other:?}"),
         }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn hook_that_never_reads_stdin_still_times_out() {
+        // Regression: previously the dispatcher wrote stdin → blocked-on-PIPE
+        // forever if the child never drained it, and only started the
+        // timeout AFTER the write. The fix wraps write + wait in one
+        // timeout, so this test pins the behaviour.
+        //
+        // We send an over-sized payload to defeat any pipe-buffer slack and
+        // give the script no chance to drain it.
+        let tmp = crate::util::unique_temp_dir("ignis-hook-disp-stdin-deadlock");
+        let script = write_script(
+            &tmp,
+            "sleep-no-read.sh",
+            // No `cat >/dev/null` — child never reads stdin. sleep is long
+            // enough that the timeout dominates; pipe write would otherwise
+            // block until the child exited.
+            "#!/bin/sh\nsleep 30\n",
+        );
+        let spec = HookSpec {
+            program: script,
+            args: vec![],
+            timeout_ms: 150,
+        };
+        let big_payload = "x".repeat(256 * 1024); // > 64 KiB pipe buf
+        let t0 = std::time::Instant::now();
+        let out = run_hook(&spec, HookEvent::UserPromptSubmit, &big_payload, &ctx()).await;
+        let elapsed = t0.elapsed();
+        match out {
+            HookOutcome::SoftFailed { reason } => assert!(reason.contains("timed out")),
+            other => panic!("expected SoftFailed, got {other:?}"),
+        }
+        // Must return well within the long sleep (with slack for spawn).
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "timeout did not fire promptly: elapsed = {elapsed:?}"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
