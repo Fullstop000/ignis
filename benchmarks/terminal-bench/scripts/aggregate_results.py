@@ -6,16 +6,23 @@ Usage:
 
 The job dir is whatever `harbor run -o ...` produced — it contains one subdir
 per trial (`<task>__<hash>/`) plus the top-level result.json. The script reads
-each trial's result.json and synced ignis log, classifies the trial into a
-non-overlapping bucket (passed / failed / errored / quota), and writes a CSV
-with one row per trial.
+each trial's result.json and synced ignis log, classifies the trial into one of
+three terminal buckets, and writes a CSV with one row per trial.
+
+The bucket axis is intentionally narrow: `passed` / `failed` / `errored`. The
+sub-cause of an `errored` row (harness timeout, rate-limit, stream drop,
+nothing-at-all) lives in the `exception` column — see the column note below.
 
 Columns:
     task                 — task name (no trial hash)
     trial                — full trial dir name (`<task>__<hash>`)
-    bucket               — passed | failed | errored | quota | unknown
+    bucket               — passed | failed | errored
     reward               — 1.0 / 0.0 / "" (no verifier result)
-    exception            — exception_type if errored, else ""
+    exception            — subtype tag when bucket==errored, else "".
+                           Possible values: AgentTimeoutError /
+                           VerifierTimeoutError / NonZeroAgentExitCodeError
+                           (and other harness exception types) /
+                           ConnectionDropped / RateLimited / Unknown.
     rate_limited         — true if the agent log shows kimi's rate_limit_reached_error
     duration_seconds     — wall time from harbor's timestamps
     n_input_tokens       — sum from synced ignis-projects/**/<session>.usage.json
@@ -25,13 +32,11 @@ Columns:
     started_at           — ISO 8601
     finished_at          — ISO 8601
 
-Bucket precedence (avoids the double-count harbor's top-level stats produce
-when a passing trial also has an exception from the post-success phase):
-    reward == 1.0   → passed   (even if exception was raised after the work)
-    exception_info  → errored
-    rate-limit log  → quota
-    reward == 0.0   → failed
-    otherwise       → unknown
+Bucket precedence:
+    reward == 1.0                                   → passed   (recovery counts)
+    reward == 0.0 with no other markers             → failed   (verifier gate failed)
+    everything else (exc / stream drop / rate-limit / missing-reward)
+                                                     → errored  (exception subtype carries the why)
 """
 
 from __future__ import annotations
@@ -86,20 +91,21 @@ def classify(
     rate_limited: bool,
     stream_dropped: bool,
 ) -> str:
+    """Bucket a trial into passed / failed / errored.
+
+    `failed` is reserved for the narrow case where the benchmark verifier
+    actually ran and rejected the agent's completed work. Everything else that
+    didn't pass — harness exceptions, provider stream drops, rate-limit cutoffs,
+    or a missing verifier verdict — is `errored`. The Exception column carries
+    the why; the bucket is just the high-level outcome.
+    """
     if reward == 1.0:
         return "passed"
-    # `errored` = anything that prevented the verifier from getting a fair-shot
-    # solution: harness-level exception OR the model stream silently dropped
-    # mid-turn (provider closed the connection, etc.). The TB 2.1 / MiniMax-M3
-    # baseline surfaced 16 such trials that were previously bucketed as model
-    # misses; they are not — the agent never got a clean turn through.
-    if exc or stream_dropped:
-        return "errored"
-    if rate_limited:
-        return "quota"
-    if reward == 0.0:
-        return "failed"  # benchmark gate ran and rejected the agent's solution
-    return "unknown"
+    # Bare verifier-rejection only. Any signal that the agent didn't get a
+    # clean shot (exc / stream drop / rate-limit) pushes the row into errored.
+    if reward == 0.0 and not (exc or stream_dropped or rate_limited):
+        return "failed"
+    return "errored"
 
 
 # Markers in the agent's stdout that indicate a provider-side stream drop —
@@ -166,20 +172,26 @@ def walk_trials(job_dir: Path) -> list[dict[str, Any]]:
         n_in, n_out, n_cache = _sum_usage(trial_dir / "agent" / "ignis-projects")
         cache_rate = round(n_cache / n_in, 3) if n_in else ""
 
-        # `exception` column: harness exception type wins; otherwise stamp
-        # `ConnectionDropped` so a reader can see why the row is `errored`
-        # without diffing the log.
-        if exc:
+        # Bucket and exception subtype. The bucket is just passed/failed/errored
+        # — the Exception column carries the reason a trial is errored. Order
+        # mirrors `classify`'s precedence: harness exception > stream drop >
+        # rate-limit > unknown (no reward and nothing else to say).
+        bucket = classify(reward, exc, rate_limited, stream_dropped and reward != 1.0)
+        if bucket != "errored":
+            exception_label = ""
+        elif exc:
             exception_label = (exc or {}).get("exception_type", "")
         elif stream_dropped and reward != 1.0:
             exception_label = "ConnectionDropped"
+        elif rate_limited:
+            exception_label = "RateLimited"
         else:
-            exception_label = ""
+            exception_label = "Unknown"
 
         rows.append({
             "task": task,
             "trial": trial_dir.name,
-            "bucket": classify(reward, exc, rate_limited, stream_dropped and reward != 1.0),
+            "bucket": bucket,
             "reward": "" if reward is None else reward,
             "exception": exception_label,
             "rate_limited": "true" if rate_limited else "false",
