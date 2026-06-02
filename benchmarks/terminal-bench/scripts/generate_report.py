@@ -93,19 +93,55 @@ def _tail_lines(text: str, n: int) -> str:
 # true on-disk size in the drill-down summary.
 _LOG_EMBED_CAP = 512 * 1024  # 512 KiB
 
+# Redaction for secret-shaped strings the agent stdout may have echoed (tool
+# output, env dumps, or — in the case of the TB `vulnerable-secret` task —
+# values planted in the sandbox image). The TB 2.1 / MiniMax-M3 run hit
+# GitHub push-protection with 59 hf_ + 22 ghp_ + 4 sk- + 4 BSA + 41 AKIA
+# shapes before this filter existed. The same shapes are checked by the
+# /ship secret scan; keeping them in sync is intentional.
+_SECRET_PATTERNS = [
+    (re.compile(r"sk-[A-Za-z0-9-]{24,}"), "sk-REDACTED"),
+    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "ghp_REDACTED"),
+    (re.compile(r"gho_[A-Za-z0-9]{20,}"), "gho_REDACTED"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA_REDACTED"),
+    (re.compile(r"BSA[A-Za-z0-9]{20,}"), "BSA_REDACTED"),
+    (re.compile(r"hf_[A-Za-z0-9_-]{20,}"), "hf_REDACTED"),
+    (re.compile(r"tvly-[A-Za-z0-9_-]{20,}"), "tvly-REDACTED"),
+]
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace common secret-shaped substrings with `<prefix>_REDACTED`.
+
+    Applied to every chunk of agent stdout that lands in the HTML so the
+    rendered report is safe to host publicly. False-positives (random
+    strings that match a shape) are harmless — they get a benign
+    placeholder. True positives can no longer leak through to viewers.
+    """
+    for rx, repl in _SECRET_PATTERNS:
+        text = rx.sub(repl, text)
+    return text
+
 
 def _read_log_tail(path: Path, cap: int = _LOG_EMBED_CAP) -> tuple[str, int]:
-    """Return (display_text, true_size_bytes); reads at most `cap` bytes from EOF."""
+    """Return (display_text, true_size_bytes); reads at most `cap` bytes from EOF.
+
+    The returned text is run through `_redact_secrets` so the HTML we inline
+    never contains a plaintext API key (see PR description for why).
+    """
     try:
         size = path.stat().st_size
     except OSError:
         return "", 0
     if size <= cap:
-        return path.read_text(errors="ignore"), size
+        return _redact_secrets(path.read_text(errors="ignore")), size
     with path.open("rb") as fh:
         fh.seek(size - cap)
         tail = fh.read().decode("utf-8", errors="ignore")
-    return f"… [{size:,} bytes total — showing last {cap:,}] …\n{tail}", size
+    return (
+        _redact_secrets(f"… [{size:,} bytes total — showing last {cap:,}] …\n{tail}"),
+        size,
+    )
 
 
 def _file_contains(path: Path, needle: str, chunk: int = 1 << 20) -> bool:
