@@ -1,5 +1,6 @@
 use crate::agent::Agent;
 use crate::config::CompactionConfig;
+use crate::hooks::{HookContext, HookRegistry};
 use crate::llm::LlmProvider;
 use crate::storage::SessionStorage;
 use crate::tools::tool::{AgentTool, ToolHooks};
@@ -27,6 +28,11 @@ pub struct Session {
     /// Per-run inject channel (set by the console runner before each prompt);
     /// drained between rounds by the agent. `None` = no live inject source.
     inject_rx: Option<tokio::sync::mpsc::Receiver<String>>,
+    /// External-subprocess hook registry. Shared so the console layer can
+    /// drive the `AssistantMessageRender` chain over the same registry, and
+    /// so `/hooks reload` can swap the live config without rebuilding the
+    /// session.
+    hooks: HookRegistry,
 }
 
 impl Session {
@@ -54,6 +60,13 @@ impl Session {
             Path::new(&start_dir),
             dirs::home_dir().as_deref(),
         ));
+        // External-subprocess hook registry. Loaded once per Session::open;
+        // `/hooks reload` swaps the parsed config in place via the
+        // RwLock-backed registry. Absent file = no-op, fast path.
+        let hooks = match dirs::home_dir() {
+            Some(home) => HookRegistry::from_config_dir(&home)?,
+            None => HookRegistry::empty(),
+        };
         Ok(Self {
             id,
             history,
@@ -63,6 +76,7 @@ impl Session {
             compaction: CompactionConfig::default(),
             usage,
             inject_rx: None,
+            hooks,
         })
     }
 
@@ -109,6 +123,23 @@ impl Session {
         &self.history
     }
 
+    /// The shared hook registry. The console's render path takes a clone of
+    /// this handle so it can run the `AssistantMessageRender` chain over
+    /// the same parsed config the session uses for `UserPromptSubmit`.
+    pub fn hooks(&self) -> &HookRegistry {
+        &self.hooks
+    }
+
+    /// Replace the hook registry — used in tests so they don't have to
+    /// touch the real `~/.ignis/hooks.json`.
+    pub fn set_hook_registry(&mut self, registry: HookRegistry) {
+        self.hooks = registry;
+    }
+
+    pub fn start_dir(&self) -> &str {
+        &self.start_dir
+    }
+
     /// Append the user's message, run the agent loop over the history, and
     /// persist the result.
     #[tracing::instrument(
@@ -137,10 +168,37 @@ impl Session {
         {
             let _ = self.compact().await;
         }
+
+        // Run UserPromptSubmit hooks. The final string is what gets pushed
+        // into history; the original is dropped. Hooks never kill the turn
+        // — failures fall back to the previous value and emit a Warning
+        // event to the UI via `tx`.
+        let effective = self
+            .hooks
+            .run_user_prompt_submit(
+                text,
+                HookContext {
+                    session_id: &self.id,
+                    cwd: &self.start_dir,
+                },
+                &tx,
+            )
+            .await;
+
+        // Announce the post-hook text so the console can render it to
+        // scrollback. Without this, the console would echo the user's
+        // pre-hook typed buffer and the visible block would diverge from
+        // history — the model would see one string and the user another.
+        let _ = tx
+            .send(AgentEvent::UserPromptCommitted {
+                text: effective.clone(),
+            })
+            .await;
+
         self.history.push(
             Message {
                 role: "user".to_string(),
-                content: Some(text.to_string()),
+                content: Some(effective),
                 reasoning_content: None,
                 name: None,
                 tool_call_id: None,

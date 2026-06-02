@@ -60,6 +60,19 @@ pub enum AgentEvent {
         max: u32,
         reason: String,
     },
+    /// The user's submitted prompt, after any `UserPromptSubmit` hook chain
+    /// has run. Carries the final string that gets pushed into history —
+    /// this is what the console renders to scrollback so the visible block
+    /// matches what the model actually saw. Emitted on every direct submit
+    /// (`UserInjected` covers the queued/inject path).
+    #[serde(rename = "user_prompt_committed")]
+    UserPromptCommitted { text: String },
+    /// Non-fatal advisory from a subsystem (e.g. hook chain). Rendered as a
+    /// dim `[warn] {source}: {message}` line in scrollback. Never produced
+    /// by the model loop itself — only by ignis-side machinery that wants
+    /// to surface a soft failure without breaking the turn.
+    #[serde(rename = "warning")]
+    Warning { source: String, message: String },
 }
 
 /// Build the system prompt for an interactive/one-shot run: the static agent

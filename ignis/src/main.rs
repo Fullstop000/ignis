@@ -117,6 +117,11 @@ async fn main() -> Result<(), anyhow::Error> {
         ignis::telemetry::record_session_start(&active_provider, &active_model);
     }
 
+    // Load the external-subprocess hook registry once at startup; the
+    // runner shares this handle so `/hooks reload` swaps the live config
+    // for every session that follows.
+    let hook_registry = ignis::hooks::HookRegistry::from_config_dir(&home)?;
+
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {
         let res = ignis::console::run_console(
@@ -130,6 +135,7 @@ async fn main() -> Result<(), anyhow::Error> {
             skill_registry.clone(),
             mcp_registry.clone(),
             permissions.clone(),
+            hook_registry.clone(),
         )
         .await;
         // Bring down MCP servers explicitly before tokio runtime tears down —
@@ -159,6 +165,7 @@ async fn main() -> Result<(), anyhow::Error> {
     )
     .await?;
     session.set_compaction(config.compaction.clone());
+    session.set_hook_registry(hook_registry);
 
     // Register tools
     let mcp_for_subagent = if !mcp_registry.is_empty() {

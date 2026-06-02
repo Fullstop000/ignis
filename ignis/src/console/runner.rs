@@ -68,6 +68,7 @@ pub async fn run_console(
     skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
     mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
     permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
+    hook_registry: crate::hooks::HookRegistry,
 ) -> Result<(), anyhow::Error> {
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
     // Context windows: config override → cached models.dev → compaction threshold.
@@ -107,6 +108,12 @@ pub async fn run_console(
     // (telemetry, AFK) can't reach `app.add_assistant_notice` directly, so
     // they send the confirm string here and the main loop drains it.
     let (notice_tx, mut notice_rx) = mpsc::channel::<String>(8);
+    // AssistantMessageRender hook chain runs in a spawned task per assistant
+    // turn so the agent loop doesn't stall while we shell out. The task
+    // sends rewrite results back here as `AgentEvent`s — they ride the same
+    // ordered channel the live UI already consumes, so committing the
+    // rewrite block respects the same scrollback order as the rest.
+    let render_hook_tx = agent_tx.clone();
     let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
     let active_inject_runner = active_inject.clone();
 
@@ -115,6 +122,9 @@ pub async fn run_console(
     let ui_storage_dir = storage_dir;
     let agent_cwd = cwd;
     let mut agent_config = config;
+    let runner_hook_registry = hook_registry.clone();
+    let ui_hook_registry = hook_registry.clone();
+    app.hooks = Some(hook_registry);
 
     let ui_skill_registry = skill_registry.clone();
     let runner_skill_registry = skill_registry.clone();
@@ -193,6 +203,10 @@ pub async fn run_console(
                 }
             };
             session.set_compaction(agent_config.compaction.clone());
+            // Share the runner's HookRegistry handle so `/hooks reload`
+            // immediately affects the next prompt — Session::open loaded
+            // its own copy from disk, but the runner owns the live one.
+            session.set_hook_registry(runner_hook_registry.clone());
 
             let mcp_for_subagent = if !runner_mcp_registry.is_empty() {
                 Some(runner_mcp_registry.clone())
@@ -302,7 +316,16 @@ pub async fn run_console(
         // picker request from a tool.
         tokio::select! {
             _ = tokio::time::sleep(frame) => {}
-            Some(ev) = agent_rx.recv() => app.handle_event(ev),
+            Some(ev) = agent_rx.recv() => {
+                maybe_spawn_render_hook(
+                    &ev,
+                    &ui_hook_registry,
+                    &render_hook_tx,
+                    &app.session_id,
+                    &app.cwd,
+                );
+                app.handle_event(ev);
+            }
             Some(req) = picker_rx.recv() => {
                 if app.inline_picker.is_some() {
                     // One picker at a time — reject the second so the tool
@@ -316,6 +339,13 @@ pub async fn run_console(
 
         // Drain any other pending agent events and key input — state only, no draw.
         while let Ok(ev) = agent_rx.try_recv() {
+            maybe_spawn_render_hook(
+                &ev,
+                &ui_hook_registry,
+                &render_hook_tx,
+                &app.session_id,
+                &app.cwd,
+            );
             app.handle_event(ev);
         }
         // Drain picker-spawn notices into the transcript.
@@ -347,9 +377,10 @@ pub async fn run_console(
         }
 
         // Edge-triggered: exactly one queued prompt per turn-end (AgentEnd).
+        // The user block is rendered when `Session::prompt` emits
+        // `UserPromptCommitted` (post-hook), so we don't push it here.
         if app.take_turn_just_ended() {
             if let Some(text) = app.take_queued_front() {
-                app.push_user_prompt(text.clone());
                 app.turn_in_flight = true;
                 let _ = prompt_tx
                     .send(AgentRequest::Prompt {
@@ -411,4 +442,90 @@ pub async fn run_console(
     // `?`-bubbled Err returns, and panics in the main loop.
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Prefix used to label the assistant block that carries an
+/// `AssistantMessageRender`-hook rewrite. Doubles as the gate that keeps
+/// the render seam from re-processing its own output (see
+/// `maybe_spawn_render_hook`).
+const HOOK_REWRITE_PREFIX: &str = "[hook rewrite]";
+
+/// Inspect each incoming event; when an assistant `MessageEnd` carries
+/// final text and at least one `AssistantMessageRender` hook is declared,
+/// spawn a background task that runs the hook chain and emits the
+/// rewritten text as a second labeled assistant block.
+///
+/// Design choice (per spec's render-seam section): a true *swap* of the
+/// already-committed scrollback block isn't trivial — committed
+/// `Line`s in `app.transcript` are styled and indexed by `app.committed`.
+/// Re-rendering one block in place would require tracking its start/end
+/// row, undoing the auto-follow scroll, and re-flowing the next blocks.
+/// The spec explicitly allows the fallback: render the rewrite as a new
+/// labeled block "below the original" and document the choice. That's
+/// what we do — the assistant block produced by the model commits as
+/// usual, then a follow-up `[hook: <name>] <rewritten>` block lands
+/// underneath. History stores only the model's original text (see
+/// `Agent::run`'s `history.push`), so prompt cache + replay stay exact.
+fn maybe_spawn_render_hook(
+    ev: &crate::AgentEvent,
+    registry: &crate::hooks::HookRegistry,
+    tx: &mpsc::Sender<crate::AgentEvent>,
+    session_id: &str,
+    cwd: &std::path::Path,
+) {
+    use crate::AgentEvent;
+    let content = match ev {
+        AgentEvent::MessageEnd { message } => match message.content.as_deref() {
+            Some(c) if !c.is_empty() => c.to_string(),
+            _ => return,
+        },
+        _ => return,
+    };
+    // Don't re-process our own rewrite blocks — they're the *output* of
+    // the hook chain, not a fresh assistant turn.
+    if content.starts_with(HOOK_REWRITE_PREFIX) {
+        return;
+    }
+    let registry = registry.clone();
+    let tx = tx.clone();
+    let session_id = session_id.to_string();
+    let cwd_string = cwd.to_string_lossy().to_string();
+    tokio::spawn(async move {
+        // Fast path: don't even take the read lock past a length check.
+        if !registry
+            .has_hooks(crate::hooks::HookEvent::AssistantMessageRender)
+            .await
+        {
+            return;
+        }
+        let ctx = crate::hooks::HookContext {
+            session_id: &session_id,
+            cwd: &cwd_string,
+        };
+        let rewritten = registry
+            .run_assistant_message_render(&content, ctx, &tx)
+            .await;
+        // Only commit a follow-up block when the chain actually rewrote
+        // the text — otherwise it's noise.
+        if rewritten == content {
+            return;
+        }
+        let labeled = format!("{HOOK_REWRITE_PREFIX}\n{rewritten}");
+        let msg = crate::Message {
+            role: "assistant".to_string(),
+            content: Some(labeled.clone()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        };
+        let _ = tx
+            .send(AgentEvent::MessageStart {
+                message: msg.clone(),
+            })
+            .await;
+        let _ = tx.send(AgentEvent::MessageUpdate { delta: labeled }).await;
+        let _ = tx.send(AgentEvent::MessageEnd { message: msg }).await;
+    });
 }

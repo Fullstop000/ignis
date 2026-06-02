@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod cli;
 pub mod config;
+pub mod hooks;
 pub mod llm;
 pub mod logger;
 pub mod mcp;

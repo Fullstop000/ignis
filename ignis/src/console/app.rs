@@ -571,6 +571,9 @@ pub(crate) struct App {
     /// Auto-update-check result. `None` until the background check resolves;
     /// once `Some`, the footer renders a "new version available" segment.
     pub(crate) update_notice: Option<crate::cli::upgrade::UpdateNotice>,
+    /// Shared external-subprocess hook registry — used by `/hooks reload`
+    /// and (clone-handed) by the assistant-render seam in `runner.rs`.
+    pub(crate) hooks: Option<crate::hooks::HookRegistry>,
 }
 
 impl App {
@@ -616,6 +619,7 @@ impl App {
             mcp: None,
             permissions: None,
             update_notice: None,
+            hooks: None,
             transcript: Vec::new(),
             scroll_offset: 0,
             auto_follow: true,
@@ -883,6 +887,21 @@ impl App {
                 }
                 self.push_user_prompt(text);
             }
+            AgentEvent::UserPromptCommitted { text } => {
+                // Fired by `Session::prompt` after the `UserPromptSubmit`
+                // hook chain runs. This is the authoritative text that went
+                // into history — render it so scrollback matches what the
+                // model received. With no hooks installed, `text` equals
+                // what the user typed; the user perceives no delay.
+                self.push_user_prompt(text);
+            }
+            AgentEvent::Warning { source, message } => {
+                // Surfaces hook-chain failures (and any other ignis-side
+                // soft-failure path that opts into Warning). Rendered as a
+                // dim assistant notice prefixed `[warn]` so the line is
+                // visible without burying the conversation.
+                self.add_assistant_notice(format!("[warn] {source}: {message}"));
+            }
         }
     }
 
@@ -992,7 +1011,9 @@ impl App {
         if text.is_empty() || self.mode != Mode::Idle {
             return None;
         }
-        self.push_user_prompt(text.clone());
+        // Don't push the user block from the typed buffer — `Session::prompt`
+        // emits `UserPromptCommitted` after the hook chain runs so the
+        // visible block matches what hit history. Just clear the input.
         self.input.clear();
         self.cursor = 0;
         Some(text)
@@ -1841,6 +1862,7 @@ mod tests {
                 "/mcp",
                 "/afk",
                 "/telemetry",
+                "/hooks",
             ]
         );
     }
