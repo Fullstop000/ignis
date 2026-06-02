@@ -225,11 +225,7 @@ fn record(span: &tracing::Span, started: std::time::Instant, outcome: HookOutcom
 
 fn trim_stderr(stderr: &str) -> String {
     let one_line = stderr.replace('\n', " ");
-    if one_line.len() > 200 {
-        format!("{}…", &one_line[..200])
-    } else {
-        one_line
-    }
+    super::truncate_chars(&one_line, 200)
 }
 
 #[cfg(test)]

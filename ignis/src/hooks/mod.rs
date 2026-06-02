@@ -200,11 +200,28 @@ async fn emit_warning(tx: &EventSender, event: HookEvent, message: &str) {
 
 fn trim_one_line(s: &str) -> String {
     let one = s.replace('\n', " ").trim().to_string();
-    if one.len() > 200 {
-        format!("{}…", &one[..200])
-    } else {
-        one
+    truncate_chars(&one, 200)
+}
+
+/// Char-boundary-safe truncation. Returns at most `n` chars from `s`,
+/// appending `…` when the original was longer. Slicing `&s[..200]` on a
+/// CJK / multibyte string panics if 200 lands inside a code point; warning
+/// paths must never panic.
+pub(crate) fn truncate_chars(s: &str, n: usize) -> String {
+    let mut taken = 0usize;
+    let mut iter = s.chars();
+    let mut out = String::new();
+    for ch in iter.by_ref() {
+        if taken >= n {
+            break;
+        }
+        out.push(ch);
+        taken += 1;
     }
+    if iter.next().is_some() {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -364,6 +381,22 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         }
         assert_eq!(warnings, 1);
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn truncate_chars_handles_cjk_at_boundary() {
+        // 250 CJK characters (each 3 bytes in UTF-8) — a byte-slice at 200
+        // would have panicked at a multibyte boundary. Char-safe trim
+        // returns 200 chars + an ellipsis.
+        let s: String = std::iter::repeat('中').take(250).collect();
+        let out = truncate_chars(&s, 200);
+        assert_eq!(out.chars().count(), 201);
+        assert!(out.ends_with('…'));
+        // No truncation when already short enough.
+        assert_eq!(truncate_chars("hi", 200), "hi");
+        // Exact-length input: no ellipsis.
+        let exact: String = std::iter::repeat('a').take(200).collect();
+        assert_eq!(truncate_chars(&exact, 200), exact);
     }
 
     #[tokio::test]
