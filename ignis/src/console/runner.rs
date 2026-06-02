@@ -369,18 +369,24 @@ pub async fn run_console(
             }
         }
 
-        // Edge-triggered: exactly one queued prompt per turn-end (AgentEnd).
-        // The user block is rendered when `Session::prompt` emits
-        // `UserPromptCommitted` (post-hook), so we don't push it here.
+        // Edge-triggered: exactly one queued line per turn-end (AgentEnd).
+        // Route through the same dispatcher Enter uses so queued slash
+        // commands (`/compact`, `/model`, …) actually execute — sending the
+        // text as a raw `AgentRequest::Prompt` would deliver "/compact" to
+        // the LLM as a user message. The user block is rendered when
+        // `Session::prompt` emits `UserPromptCommitted` (post-hook), so we
+        // don't push it here.
         if app.take_turn_just_ended() {
             if let Some(text) = app.take_queued_front() {
-                app.turn_in_flight = true;
-                let _ = prompt_tx
-                    .send(AgentRequest::Prompt {
-                        session_id: app.session_id.clone(),
-                        prompt: text,
-                    })
-                    .await;
+                crate::console::keys::submit_text(
+                    &mut app,
+                    text,
+                    &prompt_tx,
+                    &picker_tx,
+                    &notice_tx,
+                    &ui_storage_dir,
+                )
+                .await;
             }
         }
 

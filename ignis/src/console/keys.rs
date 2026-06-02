@@ -437,127 +437,7 @@ pub(crate) async fn handle_key(
                 app.submit().unwrap_or_default()
             };
             if !text.is_empty() {
-                let command = text.split_whitespace().next().unwrap_or("");
-                let arg_count = text.split_whitespace().count();
-                if command == "/sessions" && arg_count == 1 {
-                    let projects_dir = match dirs::home_dir() {
-                        Some(h) => h.join(".ignis/projects"),
-                        None => {
-                            app.add_assistant_notice(
-                                "Could not locate home directory.".to_string(),
-                            );
-                            return;
-                        }
-                    };
-                    let mut records = crate::cli::sessions::walk_sessions(
-                        &projects_dir,
-                        crate::cli::sessions::Scope::Current,
-                        &app.cwd,
-                    )
-                    .unwrap_or_default();
-                    // The currently-running session may not be on disk yet
-                    // (no messages persisted). Splice in a synthetic record so
-                    // the user can still see "themselves" in the list and the
-                    // ▸ marker has a row to land on.
-                    if !records.iter().any(|r| r.session_id == app.session_id) {
-                        let user_count = app
-                            .blocks
-                            .iter()
-                            .filter(|b| matches!(b, crate::console::app::UIBlock::User(_)))
-                            .count() as u64;
-                        records.push(crate::cli::sessions::SessionRecord {
-                            session_id: app.session_id.clone(),
-                            project_slug: crate::session::project_slug(&app.cwd),
-                            project_start_dir: Some(app.cwd.to_string_lossy().to_string()),
-                            // Sort to the top — synthetic row represents "now".
-                            last_modified: Some(u64::MAX),
-                            user_queries: user_count,
-                            ..Default::default()
-                        });
-                    }
-                    records.sort_by_key(|r| std::cmp::Reverse(r.last_modified.unwrap_or(0)));
-                    app.show_session_picker(records, projects_dir);
-                } else if command == "/clear" && arg_count == 1 {
-                    let new_id = crate::session::SessionManager::create_id();
-                    // Create an empty session file so /sessions can see it
-                    let storage = crate::storage::FileStorage::new(storage_dir.to_path_buf());
-                    let _ = storage.save_session(&new_id, &[], None).await;
-                    app.start_new_session(new_id);
-                } else if command == "/connect" && arg_count == 1 {
-                    if let Some(req) = app.start_connect() {
-                        let _ = picker_tx.send(req).await;
-                    }
-                } else if app.provider.is_empty() && requires_provider(app, command) {
-                    // Single guard for every command (and the agent prompt
-                    // path) that needs a live provider. Anything benign in
-                    // no-provider mode — /skills, /mcp, /sessions, /afk,
-                    // /telemetry, /clear — falls through unchanged.
-                    app.add_assistant_notice(NO_PROVIDER_HINT.to_string());
-                } else if command == "/compact" && arg_count == 1 {
-                    app.turn_in_flight = true;
-                    let _ = prompt_tx
-                        .send(AgentRequest::Compact {
-                            session_id: app.session_id.clone(),
-                        })
-                        .await;
-                } else if command == "/copy" && arg_count == 1 {
-                    app.copy_last_assistant_message();
-                } else if command == "/model" && arg_count == 1 {
-                    app.show_model_picker();
-                } else if command == "/skills" && arg_count == 1 {
-                    app.show_skill_picker();
-                } else if command == "/mcp" && arg_count == 1 {
-                    app.show_mcp_picker();
-                } else if command == "/afk" && arg_count == 1 {
-                    handle_afk_toggle(app, picker_tx, notice_tx).await;
-                } else if command == "/telemetry" && arg_count == 1 {
-                    handle_telemetry_picker(app, picker_tx, notice_tx).await;
-                } else if command == "/hooks" {
-                    handle_hooks_command(app, &text).await;
-                } else if command.starts_with('/')
-                    && app
-                        .skills
-                        .as_deref()
-                        .map(|r| r.all().iter().any(|s| format!("/{}", s.name) == command))
-                        .unwrap_or(false)
-                {
-                    let name = command.trim_start_matches('/').to_string();
-                    let reg = app.skills.clone().unwrap();
-                    if let Some(skill) = reg.get_enabled(&name) {
-                        let args = text[command.len()..].trim();
-                        let mut prompt = build_skill_prompt(&skill.name, &skill.body, args);
-                        // Bundled-file skills get their directory + file list so
-                        // the model can read referenced resources (no-op for
-                        // pure-instruction skills).
-                        if let Some(note) = skill.resources_note() {
-                            prompt.push_str(&note);
-                        }
-                        app.turn_in_flight = true;
-                        let _ = prompt_tx
-                            .send(AgentRequest::Prompt {
-                                session_id: app.session_id.clone(),
-                                prompt,
-                            })
-                            .await;
-                    } else {
-                        app.add_assistant_notice(format!(
-                            "Skill '{name}' is disabled. Enable it with /skills."
-                        ));
-                    }
-                } else if text.starts_with('/') {
-                    app.add_assistant_notice(format!("Unknown command `{}`.", command));
-                } else {
-                    // The early `requires_provider` guard already short-
-                    // circuited the empty-provider case; here we know
-                    // there's a provider to send the prompt to.
-                    app.turn_in_flight = true;
-                    let _ = prompt_tx
-                        .send(AgentRequest::Prompt {
-                            session_id: app.session_id.clone(),
-                            prompt: text,
-                        })
-                        .await;
-                }
+                submit_text(app, text, prompt_tx, picker_tx, notice_tx, storage_dir).await;
             }
         }
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
@@ -657,6 +537,125 @@ pub(crate) async fn handle_key(
             app.scroll_transcript_down(10, visible);
         }
         _ => {}
+    }
+}
+
+/// Dispatch a submitted line — either typed at idle (Enter) or drained
+/// from the busy-mode queue at the next `AgentEnd`. Routes built-in slash
+/// commands, skill commands, and plain prompts. Centralizing this is what
+/// lets queued slash commands (e.g. `/compact`, `/model`) actually run on
+/// drain instead of being sent to the LLM as a literal user message.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn submit_text(
+    app: &mut App,
+    text: String,
+    prompt_tx: &mpsc::Sender<AgentRequest>,
+    picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
+    notice_tx: &mpsc::Sender<String>,
+    storage_dir: &std::path::Path,
+) {
+    let command = text.split_whitespace().next().unwrap_or("");
+    let arg_count = text.split_whitespace().count();
+    if command == "/sessions" && arg_count == 1 {
+        let projects_dir = match dirs::home_dir() {
+            Some(h) => h.join(".ignis/projects"),
+            None => {
+                app.add_assistant_notice("Could not locate home directory.".to_string());
+                return;
+            }
+        };
+        let mut records = crate::cli::sessions::walk_sessions(
+            &projects_dir,
+            crate::cli::sessions::Scope::Current,
+            &app.cwd,
+        )
+        .unwrap_or_default();
+        if !records.iter().any(|r| r.session_id == app.session_id) {
+            let user_count = app
+                .blocks
+                .iter()
+                .filter(|b| matches!(b, crate::console::app::UIBlock::User(_)))
+                .count() as u64;
+            records.push(crate::cli::sessions::SessionRecord {
+                session_id: app.session_id.clone(),
+                project_slug: crate::session::project_slug(&app.cwd),
+                project_start_dir: Some(app.cwd.to_string_lossy().to_string()),
+                last_modified: Some(u64::MAX),
+                user_queries: user_count,
+                ..Default::default()
+            });
+        }
+        records.sort_by_key(|r| std::cmp::Reverse(r.last_modified.unwrap_or(0)));
+        app.show_session_picker(records, projects_dir);
+    } else if command == "/clear" && arg_count == 1 {
+        let new_id = crate::session::SessionManager::create_id();
+        let storage = crate::storage::FileStorage::new(storage_dir.to_path_buf());
+        let _ = storage.save_session(&new_id, &[], None).await;
+        app.start_new_session(new_id);
+    } else if command == "/connect" && arg_count == 1 {
+        if let Some(req) = app.start_connect() {
+            let _ = picker_tx.send(req).await;
+        }
+    } else if app.provider.is_empty() && requires_provider(app, command) {
+        app.add_assistant_notice(NO_PROVIDER_HINT.to_string());
+    } else if command == "/compact" && arg_count == 1 {
+        app.turn_in_flight = true;
+        let _ = prompt_tx
+            .send(AgentRequest::Compact {
+                session_id: app.session_id.clone(),
+            })
+            .await;
+    } else if command == "/copy" && arg_count == 1 {
+        app.copy_last_assistant_message();
+    } else if command == "/model" && arg_count == 1 {
+        app.show_model_picker();
+    } else if command == "/skills" && arg_count == 1 {
+        app.show_skill_picker();
+    } else if command == "/mcp" && arg_count == 1 {
+        app.show_mcp_picker();
+    } else if command == "/afk" && arg_count == 1 {
+        handle_afk_toggle(app, picker_tx, notice_tx).await;
+    } else if command == "/telemetry" && arg_count == 1 {
+        handle_telemetry_picker(app, picker_tx, notice_tx).await;
+    } else if command == "/hooks" {
+        handle_hooks_command(app, &text).await;
+    } else if command.starts_with('/')
+        && app
+            .skills
+            .as_deref()
+            .map(|r| r.all().iter().any(|s| format!("/{}", s.name) == command))
+            .unwrap_or(false)
+    {
+        let name = command.trim_start_matches('/').to_string();
+        let reg = app.skills.clone().unwrap();
+        if let Some(skill) = reg.get_enabled(&name) {
+            let args = text[command.len()..].trim();
+            let mut prompt = build_skill_prompt(&skill.name, &skill.body, args);
+            if let Some(note) = skill.resources_note() {
+                prompt.push_str(&note);
+            }
+            app.turn_in_flight = true;
+            let _ = prompt_tx
+                .send(AgentRequest::Prompt {
+                    session_id: app.session_id.clone(),
+                    prompt,
+                })
+                .await;
+        } else {
+            app.add_assistant_notice(format!(
+                "Skill '{name}' is disabled. Enable it with /skills."
+            ));
+        }
+    } else if text.starts_with('/') {
+        app.add_assistant_notice(format!("Unknown command `{}`.", command));
+    } else {
+        app.turn_in_flight = true;
+        let _ = prompt_tx
+            .send(AgentRequest::Prompt {
+                session_id: app.session_id.clone(),
+                prompt: text,
+            })
+            .await;
     }
 }
 
@@ -894,4 +893,103 @@ async fn handle_afk_toggle(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::console::format::AgentRequest;
+    use std::path::PathBuf;
+    use tokio::sync::mpsc;
+
+    fn test_app() -> App {
+        App::new(
+            "test-provider".to_string(),
+            "test-model".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn channels() -> (
+        mpsc::Sender<AgentRequest>,
+        mpsc::Receiver<AgentRequest>,
+        mpsc::Sender<crate::console::picker::PickerRequest>,
+        mpsc::Receiver<crate::console::picker::PickerRequest>,
+        mpsc::Sender<String>,
+        mpsc::Receiver<String>,
+    ) {
+        let (p_tx, p_rx) = mpsc::channel(8);
+        let (pk_tx, pk_rx) = mpsc::channel(4);
+        let (n_tx, n_rx) = mpsc::channel(8);
+        (p_tx, p_rx, pk_tx, pk_rx, n_tx, n_rx)
+    }
+
+    #[tokio::test]
+    async fn queued_compact_routes_to_compact_request_not_prompt() {
+        // Bug fix: a `/compact` typed while busy used to be enqueued and then
+        // sent to the LLM as a plain user message on drain. `submit_text` is
+        // now the shared dispatcher for Enter and drain, so it must route
+        // `/compact` to `AgentRequest::Compact`.
+        let mut app = test_app();
+        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        submit_text(
+            &mut app,
+            "/compact".to_string(),
+            &p_tx,
+            &pk_tx,
+            &n_tx,
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        match p_rx.try_recv().expect("expected a Compact request") {
+            AgentRequest::Compact { .. } => {}
+            other => panic!("expected Compact, got {:?}", std::mem::discriminant(&other)),
+        }
+        assert!(app.turn_in_flight, "/compact marks the turn in flight");
+    }
+
+    #[tokio::test]
+    async fn queued_model_opens_picker_without_sending_prompt() {
+        // `/model` is a local-only command — drain must open the picker
+        // (or emit "No models configured." when empty), never send the
+        // literal string to the LLM.
+        let mut app = test_app();
+        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        submit_text(
+            &mut app,
+            "/model".to_string(),
+            &p_tx,
+            &pk_tx,
+            &n_tx,
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        assert!(
+            p_rx.try_recv().is_err(),
+            "/model must not push anything onto the agent request channel"
+        );
+        assert!(!app.turn_in_flight, "/model does not start a turn");
+    }
+
+    #[tokio::test]
+    async fn plain_text_routes_to_prompt_request() {
+        let mut app = test_app();
+        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        submit_text(
+            &mut app,
+            "hello world".to_string(),
+            &p_tx,
+            &pk_tx,
+            &n_tx,
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        match p_rx.try_recv().expect("expected a Prompt request") {
+            AgentRequest::Prompt { prompt, .. } => assert_eq!(prompt, "hello world"),
+            _ => panic!("expected Prompt"),
+        }
+        assert!(app.turn_in_flight);
+    }
 }
