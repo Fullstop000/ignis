@@ -1105,8 +1105,6 @@ mod tests {
             Some("Unknown command `/nope`.")
         );
     }
-<<<<<<< HEAD
-
     #[tokio::test]
     async fn connect_bypasses_no_provider_gate_even_when_a_connect_skill_exists() {
         // Regression: the hoisted gate must not block /connect when the user
@@ -1148,6 +1146,4 @@ mod tests {
 
         std::fs::remove_dir_all(&tmp).ok();
     }
-=======
->>>>>>> 5cb27cc (refactor(tui): slash-command dispatch as a match + hoisted provider gate)
 }
