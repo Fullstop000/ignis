@@ -5,9 +5,10 @@
 //!
 //! Process model:
 //!   * spawn via `tokio::process::Command` with piped stdin/stdout/stderr;
-//!   * write the envelope, close stdin;
-//!   * wait for the child with a `tokio::time::timeout`;
-//!   * on timeout, `SIGTERM` then `SIGKILL` after a 1 s grace.
+//!   * inside ONE `tokio::time::timeout`: write the envelope, close stdin,
+//!     wait for the child;
+//!   * on timeout, `kill_on_drop` fires SIGKILL when the future is dropped.
+//!     v2 will add a SIGTERM grace window before SIGKILL.
 
 use std::process::Stdio;
 use std::time::Duration;

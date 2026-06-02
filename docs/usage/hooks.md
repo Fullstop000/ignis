@@ -83,8 +83,9 @@ hook" — but `continue: false` is also a block signal (see exit codes).
 | `2` | Block the chain. Honoured for `UserPromptSubmit` (turn does not send). Degraded to a soft failure for `AssistantMessageRender`. |
 | anything else | Soft failure: original text kept; a `[warn]` line is committed to scrollback. |
 
-A hook that runs longer than its `timeout_ms` is killed (SIGTERM,
-then SIGKILL after a 1s grace) and treated as a soft failure.
+A hook that runs longer than its `timeout_ms` is killed (SIGKILL,
+via `kill_on_drop`) and treated as a soft failure. v2 will add a
+SIGTERM grace window before the SIGKILL.
 
 ## Declaration — `~/.ignis/hooks.json`
 
