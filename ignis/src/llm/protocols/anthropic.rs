@@ -202,15 +202,7 @@ impl LlmProvider for AnthropicCompatible {
         let byte_stream = res.bytes_stream();
         let line_stream = bytes_to_lines(byte_stream);
 
-        struct ParserState {
-            active_tool_calls: HashMap<usize, (String, String)>,
-            current_event_type: String,
-        }
-
-        let state = std::sync::Arc::new(tokio::sync::Mutex::new(ParserState {
-            active_tool_calls: HashMap::new(),
-            current_event_type: String::new(),
-        }));
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(ParserState::default()));
 
         let state_clone = state.clone();
         let delta_stream = line_stream.filter_map(move |line_result| {
@@ -218,67 +210,7 @@ impl LlmProvider for AnthropicCompatible {
             async move {
                 match line_result {
                     Err(err) => Some(Err(err)),
-                    Ok(line) => {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            return None;
-                        }
-
-                        let mut state_lock = state.lock().await;
-
-                        if let Some(stripped) = line.strip_prefix("event:") {
-                            state_lock.current_event_type = stripped.trim().to_string();
-                            return None;
-                        }
-                        let data_part = match line.strip_prefix("data:") {
-                            Some(d) => d.trim(),
-                            None => return None,
-                        };
-
-                        match serde_json::from_str::<AnthropicEvent>(data_part) {
-                            Err(_) => None,
-                            Ok(event) => match event {
-                                AnthropicEvent::ContentBlockStart {
-                                    index,
-                                    content_block,
-                                } => {
-                                    if let AnthropicContentBlock::ToolUse { id, name } =
-                                        content_block
-                                    {
-                                        state_lock
-                                            .active_tool_calls
-                                            .insert(index, (id.clone(), name.clone()));
-                                        return Some(Ok(LlmResponseDelta::ToolCall {
-                                            index,
-                                            id: Some(id),
-                                            name: Some(name),
-                                            arguments: String::new(),
-                                        }));
-                                    }
-                                    None
-                                }
-                                AnthropicEvent::ContentBlockDelta { index, delta } => match delta {
-                                    AnthropicDelta::TextDelta { text } => {
-                                        Some(Ok(LlmResponseDelta::Text(text)))
-                                    }
-                                    AnthropicDelta::InputJsonDelta { partial_json } => {
-                                        let (id, name) = state_lock
-                                            .active_tool_calls
-                                            .get(&index)
-                                            .cloned()
-                                            .unwrap_or_else(|| (String::new(), String::new()));
-                                        Some(Ok(LlmResponseDelta::ToolCall {
-                                            index,
-                                            id: if id.is_empty() { None } else { Some(id) },
-                                            name: if name.is_empty() { None } else { Some(name) },
-                                            arguments: partial_json,
-                                        }))
-                                    }
-                                },
-                                _ => None,
-                            },
-                        }
-                    }
+                    Ok(line) => parse_line(&mut *state.lock().await, line.trim()),
                 }
             }
         });
@@ -287,9 +219,121 @@ impl LlmProvider for AnthropicCompatible {
     }
 }
 
+#[derive(Default)]
+struct ParserState {
+    /// Per-content-block: the tool-call id + name announced by `content_block_start`,
+    /// so we can drop them from subsequent `input_json_delta` events (the agent
+    /// accumulator `push_str`s `Some(name)` per delta — emitting them on every
+    /// chunk produced `bashbashbash`-style tripled names).
+    active_tool_calls: HashMap<usize, (String, String)>,
+}
+
+/// Translates one SSE line into at most one `LlmResponseDelta`.
+///
+/// Anthropic streams an `event: <type>` line followed by a `data: <json>` line.
+/// We ignore the `event:` line — `data` already carries `"type"` for serde's tag.
+fn parse_line(
+    state: &mut ParserState,
+    line: &str,
+) -> Option<Result<LlmResponseDelta, anyhow::Error>> {
+    if line.is_empty() || line.starts_with("event:") {
+        return None;
+    }
+    let data_part = line.strip_prefix("data:")?.trim();
+    let event: AnthropicEvent = serde_json::from_str(data_part).ok()?;
+    match event {
+        AnthropicEvent::ContentBlockStart {
+            index,
+            content_block: AnthropicContentBlock::ToolUse { id, name },
+        } => {
+            state
+                .active_tool_calls
+                .insert(index, (id.clone(), name.clone()));
+            Some(Ok(LlmResponseDelta::ToolCall {
+                index,
+                id: Some(id),
+                name: Some(name),
+                arguments: String::new(),
+            }))
+        }
+        AnthropicEvent::ContentBlockDelta {
+            delta: AnthropicDelta::TextDelta { text },
+            ..
+        } => Some(Ok(LlmResponseDelta::Text(text))),
+        AnthropicEvent::ContentBlockDelta {
+            index,
+            delta: AnthropicDelta::InputJsonDelta { partial_json },
+        } => Some(Ok(LlmResponseDelta::ToolCall {
+            index,
+            // id + name were already emitted on ContentBlockStart and are
+            // accumulated by the agent via push_str — re-sending them here
+            // would triple the name (see active_tool_calls comment).
+            id: None,
+            name: None,
+            arguments: partial_json,
+        })),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mirror of the agent loop's tool-call accumulator (`agent/mod.rs` keeps
+    /// `id`/`name`/`arguments` strings and `push_str`s every delta that arrives
+    /// with `Some(...)`). Used to assert that the parser doesn't re-send `name`
+    /// per chunk — if it does, the accumulated name comes out duplicated.
+    fn accumulate(deltas: Vec<LlmResponseDelta>) -> (String, String, String) {
+        let (mut id, mut name, mut args) = (String::new(), String::new(), String::new());
+        for d in deltas {
+            if let LlmResponseDelta::ToolCall {
+                id: did,
+                name: dname,
+                arguments,
+                ..
+            } = d
+            {
+                if let Some(v) = did {
+                    id.push_str(&v);
+                }
+                if let Some(v) = dname {
+                    name.push_str(&v);
+                }
+                args.push_str(&arguments);
+            }
+        }
+        (id, name, args)
+    }
+
+    #[test]
+    fn tool_name_emitted_only_once_across_input_json_chunks() {
+        // Regression: small bash calls produce a `content_block_start` followed
+        // by N `input_json_delta` chunks. Before the fix, every chunk re-sent
+        // `Some("bash")`, so the agent accumulator built `bashbashbash` — which
+        // then showed in the tool-block header and the permission picker.
+        let mut state = ParserState::default();
+        let sse = [
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"bash"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":" -la /home/zht/ignis\"}"}}"#,
+        ];
+        let deltas: Vec<_> = sse
+            .iter()
+            .filter_map(|l| parse_line(&mut state, l))
+            .map(|r| r.unwrap())
+            .collect();
+        let (id, name, args) = accumulate(deltas);
+        assert_eq!(
+            name, "bash",
+            "tool name must not be duplicated across chunks"
+        );
+        assert_eq!(
+            id, "toolu_01",
+            "tool id must not be duplicated across chunks"
+        );
+        assert_eq!(args, r#"{"command":"ls -la /home/zht/ignis"}"#);
+    }
 
     #[test]
     fn request_body_includes_max_tokens() {
