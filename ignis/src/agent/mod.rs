@@ -60,6 +60,19 @@ pub enum AgentEvent {
         max: u32,
         reason: String,
     },
+    /// The user's submitted prompt, after any `UserPromptSubmit` hook chain
+    /// has run. Carries the final string that gets pushed into history —
+    /// this is what the console renders to scrollback so the visible block
+    /// matches what the model actually saw. Emitted on every direct submit
+    /// (`UserInjected` covers the queued/inject path).
+    #[serde(rename = "user_prompt_committed")]
+    UserPromptCommitted { text: String },
+    /// Non-fatal advisory from a subsystem (e.g. hook chain). Rendered as a
+    /// dim `[warn] {source}: {message}` line in scrollback. Never produced
+    /// by the model loop itself — only by ignis-side machinery that wants
+    /// to surface a soft failure without breaking the turn.
+    #[serde(rename = "warning")]
+    Warning { source: String, message: String },
 }
 
 /// Build the system prompt for an interactive/one-shot run: the static agent
@@ -144,27 +157,51 @@ fn get_current_date() -> String {
         .unwrap_or_else(|_| "Unknown Date".to_string())
 }
 
-/// Drain any pending inject messages into `history` as user turns, emitting a
-/// `UserInjected` event for each. Returns how many were drained.
+/// Drain any pending inject messages, run them through the
+/// `UserPromptSubmit` hook chain when a registry is installed, push the
+/// effective text to `history`, and emit a `UserInjected` event for
+/// each. Returns how many were drained.
+///
+/// Block semantics match `Session::prompt`: a `Blocked` outcome drops
+/// the inject (no history push, no `UserInjected` event) — the chain
+/// already emitted a Warning. Without this, a steer message reaches
+/// the model untranslated / unfiltered, which is the bilingual hook's
+/// primary use case.
 async fn drain_injected(
     inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     history: &mut Vec<Message>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    prompt_hooks: Option<&crate::hooks::HookRegistry>,
+    hook_ctx: Option<crate::hooks::HookContext<'_>>,
 ) -> usize {
     let mut n = 0;
     if let Some(rx) = inject_rx {
         while let Ok(text) = rx.try_recv() {
-            history.push(Message {
-                role: "user".to_string(),
-                content: Some(text.clone()),
-                reasoning_content: None,
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-                created_at_ms: Some(now_ms()),
-            });
-            let _ = tx.send(AgentEvent::UserInjected { text }).await;
-            n += 1;
+            let effective = match (prompt_hooks, hook_ctx) {
+                (Some(reg), Some(ctx)) => {
+                    match reg.run_user_prompt_submit(&text, ctx, tx).await {
+                        crate::hooks::PromptHookResult::Continue(t) => Some(t),
+                        // Block: warning already emitted on `tx`; drop
+                        // the inject entirely — same posture as
+                        // Session::prompt's short-circuit.
+                        crate::hooks::PromptHookResult::Blocked { .. } => None,
+                    }
+                }
+                _ => Some(text),
+            };
+            if let Some(effective) = effective {
+                history.push(Message {
+                    role: "user".to_string(),
+                    content: Some(effective.clone()),
+                    reasoning_content: None,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                    created_at_ms: Some(now_ms()),
+                });
+                let _ = tx.send(AgentEvent::UserInjected { text: effective }).await;
+                n += 1;
+            }
         }
     }
     n
@@ -637,6 +674,8 @@ impl Agent {
         history: &mut Vec<Message>,
         tx: tokio::sync::mpsc::Sender<AgentEvent>,
         mut inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+        prompt_hooks: Option<&crate::hooks::HookRegistry>,
+        hook_ctx: Option<crate::hooks::HookContext<'_>>,
     ) -> Result<Usage, anyhow::Error> {
         let _ = tx.send(AgentEvent::AgentStart).await;
         let mut total_usage = Usage::default();
@@ -662,7 +701,14 @@ impl Agent {
             .collect();
 
         loop {
-            drain_injected(inject_rx.as_deref_mut(), history, &tx).await;
+            drain_injected(
+                inject_rx.as_deref_mut(),
+                history,
+                &tx,
+                prompt_hooks,
+                hook_ctx,
+            )
+            .await;
             let _ = tx.send(AgentEvent::TurnStart).await;
 
             // LLM request span. Captures wall-clock via construct→drop; final
@@ -918,7 +964,14 @@ impl Agent {
                 // No tools: this round would end the turn. But if a steering
                 // message arrived, fold it in and run one more round so the model
                 // actually responds to it (keep-the-turn-alive).
-                let injected = drain_injected(inject_rx.as_deref_mut(), history, &tx).await;
+                let injected = drain_injected(
+                    inject_rx.as_deref_mut(),
+                    history,
+                    &tx,
+                    prompt_hooks,
+                    hook_ctx,
+                )
+                .await;
                 let _ = tx.send(AgentEvent::TurnEnd).await;
                 if injected == 0 {
                     break;

@@ -68,6 +68,7 @@ pub async fn run_console(
     skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
     mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
     permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
+    hook_registry: crate::hooks::HookRegistry,
 ) -> Result<(), anyhow::Error> {
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
     // Context windows: config override → cached models.dev → compaction threshold.
@@ -107,6 +108,13 @@ pub async fn run_console(
     // (telemetry, AFK) can't reach `app.add_assistant_notice` directly, so
     // they send the confirm string here and the main loop drains it.
     let (notice_tx, mut notice_rx) = mpsc::channel::<String>(8);
+    // AssistantMessageRender hook chain runs on a single per-session
+    // worker task that drains a bounded queue serially — so two
+    // back-to-back MessageEnds with different hook latencies always
+    // commit their rewrites in the order they arrived. Rewrite events
+    // ride the same `agent_tx` the live UI consumes, so scrollback
+    // ordering follows event arrival.
+    let render_hook_queue = spawn_render_hook_worker(hook_registry.clone(), agent_tx.clone());
     let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
     let active_inject_runner = active_inject.clone();
 
@@ -115,6 +123,8 @@ pub async fn run_console(
     let ui_storage_dir = storage_dir;
     let agent_cwd = cwd;
     let mut agent_config = config;
+    let runner_hook_registry = hook_registry.clone();
+    app.hooks = Some(hook_registry);
 
     let ui_skill_registry = skill_registry.clone();
     let runner_skill_registry = skill_registry.clone();
@@ -193,6 +203,10 @@ pub async fn run_console(
                 }
             };
             session.set_compaction(agent_config.compaction.clone());
+            // Share the runner's HookRegistry handle so `/hooks reload`
+            // immediately affects the next prompt — Session::open loaded
+            // its own copy from disk, but the runner owns the live one.
+            session.set_hook_registry(runner_hook_registry.clone());
 
             let mcp_for_subagent = if !runner_mcp_registry.is_empty() {
                 Some(runner_mcp_registry.clone())
@@ -302,7 +316,15 @@ pub async fn run_console(
         // picker request from a tool.
         tokio::select! {
             _ = tokio::time::sleep(frame) => {}
-            Some(ev) = agent_rx.recv() => app.handle_event(ev),
+            Some(ev) = agent_rx.recv() => {
+                enqueue_render_hook(
+                    &ev,
+                    &render_hook_queue,
+                    &app.session_id,
+                    &app.cwd,
+                );
+                app.handle_event(ev);
+            }
             Some(req) = picker_rx.recv() => {
                 if app.inline_picker.is_some() {
                     // One picker at a time — reject the second so the tool
@@ -316,6 +338,7 @@ pub async fn run_console(
 
         // Drain any other pending agent events and key input — state only, no draw.
         while let Ok(ev) = agent_rx.try_recv() {
+            enqueue_render_hook(&ev, &render_hook_queue, &app.session_id, &app.cwd);
             app.handle_event(ev);
         }
         // Drain picker-spawn notices into the transcript.
@@ -347,9 +370,10 @@ pub async fn run_console(
         }
 
         // Edge-triggered: exactly one queued prompt per turn-end (AgentEnd).
+        // The user block is rendered when `Session::prompt` emits
+        // `UserPromptCommitted` (post-hook), so we don't push it here.
         if app.take_turn_just_ended() {
             if let Some(text) = app.take_queued_front() {
-                app.push_user_prompt(text.clone());
                 app.turn_in_flight = true;
                 let _ = prompt_tx
                     .send(AgentRequest::Prompt {
@@ -411,4 +435,299 @@ pub async fn run_console(
     // `?`-bubbled Err returns, and panics in the main loop.
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Prefix used to label the assistant block that carries an
+/// `AssistantMessageRender`-hook rewrite. Doubles as the gate that keeps
+/// the render seam from re-processing its own output (see
+/// `enqueue_render_hook`).
+const HOOK_REWRITE_PREFIX: &str = "[hook rewrite]";
+
+/// One unit of work for the render-hook queue: a single assistant
+/// `MessageEnd`'s text plus the context the hook needs.
+pub(crate) struct RenderJob {
+    pub content: String,
+    pub session_id: String,
+    pub cwd: String,
+}
+
+/// Inspect an incoming event; when it's an assistant `MessageEnd`
+/// carrying *final assistant text* (i.e. not a reasoning block), submit
+/// a [`RenderJob`] to the per-session render-hook queue so the
+/// `AssistantMessageRender` chain runs in submission order.
+///
+/// Two filters per spec & PR review:
+///   1. **Skip reasoning blocks.** Each `MessageEnd` for the same turn
+///      can carry a reasoning-only `Message` (✻ Thinking) before the
+///      final assistant text. The translator hook should NOT see those
+///      — they aren't shown to the user as the assistant's reply, and
+///      running translation on them is both wrong and wasteful.
+///   2. **Skip our own rewrite blocks.** The rewrite we emit lands as
+///      another `MessageEnd`; we mustn't loop on it.
+///
+/// Design choice (per spec's render-seam section): a true *swap* of the
+/// already-committed scrollback block isn't trivial — committed
+/// `Line`s in `app.transcript` are styled and indexed by `app.committed`.
+/// Re-rendering one block in place would require tracking its start/end
+/// row, undoing the auto-follow scroll, and re-flowing the next blocks.
+/// The spec explicitly allows the fallback: render the rewrite as a new
+/// labeled block "below the original" and document the choice. That's
+/// what we do — the assistant block produced by the model commits as
+/// usual, then a follow-up `[hook rewrite] <rewritten>` block lands
+/// underneath. History stores only the model's original text (see
+/// `Agent::run`'s `history.push`), so prompt cache + replay stay exact.
+fn enqueue_render_hook(
+    ev: &crate::AgentEvent,
+    queue_tx: &mpsc::Sender<RenderJob>,
+    session_id: &str,
+    cwd: &std::path::Path,
+) {
+    use crate::AgentEvent;
+    let message = match ev {
+        AgentEvent::MessageEnd { message } => message,
+        _ => return,
+    };
+    // Reasoning-only blocks (`reasoning_content` set, `content` empty
+    // or absent) are not the assistant's reply — the translator hook
+    // must skip them. Some providers emit BOTH reasoning_content and
+    // content in the same MessageEnd; that's a real assistant turn so
+    // we keep it.
+    if message
+        .reasoning_content
+        .as_deref()
+        .is_some_and(|r| !r.is_empty())
+        && message.content.as_deref().is_none_or(str::is_empty)
+    {
+        return;
+    }
+    let content = match message.content.as_deref() {
+        Some(c) if !c.is_empty() => c.to_string(),
+        _ => return,
+    };
+    // Don't re-process our own rewrite blocks — they're the *output* of
+    // the hook chain, not a fresh assistant turn.
+    if content.starts_with(HOOK_REWRITE_PREFIX) {
+        return;
+    }
+    // Drop if the queue is full — the worker is presumably stuck on a
+    // slow hook; dropping a single render is better than blocking the
+    // whole event loop. Render hook is best-effort by design.
+    let _ = queue_tx.try_send(RenderJob {
+        content,
+        session_id: session_id.to_string(),
+        cwd: cwd.to_string_lossy().to_string(),
+    });
+}
+
+/// Spawn the per-session render-hook worker. Owns a single
+/// `mpsc::Receiver<RenderJob>` and processes jobs in submission order so
+/// concurrent hook latencies don't reorder rewrites (which previously
+/// happened because every `MessageEnd` fired a fresh `tokio::spawn`).
+/// The worker exits when the queue's sender side drops at console exit.
+pub(crate) fn spawn_render_hook_worker(
+    registry: crate::hooks::HookRegistry,
+    event_tx: mpsc::Sender<crate::AgentEvent>,
+) -> mpsc::Sender<RenderJob> {
+    // Bounded; if hooks back up the producer drops via try_send rather
+    // than stall the event loop (see `enqueue_render_hook`).
+    let (queue_tx, mut queue_rx) = mpsc::channel::<RenderJob>(16);
+    tokio::spawn(async move {
+        while let Some(job) = queue_rx.recv().await {
+            // Fast path: no hooks declared → drop straight through. The
+            // check is cheap (one read-lock guard length check) and
+            // saves the envelope encode + subprocess spawn on the
+            // overwhelmingly common no-hook path.
+            if !registry
+                .has_hooks(crate::hooks::HookEvent::AssistantMessageRender)
+                .await
+            {
+                continue;
+            }
+            let ctx = crate::hooks::HookContext {
+                session_id: &job.session_id,
+                cwd: &job.cwd,
+            };
+            let rewritten = registry
+                .run_assistant_message_render(&job.content, ctx, &event_tx)
+                .await;
+            if rewritten == job.content {
+                continue;
+            }
+            let labeled = format!("{HOOK_REWRITE_PREFIX}\n{rewritten}");
+            let msg = crate::Message {
+                role: "assistant".to_string(),
+                content: Some(labeled.clone()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                created_at_ms: None,
+            };
+            let _ = event_tx
+                .send(crate::AgentEvent::MessageStart {
+                    message: msg.clone(),
+                })
+                .await;
+            let _ = event_tx
+                .send(crate::AgentEvent::MessageUpdate { delta: labeled })
+                .await;
+            let _ = event_tx
+                .send(crate::AgentEvent::MessageEnd { message: msg })
+                .await;
+        }
+    });
+    queue_tx
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::hooks::{HookRegistry, HookSpec, HooksConfig};
+    use crate::{AgentEvent, Message};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn write_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&p, perms).unwrap();
+        p
+    }
+
+    fn assistant_msg(content: &str, reasoning: Option<&str>) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Some(content.to_string()),
+            reasoning_content: reasoning.map(str::to_string),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn render_hook_skips_reasoning_only_messages() {
+        // Reasoning-only MessageEnd MUST NOT trigger the render hook —
+        // the translator hook is for the assistant's *reply* text, not
+        // the ✻ Thinking block (it isn't shown as the assistant's
+        // visible answer, and running translation on it is both wrong
+        // and wasteful).
+        let (queue_tx, mut queue_rx) = mpsc::channel::<RenderJob>(4);
+        let ev = AgentEvent::MessageEnd {
+            message: Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: Some("thinking out loud".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                created_at_ms: None,
+            },
+        };
+        enqueue_render_hook(&ev, &queue_tx, "s", Path::new("/tmp"));
+        // Same shape, but reasoning_content set + content empty string.
+        let ev2 = AgentEvent::MessageEnd {
+            message: Message {
+                role: "assistant".to_string(),
+                content: Some("".to_string()),
+                reasoning_content: Some("more thinking".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                created_at_ms: None,
+            },
+        };
+        enqueue_render_hook(&ev2, &queue_tx, "s", Path::new("/tmp"));
+        // A real assistant text DOES enqueue.
+        let real = AgentEvent::MessageEnd {
+            message: assistant_msg("hello user", None),
+        };
+        enqueue_render_hook(&real, &queue_tx, "s", Path::new("/tmp"));
+        drop(queue_tx);
+        // Expect exactly ONE job — the assistant text.
+        let first = queue_rx.recv().await.expect("one job enqueued");
+        assert_eq!(first.content, "hello user");
+        assert!(queue_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn render_hook_preserves_order_when_first_hook_is_slower() {
+        // Spec from review: two MessageEnd events with different hook
+        // latencies must commit their rewrites in the order they
+        // arrived. Previously every event spawned its own task, so a
+        // slow first hook could land AFTER a fast second one.
+        //
+        // We use ONE hook whose body sleeps based on the prompt: the
+        // first call sleeps longer than the second. With the per-
+        // session queue, jobs drain serially — outputs land in order.
+        let tmp = crate::util::unique_temp_dir("ignis-render-order");
+        // Reads prompt, sleeps proportional to its length, emits rewrite
+        // that prefixes the prompt with the round number.
+        let script = write_script(
+            &tmp,
+            "ordered.sh",
+            r#"#!/bin/sh
+RAW=$(cat)
+CONTENT=$(printf '%s' "$RAW" | sed -E 's/.*"content":"([^"]*)".*/\1/' )
+case "$CONTENT" in
+  slow*) sleep 0.3 ;;
+  fast*) sleep 0.05 ;;
+esac
+printf '{"hookSpecificOutput":{"updatedOutput":"R:%s"}}' "$CONTENT"
+"#,
+        );
+        let cfg = HooksConfig {
+            user_prompt_submit: vec![],
+            assistant_message_render: vec![HookSpec {
+                program: script,
+                args: vec![],
+                timeout_ms: 5_000,
+            }],
+        };
+        let registry = HookRegistry::from_config(cfg);
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+        let queue_tx = spawn_render_hook_worker(registry, event_tx);
+
+        // First job is slow, second is fast — without the per-session
+        // queue these would commit out-of-order.
+        let slow = AgentEvent::MessageEnd {
+            message: assistant_msg("slow-one", None),
+        };
+        let fast = AgentEvent::MessageEnd {
+            message: assistant_msg("fast-two", None),
+        };
+        enqueue_render_hook(&slow, &queue_tx, "s", Path::new("/tmp"));
+        enqueue_render_hook(&fast, &queue_tx, "s", Path::new("/tmp"));
+        // Close the worker's input so it exits after draining.
+        drop(queue_tx);
+
+        // Collect the rewrite MessageEnd events in order.
+        let mut rewrites = Vec::new();
+        while let Some(ev) = event_rx.recv().await {
+            if let AgentEvent::MessageEnd { message } = ev {
+                if let Some(c) = message.content {
+                    if c.starts_with(HOOK_REWRITE_PREFIX) {
+                        rewrites.push(c);
+                    }
+                }
+            }
+        }
+        assert_eq!(rewrites.len(), 2, "two rewrites expected");
+        // Submission order preserved: slow-one before fast-two.
+        assert!(
+            rewrites[0].contains("R:slow-one"),
+            "first rewrite: {}",
+            rewrites[0]
+        );
+        assert!(
+            rewrites[1].contains("R:fast-two"),
+            "second rewrite: {}",
+            rewrites[1]
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }

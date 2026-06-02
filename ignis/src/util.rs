@@ -57,10 +57,17 @@ pub fn parse_jsonl_messages(content: &str) -> Vec<Message> {
 pub static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Generate a unique temporary directory path for tests.
+///
+/// Combines wall-clock nanos with a process-wide monotonic counter so
+/// two tests calling this in the same nanosecond bucket (very possible
+/// under cargo test's thread-pool) still get distinct paths.
 pub fn unique_temp_dir(prefix: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock should be after unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{nanos}-{seq}"))
 }

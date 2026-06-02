@@ -661,3 +661,113 @@ async fn session_captures_real_token_usage() {
     assert_eq!(session.usage().output_tokens, 50);
     assert_eq!(session.usage().total(), 1050);
 }
+
+// ==========================================
+// Hook block behaviour — UserPromptSubmit exit 2 must short-circuit the
+// turn. Without this, a DLP-style hook returning exit 2 would still see
+// the original prompt sent to the model (the bug fix #2 addresses).
+// ==========================================
+
+#[cfg(unix)]
+#[tokio::test]
+async fn user_prompt_submit_block_short_circuits_turn() {
+    use ignis::hooks::{HookRegistry, HookSpec, HooksConfig};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // Counting provider — records how many times the model was asked. A
+    // properly short-circuited turn never reaches the provider, so this
+    // stays at zero.
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl LlmProvider for CountingProvider {
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+        async fn chat_stream(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _tools: &[serde_json::Value],
+        ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(stream::iter(std::iter::empty()).boxed())
+        }
+    }
+
+    // Hook script: exit 2 + a stderr line. Spec: "Hook exits 2 → Block
+    // the turn (only event where blocking makes sense — UserPromptSubmit).
+    // Show stderr to user."
+    let tmp = tempfile::tempdir().unwrap();
+    let hook_path = tmp.path().join("dlp.sh");
+    std::fs::write(
+        &hook_path,
+        "#!/bin/sh\ncat >/dev/null\nprintf 'sensitive material detected' >&2\nexit 2\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hook_path, perms).unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = CountingProvider {
+        calls: calls.clone(),
+    };
+    let storage = InMemoryStorage::new();
+    let mut session = Session::open(
+        "blk".to_string(),
+        "system".to_string(),
+        Box::new(provider),
+        Box::new(storage.clone()),
+        "/tmp".to_string(),
+    )
+    .await
+    .unwrap();
+    session.set_hook_registry(HookRegistry::from_config(HooksConfig {
+        user_prompt_submit: vec![HookSpec {
+            program: hook_path,
+            args: vec![],
+            timeout_ms: 5_000,
+        }],
+        assistant_message_render: vec![],
+    }));
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    session.prompt("leaky prompt", tx).await.unwrap();
+    let events = collect_events(&mut rx).await;
+
+    // Model was never asked — the block short-circuited the turn.
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "block must not call model");
+
+    // History stays empty — the prompt MUST NOT be persisted.
+    let hist = storage.load_session("blk").await.unwrap();
+    let any_user = hist.iter().any(|m| m.role == "user");
+    assert!(!any_user, "blocked prompt must not be in history");
+
+    // The user sees a Warning carrying the hook stderr.
+    let warning = events.iter().find_map(|e| match e {
+        AgentEvent::Warning { source, message } => Some((source.clone(), message.clone())),
+        _ => None,
+    });
+    let (src, msg) = warning.expect("Warning event emitted on block");
+    assert_eq!(src, "UserPromptSubmit");
+    assert!(
+        msg.contains("sensitive material detected"),
+        "stderr in warning: {msg}"
+    );
+
+    // No UserPromptCommitted — the prompt never reached the model side.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserPromptCommitted { .. })),
+        "must not announce a committed prompt on block"
+    );
+}

@@ -512,6 +512,8 @@ pub(crate) async fn handle_key(
                     handle_afk_toggle(app, picker_tx, notice_tx).await;
                 } else if command == "/telemetry" && arg_count == 1 {
                     handle_telemetry_picker(app, picker_tx, notice_tx).await;
+                } else if command == "/hooks" {
+                    handle_hooks_command(app, &text).await;
                 } else if command.starts_with('/')
                     && app
                         .skills
@@ -655,6 +657,38 @@ pub(crate) async fn handle_key(
             app.scroll_transcript_down(10, visible);
         }
         _ => {}
+    }
+}
+
+/// `/hooks` — currently only the `reload` subcommand. Re-reads
+/// `~/.ignis/hooks.json`, swaps the parsed config into the shared
+/// registry, and posts an `[info]` or `[err]` line to scrollback. The
+/// security reminder rides along on success so the user keeps noticing
+/// it every time they touch the file.
+async fn handle_hooks_command(app: &mut App, text: &str) {
+    let mut parts = text.split_whitespace();
+    let _ = parts.next(); // "/hooks"
+    let sub = parts.next().unwrap_or("");
+    if sub != "reload" {
+        app.add_assistant_notice(
+            "Usage: /hooks reload — re-reads ~/.ignis/hooks.json into memory.".to_string(),
+        );
+        return;
+    }
+    let Some(reg) = app.hooks.clone() else {
+        app.add_assistant_notice("[err] hooks registry unavailable in this session.".to_string());
+        return;
+    };
+    let Some(home) = dirs::home_dir() else {
+        app.add_assistant_notice("[err] could not locate home directory.".to_string());
+        return;
+    };
+    match reg.reload(&home).await {
+        Ok(count) => app.add_assistant_notice(format!(
+            "[info] reloaded {count} hook{plural} \u{00b7} run unsandboxed; audit before installing",
+            plural = if count == 1 { "" } else { "s" }
+        )),
+        Err(e) => app.add_assistant_notice(format!("[err] /hooks reload: {e}")),
     }
 }
 
