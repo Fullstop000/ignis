@@ -859,6 +859,20 @@ impl App {
                     }
                 }
             }
+            AgentEvent::Reconnecting {
+                attempt,
+                max,
+                reason,
+            } => {
+                // The agent dropped a stream and is re-issuing the same request.
+                // Render as a dim notice line in scrollback so the user sees
+                // *why* there's a pause — borrowing the same `UIBlock::Assistant`
+                // path the /copy notices use. The model's `history` doesn't
+                // include UI blocks, so this never leaks into the prompt.
+                self.blocks.push(UIBlock::Assistant(format!(
+                    "↻ Reconnecting ({attempt}/{max}): {reason}"
+                )));
+            }
             AgentEvent::UserInjected { text } => {
                 // Events arrive on one ordered channel and the agent emits
                 // `UserInjected` in the same FIFO order injects were sent, so the

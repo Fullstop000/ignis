@@ -49,6 +49,17 @@ pub enum AgentEvent {
     AgentEnd,
     #[serde(rename = "user_injected")]
     UserInjected { text: String },
+    /// Streaming HTTP request to the model dropped mid-flight (e.g. provider
+    /// closed the connection); the agent is about to re-issue the same request.
+    /// Fires only when no partial content has been emitted yet to the user.
+    /// `attempt` is 1-indexed; `max` is the total retry budget (so the visible
+    /// sequence is `1/3`, `2/3`, `3/3`). `reason` is the sanitized provider error.
+    #[serde(rename = "reconnecting")]
+    Reconnecting {
+        attempt: u32,
+        max: u32,
+        reason: String,
+    },
 }
 
 /// Build the system prompt for an interactive/one-shot run: the static agent
@@ -278,6 +289,26 @@ struct TurnStream {
     message_started: bool,
     reasoning_streaming: bool,
     turn_usage: Usage,
+    /// Sanitized provider error if the stream terminated abnormally mid-flight
+    /// (the `Err` branch in the consume loop). `None` on clean completion.
+    /// The caller decides whether to retry or surface the error to the user;
+    /// `consume_turn_stream` itself does not emit `[Error in stream: …]`.
+    stream_error: Option<String>,
+}
+
+impl TurnStream {
+    /// `true` when no UI-visible state was produced. Used by the retry loop
+    /// to decide whether re-issuing the request is safe: emitting any
+    /// assistant/reasoning text or accumulating tool-call fragments means
+    /// the user has already seen partial output, so retrying would
+    /// duplicate or contradict it.
+    fn is_empty(&self) -> bool {
+        self.assistant_content.is_empty()
+            && self.reasoning_content.is_empty()
+            && self.tool_calls.is_empty()
+            && !self.message_started
+            && !self.reasoning_streaming
+    }
 }
 
 /// Consume one streamed turn: accumulate text / reasoning / tool-call / usage
@@ -299,21 +330,20 @@ async fn consume_turn_stream(
     let mut message_started = false;
     let mut reasoning_streaming = false;
     let mut turn_usage = Usage::default();
+    let mut stream_error: Option<String> = None;
 
     while let Some(delta_result) = stream.next().await {
         match delta_result {
             Err(err) => {
-                let err_msg = Agent::sanitize_and_truncate_error(&err.to_string());
-                let _ = tx
-                    .send(AgentEvent::MessageUpdate {
-                        delta: format!("\n[Error in stream: {}]", err_msg),
-                    })
-                    .await;
-                // A streamed transport error (e.g. connection reset) means the
-                // connection is broken; remaining items are unreliable and a
-                // failing stream can re-yield the same error indefinitely. Stop
-                // consuming rather than spin — otherwise the turn loops until the
-                // agent timeout, emitting the same error millions of times.
+                // Capture the error; do NOT emit it here. The caller's retry
+                // loop checks `stream_error` and decides between re-issuing
+                // the request (safe iff no partial UI state was produced) and
+                // surfacing the error to the user as a normal message.
+                //
+                // The `break` below preserves the PR-#55 invariant: a stream
+                // that re-yields the same error infinitely won't spin the loop
+                // — we stop after the first error regardless of retry policy.
+                stream_error = Some(Agent::sanitize_and_truncate_error(&err.to_string()));
                 break;
             }
             Ok(delta) => match delta {
@@ -454,7 +484,43 @@ async fn consume_turn_stream(
         message_started,
         reasoning_streaming,
         turn_usage,
+        stream_error,
     }
+}
+
+/// Maximum number of automatic retries when the model stream drops mid-flight
+/// or `chat_stream()` returns a transport error. Total attempts = 1 initial +
+/// `MAX_STREAM_RETRIES`. Three is the typical production sweet spot: enough
+/// to absorb both a single blip and a brief multi-second outage, not so many
+/// that a truly broken endpoint burns minutes before surfacing the error.
+const MAX_STREAM_RETRIES: u32 = 3;
+
+/// Initial backoff before retry #1. Subsequent retries double this until
+/// `MAX_BACKOFF_MS` is hit. A non-zero start avoids hammering an endpoint
+/// that just dropped us — the typical failure mode is upstream load, not
+/// pure jitter, so an immediate retry tends to hit the same overloaded
+/// state.
+const BASE_BACKOFF_MS: u64 = 500;
+
+/// Ceiling for any single retry sleep. With the current budget the schedule
+/// is 500 ms → 1 s → 2 s and never reaches the cap; it exists so a future
+/// `MAX_STREAM_RETRIES` bump cannot accidentally introduce minutes-long
+/// sleeps if someone forgets to revisit this function.
+const MAX_BACKOFF_MS: u64 = 10_000;
+
+/// Exponential backoff before retry attempt `n` (1-indexed). Doubles from
+/// `BASE_BACKOFF_MS` and saturates at `MAX_BACKOFF_MS`. Sequence with the
+/// current constants: 500 ms, 1 s, 2 s, 4 s, 8 s, 10 s, 10 s, …
+fn retry_backoff_ms(attempt: u32) -> u64 {
+    // saturating_sub guards attempt=0 (defensive — callers pass attempt>=1);
+    // .min(30) keeps the left shift in the safe range for u64 even if the
+    // retry budget is ever raised dramatically. checked_shl returns None on
+    // overflow → fall back to u64::MAX and then clamp to MAX_BACKOFF_MS.
+    let shift = attempt.saturating_sub(1).min(30);
+    BASE_BACKOFF_MS
+        .checked_shl(shift)
+        .unwrap_or(u64::MAX)
+        .min(MAX_BACKOFF_MS)
 }
 
 /// Compose the effective system prompt: base + the enabled-skills catalog +
@@ -618,13 +684,81 @@ impl Agent {
             // there is no AGENTS.md).
             let messages = agents_md::prepend(self.project_instructions.as_deref(), history);
 
-            let stream = match self
-                .provider
-                .chat_stream(&effective_prompt, &messages, &tool_schemas)
-                .await
-            {
-                Ok(s) => s,
+            // Auto-retry seam. Each iteration of the inner loop is one attempt
+            // at "open the stream, consume one turn." A failure is retryable
+            // iff (a) attempts remain in the budget AND (b) the failure is
+            // safe to retry — meaning *no UI state* has been produced yet for
+            // this attempt. Two failure shapes feed in:
+            //   * `chat_stream(...)` returns Err before any stream items
+            //     — always safe to retry, no events were sent.
+            //   * `consume_turn_stream` returns a TurnStream with
+            //     `stream_error: Some` AND `is_empty()` — the request opened
+            //     but the response body closed before any delta arrived.
+            // Anything else (partial content / partial tool-call already
+            // streamed to the user) falls through to the existing post-turn
+            // handling, which surfaces the error inline and lets the turn loop
+            // continue. Retries emit `AgentEvent::Reconnecting { attempt, max,
+            // reason }` so the UI can show "Reconnecting (1/2): …".
+            let turn_result: Result<TurnStream, anyhow::Error> = {
+                let mut attempt: u32 = 0;
+                loop {
+                    match self
+                        .provider
+                        .chat_stream(&effective_prompt, &messages, &tool_schemas)
+                        .await
+                    {
+                        Err(err) => {
+                            if attempt < MAX_STREAM_RETRIES {
+                                let next = attempt + 1;
+                                let reason = Self::sanitize_and_truncate_error(&err.to_string());
+                                let _ = tx
+                                    .send(AgentEvent::Reconnecting {
+                                        attempt: next,
+                                        max: MAX_STREAM_RETRIES,
+                                        reason,
+                                    })
+                                    .await;
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    retry_backoff_ms(next),
+                                ))
+                                .await;
+                                attempt = next;
+                                continue;
+                            }
+                            break Err(err);
+                        }
+                        Ok(stream) => {
+                            let turn = consume_turn_stream(stream, &tx).await;
+                            match turn.stream_error.as_deref() {
+                                Some(reason) if attempt < MAX_STREAM_RETRIES && turn.is_empty() => {
+                                    let next = attempt + 1;
+                                    let _ = tx
+                                        .send(AgentEvent::Reconnecting {
+                                            attempt: next,
+                                            max: MAX_STREAM_RETRIES,
+                                            reason: reason.to_string(),
+                                        })
+                                        .await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        retry_backoff_ms(next),
+                                    ))
+                                    .await;
+                                    attempt = next;
+                                    continue;
+                                }
+                                _ => break Ok(turn),
+                            }
+                        }
+                    }
+                }
+            };
+
+            let turn = match turn_result {
+                Ok(t) => t,
                 Err(err) => {
+                    // All retries exhausted with no stream ever opened.
+                    // Surface as an assistant `Error: …` message-pair (existing
+                    // pre-stream-error UX) and exit the turn loop.
                     let err_msg = Self::sanitize_and_truncate_error(&err.to_string());
                     llm_span.record("success", false);
                     crate::telemetry::record_llm_request(
@@ -677,11 +811,29 @@ impl Agent {
                 message_started,
                 reasoning_streaming,
                 turn_usage,
-            } = consume_turn_stream(stream, &tx).await;
+                stream_error,
+            } = turn;
 
-            // Record final LLM-request span attrs + duration metric. Span drops
-            // at the end of this loop iteration; record before drop.
-            llm_span.record("success", true);
+            // Mid-stream error AFTER partial UI state was produced (so retry
+            // was not safe). Surface the error inline as a MessageUpdate so
+            // the user sees the response was truncated. The outer turn loop
+            // continues — same behavior as before the retry change.
+            if let Some(reason) = &stream_error {
+                let _ = tx
+                    .send(AgentEvent::MessageUpdate {
+                        delta: format!("\n[Error in stream: {}]", reason),
+                    })
+                    .await;
+            }
+
+            // Record final LLM-request span attrs + duration metric. A
+            // mid-stream error that survived all retries means the turn
+            // produced partial-or-no content under an unhealthy stream —
+            // count that as a failed request, mirroring the pre-stream
+            // failure path's `success=false` book-keeping. Span drops at
+            // the end of this loop iteration; record before drop.
+            let success = stream_error.is_none();
+            llm_span.record("success", success);
             llm_span.record("input_tokens", turn_usage.input_tokens);
             llm_span.record("output_tokens", turn_usage.output_tokens);
             llm_span.record("reasoning_tokens", turn_usage.reasoning_tokens);
@@ -689,7 +841,7 @@ impl Agent {
                 self.provider.provider_name(),
                 self.provider.model_id(),
                 llm_start.elapsed(),
-                true,
+                success,
             );
 
             // Report this turn's real token usage (if the provider supplied it).
@@ -976,11 +1128,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_error_stops_consuming_instead_of_looping() {
+    async fn stream_error_captured_and_stops_consuming() {
         use futures_util::stream::StreamExt;
-        // Simulate a broken connection that re-yields the same transport error.
-        // Pre-fix, consume_turn_stream emitted the error once per item; a truly
-        // stuck stream looped millions of times until the agent timeout.
+        // PR #55 invariant: a stream that re-yields the same transport error
+        // doesn't spin — we stop after the first error. The retry refactor
+        // changed *where* the error surfaces: `consume_turn_stream` now
+        // captures it in `stream_error` and emits nothing itself; the caller
+        // (the retry loop in `Agent::run`) decides between re-issuing the
+        // request and surfacing the error to the user. Both properties are
+        // checked here.
         let errs: Vec<Result<LlmResponseDelta, anyhow::Error>> = (0..50)
             .map(|_| {
                 Err(anyhow::anyhow!(
@@ -993,19 +1149,109 @@ mod tests {
         let result = consume_turn_stream(stream, &tx).await;
         drop(tx);
 
-        let mut errors = 0;
+        let mut error_messages = 0;
+        let mut any_events = 0;
         while let Some(ev) = rx.recv().await {
+            any_events += 1;
             if let AgentEvent::MessageUpdate { delta } = ev {
                 if delta.contains("Error in stream") {
-                    errors += 1;
+                    error_messages += 1;
                 }
             }
         }
         assert_eq!(
-            errors, 1,
-            "should stop after the first stream error, not loop over all 50"
+            any_events, 0,
+            "consume_turn_stream should emit no events for a pure-error stream; \
+             error surfacing is the caller's job"
         );
+        assert_eq!(error_messages, 0);
         assert!(result.assistant_content.is_empty());
+        assert!(result.is_empty());
+        assert!(
+            result
+                .stream_error
+                .as_deref()
+                .is_some_and(|s| s.contains("connection reset")),
+            "stream_error should carry the sanitized failure reason, got {:?}",
+            result.stream_error
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_stream_leaves_stream_error_none() {
+        use crate::llm::Usage;
+        use futures_util::stream::StreamExt;
+        let deltas: Vec<Result<LlmResponseDelta, anyhow::Error>> = vec![
+            Ok(LlmResponseDelta::Text("hello ".into())),
+            Ok(LlmResponseDelta::Text("world".into())),
+            Ok(LlmResponseDelta::Usage(Usage::default())),
+        ];
+        let stream = futures_util::stream::iter(deltas).boxed();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let result = consume_turn_stream(stream, &tx).await;
+        drop(tx);
+        // Drain so the channel doesn't leak warnings in test output.
+        while rx.recv().await.is_some() {}
+        assert_eq!(result.assistant_content, "hello world");
+        assert!(result.stream_error.is_none());
+        assert!(!result.is_empty(), "non-empty content => is_empty()==false");
+    }
+
+    #[test]
+    fn turn_stream_is_empty_is_strict() {
+        let mut t = TurnStream {
+            assistant_content: String::new(),
+            reasoning_content: String::new(),
+            tool_calls: Vec::new(),
+            message_started: false,
+            reasoning_streaming: false,
+            turn_usage: crate::llm::Usage::default(),
+            stream_error: None,
+        };
+        assert!(t.is_empty());
+        // Any one of these means the user has already seen partial state, so
+        // retry would corrupt the UI; `is_empty()` must reject all of them.
+        t.assistant_content.push('x');
+        assert!(!t.is_empty());
+        t.assistant_content.clear();
+        t.reasoning_content.push('y');
+        assert!(!t.is_empty());
+        t.reasoning_content.clear();
+        t.tool_calls.push(ToolCall {
+            id: "1".into(),
+            r#type: "function".into(),
+            function: ToolCallFunction {
+                name: "bash".into(),
+                arguments: "{}".into(),
+            },
+        });
+        assert!(!t.is_empty());
+        t.tool_calls.clear();
+        t.message_started = true;
+        assert!(!t.is_empty());
+        t.message_started = false;
+        t.reasoning_streaming = true;
+        assert!(!t.is_empty());
+    }
+
+    #[test]
+    fn retry_backoff_is_exponential_and_capped() {
+        // Schedule for the current budget of 3 retries: 500 ms → 1 s → 2 s.
+        assert_eq!(retry_backoff_ms(1), BASE_BACKOFF_MS);
+        assert_eq!(retry_backoff_ms(2), BASE_BACKOFF_MS * 2);
+        assert_eq!(retry_backoff_ms(3), BASE_BACKOFF_MS * 4);
+        // Doubling continues until MAX_BACKOFF_MS clamps it.
+        assert_eq!(retry_backoff_ms(4), BASE_BACKOFF_MS * 8);
+        assert!(
+            retry_backoff_ms(5) >= BASE_BACKOFF_MS * 16 || retry_backoff_ms(5) == MAX_BACKOFF_MS
+        );
+        // The ceiling holds for any number of attempts, including pathological
+        // values that would otherwise overflow the u64 shift.
+        assert_eq!(retry_backoff_ms(30), MAX_BACKOFF_MS);
+        assert_eq!(retry_backoff_ms(u32::MAX), MAX_BACKOFF_MS);
+        // Defensive: attempt=0 (shouldn't happen, but if it does) still
+        // returns a sane positive value, not zero or a panic.
+        assert_eq!(retry_backoff_ms(0), BASE_BACKOFF_MS);
     }
 
     #[test]
