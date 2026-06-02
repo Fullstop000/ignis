@@ -1,6 +1,6 @@
 use crate::agent::Agent;
 use crate::config::CompactionConfig;
-use crate::hooks::{HookContext, HookRegistry};
+use crate::hooks::{HookContext, HookRegistry, PromptHookResult};
 use crate::llm::LlmProvider;
 use crate::storage::SessionStorage;
 use crate::tools::tool::{AgentTool, ToolHooks};
@@ -169,11 +169,13 @@ impl Session {
             let _ = self.compact().await;
         }
 
-        // Run UserPromptSubmit hooks. The final string is what gets pushed
-        // into history; the original is dropped. Hooks never kill the turn
-        // — failures fall back to the previous value and emit a Warning
-        // event to the UI via `tx`.
-        let effective = self
+        // Run UserPromptSubmit hooks. Soft failures fall back to the
+        // previous value and emit a Warning. A hard block (exit 2 / a
+        // hook returning `continue: false`) short-circuits the turn —
+        // the spec's one explicit exception to "hooks never kill a turn"
+        // — so the prompt MUST NOT reach the model. Without this, a
+        // DLP-style hook returning exit 2 would leak the original prompt.
+        let effective = match self
             .hooks
             .run_user_prompt_submit(
                 text,
@@ -183,7 +185,17 @@ impl Session {
                 },
                 &tx,
             )
-            .await;
+            .await
+        {
+            PromptHookResult::Continue(t) => t,
+            PromptHookResult::Blocked { .. } => {
+                // The hook chain already emitted a Warning event carrying
+                // the stderr reason. Do NOT push to history, do NOT call
+                // the agent. The console handler renders Warning lines
+                // into scrollback, so the user sees the block reason.
+                return Ok(());
+            }
+        };
 
         // Announce the post-hook text so the console can render it to
         // scrollback. Without this, the console would echo the user's

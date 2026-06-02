@@ -10,7 +10,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use ignis::hooks::{HookContext, HookRegistry, HookSpec, HooksConfig};
+use ignis::hooks::{HookContext, HookRegistry, HookSpec, HooksConfig, PromptHookResult};
 use tokio::sync::mpsc;
 
 fn write_executable(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
@@ -62,7 +62,7 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","updatedI
         .await;
     drop(tx);
 
-    assert_eq!(out, "HELLO_FROM_HOOK");
+    assert_eq!(out, PromptHookResult::Continue("HELLO_FROM_HOOK".to_string()));
     // No warnings on the happy path.
     assert!(rx.recv().await.is_none());
 }
@@ -135,5 +135,5 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"FROM_DISK"}}'
             &tx,
         )
         .await;
-    assert_eq!(out, "FROM_DISK");
+    assert_eq!(out, PromptHookResult::Continue("FROM_DISK".to_string()));
 }

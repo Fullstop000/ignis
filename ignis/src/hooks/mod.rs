@@ -82,18 +82,25 @@ impl HookRegistry {
         Ok(total)
     }
 
-    /// Run the `UserPromptSubmit` chain. Each hook's `updatedInput` feeds
-    /// the next hook's `prompt`; soft-failures stop the chain at the last
-    /// good value and emit a `Warning` event. Returns the final string —
-    /// equal to the input when no hook mutated it.
+    /// Run the `UserPromptSubmit` chain. Returns:
+    ///
+    /// - [`PromptHookResult::Continue`] with the (possibly rewritten) prompt
+    ///   when every hook passed through or successfully rewrote, or when a
+    ///   soft-failure short-circuited the chain at the last good value
+    ///   (caller pushes the string to history and runs the agent).
+    /// - [`PromptHookResult::Blocked`] when a hook returned exit 2 or
+    ///   `continue: false`. The spec's iron rule: hooks cannot kill a
+    ///   turn EXCEPT here — `UserPromptSubmit` is the one event where
+    ///   blocking is meaningful. The caller MUST NOT push the prompt to
+    ///   history and MUST NOT call the agent; the warning has already
+    ///   been emitted to `tx`, so the user sees the block reason.
     pub async fn run_user_prompt_submit(
         &self,
         prompt: &str,
         ctx: HookContext<'_>,
         tx: &EventSender,
-    ) -> String {
-        self.run_chain(HookEvent::UserPromptSubmit, prompt, ctx, tx)
-            .await
+    ) -> PromptHookResult {
+        self.run_prompt_chain(prompt, ctx, tx).await
     }
 
     /// Run the `AssistantMessageRender` chain. Same semantics as
@@ -106,8 +113,7 @@ impl HookRegistry {
         ctx: HookContext<'_>,
         tx: &EventSender,
     ) -> String {
-        self.run_chain(HookEvent::AssistantMessageRender, content, ctx, tx)
-            .await
+        self.run_render_chain(content, ctx, tx).await
     }
 
     /// Are any hooks declared for `event`? Fast path the render seam uses
@@ -116,15 +122,75 @@ impl HookRegistry {
         !self.inner.read().await.for_event(event).is_empty()
     }
 
-    async fn run_chain(
+    /// `UserPromptSubmit` chain — same body as the render chain except
+    /// that `Blocked` is honoured (returns `PromptHookResult::Blocked`)
+    /// instead of being degraded to a Warning. Kept separate so the
+    /// caller's return type carries the block decision at the type level.
+    async fn run_prompt_chain(
         &self,
-        event: HookEvent,
+        initial: &str,
+        ctx: HookContext<'_>,
+        tx: &EventSender,
+    ) -> PromptHookResult {
+        let event = HookEvent::UserPromptSubmit;
+        // Clone the small Vec of HookSpec out of the RwLock so we don't
+        // hold the read guard across `.await` points in dispatch.
+        let specs: Vec<HookSpec> = {
+            let guard = self.inner.read().await;
+            guard.for_event(event).to_vec()
+        };
+        if specs.is_empty() {
+            return PromptHookResult::Continue(initial.to_string());
+        }
+
+        let dispatch_ctx = DispatchContext {
+            session_id: ctx.session_id,
+            cwd: ctx.cwd,
+        };
+
+        let mut current = initial.to_string();
+        for spec in &specs {
+            let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx).await;
+            match outcome {
+                HookOutcome::Mutated(next) => current = next,
+                HookOutcome::PassThrough => {}
+                HookOutcome::Blocked { stderr } => {
+                    // Honour the block. Spec: "Hook exits 2 → Block the
+                    // turn (only event where blocking makes sense —
+                    // UserPromptSubmit). Show stderr to user." Emit the
+                    // warning here so the caller doesn't have to.
+                    let trimmed = trim_one_line(&stderr);
+                    emit_warning(
+                        tx,
+                        event,
+                        &format!(
+                            "blocked by {} (exit 2): {}",
+                            spec.display_name(),
+                            trimmed
+                        ),
+                    )
+                    .await;
+                    return PromptHookResult::Blocked { stderr: trimmed };
+                }
+                HookOutcome::SoftFailed { reason } => {
+                    emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
+                    break;
+                }
+            }
+        }
+        PromptHookResult::Continue(current)
+    }
+
+    /// `AssistantMessageRender` chain — `Blocked` is degraded to a
+    /// Warning because the assistant message already exists; the spec
+    /// explicitly forbids losing it.
+    async fn run_render_chain(
+        &self,
         initial: &str,
         ctx: HookContext<'_>,
         tx: &EventSender,
     ) -> String {
-        // Clone the small Vec of HookSpec out of the RwLock so we don't
-        // hold the read guard across `.await` points in dispatch.
+        let event = HookEvent::AssistantMessageRender;
         let specs: Vec<HookSpec> = {
             let guard = self.inner.read().await;
             guard.for_event(event).to_vec()
@@ -144,49 +210,40 @@ impl HookRegistry {
             match outcome {
                 HookOutcome::Mutated(next) => current = next,
                 HookOutcome::PassThrough => {}
-                HookOutcome::Blocked { stderr } => match event {
-                    HookEvent::UserPromptSubmit => {
-                        // Honour the block: keep the last good value, warn,
-                        // stop the chain.
-                        emit_warning(
-                            tx,
-                            event,
-                            &format!(
-                                "blocked by {} (exit 2): {}",
-                                spec.display_name(),
-                                trim_one_line(&stderr)
-                            ),
-                        )
-                        .await;
-                        break;
-                    }
-                    HookEvent::AssistantMessageRender => {
-                        // Render side: blocking a message we already
-                        // produced would lose it. Degrade to soft failure.
-                        emit_warning(
-                            tx,
-                            event,
-                            &format!(
-                                "{} requested block (ignored for render): {}",
-                                spec.display_name(),
-                                trim_one_line(&stderr)
-                            ),
-                        )
-                        .await;
-                    }
-                },
+                HookOutcome::Blocked { stderr } => {
+                    emit_warning(
+                        tx,
+                        event,
+                        &format!(
+                            "{} requested block (ignored for render): {}",
+                            spec.display_name(),
+                            trim_one_line(&stderr)
+                        ),
+                    )
+                    .await;
+                }
                 HookOutcome::SoftFailed { reason } => {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
-                    // Spec: "Soft failure mid-chain returns last good
-                    // value, emits Warning." Stop the chain so we don't
-                    // pile up duplicate warnings if a misconfigured hook
-                    // fails for every entry.
                     break;
                 }
             }
         }
         current
     }
+}
+
+/// Outcome of running the `UserPromptSubmit` chain. Drives the caller's
+/// decision in `Session::prompt` — `Continue` proceeds to history.push
+/// and the model call; `Blocked` short-circuits the turn entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptHookResult {
+    /// All hooks passed/rewrote, or the chain soft-failed; carry on with
+    /// the (possibly-rewritten) prompt.
+    Continue(String),
+    /// A hook explicitly blocked (`exit 2` or `continue: false`). The
+    /// warning has already been emitted to the event channel. The caller
+    /// MUST NOT push the prompt to history or call the agent.
+    Blocked { stderr: String },
 }
 
 async fn emit_warning(tx: &EventSender, event: HookEvent, message: &str) {
@@ -255,7 +312,7 @@ mod tests {
         let reg = HookRegistry::empty();
         let (tx, mut rx) = mpsc::channel(8);
         let out = reg.run_user_prompt_submit("hello", ctx(), &tx).await;
-        assert_eq!(out, "hello");
+        assert_eq!(out, PromptHookResult::Continue("hello".to_string()));
         drop(tx);
         assert!(rx.recv().await.is_none());
     }
@@ -298,7 +355,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         let reg = HookRegistry::from_config(cfg);
         let (tx, _rx) = mpsc::channel(8);
         let out = reg.run_user_prompt_submit("A", ctx(), &tx).await;
-        assert_eq!(out, "STEP1!");
+        assert_eq!(out, PromptHookResult::Continue("STEP1!".to_string()));
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -337,12 +394,54 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         let (tx, mut rx) = mpsc::channel(8);
         let out = reg.run_user_prompt_submit("A", ctx(), &tx).await;
         // Last good value is preserved.
-        assert_eq!(out, "GOOD");
+        assert_eq!(out, PromptHookResult::Continue("GOOD".to_string()));
         drop(tx);
         // Exactly one warning emitted.
         let mut warnings = 0;
         while let Some(ev) = rx.recv().await {
             if matches!(ev, AgentEvent::Warning { .. }) {
+                warnings += 1;
+            }
+        }
+        assert_eq!(warnings, 1);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_block_returns_blocked_and_warns() {
+        // Spec: exit 2 from a UserPromptSubmit hook MUST short-circuit the
+        // turn. Previously this path returned the last good string and the
+        // caller pushed it to history anyway — defeating the only event
+        // where blocking is meaningful.
+        let tmp = crate::util::unique_temp_dir("ignis-hooks-prompt-block");
+        let blocker = write_script(
+            &tmp,
+            "blk.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf 'leaks secret' >&2\nexit 2\n",
+        );
+        let cfg = HooksConfig {
+            user_prompt_submit: vec![HookSpec {
+                program: blocker,
+                args: vec![],
+                timeout_ms: 5_000,
+            }],
+            assistant_message_render: vec![],
+        };
+        let reg = HookRegistry::from_config(cfg);
+        let (tx, mut rx) = mpsc::channel(8);
+        let out = reg.run_user_prompt_submit("original", ctx(), &tx).await;
+        match out {
+            PromptHookResult::Blocked { stderr } => {
+                assert!(stderr.contains("leaks secret"));
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        drop(tx);
+        let mut warnings = 0;
+        while let Some(ev) = rx.recv().await {
+            if let AgentEvent::Warning { source, message } = ev {
+                assert_eq!(source, "UserPromptSubmit");
+                assert!(message.contains("blocked"));
                 warnings += 1;
             }
         }
