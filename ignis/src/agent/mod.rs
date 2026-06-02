@@ -813,9 +813,14 @@ impl Agent {
                     .await;
             }
 
-            // Record final LLM-request span attrs + duration metric. Span drops
-            // at the end of this loop iteration; record before drop.
-            llm_span.record("success", true);
+            // Record final LLM-request span attrs + duration metric. A
+            // mid-stream error that survived all retries means the turn
+            // produced partial-or-no content under an unhealthy stream —
+            // count that as a failed request, mirroring the pre-stream
+            // failure path's `success=false` book-keeping. Span drops at
+            // the end of this loop iteration; record before drop.
+            let success = stream_error.is_none();
+            llm_span.record("success", success);
             llm_span.record("input_tokens", turn_usage.input_tokens);
             llm_span.record("output_tokens", turn_usage.output_tokens);
             llm_span.record("reasoning_tokens", turn_usage.reasoning_tokens);
@@ -823,7 +828,7 @@ impl Agent {
                 self.provider.provider_name(),
                 self.provider.model_id(),
                 llm_start.elapsed(),
-                true,
+                success,
             );
 
             // Report this turn's real token usage (if the provider supplied it).
