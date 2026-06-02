@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-06-03
+
 ### Fixed
 - Tool-block headers and permission prompts on Anthropic-compatible streams (Anthropic, MiniMax `/anthropic`) showed the tool name duplicated — `bashbashbash("…")` — because the SSE parser re-sent `name` on every `input_json_delta` chunk; now emitted only on `content_block_start`. ([#104](https://github.com/Fullstop000/ignis/pull/104))
 
