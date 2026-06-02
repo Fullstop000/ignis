@@ -1,35 +1,46 @@
 //! Generic process-confinement primitive shared by every ignis caller
 //! that spawns an untrusted subprocess (hooks today, bash-tool next).
 //!
-//! This module owns the **mechanism**: a Linux Landlock ruleset applied
-//! inside a `Command::pre_exec` closure between fork and execve. It is
-//! deliberately **policy-free** — the caller passes pre-built `reads`
-//! and `writes` slices and chooses what to allow. Hook-specific paths
-//! (its own folder, TLS roots, scratch dirs) live in
+//! This module owns the **mechanism**: a per-platform process-confinement
+//! API applied inside a `Command::pre_exec` closure between fork and
+//! execve. It is deliberately **policy-free** — the caller passes
+//! pre-built `reads` and `writes` slices and chooses what to allow.
+//! Hook-specific paths (its own folder, TLS roots, scratch dirs) live in
 //! [`crate::hooks::sandbox`]; future bash-tool paths (cwd, system
 //! binaries, project root with `$HOME` excluded) will live alongside
 //! the bash tool.
 //!
+//! ## Platforms
+//!
+//! * **Linux** uses Landlock (ABI V1) via the `landlock` crate. See
+//!   [`linux`].
+//! * **macOS** uses Apple's `sandbox_init(3)` ("Seatbelt") with a
+//!   Scheme-syntax profile built in the parent. See [`macos`]. The
+//!   `sandbox_init` ABI is a private Apple API but has been stable
+//!   since macOS 10.5 (2007) and is the same primitive Chromium and
+//!   Firefox use for renderer confinement.
+//! * **Other Unix / Windows** return [`SandboxStatus::PlatformUnsupported`]
+//!   and the dispatcher emits a one-time degradation warning.
+//!
 //! ## Async-signal-safety
 //!
-//! [`apply_with_paths`] is intended to run inside a `pre_exec` closure
-//! in the forked child, between `fork(2)` and `execve(2)`. It does
-//! **not** allocate from the child's heap — path lists arrive as
-//! borrowed slices (parent-built) and error paths use
-//! `io::Error::from_raw_os_error` instead of the boxing
-//! `io::Error::other`. The landlock crate's syscall surface
-//! (`Ruleset::default` → `create` → `add_rule` → `restrict_self`)
-//! itself only does direct syscalls with stack-only `BitFlags`.
+//! The two-step `SandboxPolicy::new` → `SandboxPolicy::apply` split
+//! exists so the *child-side* `apply` call is allocation-free:
 //!
-//! ## Non-Linux
-//!
-//! Stub returning [`SandboxStatus::PlatformUnsupported`]. Callers
-//! proceed unconfined; the dispatcher emits a one-time degradation
-//! warning so the user knows.
+//! * `SandboxPolicy::new` runs in the **parent**, where allocation is
+//!   safe. On Linux it clones the path lists; on macOS it serialises
+//!   the Seatbelt profile into a `CString`.
+//! * `SandboxPolicy::apply` runs inside a `pre_exec` closure in the
+//!   forked child, between `fork(2)` and `execve(2)`. In that window
+//!   heap allocation is **unsafe** — the allocator's mutex may be held
+//!   by a thread that no longer exists in the child. `apply` therefore
+//!   only does syscalls plus stack-resident pointer manipulation, and
+//!   error paths use `io::Error::from_raw_os_error` (no boxing) instead
+//!   of the boxing `io::Error::other`.
 
 use std::path::PathBuf;
 
-/// Outcome of attempting to install the Landlock ruleset for one call.
+/// Outcome of attempting to install the platform sandbox for one call.
 /// Threaded into the caller's `tracing` span via
 /// `record("sandbox.status", …)` for telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,12 +49,14 @@ pub enum SandboxStatus {
     FullyEnforced,
     /// Kernel accepted the ruleset but downgraded some access modes
     /// (older Landlock ABI). Confinement is real but narrower than
-    /// what we requested.
+    /// what we requested. macOS's `sandbox_init` has no partial-
+    /// enforcement concept and never reports this variant.
     PartiallyEnforced,
-    /// Kernel doesn't support Landlock (or `landlock_create_ruleset`
-    /// returned `ENOSYS`). The process runs **unconfined** on Linux.
+    /// Kernel doesn't support the sandbox primitive (e.g. Landlock
+    /// `ENOSYS` on older Linux). The process runs **unconfined**.
     NotEnforced,
-    /// Non-Linux build — sandboxing is not implemented.
+    /// Build target has no sandbox implementation (currently anything
+    /// other than Linux or macOS).
     PlatformUnsupported,
     /// Caller explicitly opted out of sandboxing. Distinct from
     /// `PlatformUnsupported` so telemetry can separate "user choice"
@@ -130,27 +143,94 @@ mod linux {
     }
 }
 
-/// Apply a Landlock ruleset with the given pre-built path slices. The
-/// parent constructs the `reads` / `writes` `Vec<PathBuf>` and `move`s
-/// them into the `pre_exec` closure; this function takes references
-/// only and performs syscalls — it does not allocate from the child's
-/// heap.
+#[cfg(target_os = "macos")]
+mod macos;
+
+/// A parent-built, child-applied sandbox policy.
 ///
-/// On non-Linux this is a no-op that returns
-/// [`SandboxStatus::PlatformUnsupported`].
+/// Construction (`new`) runs in the parent and is allowed to allocate.
+/// Application (`apply`) runs in the forked child between `fork` and
+/// `execve` and is allocation-free — it only does syscalls and stack-
+/// resident pointer work.
 ///
-/// This is the *async-signal-safe* entry point — use it from a
-/// `Command::pre_exec` closure on Unix.
-pub fn apply_with_paths(reads: &[PathBuf], writes: &[PathBuf]) -> std::io::Result<SandboxStatus> {
+/// Internally the representation is per-target:
+///
+/// * **Linux** stores the parent-owned `Vec<PathBuf>` lists; `apply`
+///   borrows slices and walks them with Landlock.
+/// * **macOS** stores a single parent-built Seatbelt `CString`; `apply`
+///   borrows it as `&CStr` and hands the pointer to `sandbox_init`.
+/// * Other targets store a unit `_phantom` and `apply` reports
+///   `PlatformUnsupported`.
+pub struct SandboxPolicy {
     #[cfg(target_os = "linux")]
-    {
-        linux::apply_with_paths(reads, writes)
+    reads: Vec<PathBuf>,
+    #[cfg(target_os = "linux")]
+    writes: Vec<PathBuf>,
+    #[cfg(target_os = "macos")]
+    profile: std::ffi::CString,
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    _phantom: (),
+}
+
+impl SandboxPolicy {
+    /// Build a policy from path lists. Runs in the **parent**; allowed
+    /// to allocate. On macOS this is where the Seatbelt profile string
+    /// is serialised into a `CString`, so by the time we reach the
+    /// child only a pointer needs to be handed to `sandbox_init`.
+    pub fn new(reads: &[PathBuf], writes: &[PathBuf]) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                reads: reads.to_vec(),
+                writes: writes.to_vec(),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                profile: macos::build_profile(reads, writes),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (reads, writes);
+            Self { _phantom: () }
+        }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (reads, writes);
-        Ok(SandboxStatus::PlatformUnsupported)
+
+    /// Apply the policy to the current process. Intended to run in a
+    /// `Command::pre_exec` closure in the forked child.
+    ///
+    /// **Async-signal-safety:** this call performs syscalls (and on
+    /// macOS, one call into Apple's `sandbox_init`) and pointer
+    /// dereferences only. No heap allocation in the success path; the
+    /// error path uses `io::Error::from_raw_os_error` rather than the
+    /// boxing `io::Error::other`.
+    pub fn apply(&self) -> std::io::Result<SandboxStatus> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::apply_with_paths(&self.reads, &self.writes)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            macos::apply_profile(&self.profile)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Ok(SandboxStatus::PlatformUnsupported)
+        }
     }
+}
+
+/// Allocating convenience wrapper: build a [`SandboxPolicy`] from the
+/// given path slices and immediately apply it. Equivalent to
+/// `SandboxPolicy::new(reads, writes).apply()`.
+///
+/// **Not** for use inside a `pre_exec` closure — the construction step
+/// allocates. Build the `SandboxPolicy` in the parent and call
+/// [`SandboxPolicy::apply`] in the child.
+pub fn apply_with_paths(reads: &[PathBuf], writes: &[PathBuf]) -> std::io::Result<SandboxStatus> {
+    SandboxPolicy::new(reads, writes).apply()
 }
 
 #[cfg(test)]

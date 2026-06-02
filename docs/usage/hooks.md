@@ -15,17 +15,30 @@ render).
 >    whatever extra names the hook declares in `env: [...]`. Default
 >    `env: []`. A hook that doesn't declare `ANTHROPIC_API_KEY` does
 >    not see `ANTHROPIC_API_KEY`.
-> 2. **Linux Landlock filesystem sandbox.** Per hook `sandbox: bool`,
->    default `true`. The hook can **read** its own folder, `/etc/ssl/certs`,
+> 2. **Filesystem sandbox.** Per hook `sandbox: bool`, default `true`.
+>    The hook can **read** its own folder, `/etc/ssl/certs`,
 >    `/usr/lib`, `/lib`, `/lib64`, `/bin`, `/usr/bin`, `/sbin`,
 >    `/usr/sbin`, `/etc/resolv.conf`, `$TMPDIR`, `/dev/urandom`; it can
 >    **write** `$TMPDIR` and `/dev/null`. Net access is unrestricted —
 >    that's fine because the env-var allowlist already stops it learning
->    a credential it could exfil. On non-Linux platforms the flag is a
->    no-op and a one-time `[warn] hook.sandbox: <hook>: Landlock
->    unavailable on this kernel; hook runs unconfined` notice fires per
->    session. Set `sandbox: false` if your hook genuinely needs broader
->    access (e.g. a project-indexer that reads the whole tree).
+>    a credential it could exfil. Set `sandbox: false` if your hook
+>    genuinely needs broader access (e.g. a project-indexer that reads
+>    the whole tree).
+>
+>    The mechanism is per-platform:
+>    * **Linux** uses Landlock (ABI V1, Linux 5.13+). On older kernels
+>      a one-time `[warn] hook.sandbox: <hook>: Landlock unavailable
+>      on this kernel; hook runs unconfined` notice fires per session.
+>    * **macOS** uses Apple's `sandbox_init(3)` ("Seatbelt") with a
+>      Scheme-syntax profile translated from the same default path
+>      list. `sandbox_init` is technically a private Apple API but has
+>      been ABI-stable since macOS 10.5 (2007) and is the same primitive
+>      Chromium and Firefox use for renderer confinement. The
+>      `/tmp → /private/tmp` and `/var → /private/var` symlink
+>      rewrites are emitted automatically so a hook that opens
+>      `/tmp/foo` is matched against the canonical `/private/tmp/foo`.
+>    * **Other platforms** (Windows, other BSDs) the flag is a no-op and
+>      the unconfined-warning fires.
 > 3. **SIGTERM → 1 s grace → SIGKILL on timeout.** A misbehaving hook
 >    gets one second of "please clean up" before it's force-killed.
 > 4. **1 MiB cap per stdout / stderr stream.** Bytes beyond the cap are
@@ -149,10 +162,11 @@ given one second to exit cleanly, and then `SIGKILL`'d. Outcome is
   allowlist (`PATH HOME USER LANG LC_ALL TZ`) is always passed in
   addition. A name listed but unset in ignis's env is silently
   skipped.
-- `sandbox` toggles the Linux Landlock filesystem confinement.
-  Defaults to `true`. Set `false` for hooks that legitimately need
-  broader filesystem access. On non-Linux platforms the flag has no
-  effect — the one-time `[warn] hook.sandbox` notice is your hint.
+- `sandbox` toggles the filesystem confinement (Linux Landlock or
+  macOS Seatbelt). Defaults to `true`. Set `false` for hooks that
+  legitimately need broader filesystem access. On platforms with no
+  sandbox implementation the flag has no effect — the one-time
+  `[warn] hook.sandbox` notice is your hint.
 - Each event takes a JSON array — multiple hooks chain left-to-right,
   each receiving the previous hook's output.
 - The file is loaded at session start. An absent file means no hooks

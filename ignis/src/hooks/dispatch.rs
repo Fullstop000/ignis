@@ -208,19 +208,22 @@ pub async fn run_hook(
         // (gated on cfg(unix)), not the std `CommandExt` trait — no import
         // needed here.
         if want_sandbox {
-            // Pre-build the path lists in the PARENT so the `pre_exec`
-            // closure (which runs in the forked child between fork and
-            // execve) does not allocate. Heap allocation in that window is
-            // unsafe — the allocator's mutex may be held by a thread that no
-            // longer exists in the child.
-            let sandbox_reads = hook_sandbox::default_read_paths(hook_folder.as_deref());
-            let sandbox_writes = hook_sandbox::default_write_paths();
+            // Build the policy in the PARENT (allocations live here).
+            // The closure below is the child seam between fork and
+            // execve — heap allocation there is unsafe because the
+            // allocator's mutex may be held by a thread that no
+            // longer exists in the child. `SandboxPolicy::apply` is
+            // designed to be allocation-free (Linux: walks borrowed
+            // path slices; macOS: hands a pointer to `sandbox_init`).
+            let policy = sandbox::SandboxPolicy::new(
+                &hook_sandbox::default_read_paths(hook_folder.as_deref()),
+                &hook_sandbox::default_write_paths(),
+            );
             // SAFETY: the closure runs in the forked child before execve. It
             // must be async-signal-safe — no allocation that can panic, no
-            // global locks, no tracing. `sandbox::apply_with_paths`
-            // takes refs to the parent-built lists and performs syscalls
-            // only (no allocation), and uses `io::Error::from_raw_os_error`
-            // (no boxing) on the error path.
+            // global locks, no tracing. `policy.apply()` only performs
+            // syscalls / Apple's `sandbox_init` call and uses
+            // `io::Error::from_raw_os_error` (no boxing) on the error path.
             unsafe {
                 cmd.pre_exec(move || {
                     // Map our SandboxStatus into io::Result success/failure
@@ -230,10 +233,7 @@ pub async fn run_hook(
                     // handles the user-visible degradation notice. Hard
                     // errors (e.g. EPERM mid-rule) DO fail the exec so the
                     // hook is not silently unconfined when it shouldn't be.
-                    match sandbox::apply_with_paths(&sandbox_reads, &sandbox_writes) {
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(e),
-                    }
+                    policy.apply().map(|_| ())
                 });
             }
         }
@@ -486,7 +486,17 @@ fn sandbox_status_for_telemetry(spec: &HookSpec) -> SandboxStatus {
         static CACHED: OnceLock<SandboxStatus> = OnceLock::new();
         *CACHED.get_or_init(probe_landlock_kernel)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // `sandbox_init` has shipped on every macOS since 10.5 (2007).
+        // We don't probe it (a probe call would actually confine this
+        // process); we just trust the ABI and report `FullyEnforced`
+        // when the user opted in. The actual install happens in the
+        // child's `pre_exec` — if it fails the child fails to exec
+        // and the dispatcher surfaces a `SoftFailed` outcome.
+        SandboxStatus::FullyEnforced
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         SandboxStatus::PlatformUnsupported
     }
