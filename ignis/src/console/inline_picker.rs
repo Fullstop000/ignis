@@ -728,11 +728,13 @@ fn recommended_badge() -> Vec<Span<'static>> {
     ]
 }
 
-/// Height (rows) the picker wants for its current state, ignoring any cap.
-/// Phase C uses this to decide when windowing kicks in (`picker_height >
-/// available_rows` → window the option list).
-#[allow(dead_code)]
-pub(crate) fn picker_height(state: &InlinePickerState) -> u16 {
+/// Height (rows) the picker wants at the given render width, ignoring any
+/// cap. Used by the renderer to anchor the picker to the bottom of the body
+/// area: the picker reserves only as many rows as it actually needs, leaving
+/// the transcript visible above. `width` is the viewport width — needed so
+/// option descriptions that wrap onto multiple display rows are budgeted
+/// correctly. Passing the body width prevents the footer hint from clipping.
+pub(crate) fn picker_height(state: &InlinePickerState, width: u16) -> u16 {
     let q = state.current_question();
     let header_rows: u16 = 4; // divider + blank + header + question
     let footer_rows: u16 = 2; // blank + footer
@@ -740,36 +742,33 @@ pub(crate) fn picker_height(state: &InlinePickerState) -> u16 {
         // Header + one input row + footer. No options, no separator.
         return header_rows + 1 + footer_rows;
     }
+    let wrap_at = |cols: u16, s: &str| -> u16 {
+        let cols = cols.max(1) as usize;
+        s.lines()
+            .map(|line| {
+                let n = line.chars().count();
+                1u16.max(n.div_ceil(cols) as u16)
+            })
+            .sum()
+    };
     if state.has_any_preview() {
         // Split layout: max(left pane, right pane + border) + header + footer.
         // Left pane = N options (1 row each) + separator + Other = N + 2.
         let left = q.options.len() as u16 + 2;
-        // Right pane is ~55% of the inline viewport width, minus the border
-        // padding. At a conservative 80-col terminal that's ≈40 usable cols,
-        // so any long description / preview line wraps to extra rows. Estimate
-        // wrap rows per line at the narrow-terminal bound (40 cols) so the
-        // live band stays generous enough to render without clipping.
-        const PANE_USABLE_COLS: usize = 40;
-        let wrapped = |s: &str| -> u16 {
-            s.lines()
-                .map(|line| {
-                    let cols = line.chars().count();
-                    1u16.max((cols as u16).div_ceil(PANE_USABLE_COLS as u16))
-                })
-                .sum()
-        };
+        // Right pane is ~55% of the viewport width, minus the border padding.
+        // Use the actual width so this scales with the terminal instead of
+        // baking in a 40-col assumption that under-budgets wide terminals.
+        let right_cols = ((width as u32) * 55 / 100).saturating_sub(2).max(20) as u16;
         let max_right_body = q
             .options
             .iter()
             .map(|o| {
-                // 1 title row (may wrap), optional desc (may wrap),
-                // optional preview block (blank + lines, each may wrap).
-                let mut rows: u16 = wrapped(&o.label);
+                let mut rows: u16 = wrap_at(right_cols, &o.label);
                 if !o.description.is_empty() {
-                    rows += wrapped(&o.description);
+                    rows += wrap_at(right_cols, &o.description);
                 }
                 if let Some(p) = &o.preview {
-                    rows += 1 /*blank*/ + wrapped(p);
+                    rows += 1 /*blank*/ + wrap_at(right_cols, p);
                 }
                 rows
             })
@@ -778,15 +777,32 @@ pub(crate) fn picker_height(state: &InlinePickerState) -> u16 {
         let right = max_right_body + 2 /*border*/;
         header_rows + left.max(right) + footer_rows
     } else {
-        // Single-column layout: options (2 rows each if desc, 1 if not) +
-        // separator + Other.
+        // Single-column layout. Titles render on one line each. Descriptions
+        // are indented under the number ("  N. ") so their effective wrap
+        // width is `width - desc_indent` — using the full width here used to
+        // undercount by 1 row whenever the description sat near the right
+        // margin and pushed the footer hint off-screen.
+        let opts_n = q.options.len();
+        let max_number_width = (opts_n + 1).to_string().len() as u16;
+        let desc_indent = 2 /*cursor col*/ + max_number_width + 2 /*". "*/;
+        let desc_width = width.saturating_sub(desc_indent).max(1);
         let option_rows: u16 = q
             .options
             .iter()
-            .map(|o| if o.description.is_empty() { 1 } else { 2 })
-            .sum::<usize>() as u16;
-        let separator: u16 = 1;
-        let other_row: u16 = 1;
+            .map(|o| {
+                let title = 1u16;
+                let desc = if o.description.is_empty() {
+                    0
+                } else {
+                    wrap_at(desc_width, &o.description)
+                };
+                title + desc
+            })
+            .sum();
+        // Separator + Other row only render when the picker opts in (permission
+        // and AFK skip both — closed-by-design option sets).
+        let separator: u16 = if q.allow_other { 1 } else { 0 };
+        let other_row: u16 = if q.allow_other { 1 } else { 0 };
         header_rows + option_rows + separator + other_row + footer_rows
     }
 }
@@ -1113,7 +1129,7 @@ mod tests {
     fn text_input_height_is_smaller_than_options_picker() {
         let (s_text, _rx) = make_request(vec![text_input_q("API key", "API Key", true)]);
         let (s_opts, _rx2) = make_request(vec![q("Pick", "h", false, &["a", "b", "c"])]);
-        assert!(picker_height(&s_text) < picker_height(&s_opts));
+        assert!(picker_height(&s_text, 80) < picker_height(&s_opts, 80));
     }
 
     #[test]
