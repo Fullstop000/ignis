@@ -28,8 +28,9 @@ use tokio::process::Command;
 
 use super::config::HookSpec;
 use super::protocol::{HookEvent, HookOutput};
-use super::sandbox::{self, SandboxStatus};
+use super::sandbox as hook_sandbox;
 use super::EventSender;
+use crate::sandbox::{self, SandboxStatus};
 use crate::AgentEvent;
 
 /// Universal env-var allowlist. Every hook always sees these names from
@@ -212,8 +213,8 @@ pub async fn run_hook(
             // execve) does not allocate. Heap allocation in that window is
             // unsafe — the allocator's mutex may be held by a thread that no
             // longer exists in the child.
-            let sandbox_reads = sandbox::default_read_paths(hook_folder.as_deref());
-            let sandbox_writes = sandbox::default_write_paths();
+            let sandbox_reads = hook_sandbox::default_read_paths(hook_folder.as_deref());
+            let sandbox_writes = hook_sandbox::default_write_paths();
             // SAFETY: the closure runs in the forked child before execve. It
             // must be async-signal-safe — no allocation that can panic, no
             // global locks, no tracing. `sandbox::apply_with_paths`
