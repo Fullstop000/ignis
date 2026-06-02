@@ -11,7 +11,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::console::app::{App, Mode};
+use crate::console::app::App;
 use crate::console::{BG, BORDER, TEXT_DIM};
 
 pub(crate) mod blocks;
@@ -36,7 +36,7 @@ pub(crate) fn band_height(app: &App, term_rows: u16) -> u16 {
     let cap = term_rows.saturating_sub(1).max(3);
     let input_h = input_height(app, cap);
     let sugg = app.slash_suggestions();
-    let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
+    let sugg_h = if !sugg.is_empty() {
         (sugg.len() as u16).min(MAX_SLASH_ROWS)
     } else {
         0
@@ -133,7 +133,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // the legacy inline band — status, queued, slash, input, footer.
     let input_h = input_height(app, band_area.height);
     let sugg = app.slash_suggestions();
-    let sugg_h = if app.mode == Mode::Idle && !sugg.is_empty() {
+    let sugg_h = if !sugg.is_empty() {
         band_area
             .height
             .saturating_sub(input_h + 2)
@@ -466,7 +466,7 @@ mod queue_render_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::app::{SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
+    use crate::console::app::{Mode, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
     use crate::console::render::tool_block::compact_tool_args;
     use crate::console::{format_context, DIFF_ADD_BG, DIFF_DEL_BG};
     use ratatui::{backend::TestBackend, Terminal};
