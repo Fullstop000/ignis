@@ -199,7 +199,7 @@ static SPECS: &[ProviderSpec] = &[
         models: &[
             ModelSpec {
                 name: "MiniMax-M3",
-                context: None,
+                context: Some(1_000_000),
                 reasoning_effort: &[],
             },
             ModelSpec {
