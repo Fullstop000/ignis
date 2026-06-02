@@ -10,9 +10,16 @@
 //!
 //! Reads: the hook's own folder (so `import` / `require` of sibling
 //! files works), the system library paths (`/usr/lib`, `/lib`,
-//! `/lib64`), TLS roots (`/etc/ssl/certs`), DNS config
-//! (`/etc/resolv.conf`), `$TMPDIR` (typically `/tmp`), and
-//! `/dev/urandom` (for RNG). Writes: `$TMPDIR` only.
+//! `/lib64`), the standard binary paths (`/bin`, `/usr/bin`, `/sbin`,
+//! `/usr/sbin`), TLS roots (`/etc/ssl/certs`), DNS config
+//! (`/etc/resolv.conf`), `/dev/urandom` + `/dev/zero` (for RNG and
+//! shell-script zero-fills), and the kernel-managed scratch
+//! directories `/tmp` + `/var/tmp`. Writes: `/tmp`, `/var/tmp`,
+//! `/dev/null`.
+//!
+//! `$TMPDIR` is **not** trusted from the environment: a user launching
+//! ignis with `TMPDIR=$HOME` would otherwise expose the entire home
+//! directory to every sandboxed hook. See the `TMPDIRS` constant below.
 //!
 //! Net access is **not** restricted — Landlock is a filesystem LSM.
 //! That's fine for v2: env-var allowlisting already prevents the hook
