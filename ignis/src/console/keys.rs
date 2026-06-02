@@ -248,10 +248,17 @@ pub(crate) async fn handle_key(
         return;
     }
 
-    // While busy: type to queue / steer. No pickers, no slash menu.
+    // While busy: type to queue / steer. Slash autocomplete IS shown (queued
+    // slash commands now run on drain), but other pickers stay closed.
     if app.mode != Mode::Idle {
         match (key.modifiers, key.code) {
             (_, KeyCode::Enter) => {
+                // Enter on a highlighted slash suggestion commits the suggestion
+                // into the input first, so the queued line is the full command
+                // (e.g. "/com" + Enter → "/compact" queued).
+                if let Some(cmd) = app.selected_slash_command() {
+                    app.input = cmd;
+                }
                 let text = app.input.trim().to_string();
                 if !text.is_empty() {
                     app.enqueue(text);
@@ -259,6 +266,12 @@ pub(crate) async fn handle_key(
                     app.cursor = 0;
                     app.reset_slash_selection();
                 }
+            }
+            (_, KeyCode::Up) if !app.slash_suggestions().is_empty() => {
+                app.select_slash_suggestion(SelectionDirection::Previous);
+            }
+            (_, KeyCode::Down) if !app.slash_suggestions().is_empty() => {
+                app.select_slash_suggestion(SelectionDirection::Next);
             }
             (_, KeyCode::Up) if app.input.is_empty() && !app.queue.is_empty() => {
                 app.recall_last_queued();
