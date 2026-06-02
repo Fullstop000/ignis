@@ -28,6 +28,12 @@ const NO_PROVIDER_HINT: &str = "Run /connect first.";
 /// `/connect` itself is NOT here — it's the way out of no-provider mode.
 const PROVIDER_REQUIRED_BUILTINS: &[&str] = &["/compact", "/copy", "/model"];
 
+/// Provider-independent built-ins that bypass the no-provider gate. These were
+/// dispatched *before* the gate in the original ladder, so they must run even
+/// when a same-named skill is registered — `/connect` above all, since it is
+/// the only way out of no-provider mode.
+const PROVIDER_GATE_EXEMPT: &[&str] = &["/sessions", "/clear", "/connect"];
+
 /// `true` iff submitting `command` in no-provider mode should be blocked
 /// with [`NO_PROVIDER_HINT`]. Covers: plain prompts to the agent (no slash),
 /// the built-in LLM commands above, and any `/skill-name` registered in the
@@ -585,9 +591,12 @@ pub(crate) async fn submit_text(
 
     // No-provider gate: block anything that would talk to the LLM (plain
     // prompts, the built-in LLM commands, skill commands) until /connect runs.
-    // Provider-independent commands (/sessions, /clear, /connect, /skills, …)
-    // are not flagged by `requires_provider`, so they fall through to dispatch.
-    if app.provider.is_empty() && requires_provider(app, command) {
+    // PROVIDER_GATE_EXEMPT commands bypass it even when a same-named skill is
+    // registered (they were dispatched before this gate in the original ladder).
+    if app.provider.is_empty()
+        && !PROVIDER_GATE_EXEMPT.contains(&command)
+        && requires_provider(app, command)
+    {
         app.add_assistant_notice(NO_PROVIDER_HINT.to_string());
         return;
     }
@@ -1095,5 +1104,47 @@ mod tests {
             last_notice(&app).as_deref(),
             Some("Unknown command `/nope`.")
         );
+    }
+
+    #[tokio::test]
+    async fn connect_bypasses_no_provider_gate_even_when_a_connect_skill_exists() {
+        // Regression: the hoisted gate must not block /connect when the user
+        // has a skill literally named `connect` (skill names don't reserve it).
+        // /connect is the only way out of no-provider mode — gating it would
+        // lock the user out of ever configuring a provider from the TUI.
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        let tmp = crate::util::unique_temp_dir("ignis-keys-connect-skill");
+        let dir = tmp.join(".ignis/skills/connect");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: connect\n---\nbody").unwrap();
+        let reg = crate::skills::SkillRegistry::load(None, &tmp, HashSet::new());
+        assert!(
+            reg.all().iter().any(|s| s.name == "connect"),
+            "fixture must register a `connect` skill"
+        );
+
+        let mut app = test_app();
+        app.provider = String::new();
+        app.skills = Some(Arc::new(reg));
+        let (p_tx, _p_rx, pk_tx, mut pk_rx, n_tx, _n_rx) = channels();
+
+        submit_text(
+            &mut app,
+            "/connect".to_string(),
+            &p_tx,
+            &pk_tx,
+            &n_tx,
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+
+        assert!(
+            pk_rx.try_recv().is_ok(),
+            "/connect must start the connect flow, not be blocked by the gate"
+        );
+        assert_ne!(last_notice(&app).as_deref(), Some(NO_PROVIDER_HINT));
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

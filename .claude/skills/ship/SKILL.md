@@ -1,6 +1,6 @@
 ---
 name: ship
-description: Ship ignis — land a PR on master, optionally bump+tag for cross-platform release. Triggers: "ship", "release", "cut a release", "deploy ignis".
+description: "Ship ignis — land a PR on master, optionally bump+tag for cross-platform release. Triggers: ship, release, cut a release, deploy ignis."
 ---
 
 # Ship (ignis)
