@@ -228,7 +228,8 @@ def walk_trials(job_dir: Path) -> list[Trial]:
             _read_log_tail(agent_log_path) if agent_log_path.exists() else ("", 0)
         )
         # Scan the FULL file, not the embedded tail — a rate-limit marker early
-        # in a huge log must still flip the trial to the `quota` bucket.
+        # in a huge log must still flip the trial to the `errored` bucket with
+        # `RateLimited` in the Exception column.
         rate_limited = _file_contains(agent_log_path, "rate_limit_reached_error")
         # Same WHOLE-file scan for the stream-drop markers — the connection
         # may have died and recovered earlier in the turn, leaving the
