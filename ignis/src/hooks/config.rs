@@ -22,7 +22,13 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 /// care about a subset of fields can use `..HookSpec::default()` without
 /// re-listing every knob. The default program is the empty path — useless
 /// in production, fine for tests that always set it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// IMPORTANT: `sandbox` defaults to `true` so tests written with
+/// `..HookSpec::default()` exercise the sandboxed code path; an
+/// accidentally-derived default would leave production hooks unconfined.
+/// Tests that need to spawn outside the sandbox must opt out explicitly
+/// (`sandbox: false`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookSpec {
     /// Executable path (post-`~` expansion).
     pub program: PathBuf,
@@ -39,6 +45,19 @@ pub struct HookSpec {
     /// that legitimately needs broad read access). On non-Linux platforms
     /// the flag has no effect — see `super::sandbox`.
     pub sandbox: bool,
+}
+
+impl Default for HookSpec {
+    fn default() -> Self {
+        Self {
+            program: PathBuf::new(),
+            args: Vec::new(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            env: Vec::new(),
+            // Secure-by-default — see the type-level doc-comment.
+            sandbox: true,
+        }
+    }
 }
 
 impl HookSpec {

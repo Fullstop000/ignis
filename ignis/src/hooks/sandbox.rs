@@ -71,9 +71,8 @@ impl SandboxStatus {
 /// `/usr/sbin`) so a `#!/bin/sh` hook can actually exec `sh`. Skipping
 /// these caused every shell-based hook to fail silently with Landlock
 /// engaged — discovered during integration testing.
-pub fn default_read_paths(hook_folder: &Path) -> Vec<PathBuf> {
+pub fn default_read_paths(hook_folder: Option<&Path>) -> Vec<PathBuf> {
     let mut v = vec![
-        hook_folder.to_path_buf(),
         PathBuf::from("/etc/ssl/certs"),
         PathBuf::from("/usr/lib"),
         PathBuf::from("/lib"),
@@ -84,8 +83,18 @@ pub fn default_read_paths(hook_folder: &Path) -> Vec<PathBuf> {
         PathBuf::from("/usr/sbin"),
         PathBuf::from("/etc/resolv.conf"),
         PathBuf::from("/dev/urandom"),
+        PathBuf::from("/dev/zero"),
     ];
-    v.push(tmpdir());
+    v.extend(tmpdirs());
+    // Only add the hook's folder when we know it. Bare programs like
+    // `python3 hook.py` (no parent) used to fall back to `/`, which
+    // silently disabled read confinement — those hooks now confine to
+    // the universal paths above and will fail to find their script
+    // unless it sits in /tmp or /var/tmp. The right user-error to
+    // surface.
+    if let Some(folder) = hook_folder {
+        v.push(folder.to_path_buf());
+    }
     v
 }
 
@@ -96,19 +105,30 @@ pub fn default_read_paths(hook_folder: &Path) -> Vec<PathBuf> {
 /// common denominator hook (a shell script) for negligible security gain.
 /// `/dev/null` is a write-only sink with no observable state.
 pub fn default_write_paths() -> Vec<PathBuf> {
-    vec![tmpdir(), PathBuf::from("/dev/null")]
+    let mut v: Vec<PathBuf> = tmpdirs().collect();
+    v.push(PathBuf::from("/dev/null"));
+    v
 }
 
-fn tmpdir() -> PathBuf {
-    std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+/// The hardcoded scratch directories the sandbox allows reads/writes on.
+///
+/// We deliberately do NOT trust `$TMPDIR`: if ignis is launched with
+/// `TMPDIR=/home/user`, every sandboxed hook would silently get
+/// read/write access to the entire home directory despite our env
+/// scrubbing. Both `/tmp` (tmpfs everywhere) and `/var/tmp` (per-boot
+/// persistent on Linux) are the conventional, kernel-managed scratch
+/// locations; hooks that need somewhere to put files write to one of
+/// these regardless of what `TMPDIR` says.
+const TMPDIRS: &[&str] = &["/tmp", "/var/tmp"];
+
+fn tmpdirs() -> impl Iterator<Item = PathBuf> {
+    TMPDIRS.iter().map(PathBuf::from)
 }
 
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io;
-    use std::path::Path;
+    use std::path::PathBuf;
 
     use landlock::{
         Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
@@ -123,10 +143,12 @@ mod linux {
     /// closure runs between fork and execve where Landlock's self-restrict
     /// semantics work without confining ignis itself.
     ///
-    /// Returns the ruleset status; the caller cannot easily plumb it back to
-    /// the parent from `pre_exec`, but the parent re-records the same value
-    /// in the `tracing` span via a separate (cheap) ABI probe.
-    pub fn apply(hook_folder: &Path) -> io::Result<SandboxStatus> {
+    /// **Async-signal-safety:** the read/write path slices are pre-built
+    /// by the *parent* (see `apply` wrapper below) and passed in by
+    /// reference, so this function does not allocate from the child's
+    /// heap. Error mapping uses `io::Error::from_raw_os_error` (no
+    /// allocation) rather than the boxing `io::Error::other`.
+    pub fn apply_with_paths(reads: &[PathBuf], writes: &[PathBuf]) -> io::Result<SandboxStatus> {
         // ABI V1 is the introductory Landlock ABI (Linux 5.13). All the
         // access modes we need (read_file, read_dir, write_file, etc.) are
         // present in V1, so pinning to V1 makes our confinement deterministic
@@ -138,28 +160,32 @@ mod linux {
 
         let ruleset_built = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))
-            .map_err(io::Error::other)?;
-        let mut created = ruleset_built.create().map_err(io::Error::other)?;
+            .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
+        let mut created = ruleset_built
+            .create()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
 
-        for p in super::default_read_paths(hook_folder) {
+        for p in reads {
             // Best-effort: a missing path (e.g. `/lib64` on Debian pure-
             // multiarch, or `/dev/urandom` in a stripped chroot) is not a
             // sandbox failure. Skip silently.
-            if let Ok(fd) = PathFd::new(&p) {
+            if let Ok(fd) = PathFd::new(p) {
                 created = created
                     .add_rule(PathBeneath::new(fd, AccessFs::from_read(abi)))
-                    .map_err(io::Error::other)?;
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
             }
         }
-        for p in super::default_write_paths() {
-            if let Ok(fd) = PathFd::new(&p) {
+        for p in writes {
+            if let Ok(fd) = PathFd::new(p) {
                 created = created
                     .add_rule(PathBeneath::new(fd, AccessFs::from_write(abi)))
-                    .map_err(io::Error::other)?;
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
             }
         }
 
-        let restricted = created.restrict_self().map_err(io::Error::other)?;
+        let restricted = created
+            .restrict_self()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
         Ok(match restricted.ruleset {
             RulesetStatus::FullyEnforced => SandboxStatus::FullyEnforced,
             RulesetStatus::PartiallyEnforced => SandboxStatus::PartiallyEnforced,
@@ -168,25 +194,36 @@ mod linux {
     }
 }
 
-/// Apply the default Landlock ruleset to the current process. On Linux this
-/// is the real call; on every other platform it's a no-op that returns
+/// Apply the default Landlock ruleset using **pre-built** path lists. The
+/// parent constructs the `reads` / `writes` `Vec<PathBuf>` and `move`s
+/// them into the `pre_exec` closure; this function only takes references
+/// and performs syscalls — it does not allocate from the child's heap.
+/// On non-Linux it is a no-op that returns
 /// [`SandboxStatus::PlatformUnsupported`].
 ///
-/// Intended call site: a `pre_exec` closure on a `Command`. The closure
-/// runs in the forked child, before `execve`, so this function MUST stay
-/// async-signal-safe — no allocation that can fail, no global locks, no
-/// `tracing` calls.
-pub fn apply(hook_folder: &Path) -> std::io::Result<SandboxStatus> {
+/// This is the *async-signal-safe* entry point. Use it from a
+/// `Command::pre_exec` closure on Unix. For tests and non-`pre_exec`
+/// callers, see [`apply`] which is a convenience wrapper that allocates
+/// the default lists itself.
+pub fn apply_with_paths(reads: &[PathBuf], writes: &[PathBuf]) -> std::io::Result<SandboxStatus> {
     #[cfg(target_os = "linux")]
     {
-        linux::apply(hook_folder)
+        linux::apply_with_paths(reads, writes)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // Reference the parameter so non-Linux builds don't warn.
-        let _ = hook_folder;
+        let _ = (reads, writes);
         Ok(SandboxStatus::PlatformUnsupported)
     }
+}
+
+/// Allocating convenience wrapper: build the default read/write paths
+/// from `hook_folder` and apply them. **Not** for use inside `pre_exec`
+/// — call [`apply_with_paths`] from there with parent-built slices.
+pub fn apply(hook_folder: Option<&Path>) -> std::io::Result<SandboxStatus> {
+    let reads = default_read_paths(hook_folder);
+    let writes = default_write_paths();
+    apply_with_paths(&reads, &writes)
 }
 
 #[cfg(test)]
@@ -199,7 +236,7 @@ mod tests {
         // `/etc/ssl/certs` the translator hook silently breaks. Better to
         // notice in CI.
         let hook = PathBuf::from("/home/me/.ignis/hooks/translate-en");
-        let paths = default_read_paths(&hook);
+        let paths = default_read_paths(Some(&hook));
         assert!(paths.contains(&hook));
         for required in [
             "/etc/ssl/certs",
@@ -212,6 +249,9 @@ mod tests {
             "/usr/sbin",
             "/etc/resolv.conf",
             "/dev/urandom",
+            "/dev/zero",
+            "/tmp",
+            "/var/tmp",
         ] {
             assert!(
                 paths.iter().any(|p| p == Path::new(required)),
@@ -221,13 +261,27 @@ mod tests {
     }
 
     #[test]
-    fn default_write_list_includes_tmpdir_and_dev_null() {
+    fn default_read_list_omits_hook_folder_when_none() {
+        // Bare programs (`python3 hook.py`) have no parent → no hook folder.
+        // Pre-fix this fell back to `/`, silently disabling read confinement.
+        let paths = default_read_paths(None);
+        for p in &paths {
+            assert_ne!(p, Path::new("/"), "must not allow reads beneath /");
+        }
+        // Universal paths still present.
+        assert!(paths.iter().any(|p| p == Path::new("/usr/lib")));
+        assert!(paths.iter().any(|p| p == Path::new("/tmp")));
+    }
+
+    #[test]
+    fn default_write_list_includes_tmpdirs_and_dev_null() {
         let writes = default_write_paths();
-        assert!(writes.iter().any(|p| p == &tmpdir()));
+        assert!(writes.iter().any(|p| p == Path::new("/tmp")));
+        assert!(writes.iter().any(|p| p == Path::new("/var/tmp")));
         assert!(writes.iter().any(|p| p == Path::new("/dev/null")));
         // Keep the list short — adding new write paths is a sandbox loosening
         // and should be deliberate. Pin the count so a stray push trips CI.
-        assert_eq!(writes.len(), 2);
+        assert_eq!(writes.len(), 3);
     }
 
     #[test]
@@ -268,7 +322,7 @@ mod tests {
         // `restrict_self` would confine cargo. Instead, just verify the
         // path list builds — exhaustive enforcement check lives in the
         // integration test.
-        let reads = default_read_paths(&hook_folder);
+        let reads = default_read_paths(Some(&hook_folder));
         assert!(!reads.is_empty());
         std::fs::remove_dir_all(&tmp).ok();
     }

@@ -194,14 +194,12 @@ pub async fn run_hook(
     // `apply` is a no-op stub returning PlatformUnsupported (which we only
     // log once per session, below).
     //
-    // Hook folder: the directory containing the program. Falls back to "/"
-    // if the path has no parent (e.g. a bare binary name resolved by PATH);
-    // "/" is harmless because Landlock only adds rules for paths that exist.
-    let hook_folder: std::path::PathBuf = spec
-        .program
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    // Hook folder: the directory containing the program. `None` for a
+    // bare binary name (e.g. `python3 hook.py` resolved by PATH). The
+    // previous code fell back to `/`, which silently disabled read
+    // confinement — sandboxed hooks now omit the program directory from
+    // the read allowlist when it's unknown.
+    let hook_folder: Option<std::path::PathBuf> = spec.program.parent().map(|p| p.to_path_buf());
     let want_sandbox = spec.sandbox;
     #[cfg(unix)]
     {
@@ -209,15 +207,19 @@ pub async fn run_hook(
         // (gated on cfg(unix)), not the std `CommandExt` trait — no import
         // needed here.
         if want_sandbox {
-            let folder_for_closure = hook_folder.clone();
+            // Pre-build the path lists in the PARENT so the `pre_exec`
+            // closure (which runs in the forked child between fork and
+            // execve) does not allocate. Heap allocation in that window is
+            // unsafe — the allocator's mutex may be held by a thread that no
+            // longer exists in the child.
+            let sandbox_reads = sandbox::default_read_paths(hook_folder.as_deref());
+            let sandbox_writes = sandbox::default_write_paths();
             // SAFETY: the closure runs in the forked child before execve. It
             // must be async-signal-safe — no allocation that can panic, no
-            // global locks, no tracing. `sandbox::apply` is documented to
-            // hold to that contract; we ignore its returned status here
-            // because there's no back-channel to the parent. The parent
-            // re-runs the rule build under `is_test()`-style checks via the
-            // unit test in sandbox.rs and the integration test in
-            // tests/hook_sandbox.rs to confirm the kernel cooperated.
+            // global locks, no tracing. `sandbox::apply_with_paths`
+            // takes refs to the parent-built lists and performs syscalls
+            // only (no allocation), and uses `io::Error::from_raw_os_error`
+            // (no boxing) on the error path.
             unsafe {
                 cmd.pre_exec(move || {
                     // Map our SandboxStatus into io::Result success/failure
@@ -227,7 +229,7 @@ pub async fn run_hook(
                     // handles the user-visible degradation notice. Hard
                     // errors (e.g. EPERM mid-rule) DO fail the exec so the
                     // hook is not silently unconfined when it shouldn't be.
-                    match sandbox::apply(&folder_for_closure) {
+                    match sandbox::apply_with_paths(&sandbox_reads, &sandbox_writes) {
                         Ok(_) => Ok(()),
                         Err(e) => Err(e),
                     }
@@ -254,19 +256,23 @@ pub async fn run_hook(
     // whether the child got real confinement.
     let sandbox_status = sandbox_status_for_telemetry(spec);
     span.record("sandbox.status", sandbox_status.as_str());
-    if sandbox_status == SandboxStatus::NotEnforced && should_emit_sandbox_warning(&cmd_name) {
-        if let Some(tx) = tx {
-            let _ = tx
-                .send(AgentEvent::Warning {
-                    source: "hook.sandbox".to_string(),
-                    message: format!(
-                        "{}: Landlock unavailable on this kernel; hook runs unconfined",
-                        cmd_name
-                    ),
-                })
-                .await;
+    let unconfined_reason = match sandbox_status {
+        SandboxStatus::NotEnforced => Some("Landlock unavailable on this kernel"),
+        SandboxStatus::PlatformUnsupported => Some("sandboxing unavailable on this platform"),
+        _ => None,
+    };
+    if let Some(reason) = unconfined_reason {
+        if should_emit_sandbox_warning(&cmd_name) {
+            if let Some(tx) = tx {
+                let _ = tx
+                    .send(AgentEvent::Warning {
+                        source: "hook.sandbox".to_string(),
+                        message: format!("{}: {}; hook runs unconfined", cmd_name, reason),
+                    })
+                    .await;
+            }
+            tracing::warn!(hook = %cmd_name, reason = %reason, "hook unconfined");
         }
-        tracing::warn!(hook = %cmd_name, "Landlock unavailable; hook unconfined");
     }
 
     // === Bounded stdout/stderr (v2 layer 4) ================================

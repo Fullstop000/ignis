@@ -748,7 +748,7 @@ async fn reload_hooks(app: &mut App) {
     };
     match reg.reload(&home).await {
         Ok(count) => app.add_assistant_notice(format!(
-            "[info] reloaded {count} hook{plural} \u{00b7} run unsandboxed; audit before installing",
+            "[info] reloaded {count} hook{plural}",
             plural = if count == 1 { "" } else { "s" }
         )),
         Err(e) => app.add_assistant_notice(format!("[err] /hooks reload: {e}")),

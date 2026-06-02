@@ -11,8 +11,12 @@
 //! malformed JSON, missing binary) degrades to "use the original value +
 //! emit a Warning event to the UI".
 //!
-//! **Security:** v1 ships with no sandbox. Hooks run with ignis's full
-//! privileges. See `docs/usage/hooks.md` for the threat model.
+//! **Security:** hook subprocesses run with an env-var allowlist and (on
+//! Linux) a Landlock filesystem sandbox by default. Per-hook
+//! `sandbox: false` opts out; per-hook `env: [...]` extends the universal
+//! allowlist (`PATH HOME USER LANG LC_ALL TZ`). Network egress is NOT
+//! restricted — a hook with `env: ["ANTHROPIC_API_KEY"]` can still
+//! exfiltrate it. See `docs/usage/hooks.md` for the full threat model.
 
 pub mod config;
 pub mod dispatch;
