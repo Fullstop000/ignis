@@ -52,8 +52,8 @@ pub enum AgentEvent {
     /// Streaming HTTP request to the model dropped mid-flight (e.g. provider
     /// closed the connection); the agent is about to re-issue the same request.
     /// Fires only when no partial content has been emitted yet to the user.
-    /// `attempt` is 1-indexed; `max` is the total retry budget (so `1/2`,
-    /// `2/2`). `reason` is the sanitized provider error.
+    /// `attempt` is 1-indexed; `max` is the total retry budget (so the visible
+    /// sequence is `1/3`, `2/3`, `3/3`). `reason` is the sanitized provider error.
     #[serde(rename = "reconnecting")]
     Reconnecting {
         attempt: u32,
@@ -489,21 +489,38 @@ async fn consume_turn_stream(
 }
 
 /// Maximum number of automatic retries when the model stream drops mid-flight
-/// or `chat_stream()` returns a transport error. The total attempts equal
-/// `1 + MAX_STREAM_RETRIES`. Two is enough to absorb single-blip provider
-/// instability (commonly seen against MiniMax's OpenAI-compat endpoint and
-/// any HTTP/2 stream); going higher just wastes time/tokens against truly
-/// unhealthy endpoints.
-const MAX_STREAM_RETRIES: u32 = 2;
+/// or `chat_stream()` returns a transport error. Total attempts = 1 initial +
+/// `MAX_STREAM_RETRIES`. Three is the typical production sweet spot: enough
+/// to absorb both a single blip and a brief multi-second outage, not so many
+/// that a truly broken endpoint burns minutes before surfacing the error.
+const MAX_STREAM_RETRIES: u32 = 3;
 
-/// Backoff before retry attempt `n` (1-indexed in `Reconnecting.attempt`):
-/// 0 ms before the first retry (drops are often instantaneous and recover),
-/// 500 ms before the second to give an overloaded endpoint a beat.
+/// Initial backoff before retry #1. Subsequent retries double this until
+/// `MAX_BACKOFF_MS` is hit. A non-zero start avoids hammering an endpoint
+/// that just dropped us — the typical failure mode is upstream load, not
+/// pure jitter, so an immediate retry tends to hit the same overloaded
+/// state.
+const BASE_BACKOFF_MS: u64 = 500;
+
+/// Ceiling for any single retry sleep. With the current budget the schedule
+/// is 500 ms → 1 s → 2 s and never reaches the cap; it exists so a future
+/// `MAX_STREAM_RETRIES` bump cannot accidentally introduce minutes-long
+/// sleeps if someone forgets to revisit this function.
+const MAX_BACKOFF_MS: u64 = 10_000;
+
+/// Exponential backoff before retry attempt `n` (1-indexed). Doubles from
+/// `BASE_BACKOFF_MS` and saturates at `MAX_BACKOFF_MS`. Sequence with the
+/// current constants: 500 ms, 1 s, 2 s, 4 s, 8 s, 10 s, 10 s, …
 fn retry_backoff_ms(attempt: u32) -> u64 {
-    match attempt {
-        1 => 0,
-        _ => 500,
-    }
+    // saturating_sub guards attempt=0 (defensive — callers pass attempt>=1);
+    // .min(30) keeps the left shift in the safe range for u64 even if the
+    // retry budget is ever raised dramatically. checked_shl returns None on
+    // overflow → fall back to u64::MAX and then clamp to MAX_BACKOFF_MS.
+    let shift = attempt.saturating_sub(1).min(30);
+    BASE_BACKOFF_MS
+        .checked_shl(shift)
+        .unwrap_or(u64::MAX)
+        .min(MAX_BACKOFF_MS)
 }
 
 /// Compose the effective system prompt: base + the enabled-skills catalog +
@@ -701,11 +718,10 @@ impl Agent {
                                         reason,
                                     })
                                     .await;
-                                let backoff = retry_backoff_ms(next);
-                                if backoff > 0 {
-                                    tokio::time::sleep(std::time::Duration::from_millis(backoff))
-                                        .await;
-                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    retry_backoff_ms(next),
+                                ))
+                                .await;
                                 attempt = next;
                                 continue;
                             }
@@ -723,13 +739,10 @@ impl Agent {
                                             reason: reason.to_string(),
                                         })
                                         .await;
-                                    let backoff = retry_backoff_ms(next);
-                                    if backoff > 0 {
-                                        tokio::time::sleep(std::time::Duration::from_millis(
-                                            backoff,
-                                        ))
-                                        .await;
-                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        retry_backoff_ms(next),
+                                    ))
+                                    .await;
                                     attempt = next;
                                     continue;
                                 }
@@ -1222,15 +1235,23 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_grows_after_first_attempt() {
-        // First retry is immediate (drops often recover instantaneously);
-        // subsequent retries get a small fixed beat so an overloaded endpoint
-        // can settle. Two attempts is the policy, so [1]=0, [2]=500.
-        assert_eq!(retry_backoff_ms(1), 0);
-        assert_eq!(retry_backoff_ms(2), 500);
-        // Defensive: if MAX_STREAM_RETRIES is ever bumped, the backoff still
-        // returns a positive value rather than 0.
-        assert!(retry_backoff_ms(3) > 0);
+    fn retry_backoff_is_exponential_and_capped() {
+        // Schedule for the current budget of 3 retries: 500 ms → 1 s → 2 s.
+        assert_eq!(retry_backoff_ms(1), BASE_BACKOFF_MS);
+        assert_eq!(retry_backoff_ms(2), BASE_BACKOFF_MS * 2);
+        assert_eq!(retry_backoff_ms(3), BASE_BACKOFF_MS * 4);
+        // Doubling continues until MAX_BACKOFF_MS clamps it.
+        assert_eq!(retry_backoff_ms(4), BASE_BACKOFF_MS * 8);
+        assert!(
+            retry_backoff_ms(5) >= BASE_BACKOFF_MS * 16 || retry_backoff_ms(5) == MAX_BACKOFF_MS
+        );
+        // The ceiling holds for any number of attempts, including pathological
+        // values that would otherwise overflow the u64 shift.
+        assert_eq!(retry_backoff_ms(30), MAX_BACKOFF_MS);
+        assert_eq!(retry_backoff_ms(u32::MAX), MAX_BACKOFF_MS);
+        // Defensive: attempt=0 (shouldn't happen, but if it does) still
+        // returns a sane positive value, not zero or a panic.
+        assert_eq!(retry_backoff_ms(0), BASE_BACKOFF_MS);
     }
 
     #[test]
