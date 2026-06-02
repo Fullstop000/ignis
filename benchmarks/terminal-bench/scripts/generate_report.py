@@ -60,16 +60,32 @@ def _sum_usage(usage_dir: Path) -> tuple[int, int, int]:
     return in_t, out_t, cache_t
 
 
-def _classify(reward: float | None, exc: dict | None, rate_limited: bool) -> str:
+def _classify(
+    reward: float | None,
+    exc: dict | None,
+    rate_limited: bool,
+    stream_dropped: bool,
+) -> str:
     if reward == 1.0:
         return "passed"
-    if exc:
+    # `errored` covers both harness-raised exceptions and provider-side stream
+    # drops where the model API closed the connection mid-turn. Only `failed`
+    # means the benchmark gate ran and rejected a complete attempt.
+    if exc or stream_dropped:
         return "errored"
     if rate_limited:
         return "quota"
     if reward == 0.0:
         return "failed"
     return "unknown"
+
+
+# Same marker list as aggregate_results.py — keep in sync if either side moves.
+_STREAM_DROP_MARKERS = (
+    "connection closed before message completed",
+    "error sending request",
+    "[Error in stream:",
+)
 
 
 def _parse_tool_calls(log: str) -> Counter[str]:
@@ -213,6 +229,15 @@ def walk_trials(job_dir: Path) -> list[Trial]:
         # Scan the FULL file, not the embedded tail — a rate-limit marker early
         # in a huge log must still flip the trial to the `quota` bucket.
         rate_limited = _file_contains(agent_log_path, "rate_limit_reached_error")
+        # Same WHOLE-file scan for the stream-drop markers — the connection
+        # may have died and recovered earlier in the turn, leaving the
+        # marker buried far above the tail we embed.
+        stream_dropped = any(
+            _file_contains(agent_log_path, m) for m in _STREAM_DROP_MARKERS
+        )
+        # Don't reclassify a passing trial: a stream drop early in the turn
+        # that the model recovered from doesn't make the trial errored.
+        bucket_stream_drop = stream_dropped and reward != 1.0
 
         n_in, n_out, n_cache = _sum_usage(trial_dir / "agent" / "ignis-projects")
         cache_rate = (n_cache / n_in) if n_in else None
@@ -224,13 +249,23 @@ def walk_trials(job_dir: Path) -> list[Trial]:
             _tail_lines(verifier_test_p.read_text(errors="ignore"), 30) if verifier_test_p.exists() else ""
         )
 
+        # Exception column: harness exception type wins; otherwise stamp
+        # `ConnectionDropped` so the bucketing reason is visible without
+        # diffing the agent log.
+        if exc:
+            exception_label = (exc or {}).get("exception_type", "")
+        elif bucket_stream_drop:
+            exception_label = "ConnectionDropped"
+        else:
+            exception_label = ""
+
         trials.append(
             Trial(
                 task=task,
                 trial=trial_dir.name,
-                bucket=_classify(reward, exc, rate_limited),
+                bucket=_classify(reward, exc, rate_limited, bucket_stream_drop),
                 reward=reward,
-                exception=(exc or {}).get("exception_type", "") if exc else "",
+                exception=exception_label,
                 rate_limited=rate_limited,
                 duration_seconds=_wall_seconds(result.get("started_at"), result.get("finished_at")),
                 n_input_tokens=n_in,
@@ -414,6 +449,34 @@ def _render_main_table(trials: list[Trial]) -> str:
 </table>"""
 
 
+def _suite_label(trials: list[Trial], job_dir: Path) -> str:
+    """Derive the human-readable benchmark name from the trial source slugs.
+
+    The harbor job tags each trial's `result.json` with a `source` like
+    `terminal-bench/terminal-bench-2-1`; take the most common one. Falls back
+    to the job dir name when nothing recognizable is present.
+    """
+    sources: Counter[str] = Counter()
+    for trial_dir in job_dir.iterdir():
+        if not trial_dir.is_dir():
+            continue
+        d = _safe_load(trial_dir / "result.json") or {}
+        s = d.get("source") or d.get("config", {}).get("task", {}).get("source")
+        if isinstance(s, str):
+            sources[s] += 1
+    if not sources:
+        return "Terminal-Bench"
+    top, _ = sources.most_common(1)[0]
+    # Map `terminal-bench/terminal-bench-2-1` → `Terminal-Bench 2.1`,
+    # `terminal-bench/terminal-bench-2` → `Terminal-Bench 2.0` (the dash form
+    # is harbor's slug for the underlying 2.0 dataset).
+    m = re.match(r"terminal-bench/terminal-bench-(\d+)(?:-(\d+))?", top)
+    if m:
+        major, minor = m.group(1), m.group(2) or "0"
+        return f"Terminal-Bench {major}.{minor}"
+    return top
+
+
 def render(trials: list[Trial], job_dir: Path) -> str:
     bucket_counts = Counter(t.bucket for t in trials)
     real_attempts = [t for t in trials if t.bucket in {"passed", "failed", "errored"}]
@@ -423,6 +486,7 @@ def render(trials: list[Trial], job_dir: Path) -> str:
     total_out = sum(t.n_output_tokens for t in trials)
     total_cache = sum(t.n_cache_tokens for t in trials)
     cache_pct = (total_cache / total_in * 100) if total_in else 0.0
+    suite = _suite_label(trials, job_dir)
 
     # Stacked bar segments (passed, failed, errored, quota)
     bar_segs = []
@@ -433,9 +497,9 @@ def render(trials: list[Trial], job_dir: Path) -> str:
             bar_segs.append(f'<span class="{b}" style="flex:{c}">{c} {b}</span>')
 
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>ignis TB2 report</title>
+<html><head><meta charset="utf-8"><title>ignis {html.escape(suite)} report</title>
 <style>{_CSS}</style></head><body>
-<h1>ignis · Terminal-Bench 2 report</h1>
+<h1>ignis · {html.escape(suite)} report</h1>
 <div class="meta">job dir: <code>{html.escape(str(job_dir))}</code> · generated {dt.datetime.now().isoformat(timespec="seconds")}</div>
 
 <div class="stats">

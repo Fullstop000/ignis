@@ -49,7 +49,7 @@ mcmc-sampling-stan,mcmc-sampling-stan__5GFwjN6,errored,,VerifierTimeoutError,fal
 merge-diff-arc-agi-task,merge-diff-arc-agi-task__MSVJyqB,passed,1.0,,false,200.977394,334233,12833,325376,0.974,2026-05-29T04:26:40.683288Z,2026-05-29T04:30:01.660682Z
 model-extraction-relu-logits,model-extraction-relu-logits__NE7Et62,failed,0.0,,false,637.756938,1940950,56288,1916928,0.988,2026-05-29T04:51:42.486016Z,2026-05-29T05:02:20.242954Z
 modernize-scientific-stack,modernize-scientific-stack__Wo8XosZ,passed,1.0,,false,51.724352,33493,2212,29312,0.875,2026-05-29T05:10:51.096311Z,2026-05-29T05:11:42.820663Z
-mteb-leaderboard,mteb-leaderboard__a5zUvEx,failed,0.0,,false,1357.274247,23323,1004,19968,0.856,2026-05-28T19:05:14.981835Z,2026-05-28T19:27:52.256082Z
+mteb-leaderboard,mteb-leaderboard__a5zUvEx,errored,0.0,ConnectionDropped,false,1357.274247,23323,1004,19968,0.856,2026-05-28T19:05:14.981835Z,2026-05-28T19:27:52.256082Z
 mteb-retrieve,mteb-retrieve__wb26y6W,failed,0.0,,false,87.663375,20313,1503,15872,0.781,2026-05-29T05:21:35.478845Z,2026-05-29T05:23:03.142220Z
 multi-source-data-merger,multi-source-data-merger__tqSp7NK,passed,1.0,,false,85.520667,34942,3705,30592,0.876,2026-05-28T19:20:51.970838Z,2026-05-28T19:22:17.491505Z
 nginx-request-logging,nginx-request-logging__kRnMkM2,passed,1.0,,false,113.696113,42692,2305,38400,0.899,2026-05-28T19:30:34.409851Z,2026-05-28T19:32:28.105964Z
