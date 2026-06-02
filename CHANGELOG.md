@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-06-02
+
 ### Added
 - Auto-retry on streaming model-response drops; shows a `↻ Reconnecting (n/3)` notice instead of failing the turn (exponential backoff 500 ms → 1 s → 2 s, capped at 10 s). ([#97](https://github.com/Fullstop000/ignis/pull/97))
 
