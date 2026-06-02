@@ -777,9 +777,15 @@ pub(crate) fn picker_height(state: &InlinePickerState, width: u16) -> u16 {
         let right = max_right_body + 2 /*border*/;
         header_rows + left.max(right) + footer_rows
     } else {
-        // Single-column layout. Titles render on one line each; descriptions
-        // can wrap to many rows at narrow widths, and they share the full
-        // viewport width.
+        // Single-column layout. Titles render on one line each. Descriptions
+        // are indented under the number ("  N. ") so their effective wrap
+        // width is `width - desc_indent` — using the full width here used to
+        // undercount by 1 row whenever the description sat near the right
+        // margin and pushed the footer hint off-screen.
+        let opts_n = q.options.len();
+        let max_number_width = (opts_n + 1).to_string().len() as u16;
+        let desc_indent = 2 /*cursor col*/ + max_number_width + 2 /*". "*/;
+        let desc_width = width.saturating_sub(desc_indent).max(1);
         let option_rows: u16 = q
             .options
             .iter()
@@ -788,7 +794,7 @@ pub(crate) fn picker_height(state: &InlinePickerState, width: u16) -> u16 {
                 let desc = if o.description.is_empty() {
                     0
                 } else {
-                    wrap_at(width, &o.description)
+                    wrap_at(desc_width, &o.description)
                 };
                 title + desc
             })

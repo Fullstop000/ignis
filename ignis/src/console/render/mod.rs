@@ -75,22 +75,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     if app.inline_picker.is_some() {
         // Compute the bottom picker slice in a scope holding only an
         // immutable borrow, so render_transcript can take `&mut app` after.
-        // The picker is sized to its natural height, but we always keep at
-        // least a few rows visible above for transcript context (3 rows on
-        // anything wider than 12 rows; otherwise half the body). That way an
-        // 8-option /connect list can grow without the footer hint clipping,
-        // while a 2-option permission picker leaves most of the body for
-        // conversation.
+        // The picker takes exactly its natural height (clamped to body) and
+        // whatever's left becomes transcript context above — no proactive
+        // share cap. Capping was clipping the input/footer of tiny pickers
+        // (e.g. a 7-row text-input picker on an 8-row body) even when the
+        // full body could have shown them.
         let (picker_area, above) = {
             let picker = app.inline_picker.as_ref().expect("checked above");
             let desired = super::inline_picker::picker_height(picker, body_area.width);
-            let reserve_above = if body_area.height >= 12 {
-                3
-            } else {
-                body_area.height / 2
-            };
-            let max_picker = body_area.height.saturating_sub(reserve_above).max(1);
-            let h = desired.min(max_picker).min(body_area.height).max(1);
+            let h = desired.min(body_area.height).max(1);
             let split = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(0), Constraint::Length(h)])
