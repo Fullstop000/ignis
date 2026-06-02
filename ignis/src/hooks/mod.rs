@@ -163,11 +163,7 @@ impl HookRegistry {
                     emit_warning(
                         tx,
                         event,
-                        &format!(
-                            "blocked by {} (exit 2): {}",
-                            spec.display_name(),
-                            trimmed
-                        ),
+                        &format!("blocked by {} (exit 2): {}", spec.display_name(), trimmed),
                     )
                     .await;
                     return PromptHookResult::Blocked { stderr: trimmed };
@@ -265,16 +261,8 @@ fn trim_one_line(s: &str) -> String {
 /// CJK / multibyte string panics if 200 lands inside a code point; warning
 /// paths must never panic.
 pub(crate) fn truncate_chars(s: &str, n: usize) -> String {
-    let mut taken = 0usize;
     let mut iter = s.chars();
-    let mut out = String::new();
-    for ch in iter.by_ref() {
-        if taken >= n {
-            break;
-        }
-        out.push(ch);
-        taken += 1;
-    }
+    let mut out: String = iter.by_ref().take(n).collect();
     if iter.next().is_some() {
         out.push('…');
     }
@@ -487,14 +475,14 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         // 250 CJK characters (each 3 bytes in UTF-8) — a byte-slice at 200
         // would have panicked at a multibyte boundary. Char-safe trim
         // returns 200 chars + an ellipsis.
-        let s: String = std::iter::repeat('中').take(250).collect();
+        let s: String = "中".repeat(250);
         let out = truncate_chars(&s, 200);
         assert_eq!(out.chars().count(), 201);
         assert!(out.ends_with('…'));
         // No truncation when already short enough.
         assert_eq!(truncate_chars("hi", 200), "hi");
         // Exact-length input: no ellipsis.
-        let exact: String = std::iter::repeat('a').take(200).collect();
+        let exact: String = "a".repeat(200);
         assert_eq!(truncate_chars(&exact, 200), exact);
     }
 

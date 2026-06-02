@@ -115,9 +115,7 @@ fn parse_entry(entry: HookJsonEntry, home: &Path) -> Result<HookSpec> {
         (Some(_), Some(_)) => Err(anyhow!(
             "hook entry has both `command` and `argv`; use exactly one"
         )),
-        (None, None) => Err(anyhow!(
-            "hook entry has neither `command` nor `argv`"
-        )),
+        (None, None) => Err(anyhow!("hook entry has neither `command` nor `argv`")),
         (Some(command), None) => {
             let command = command.trim();
             if command.is_empty() {

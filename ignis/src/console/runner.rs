@@ -114,8 +114,7 @@ pub async fn run_console(
     // commit their rewrites in the order they arrived. Rewrite events
     // ride the same `agent_tx` the live UI consumes, so scrollback
     // ordering follows event arrival.
-    let render_hook_queue =
-        spawn_render_hook_worker(hook_registry.clone(), agent_tx.clone());
+    let render_hook_queue = spawn_render_hook_worker(hook_registry.clone(), agent_tx.clone());
     let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
     let active_inject_runner = active_inject.clone();
 
@@ -339,12 +338,7 @@ pub async fn run_console(
 
         // Drain any other pending agent events and key input — state only, no draw.
         while let Ok(ev) = agent_rx.try_recv() {
-            enqueue_render_hook(
-                &ev,
-                &render_hook_queue,
-                &app.session_id,
-                &app.cwd,
-            );
+            enqueue_render_hook(&ev, &render_hook_queue, &app.session_id, &app.cwd);
             app.handle_event(ev);
         }
         // Drain picker-spawn notices into the transcript.
@@ -498,7 +492,10 @@ fn enqueue_render_hook(
     // must skip them. Some providers emit BOTH reasoning_content and
     // content in the same MessageEnd; that's a real assistant turn so
     // we keep it.
-    if message.reasoning_content.as_deref().is_some_and(|r| !r.is_empty())
+    if message
+        .reasoning_content
+        .as_deref()
+        .is_some_and(|r| !r.is_empty())
         && message.content.as_deref().is_none_or(str::is_empty)
     {
         return;

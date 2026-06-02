@@ -62,7 +62,10 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","updatedI
         .await;
     drop(tx);
 
-    assert_eq!(out, PromptHookResult::Continue("HELLO_FROM_HOOK".to_string()));
+    assert_eq!(
+        out,
+        PromptHookResult::Continue("HELLO_FROM_HOOK".to_string())
+    );
     // No warnings on the happy path.
     assert!(rx.recv().await.is_none());
 }
@@ -156,17 +159,19 @@ async fn inject_runs_through_user_prompt_submit_hook_chain() {
     struct EmptyProvider;
     #[async_trait]
     impl LlmProvider for EmptyProvider {
-        fn model_id(&self) -> &str { "mock" }
-        fn provider_name(&self) -> &str { "mock" }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
         async fn chat_stream(
             &self,
             _system_prompt: &str,
             _messages: &[Message],
             _tools: &[serde_json::Value],
-        ) -> Result<
-            BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
-            anyhow::Error,
-        > {
+        ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error>
+        {
             // One token so the round produces a message and exits cleanly.
             Ok(stream::iter(vec![Ok(LlmResponseDelta::Text("ok".to_string()))]).boxed())
         }

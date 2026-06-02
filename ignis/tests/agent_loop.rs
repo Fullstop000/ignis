@@ -758,7 +758,10 @@ async fn user_prompt_submit_block_short_circuits_turn() {
     });
     let (src, msg) = warning.expect("Warning event emitted on block");
     assert_eq!(src, "UserPromptSubmit");
-    assert!(msg.contains("sensitive material detected"), "stderr in warning: {msg}");
+    assert!(
+        msg.contains("sensitive material detected"),
+        "stderr in warning: {msg}"
+    );
 
     // No UserPromptCommitted — the prompt never reached the model side.
     assert!(
