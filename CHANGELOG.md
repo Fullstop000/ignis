@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - TUI message queue now routes queued slash commands through the same dispatcher Enter uses, so `/compact`, `/model`, and other commands typed while the agent is busy actually run on drain instead of being sent to the LLM as literal user messages. Slash-command autocomplete is also surfaced while busy so the queued line can be completed from the dropdown. ([#106](https://github.com/Fullstop000/ignis/pull/106))
+- TUI: `End` now actually follows the transcript to the bottom — plain `End` (with empty input) scrolls and the renderer reserves room for the top hint so the last line is no longer clipped and no stale `↓ N more lines below` hint lingers on a followed view. ([#108](https://github.com/Fullstop000/ignis/pull/108))
+- Ctrl+C between Enter and the model's first reply no longer wipes the just-typed user prompt from disk; the next prompt's session re-loads it instead of starting a blank conversation. ([#108](https://github.com/Fullstop000/ignis/pull/108))
 
 ## [0.33.1] - 2026-06-03
 
