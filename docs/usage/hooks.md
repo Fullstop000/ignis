@@ -111,6 +111,15 @@ SIGTERM grace window before the SIGKILL.
 - `command` is **split on whitespace** at parse time and passed argv-
   style to `Command::new`. No shell is involved. No `$VAR` expansion.
   Only a leading `~/` is expanded (against the home dir).
+- For program paths that **contain whitespace** (e.g.
+  `/Users/foo bar/run.py`), use the explicit `argv` form instead:
+
+  ```json
+  { "argv": ["/Users/foo bar/run.py", "--display"], "timeout_ms": 30000 }
+  ```
+
+  `argv[0]` is the program; subsequent entries are arguments. `~/` is
+  expanded on `argv[0]`. `command` and `argv` are mutually exclusive.
 - `timeout_ms` defaults to `10000` (10 s).
 - Each event takes a JSON array — multiple hooks chain left-to-right,
   each receiving the previous hook's output.

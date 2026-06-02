@@ -107,22 +107,51 @@ impl HooksConfig {
 }
 
 fn parse_entry(entry: HookJsonEntry, home: &Path) -> Result<HookSpec> {
-    let command = entry.command.trim().to_string();
-    if command.is_empty() {
-        return Err(anyhow!("hook entry has empty `command`"));
-    }
-    let mut parts = command.split_whitespace();
-    let program_raw = parts
-        .next()
-        .ok_or_else(|| anyhow!("hook entry has empty `command`"))?;
-    let program = expand_home(program_raw, home);
-    let args: Vec<String> = parts.map(|s| s.to_string()).collect();
     let timeout_ms = entry.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-    Ok(HookSpec {
-        program,
-        args,
-        timeout_ms,
-    })
+    // Mutual exclusion: pick exactly one of `command` (single string,
+    // whitespace-split — simple default) or `argv` (pre-tokenised, supports
+    // paths-with-spaces — escape hatch).
+    match (entry.command.as_deref(), entry.argv.as_deref()) {
+        (Some(_), Some(_)) => Err(anyhow!(
+            "hook entry has both `command` and `argv`; use exactly one"
+        )),
+        (None, None) => Err(anyhow!(
+            "hook entry has neither `command` nor `argv`"
+        )),
+        (Some(command), None) => {
+            let command = command.trim();
+            if command.is_empty() {
+                return Err(anyhow!("hook entry has empty `command`"));
+            }
+            let mut parts = command.split_whitespace();
+            let program_raw = parts
+                .next()
+                .ok_or_else(|| anyhow!("hook entry has empty `command`"))?;
+            let program = expand_home(program_raw, home);
+            let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+            Ok(HookSpec {
+                program,
+                args,
+                timeout_ms,
+            })
+        }
+        (None, Some(argv)) => {
+            let mut iter = argv.iter();
+            let program_raw = iter
+                .next()
+                .ok_or_else(|| anyhow!("hook entry `argv` is empty"))?;
+            if program_raw.trim().is_empty() {
+                return Err(anyhow!("hook entry `argv[0]` is empty"));
+            }
+            let program = expand_home(program_raw, home);
+            let args: Vec<String> = iter.cloned().collect();
+            Ok(HookSpec {
+                program,
+                args,
+                timeout_ms,
+            })
+        }
+    }
 }
 
 fn expand_home(s: &str, home: &Path) -> PathBuf {
@@ -143,7 +172,17 @@ struct HooksJson {
 
 #[derive(Debug, Deserialize)]
 struct HookJsonEntry {
-    command: String,
+    /// Simple form: a single string split on whitespace, no shell. The
+    /// program is the first token; subsequent tokens are argv. No
+    /// `$VAR` expansion; only a leading `~/` is expanded against home.
+    /// Cannot represent a program path containing whitespace.
+    #[serde(default)]
+    command: Option<String>,
+    /// Explicit form: a pre-tokenised argv list. `argv[0]` is the
+    /// program; the rest are args. Use this when the program path
+    /// contains whitespace. Mutually exclusive with `command`.
+    #[serde(default)]
+    argv: Option<Vec<String>>,
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
@@ -218,6 +257,71 @@ mod tests {
     fn empty_command_rejected() {
         let home = PathBuf::from("/h");
         let raw = r#"{"hooks": {"UserPromptSubmit": [{"command": "   "}]}}"#;
+        let err = HooksConfig::from_str(raw, &home).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn command_with_space_in_program_path_silently_truncates_in_simple_form() {
+        // Documented limitation of the simple form: whitespace-split treats
+        // "/path with" as the program and "space/run.py" as the first arg.
+        // The escape hatch is the `argv` form below — this test pins the
+        // current behaviour so a future change is intentional.
+        let home = PathBuf::from("/h");
+        let raw = r#"{"hooks": {"UserPromptSubmit": [{"command": "/path with space/run.py"}]}}"#;
+        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let spec = &cfg.user_prompt_submit[0];
+        assert_eq!(spec.program, PathBuf::from("/path"));
+        assert_eq!(spec.args, vec!["with", "space/run.py"]);
+    }
+
+    #[test]
+    fn argv_form_preserves_program_path_with_spaces() {
+        let home = PathBuf::from("/h");
+        let raw = r#"{"hooks": {"UserPromptSubmit": [
+            {"argv": ["/path with space/run.py", "--display"]}
+        ]}}"#;
+        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let spec = &cfg.user_prompt_submit[0];
+        assert_eq!(spec.program, PathBuf::from("/path with space/run.py"));
+        assert_eq!(spec.args, vec!["--display"]);
+    }
+
+    #[test]
+    fn argv_form_supports_tilde_expansion_on_program() {
+        let home = PathBuf::from("/home/me");
+        let raw = r#"{"hooks": {"UserPromptSubmit": [
+            {"argv": ["~/.ignis/hooks/run.py"]}
+        ]}}"#;
+        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        assert_eq!(
+            cfg.user_prompt_submit[0].program,
+            home.join(".ignis/hooks/run.py")
+        );
+    }
+
+    #[test]
+    fn both_command_and_argv_rejected() {
+        let home = PathBuf::from("/h");
+        let raw = r#"{"hooks": {"UserPromptSubmit": [
+            {"command": "/bin/true", "argv": ["/bin/true"]}
+        ]}}"#;
+        let err = HooksConfig::from_str(raw, &home).unwrap_err();
+        assert!(err.to_string().contains("both"));
+    }
+
+    #[test]
+    fn neither_command_nor_argv_rejected() {
+        let home = PathBuf::from("/h");
+        let raw = r#"{"hooks": {"UserPromptSubmit": [{}]}}"#;
+        let err = HooksConfig::from_str(raw, &home).unwrap_err();
+        assert!(err.to_string().contains("neither"));
+    }
+
+    #[test]
+    fn empty_argv_rejected() {
+        let home = PathBuf::from("/h");
+        let raw = r#"{"hooks": {"UserPromptSubmit": [{"argv": []}]}}"#;
         let err = HooksConfig::from_str(raw, &home).unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
