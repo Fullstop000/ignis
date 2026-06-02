@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- hooks: env-var allowlist + filesystem sandbox (Linux Landlock, macOS Seatbelt) for hook subprocesses, defaults-on; SIGTERM-then-SIGKILL grace on timeout; stdout/stderr capped at 1 MiB per stream. ([#109](https://github.com/Fullstop000/ignis/pull/109))
 - TUI — `/hooks` (and the alias `/hooks list`) now prints the in-memory hook chains — one block per event, each entry showing the program path, its argv tail, and the per-hook timeout — and still re-reads `~/.ignis/hooks.json` from disk under `/hooks reload`. An empty registry prints a single `[info] no hooks registered` line pointing at the file and the reload action. ([#127](https://github.com/Fullstop000/ignis/pull/127))
 
 ### Fixed
@@ -33,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Internal — renamed agent-loop events so a `Turn` is the whole user exchange and a `Run` is one LLM round (`AgentStart`/`AgentEnd` → `TurnStart`/`TurnEnd`; old `TurnStart`/`TurnEnd` → `RunStart`/`RunEnd`). No user-visible change. ([#121](https://github.com/Fullstop000/ignis/pull/121))
 - Internal — `Agent::run` is now a stable control-flow skeleton over named lifecycle moments (`before_llm_call`, `call_llm`, `after_llm_call`, `emit_fatal`); telemetry, hooks, and message assembly moved out of the loop body. No user-visible change. ([#122](https://github.com/Fullstop000/ignis/pull/122))
 - Internal — dropped the experimental `IGNIS_HISTORY_TRIM` modes (`mask-only`, `strip-wide`, `both`) and the unused tool-result mask path. The only knob is now `strip-think` (TOML) / `IGNIS_HISTORY_TRIM=off|<anything>` (env). No user-visible change for the shipped default. ([#126](https://github.com/Fullstop000/ignis/pull/126))
+=======
+- hooks: env-var allowlist + Linux Landlock sandbox for hook subprocesses; SIGTERM grace on timeout; stdout/stderr capped at 1 MiB. ([#109](https://github.com/Fullstop000/ignis/pull/109))
+>>>>>>> 2679260 (docs(hooks): document v2 sandbox; replace v1 unsandboxed warning)
 
 ### Fixed
 - TUI message queue now routes queued slash commands through the same dispatcher Enter uses, so `/compact`, `/model`, and other commands typed while the agent is busy actually run on drain instead of being sent to the LLM as literal user messages. Slash-command autocomplete is also surfaced while busy so the queued line can be completed from the dropdown. ([#106](https://github.com/Fullstop000/ignis/pull/106))
