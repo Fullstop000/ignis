@@ -1,4 +1,4 @@
-use crate::{AgentTool, ExecutionMode, ToolResult};
+use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,25 @@ impl ReadFileTool {
         Self {
             cwd: cwd.to_path_buf(),
         }
+    }
+
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome {
+        let path = args.require_str("path")?;
+        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+        let limit = args["limit"].as_u64().unwrap_or(2000) as usize;
+
+        let resolved = crate::util::resolve_path(&self.cwd, path);
+        let content = tokio::fs::read_to_string(&resolved)
+            .await
+            .map_err(|e| format!("Failed to read file: {e}"))?;
+
+        let lines: Vec<&str> = content.lines().skip(offset).take(limit).collect();
+        let truncated = lines.len() == limit;
+        let mut result = lines.join("\n");
+        if truncated {
+            result.push_str("\n... [truncated]");
+        }
+        Ok(result)
     }
 }
 
@@ -42,26 +61,7 @@ impl AgentTool for ReadFileTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> ToolResult {
-        let path = match args["path"].as_str() {
-            Some(p) => p,
-            None => return ToolResult::error("Missing required parameter: path".to_string()),
-        };
-        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-        let limit = args["limit"].as_u64().unwrap_or(2000) as usize;
-
-        let resolved = crate::util::resolve_path(&self.cwd, path);
-        let content = match tokio::fs::read_to_string(&resolved).await {
-            Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("Failed to read file: {e}")),
-        };
-
-        let lines: Vec<&str> = content.lines().skip(offset).take(limit).collect();
-        let truncated = lines.len() == limit;
-        let mut result = lines.join("\n");
-        if truncated {
-            result.push_str("\n... [truncated]");
-        }
-        ToolResult::ok(result)
+        self.run(args).await.into_tool_result()
     }
 }
 
