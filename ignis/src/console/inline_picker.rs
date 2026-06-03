@@ -32,7 +32,10 @@ pub(crate) enum KeyOutcome {
 
 pub(crate) struct InlinePickerState {
     pub(crate) questions: Vec<PickerQuestion>,
-    /// One per already-answered question; length == `current` while open.
+    /// Indexed by question position. Grows as a high-water mark — one entry
+    /// per question answered so far — so after back-navigation its length can
+    /// exceed `current` (the earlier answers are kept and overwritten in place
+    /// on revision).
     answers: Vec<PickerAnswer>,
     /// Index of the question being answered right now.
     current: usize,

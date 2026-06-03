@@ -34,7 +34,10 @@ pub(crate) fn branch(cwd: &Path) -> Option<String> {
     let mut dir = Some(cwd);
     while let Some(d) = dir {
         let dot_git = d.join(".git");
-        if let Ok(meta) = std::fs::symlink_metadata(&dot_git) {
+        // `metadata` (not `symlink_metadata`) so a symlinked `.git` directory
+        // resolves like git itself does; a `.git` *file* still reports as a
+        // file and routes through the gitdir-pointer branch below.
+        if let Ok(meta) = std::fs::metadata(&dot_git) {
             let git_dir = if meta.is_dir() {
                 dot_git
             } else {
