@@ -1,7 +1,6 @@
 use crate::skills::SkillRegistry;
-use crate::tools::tool::{AgentTool, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
+use crate::tools::tool::{StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use serde_json::json;
 use std::sync::Arc;
 
 /// Loads a skill's full instructions by name. Registered top-level only.
@@ -22,8 +21,23 @@ impl SkillTool {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
 
-    fn run(&self, args: serde_json::Value) -> ToolOutcome {
+#[async_trait]
+impl StaticTool for SkillTool {
+    const NAME: &'static str = "skill";
+    const DESCRIPTION: &'static str =
+        "Load a specialized skill by name when the task matches one listed in \
+         <available_skills>. Returns the skill's full instructions, plus a list \
+         of any supporting files it bundles.";
+    const PARAMETERS: &'static [ToolParam] = &[ToolParam {
+        name: "name",
+        ty: "string",
+        description: "Skill name from <available_skills>",
+    }];
+    const REQUIRED: &'static [&'static str] = &["name"];
+
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let name = args.require_str("name")?;
         match self.registry.get_enabled(name) {
             // The body is the skill's instructions — emitted verbatim, not
@@ -46,36 +60,10 @@ impl SkillTool {
     }
 }
 
-#[async_trait]
-impl AgentTool for SkillTool {
-    fn name(&self) -> &str {
-        "skill"
-    }
-
-    fn description(&self) -> &str {
-        "Load a specialized skill by name when the task matches one listed in \
-         <available_skills>. Returns the skill's full instructions, plus a list \
-         of any supporting files it bundles."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "Skill name from <available_skills>" }
-            },
-            "required": ["name"]
-        })
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        self.run(args).into_tool_result()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::tool::AgentTool;
     use std::collections::HashSet;
 
     fn registry_with_react(disabled: HashSet<String>) -> Arc<SkillRegistry> {

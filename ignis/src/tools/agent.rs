@@ -1,9 +1,8 @@
 use crate::agent::Agent;
 use crate::config::Config;
 use crate::mcp::McpRegistry;
-use crate::{AgentTool, IntoToolResult, Message, ToolArgs, ToolOutcome, ToolResult};
+use crate::{AgentTool, Message, StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -37,6 +36,28 @@ impl SubagentTool {
         self.mcp = Some(mcp);
         self
     }
+}
+
+#[async_trait]
+impl StaticTool for SubagentTool {
+    const NAME: &'static str = "agent";
+    const DESCRIPTION: &'static str =
+        "Delegate a focused, self-contained task to a sub-agent that has the file/search/web \
+         tools. Returns its final answer. Use for multi-step research or lookups to keep the \
+         main thread uncluttered. The sub-agent cannot spawn further sub-agents.";
+    const PARAMETERS: &'static [ToolParam] = &[
+        ToolParam {
+            name: "prompt",
+            ty: "string",
+            description: "The task for the sub-agent, self-contained with all needed context",
+        },
+        ToolParam {
+            name: "description",
+            ty: "string",
+            description: "Optional short label for the task",
+        },
+    ];
+    const REQUIRED: &'static [&'static str] = &["prompt"];
 
     async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let prompt = args.require_str("prompt")?;
@@ -90,37 +111,10 @@ impl SubagentTool {
     }
 }
 
-#[async_trait]
-impl AgentTool for SubagentTool {
-    fn name(&self) -> &str {
-        "agent"
-    }
-
-    fn description(&self) -> &str {
-        "Delegate a focused, self-contained task to a sub-agent that has the file/search/web \
-         tools. Returns its final answer. Use for multi-step research or lookups to keep the \
-         main thread uncluttered. The sub-agent cannot spawn further sub-agents."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "prompt": { "type": "string", "description": "The task for the sub-agent, self-contained with all needed context" },
-                "description": { "type": "string", "description": "Optional short label for the task" }
-            },
-            "required": ["prompt"]
-        })
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        self.run(args).await.into_tool_result()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn subagent_requires_prompt() {

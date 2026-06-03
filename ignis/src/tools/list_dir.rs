@@ -1,6 +1,5 @@
-use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
+use crate::{StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use serde_json::json;
 use std::path::{Path, PathBuf};
 
 pub struct ListDirTool {
@@ -13,6 +12,18 @@ impl ListDirTool {
             cwd: cwd.to_path_buf(),
         }
     }
+}
+
+#[async_trait]
+impl StaticTool for ListDirTool {
+    const NAME: &'static str = "list_dir";
+    const DESCRIPTION: &'static str = "List directory contents showing file type and size.";
+    const PARAMETERS: &'static [ToolParam] = &[ToolParam {
+        name: "path",
+        ty: "string",
+        description: "Path to the directory to list",
+    }];
+    const REQUIRED: &'static [&'static str] = &["path"];
 
     async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let path = args.require_str("path")?;
@@ -41,38 +52,11 @@ impl ListDirTool {
     }
 }
 
-#[async_trait]
-impl AgentTool for ListDirTool {
-    fn name(&self) -> &str {
-        "list_dir"
-    }
-
-    fn description(&self) -> &str {
-        "List directory contents showing file type and size."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Path to the directory to list" }
-            },
-            "required": ["path"]
-        })
-    }
-
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Parallel
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        self.run(args).await.into_tool_result()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentTool;
+    use serde_json::json;
 
     #[tokio::test]
     async fn test_list_dir() {

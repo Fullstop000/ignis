@@ -1,8 +1,7 @@
-use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
+use crate::{StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
 use globset::Glob;
 use ignore::WalkBuilder;
-use serde_json::json;
 use std::path::{Path, PathBuf};
 
 /// Cap on returned paths so a broad pattern can't flood the output.
@@ -20,6 +19,27 @@ impl GlobTool {
             cwd: cwd.to_path_buf(),
         }
     }
+}
+
+#[async_trait]
+impl StaticTool for GlobTool {
+    const NAME: &'static str = "glob";
+    const DESCRIPTION: &'static str =
+        "Find files whose path matches a glob (e.g. `**/*.rs`, `src/**/mod.rs`), \
+         respecting .gitignore. Returns matching paths. Prefer this over `find` via bash.";
+    const PARAMETERS: &'static [ToolParam] = &[
+        ToolParam {
+            name: "pattern",
+            ty: "string",
+            description: "Glob pattern, matched against the path relative to the search root",
+        },
+        ToolParam {
+            name: "path",
+            ty: "string",
+            description: "Directory to search under (default: project root)",
+        },
+    ];
+    const REQUIRED: &'static [&'static str] = &["pattern"];
 
     async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let pattern = args.require_str("pattern")?;
@@ -67,40 +87,11 @@ impl GlobTool {
     }
 }
 
-#[async_trait]
-impl AgentTool for GlobTool {
-    fn name(&self) -> &str {
-        "glob"
-    }
-
-    fn description(&self) -> &str {
-        "Find files whose path matches a glob (e.g. `**/*.rs`, `src/**/mod.rs`), \
-         respecting .gitignore. Returns matching paths. Prefer this over `find` via bash."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": { "type": "string", "description": "Glob pattern, matched against the path relative to the search root" },
-                "path": { "type": "string", "description": "Directory to search under (default: project root)" }
-            },
-            "required": ["pattern"]
-        })
-    }
-
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Parallel
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        self.run(args).await.into_tool_result()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentTool;
+    use serde_json::json;
 
     #[tokio::test]
     async fn glob_matches_nested_files() {
