@@ -127,66 +127,6 @@ fn apply_edit_key(app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy)]
-enum TogglePickerKind {
-    Skill,
-    Mcp,
-}
-
-/// Handles checkbox-style pickers. Returns true when the key is consumed.
-fn handle_toggle_picker_key(app: &mut App, code: KeyCode, kind: TogglePickerKind) -> bool {
-    match code {
-        KeyCode::Up => {
-            select_toggle_picker(app, kind, SelectionDirection::Previous);
-            true
-        }
-        KeyCode::Down => {
-            select_toggle_picker(app, kind, SelectionDirection::Next);
-            true
-        }
-        KeyCode::Enter | KeyCode::Char(' ') => {
-            toggle_selected_picker_row(app, kind);
-            true
-        }
-        KeyCode::Esc => {
-            close_toggle_picker(app, kind);
-            true
-        }
-        KeyCode::Char(_) => {
-            close_toggle_picker(app, kind);
-            false
-        }
-        _ => false,
-    }
-}
-
-fn select_toggle_picker(app: &mut App, kind: TogglePickerKind, direction: SelectionDirection) {
-    match kind {
-        TogglePickerKind::Skill => app.select_skill_picker(direction),
-        TogglePickerKind::Mcp => app.select_mcp_picker(direction),
-    }
-}
-
-fn toggle_selected_picker_row(app: &mut App, kind: TogglePickerKind) {
-    match kind {
-        // The picker's [x]/[ ] checkbox is the feedback; don't emit a notice
-        // into the transcript on every toggle.
-        TogglePickerKind::Skill => {
-            app.toggle_selected_skill();
-        }
-        TogglePickerKind::Mcp => {
-            app.toggle_selected_mcp_server();
-        }
-    }
-}
-
-fn close_toggle_picker(app: &mut App, kind: TogglePickerKind) {
-    match kind {
-        TogglePickerKind::Skill => app.skill_picker = None,
-        TogglePickerKind::Mcp => app.mcp_picker = None,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_key(
     app: &mut App,
@@ -461,14 +401,56 @@ pub(crate) async fn handle_key(
         }
     }
 
-    if app.skill_picker.is_some()
-        && handle_toggle_picker_key(app, key.code, TogglePickerKind::Skill)
-    {
-        return;
+    if app.skill_picker.is_some() {
+        match key.code {
+            KeyCode::Up => {
+                app.select_skill_picker(SelectionDirection::Previous);
+                return;
+            }
+            KeyCode::Down => {
+                app.select_skill_picker(SelectionDirection::Next);
+                return;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                // The picker's [x]/[ ] checkbox is the feedback; don't emit a
+                // notice into the transcript on every toggle.
+                app.toggle_selected_skill();
+                return;
+            }
+            KeyCode::Esc => {
+                app.skill_picker = None;
+                return;
+            }
+            KeyCode::Char(_) => {
+                app.skill_picker = None;
+            }
+            _ => {}
+        }
     }
 
-    if app.mcp_picker.is_some() && handle_toggle_picker_key(app, key.code, TogglePickerKind::Mcp) {
-        return;
+    if app.mcp_picker.is_some() {
+        match key.code {
+            KeyCode::Up => {
+                app.select_mcp_picker(SelectionDirection::Previous);
+                return;
+            }
+            KeyCode::Down => {
+                app.select_mcp_picker(SelectionDirection::Next);
+                return;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                app.toggle_selected_mcp_server();
+                return;
+            }
+            KeyCode::Esc => {
+                app.mcp_picker = None;
+                return;
+            }
+            KeyCode::Char(_) => {
+                app.mcp_picker = None;
+            }
+            _ => {}
+        }
     }
 
     match (key.modifiers, key.code) {

@@ -320,24 +320,59 @@ impl SessionPicker {
     }
 }
 
-/// Shared state for checkbox-style pickers whose rows live in a registry.
+/// `/skills` picker state. Rows come from `App.skills` registry `all()`.
 #[derive(Debug, Clone)]
-pub(crate) struct TogglePicker {
+pub(crate) struct SkillPicker {
     pub(crate) selected: usize,
 }
 
-impl TogglePicker {
-    pub(crate) fn open(total: usize) -> Option<Self> {
-        (total > 0).then_some(Self { selected: 0 })
+impl SkillPicker {
+    /// Open over a non-empty registry; returns `None` (so the caller can show
+    /// a notice) when no skills are configured.
+    pub(crate) fn open(registry: &crate::skills::SkillRegistry) -> Option<Self> {
+        (!registry.is_empty()).then_some(Self { selected: 0 })
     }
 
     pub(crate) fn select(&mut self, direction: SelectionDirection, total: usize) {
         self.selected = next_selection(self.selected, total, direction);
     }
+
+    /// Toggle the highlighted skill on the registry; returns `(name, now_enabled)`
+    /// for the post-toggle notice.
+    pub(crate) fn toggle(&self, registry: &crate::skills::SkillRegistry) -> Option<(String, bool)> {
+        let name = registry.all().get(self.selected)?.name.clone();
+        let now_enabled = registry.toggle(&name);
+        Some((name, now_enabled))
+    }
 }
 
-pub(crate) type SkillPicker = TogglePicker;
-pub(crate) type McpPicker = TogglePicker;
+/// `/mcp` picker state. Rows come from `App.mcp` registry `entries()` —
+/// includes connected, failed, and disabled servers in stable name order.
+#[derive(Debug, Clone)]
+pub(crate) struct McpPicker {
+    pub(crate) selected: usize,
+}
+
+impl McpPicker {
+    /// Open over a non-empty registry; returns `None` when no servers are
+    /// configured so the caller can show the "add one with `ignis mcp add`"
+    /// notice instead of an empty picker.
+    pub(crate) fn open(registry: &crate::mcp::McpRegistry) -> Option<Self> {
+        (!registry.is_empty()).then_some(Self { selected: 0 })
+    }
+
+    pub(crate) fn select(&mut self, direction: SelectionDirection, total: usize) {
+        self.selected = next_selection(self.selected, total, direction);
+    }
+
+    /// Toggle the highlighted MCP server on the registry; returns
+    /// `(name, now_enabled)`.
+    pub(crate) fn toggle(&self, registry: &crate::mcp::McpRegistry) -> Option<(String, bool)> {
+        let name = registry.entries().get(self.selected)?.name.clone();
+        let now_enabled = registry.toggle(&name);
+        Some((name, now_enabled))
+    }
+}
 
 /// `/model` picker state. Options live on `App.model_options`; this tracks the
 /// highlighted row and, for a reasoning-capable model, the chosen effort level.
@@ -1261,11 +1296,7 @@ impl App {
 
     pub(crate) fn show_skill_picker(&mut self) {
         self.exit_pending = false;
-        match self
-            .skills
-            .as_deref()
-            .and_then(|registry| SkillPicker::open(registry.all().len()))
-        {
+        match self.skills.as_deref().and_then(SkillPicker::open) {
             Some(p) => self.skill_picker = Some(p),
             None => self.add_assistant_notice(
                 "No skills found. Add one at ~/.ignis/skills/<name>/SKILL.md".to_string(),
@@ -1285,20 +1316,12 @@ impl App {
         self.skill_picker
             .as_ref()
             .zip(self.skills.as_deref())
-            .and_then(|(p, reg)| {
-                let name = reg.all().get(p.selected)?.name.clone();
-                let now_enabled = reg.toggle(&name);
-                Some((name, now_enabled))
-            })
+            .and_then(|(p, reg)| p.toggle(reg))
     }
 
     pub(crate) fn show_mcp_picker(&mut self) {
         self.exit_pending = false;
-        match self
-            .mcp
-            .as_deref()
-            .and_then(|registry| McpPicker::open(registry.len()))
-        {
+        match self.mcp.as_deref().and_then(McpPicker::open) {
             Some(p) => self.mcp_picker = Some(p),
             None => self.add_assistant_notice(
                 "No MCP servers configured. Add one with `ignis mcp add <name> -- <cmd> [args]`."
@@ -1319,11 +1342,7 @@ impl App {
         self.mcp_picker
             .as_ref()
             .zip(self.mcp.as_deref())
-            .and_then(|(p, reg)| {
-                let name = reg.entries().get(p.selected)?.name.clone();
-                let now_enabled = reg.toggle(&name);
-                Some((name, now_enabled))
-            })
+            .and_then(|(p, reg)| p.toggle(reg))
     }
 
     pub(crate) fn render_session_history(
