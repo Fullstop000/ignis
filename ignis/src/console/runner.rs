@@ -377,6 +377,10 @@ pub async fn run_console(
         // `Session::prompt` emits `UserPromptCommitted` (post-hook), so we
         // don't push it here.
         if app.take_turn_just_ended() {
+            // Control returned to the user — refresh the footer branch so a
+            // `git checkout` the agent ran this turn is reflected (oh-my-zsh
+            // recomputes per prompt; same idea).
+            app.refresh_git_branch();
             if let Some(text) = app.take_queued_front() {
                 crate::console::keys::submit_text(
                     &mut app,

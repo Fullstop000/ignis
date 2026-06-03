@@ -134,12 +134,27 @@ pub(crate) fn draw_queued(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Abbreviate `$HOME` to `~` for the footer (shell convention) so the path
+/// leaves room for the git branch and right-side status on one line.
+fn display_cwd(cwd: &std::path::Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Ok(rel) = cwd.strip_prefix(&home) {
+            return if rel.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", rel.display())
+            };
+        }
+    }
+    cwd.display().to_string()
+}
+
 /// Status footer under the input: working dir (left) and mode badge (when in
 /// any AFK level) + model + token usage (right). The badge is the only visual
 /// indicator that you're auto-approving tool calls — it pays for itself the
 /// first time it stops a user from thinking they're in default mode.
 pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    use crate::console::colors::PEACH;
+    use crate::console::colors::{GREEN, PEACH};
     use crate::permissions::Mode as PermissionMode;
 
     let (ctx_tokens, ctx_pct) = app.context_usage();
@@ -174,20 +189,23 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     // truncated by ratatui's normal wrapping, which is the same fate any
     // long cwd already faces.
     let cwd_span = Span::styled(
-        format!("  {}", app.cwd.display()),
+        format!("  {}", display_cwd(&app.cwd)),
         Style::default().fg(TEXT_DIM),
     );
-    let left = if app.update_notice.is_some() {
-        Line::from(vec![
-            cwd_span,
-            Span::styled(
-                "   ● new version available — run `ignis upgrade`",
-                Style::default().fg(YELLOW),
-            ),
-        ])
-    } else {
-        Line::from(cwd_span)
-    };
+    let mut left_spans = vec![cwd_span];
+    // Git branch (oh-my-zsh `git:(branch)` style) when cwd is in a work tree.
+    if let Some(branch) = &app.git_branch {
+        left_spans.push(Span::styled("  git:(", Style::default().fg(TEXT_DIM)));
+        left_spans.push(Span::styled(branch.clone(), Style::default().fg(GREEN)));
+        left_spans.push(Span::styled(")", Style::default().fg(TEXT_DIM)));
+    }
+    if app.update_notice.is_some() {
+        left_spans.push(Span::styled(
+            "   ● new version available — run `ignis upgrade`",
+            Style::default().fg(YELLOW),
+        ));
+    }
+    let left = Line::from(left_spans);
     let right = if let Some((label, color)) = badge {
         Line::from(vec![
             Span::styled(
@@ -326,4 +344,53 @@ pub(crate) fn draw_slash_suggestions(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(lines).style(Style::default().bg(SURFACE)),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::path::PathBuf;
+
+    fn footer_text(app: &App, w: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
+        term.draw(|f| draw_footer(f, f.size(), app)).unwrap();
+        term.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn footer_shows_git_branch_when_present() {
+        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        app.git_branch = Some("feature/login".into());
+        let out = footer_text(&app, 120);
+        assert!(out.contains("git:("), "expected git segment, got: {out}");
+        assert!(out.contains("feature/login"), "expected branch, got: {out}");
+    }
+
+    #[test]
+    fn display_cwd_abbreviates_home() {
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            assert_eq!(display_cwd(&home), "~");
+            assert_eq!(display_cwd(&home.join("proj/src")), "~/proj/src");
+        }
+        // A path outside $HOME is left absolute.
+        assert_eq!(display_cwd(&PathBuf::from("/etc/x")), "/etc/x");
+    }
+
+    #[test]
+    fn footer_omits_git_segment_outside_repo() {
+        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        app.git_branch = None;
+        let out = footer_text(&app, 120);
+        assert!(
+            !out.contains("git:("),
+            "expected no git segment, got: {out}"
+        );
+    }
 }
