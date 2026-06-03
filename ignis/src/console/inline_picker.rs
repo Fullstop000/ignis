@@ -45,6 +45,10 @@ pub(crate) struct InlinePickerState {
     /// considered "included" iff this buffer is non-empty — no separate
     /// toggle flag, so the user can freely type spaces into it.
     other_buf: String,
+    /// True once every question has been answered and we're showing the
+    /// review-and-submit screen (multi-question batches only). Enter submits;
+    /// Left/Shift-Tab steps back into the last question to revise it.
+    reviewing: bool,
     /// Taken on `Done` / `Cancel` so the caller can `send` on it.
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<PickerResponse>>,
 }
@@ -59,6 +63,7 @@ impl InlinePickerState {
             cursor: 0,
             toggled: vec![false; first_opts],
             other_buf: String::new(),
+            reviewing: false,
             reply: Some(request.reply),
         }
     }
@@ -83,6 +88,11 @@ impl InlinePickerState {
     }
     pub(crate) fn current_index(&self) -> usize {
         self.current
+    }
+    /// True when the review-and-submit screen is showing (all questions
+    /// answered). The renderer switches to `render_review` in this state.
+    pub(crate) fn is_reviewing(&self) -> bool {
+        self.reviewing
     }
     pub(crate) fn cursor(&self) -> usize {
         self.cursor
@@ -140,6 +150,16 @@ impl InlinePickerState {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(_)) {
             return KeyOutcome::Continue;
         }
+        // Review-and-submit screen (multi-question batches, all answered).
+        // Enter submits the whole batch; Left/Shift-Tab steps back into the
+        // last question to revise it (other answers are preserved).
+        if self.reviewing {
+            return match key.code {
+                KeyCode::Enter => KeyOutcome::Done(std::mem::take(&mut self.answers)),
+                KeyCode::Left | KeyCode::BackTab => self.go_back(),
+                _ => KeyOutcome::Continue,
+            };
+        }
         // Text-input mode (e.g. `/connect`'s API-key step): no options to
         // navigate. Every printable key extends the buffer, Backspace shrinks
         // it, Enter submits whatever's in the buffer. Length cap matches the
@@ -147,6 +167,7 @@ impl InlinePickerState {
         if self.is_text_input() {
             return match key.code {
                 KeyCode::Enter => self.try_advance(),
+                KeyCode::Left | KeyCode::BackTab => self.go_back(),
                 KeyCode::Backspace => {
                     self.other_buf.pop();
                     KeyOutcome::Continue
@@ -180,6 +201,9 @@ impl InlinePickerState {
                 KeyOutcome::Continue
             }
             KeyCode::Enter => self.try_advance(),
+            // Left / Shift-Tab steps back to the previous question (or out of
+            // review), rehydrating its prior answer for revision.
+            KeyCode::Left | KeyCode::BackTab => self.go_back(),
             // When Other has focus, typing (incl. space) goes into the buffer.
             // Must come BEFORE the multi-select space toggle so users can type
             // multi-word answers like "another approach" into Other.
@@ -202,34 +226,17 @@ impl InlinePickerState {
         }
     }
 
-    /// Try to commit the current question's selection and advance. Returns
-    /// `Continue` if the user hasn't picked anything yet (no-op), `Done` when
-    /// the LAST question is answered, or `Continue` after advancing to the
-    /// next question.
+    /// Try to commit the current question's selection. Returns `Continue` if
+    /// the user hasn't picked anything yet (no-op); otherwise delegates to
+    /// `commit`, which advances, enters review, or finishes.
     fn try_advance(&mut self) -> KeyOutcome {
         let q = self.current_question();
-        // Text-input questions are always single-answer: whatever's in the
-        // buffer becomes the answer. Empty submits are rejected so the user
-        // can't accidentally save a blank API key.
-        if q.text_input {
+        let pick: Option<PickerAnswer> = if q.text_input {
+            // Text-input questions are always single-answer. Empty submits are
+            // rejected so the user can't accidentally save a blank API key.
             let text = self.other_buf.trim();
-            if text.is_empty() {
-                return KeyOutcome::Continue;
-            }
-            let answer = PickerAnswer::Single(text.to_string());
-            self.answers.push(answer);
-            if self.current + 1 >= self.questions.len() {
-                let done = std::mem::take(&mut self.answers);
-                return KeyOutcome::Done(done);
-            }
-            self.current += 1;
-            let next_opts = self.current_question().options.len();
-            self.cursor = 0;
-            self.toggled = vec![false; next_opts];
-            self.other_buf.clear();
-            return KeyOutcome::Continue;
-        }
-        let pick: Option<PickerAnswer> = if q.multi_select {
+            (!text.is_empty()).then(|| PickerAnswer::Single(text.to_string()))
+        } else if q.multi_select {
             let mut picks: Vec<String> = q
                 .options
                 .iter()
@@ -251,22 +258,97 @@ impl InlinePickerState {
             Some(PickerAnswer::Single(q.options[self.cursor].label.clone()))
         };
 
-        let Some(answer) = pick else {
-            return KeyOutcome::Continue;
-        };
-        self.answers.push(answer);
-        if self.current + 1 >= self.questions.len() {
-            // All done — drain answers out.
-            let done = std::mem::take(&mut self.answers);
-            return KeyOutcome::Done(done);
+        match pick {
+            Some(answer) => self.commit(answer),
+            None => KeyOutcome::Continue,
         }
-        // Advance to the next question, reset cursor/toggled/Other.
+    }
+
+    /// Record `answer` for the current question, then move forward: to the
+    /// next question, to the review screen (last question of a multi-question
+    /// batch), or to `Done` (last question of a single-question batch). When
+    /// revisiting an already-answered question the answer is overwritten in
+    /// place so the other answers are preserved.
+    fn commit(&mut self, answer: PickerAnswer) -> KeyOutcome {
+        if self.current < self.answers.len() {
+            self.answers[self.current] = answer;
+        } else {
+            self.answers.push(answer);
+        }
+        if self.current + 1 >= self.questions.len() {
+            // Last question answered. A single-question batch returns
+            // immediately (a review screen for one answer is pure friction);
+            // multi-question batches show the review-and-submit step.
+            if self.questions.len() > 1 {
+                self.reviewing = true;
+                return KeyOutcome::Continue;
+            }
+            return KeyOutcome::Done(std::mem::take(&mut self.answers));
+        }
         self.current += 1;
-        let next_opts = self.current_question().options.len();
-        self.cursor = 0;
-        self.toggled = vec![false; next_opts];
-        self.other_buf.clear();
+        self.load_question_state();
         KeyOutcome::Continue
+    }
+
+    /// Step back one screen: out of review into the last question, or to the
+    /// previous question. The target question's prior answer is rehydrated so
+    /// the user revises rather than re-enters. No-op at the first question.
+    fn go_back(&mut self) -> KeyOutcome {
+        if self.reviewing {
+            // `current` is still the last question — just leave review and
+            // reload it with its committed answer.
+            self.reviewing = false;
+            self.load_question_state();
+            return KeyOutcome::Continue;
+        }
+        if self.current == 0 {
+            return KeyOutcome::Continue;
+        }
+        self.current -= 1;
+        self.load_question_state();
+        KeyOutcome::Continue
+    }
+
+    /// Reset the per-question editing state (cursor / toggles / Other buffer)
+    /// for `self.current`, then rehydrate it from a previously committed
+    /// answer if one exists (i.e. we're revisiting, not answering fresh).
+    fn load_question_state(&mut self) {
+        let opts_n = self.current_question().options.len();
+        self.cursor = 0;
+        self.toggled = vec![false; opts_n];
+        self.other_buf.clear();
+        if self.current < self.answers.len() {
+            let prev = self.answers[self.current].clone();
+            self.rehydrate_into(prev);
+        }
+    }
+
+    /// Restore the cursor / toggles / Other buffer to reflect `prev` for the
+    /// current question, so a revisited question shows the user's last choice.
+    fn rehydrate_into(&mut self, prev: PickerAnswer) {
+        let q = &self.questions[self.current];
+        match prev {
+            PickerAnswer::Single(val) => {
+                if q.text_input {
+                    self.other_buf = val;
+                } else if let Some(i) = q.options.iter().position(|o| o.label == val) {
+                    self.cursor = i;
+                } else if q.allow_other {
+                    // The prior answer was free-text — restore it into Other.
+                    self.other_buf = val;
+                    self.cursor = q.options.len();
+                }
+            }
+            PickerAnswer::Multi(vals) => {
+                for v in vals {
+                    if let Some(i) = q.options.iter().position(|o| o.label == v) {
+                        self.toggled[i] = true;
+                    } else {
+                        self.other_buf = v;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -335,6 +417,93 @@ pub(crate) fn footer_lines(state: &InlinePickerState) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(Span::styled(footer, Style::default().fg(TEXT_DIM))),
     ]
+}
+
+/// Review-and-submit screen for a multi-question batch: every question with
+/// its committed answer, a Submit affordance, and a footer advertising the
+/// revise / submit / cancel keys. Shown when `state.is_reviewing()`.
+pub(crate) fn render_review(lines: &mut Vec<Line<'static>>, state: &InlinePickerState, width: u16) {
+    let n = state.questions.len();
+    let kind = state.questions[state.current].kind.clone();
+    lines.push(divider_line(width));
+    lines.push(Line::from(""));
+    // Header strip mirrors the question header but reads `· review · N/N`.
+    lines.push(Line::from(vec![
+        Span::styled("◆ ", Style::default().fg(MAUVE)),
+        Span::styled(
+            kind,
+            Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", Style::default().fg(TEXT_DIM)),
+        Span::styled(
+            "review",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {n}/{n}"), Style::default().fg(TEXT_DIM)),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "Confirm your answers:",
+        Style::default().fg(TEXT),
+    )));
+    lines.push(Line::from(""));
+
+    // `  N. <header>   <answer>` with the header column padded so answers line
+    // up; multi-select answers stack under the first, each prefixed with ✓.
+    let num_w = n.to_string().len();
+    let header_w = state
+        .questions
+        .iter()
+        .map(|q| q.header.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (i, q) in state.questions.iter().enumerate() {
+        let prefix = format!(
+            "  {:>num_w$}. {:<header_w$}   ",
+            i + 1,
+            q.header,
+            num_w = num_w,
+            header_w = header_w
+        );
+        let indent = " ".repeat(prefix.chars().count());
+        match state.answers.get(i) {
+            Some(PickerAnswer::Single(v)) => {
+                let shown = if q.text_input {
+                    format!("\"{v}\"")
+                } else {
+                    v.clone()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(TEXT_DIM)),
+                    Span::styled(shown, Style::default().fg(TEXT)),
+                ]));
+            }
+            Some(PickerAnswer::Multi(vs)) => {
+                for (j, v) in vs.iter().enumerate() {
+                    let lead = if j == 0 {
+                        prefix.clone()
+                    } else {
+                        indent.clone()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(lead, Style::default().fg(TEXT_DIM)),
+                        Span::styled(format!("✓ {v}"), Style::default().fg(TEXT)),
+                    ]));
+                }
+            }
+            None => {}
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  [ Submit ]",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "← revisit · ↵ submit · esc cancel",
+        Style::default().fg(TEXT_DIM),
+    )));
 }
 
 /// One-line input row for text-input mode. Renders the buffer (masked when
@@ -735,6 +904,20 @@ fn recommended_badge() -> Vec<Span<'static>> {
 /// option descriptions that wrap onto multiple display rows are budgeted
 /// correctly. Passing the body width prevents the footer hint from clipping.
 pub(crate) fn picker_height(state: &InlinePickerState, width: u16) -> u16 {
+    // Review screen: divider + blank + header + "Confirm" + blank (5) + one
+    // row per answer (multi-select answers stack) + blank + Submit + blank +
+    // footer (4).
+    if state.is_reviewing() {
+        let answer_rows: u16 = state
+            .answers
+            .iter()
+            .map(|a| match a {
+                PickerAnswer::Multi(v) => v.len().max(1) as u16,
+                PickerAnswer::Single(_) => 1,
+            })
+            .sum();
+        return 5 + answer_rows + 4;
+    }
     let q = state.current_question();
     let header_rows: u16 = 4; // divider + blank + header + question
     let footer_rows: u16 = 2; // blank + footer
@@ -991,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn two_question_flow_advances_between_questions() {
+    fn two_question_flow_advances_then_reviews_before_done() {
         let (mut s, _rx) = make_request(vec![
             q("Q1?", "h1", false, &["x", "y"]),
             q("Q2?", "h2", false, &["p", "q"]),
@@ -1001,6 +1184,13 @@ mod tests {
         assert_eq!(s.current_index(), 1);
         assert_eq!(s.cursor(), 0); // reset
         let _ = s.on_key(key(KeyCode::Down)); // move to "q"
+                                              // Enter on the LAST question opens review, not Done.
+        assert!(matches!(
+            s.on_key(key(KeyCode::Enter)),
+            KeyOutcome::Continue
+        ));
+        assert!(s.is_reviewing());
+        // Enter on review submits the whole batch.
         match s.on_key(key(KeyCode::Enter)) {
             KeyOutcome::Done(ans) => {
                 assert_eq!(ans.len(), 2);
@@ -1009,6 +1199,135 @@ mod tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn single_question_skips_review_and_returns_done() {
+        let (mut s, _rx) = make_request(vec![q("Q?", "h", false, &["a", "b"])]);
+        match s.on_key(key(KeyCode::Enter)) {
+            KeyOutcome::Done(ans) => assert_eq!(ans, vec![PickerAnswer::Single("a".to_string())]),
+            other => panic!("expected Done, got {other:?}"),
+        }
+        assert!(!s.is_reviewing());
+    }
+
+    #[test]
+    fn back_from_review_reopens_last_question_with_prior_answer() {
+        let (mut s, _rx) = make_request(vec![
+            q("Q1?", "h1", false, &["x", "y"]),
+            q("Q2?", "h2", false, &["p", "q"]),
+        ]);
+        let _ = s.on_key(key(KeyCode::Enter)); // Q1 -> x
+        let _ = s.on_key(key(KeyCode::Down)); // Q2 cursor -> q
+        let _ = s.on_key(key(KeyCode::Enter)); // -> review
+        assert!(s.is_reviewing());
+        let _ = s.on_key(key(KeyCode::Left)); // back into Q2
+        assert!(!s.is_reviewing());
+        assert_eq!(s.current_index(), 1);
+        assert_eq!(s.cursor(), 1, "prior answer 'q' rehydrated");
+    }
+
+    #[test]
+    fn back_nav_preserves_other_answers_and_allows_edit() {
+        let (mut s, _rx) = make_request(vec![
+            q("Q1?", "h1", false, &["a", "b"]),
+            q("Q2?", "h2", false, &["c", "d"]),
+            q("Q3?", "h3", false, &["e", "f"]),
+        ]);
+        let _ = s.on_key(key(KeyCode::Enter)); // Q1 -> a
+        let _ = s.on_key(key(KeyCode::Down));
+        let _ = s.on_key(key(KeyCode::Enter)); // Q2 -> d
+        let _ = s.on_key(key(KeyCode::Down));
+        let _ = s.on_key(key(KeyCode::Enter)); // Q3 -> f -> review
+        assert!(s.is_reviewing());
+        // Walk all the way back to Q1, prior answers rehydrated each step.
+        let _ = s.on_key(key(KeyCode::Left)); // -> Q3 (f)
+        assert_eq!((s.current_index(), s.cursor()), (2, 1));
+        let _ = s.on_key(key(KeyCode::Left)); // -> Q2 (d)
+        assert_eq!((s.current_index(), s.cursor()), (1, 1));
+        let _ = s.on_key(key(KeyCode::Left)); // -> Q1 (a)
+        assert_eq!((s.current_index(), s.cursor()), (0, 0));
+        // Change Q1 a -> b, then go forward; Q2/Q3 answers must be preserved.
+        let _ = s.on_key(key(KeyCode::Down)); // cursor -> b
+        let _ = s.on_key(key(KeyCode::Enter)); // commit b -> Q2 (rehydrated d)
+        assert_eq!((s.current_index(), s.cursor()), (1, 1));
+        let _ = s.on_key(key(KeyCode::Enter)); // keep d -> Q3 (rehydrated f)
+        assert_eq!((s.current_index(), s.cursor()), (2, 1));
+        let _ = s.on_key(key(KeyCode::Enter)); // keep f -> review
+        assert!(s.is_reviewing());
+        match s.on_key(key(KeyCode::Enter)) {
+            KeyOutcome::Done(ans) => assert_eq!(
+                ans,
+                vec![
+                    PickerAnswer::Single("b".to_string()),
+                    PickerAnswer::Single("d".to_string()),
+                    PickerAnswer::Single("f".to_string()),
+                ]
+            ),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn back_nav_rehydrates_multiselect_toggles() {
+        let (mut s, _rx) = make_request(vec![
+            q("Q1?", "h1", true, &["a", "b", "c"]),
+            q("Q2?", "h2", false, &["x", "y"]),
+        ]);
+        let _ = s.on_key(key(KeyCode::Char(' '))); // toggle a (cursor 0)
+        let _ = s.on_key(key(KeyCode::Down));
+        let _ = s.on_key(key(KeyCode::Down)); // cursor -> c
+        let _ = s.on_key(key(KeyCode::Char(' '))); // toggle c
+        let _ = s.on_key(key(KeyCode::Enter)); // commit [a,c] -> Q2
+        let _ = s.on_key(key(KeyCode::Enter)); // Q2 -> x -> review
+        let _ = s.on_key(key(KeyCode::Left)); // -> Q2
+        let _ = s.on_key(key(KeyCode::Left)); // -> Q1, toggles rehydrated
+        assert_eq!(s.current_index(), 0);
+        assert!(s.is_toggled(0));
+        assert!(!s.is_toggled(1));
+        assert!(s.is_toggled(2));
+    }
+
+    #[test]
+    fn render_review_lists_questions_and_answers() {
+        let (mut s, _rx) = make_request(vec![
+            q("Q1?", "Database", false, &["postgres", "mysql"]),
+            q("Q2?", "ORM", false, &["sqlx", "diesel"]),
+        ]);
+        let _ = s.on_key(key(KeyCode::Enter)); // Q1 -> postgres
+        let _ = s.on_key(key(KeyCode::Down));
+        let _ = s.on_key(key(KeyCode::Enter)); // Q2 -> diesel -> review
+        assert!(s.is_reviewing());
+        let mut lines: Vec<Line> = Vec::new();
+        render_review(&mut lines, &s, 80);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        for needle in ["review", "Database", "postgres", "ORM", "diesel", "Submit"] {
+            assert!(text.contains(needle), "review missing {needle:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn back_nav_rehydrates_other_free_text() {
+        let (mut s, _rx) = make_request(vec![
+            q("Q1?", "h1", false, &["a", "b"]),
+            q("Q2?", "h2", false, &["x", "y"]),
+        ]);
+        let _ = s.on_key(key(KeyCode::Down));
+        let _ = s.on_key(key(KeyCode::Down)); // cursor -> Other row
+        for c in "custom".chars() {
+            let _ = s.on_key(key(KeyCode::Char(c)));
+        }
+        let _ = s.on_key(key(KeyCode::Enter)); // commit Single("custom") -> Q2
+        let _ = s.on_key(key(KeyCode::Enter)); // Q2 -> x -> review
+        let _ = s.on_key(key(KeyCode::Left)); // -> Q2
+        let _ = s.on_key(key(KeyCode::Left)); // -> Q1
+        assert_eq!(s.current_index(), 0);
+        assert!(s.other_focused(), "cursor returned to Other row");
+        assert_eq!(s.other_buf(), "custom");
     }
 
     #[test]
