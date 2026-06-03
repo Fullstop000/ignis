@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ask_user` shows a review-and-submit screen for multi-question batches — confirm every answer, or step back (Left / Shift-Tab) to revise one before submitting. ([#115](https://github.com/Fullstop000/ignis/pull/115))
+- Footer shows the current git branch (oh-my-zsh `git:(branch)` style) when the working directory is a git repo. ([#115](https://github.com/Fullstop000/ignis/pull/115))
+
 ### Changed
 - Tool-initiated pickers (`ask_user`, `permission`, `connect`, `afk`) now anchor to the bottom of the body above the input band — transcript stays visible above — matching the Claude Code / Codex convention. ([#107](https://github.com/Fullstop000/ignis/pull/107))
 
