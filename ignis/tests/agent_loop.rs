@@ -623,6 +623,86 @@ async fn inject_on_final_round_keeps_turn_alive_one_more_round() {
         .any(|m| m.role == "user" && m.content.as_deref() == Some("STEER")));
 }
 
+/// Provider whose first stream opens but drops before any delta arrives — a
+/// retryable, no-UI-state failure — then succeeds on the retry. Guards the
+/// `stream_turn_with_retry` seam: the loop must re-issue the request, surface
+/// exactly one `Reconnecting`, and deliver the recovered turn's text without
+/// leaking the dropped attempt's error inline.
+struct DropOnceThenRecoverProvider {
+    fired: AtomicBool,
+}
+
+#[async_trait]
+impl LlmProvider for DropOnceThenRecoverProvider {
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+
+    async fn chat_stream(
+        &self,
+        _system_prompt: &str,
+        _messages: &[Message],
+        _tools: &[serde_json::Value],
+    ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error> {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            // First attempt: body closes before any delta → empty + retryable.
+            let dropped: Result<LlmResponseDelta, anyhow::Error> = Err(anyhow::anyhow!(
+                "error reading a body from connection: connection reset"
+            ));
+            return Ok(stream::iter(vec![dropped]).boxed());
+        }
+        Ok(stream::iter(vec![Ok(LlmResponseDelta::Text("recovered".to_string()))]).boxed())
+    }
+}
+
+#[tokio::test]
+async fn empty_stream_drop_retries_then_recovers() {
+    let provider = DropOnceThenRecoverProvider {
+        fired: AtomicBool::new(false),
+    };
+    let storage = InMemoryStorage::new();
+    let mut session = Session::open(
+        "retry".to_string(),
+        "system".to_string(),
+        Box::new(provider),
+        Box::new(storage),
+        "/tmp".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    session.prompt("go", tx).await.unwrap();
+    let events = collect_events(&mut rx).await;
+
+    // The dropped first attempt was retried exactly once, then recovered.
+    let reconnects: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Reconnecting { .. }))
+        .collect();
+    assert_eq!(reconnects.len(), 1, "exactly one reconnect");
+    assert!(matches!(
+        reconnects[0],
+        AgentEvent::Reconnecting {
+            attempt: 1,
+            max: 3,
+            ..
+        }
+    ));
+
+    // The recovered turn's text reached the user; no inline stream error leaked.
+    let text = find_text(&events);
+    assert_eq!(text, "recovered");
+    assert!(
+        !text.contains("Error in stream"),
+        "recovered turn must not surface the dropped attempt's error"
+    );
+}
+
 #[tokio::test]
 async fn session_captures_real_token_usage() {
     // Provider reports a usage delta → it surfaces as an AgentEvent::Usage and

@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Tool-initiated pickers (`ask_user`, `permission`, `connect`, `afk`) now anchor to the bottom of the body above the input band — transcript stays visible above — matching the Claude Code / Codex convention. ([#107](https://github.com/Fullstop000/ignis/pull/107))
 - Internal — the TUI slash-command dispatcher (`submit_text`) is now a `match` on the command token instead of a 13-arm `if/else` ladder, with the no-provider gate hoisted to a single early return and the skill-command lookup deduplicated. No user-visible change. ([#111](https://github.com/Fullstop000/ignis/pull/111))
-- Internal — native tools now share one static metadata and call adapter. No user-visible change. ([#119](https://github.com/Fullstop000/ignis/pull/119))
+- Internal — native tools now share one static metadata and call adapter; the agent loop's stream-retry and hook-block paths are factored into named helpers. No user-visible change. ([#119](https://github.com/Fullstop000/ignis/pull/119))
 
 ### Fixed
 - TUI message queue now routes queued slash commands through the same dispatcher Enter uses, so `/compact`, `/model`, and other commands typed while the agent is busy actually run on drain instead of being sent to the LLM as literal user messages. Slash-command autocomplete is also surfaced while busy so the queued line can be completed from the dropdown. ([#106](https://github.com/Fullstop000/ignis/pull/106))
