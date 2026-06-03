@@ -652,9 +652,17 @@ mod end_to_end {
             .await
         });
         let state = InlinePickerState::new(rx.recv().await.unwrap());
+        // Q1 Enter → serde_json; Q2 Down+Enter → lax → review; final Enter
+        // submits the batch from the review-and-submit screen (multi-question
+        // batches stop at review before returning).
         drive(
             state,
-            &[key(KeyCode::Enter), key(KeyCode::Down), key(KeyCode::Enter)],
+            &[
+                key(KeyCode::Enter),
+                key(KeyCode::Down),
+                key(KeyCode::Enter),
+                key(KeyCode::Enter),
+            ],
         );
         let result = call.await.unwrap();
         let v: Value = serde_json::from_str(&result.content).unwrap();

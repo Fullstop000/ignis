@@ -68,14 +68,16 @@ def _classify(
 ) -> str:
     """Bucket a trial into passed / failed / errored.
 
-    Mirrors `aggregate_results.classify` — keep both in sync. `failed` is
-    reserved for the narrow case where the verifier actually ran and rejected
-    the agent's completed work; every other not-passed outcome (harness
-    exception, stream drop, rate-limit cutoff, missing reward) is `errored`,
-    with the subtype carried in the Exception column.
+    Mirrors `aggregate_results.classify` — keep both in sync. `failed` covers
+    real model misses: either the verifier ran and rejected the work, or the
+    agent burned through its full timeout budget (`AgentTimeoutError`).
+    Everything else (other harness exception, stream drop, rate-limit, missing
+    reward) is `errored`, with the subtype carried in the Exception column.
     """
     if reward == 1.0:
         return "passed"
+    if (exc or {}).get("exception_type") == "AgentTimeoutError":
+        return "failed"
     if reward == 0.0 and not (exc or stream_dropped or rate_limited):
         return "failed"
     return "errored"
@@ -251,14 +253,18 @@ def walk_trials(job_dir: Path) -> list[Trial]:
             _tail_lines(verifier_test_p.read_text(errors="ignore"), 30) if verifier_test_p.exists() else ""
         )
 
-        # Exception column carries the *why* for errored rows. Order mirrors
-        # `_classify`: harness exception > stream drop > rate-limit > unknown
-        # (no reward and no other marker). Non-errored rows leave it blank.
+        # Exception column carries the *why*. For `failed`, `TimedOut`
+        # distinguishes "agent burned its budget" from "verifier rejected"
+        # (blank). For `errored`, order mirrors `_classify`: harness exception
+        # > stream drop > rate-limit > unknown. `passed` is always blank.
+        exc_type = (exc or {}).get("exception_type", "")
         bucket = _classify(reward, exc, rate_limited, bucket_stream_drop)
-        if bucket != "errored":
+        if bucket == "passed":
             exception_label = ""
+        elif bucket == "failed":
+            exception_label = "TimedOut" if exc_type == "AgentTimeoutError" else ""
         elif exc:
-            exception_label = (exc or {}).get("exception_type", "")
+            exception_label = exc_type
         elif bucket_stream_drop:
             exception_label = "ConnectionDropped"
         elif rate_limited:
@@ -424,8 +430,21 @@ def _render_main_table(trials: list[Trial]) -> str:
     sorted_trials = sorted(
         trials, key=lambda t: (bucket_order.get(t.bucket, 9), -(t.duration_seconds or 0))
     )
+    # `TimedOut` rows are missing usage data because harbor's sandbox-sync
+    # doesn't grab `agent/ignis-projects/*.usage.json` when ignis is SIGKILL'd
+    # mid-turn. Mark the row so hovering explains the gap instead of leaving
+    # the user wondering whether the report is broken.
+    timed_out_no_usage = (
+        'title="No usage data — sandbox killed by AgentTimeoutError before '
+        'ignis-projects/*.usage.json could sync."'
+    )
     for t in sorted_trials:
-        rows.append(f"""<tr class="{t.bucket}">
+        tr_attrs = (
+            timed_out_no_usage
+            if t.exception == "TimedOut" and not t.n_input_tokens
+            else ""
+        )
+        rows.append(f"""<tr class="{t.bucket}" {tr_attrs}>
   <td>{html.escape(t.task)}</td>
   <td data-sort="{bucket_order.get(t.bucket, 9)}">{_bucket_tag(t.bucket)}</td>
   <td class="num" data-sort="{t.reward if t.reward is not None else -1}">{_fmt_num(t.reward) if t.reward is not None else "—"}</td>
@@ -506,7 +525,7 @@ def render(trials: list[Trial], job_dir: Path) -> str:
 <html><head><meta charset="utf-8"><title>ignis {html.escape(suite)} report</title>
 <style>{_CSS}</style></head><body>
 <h1>ignis · {html.escape(suite)} report</h1>
-<div class="meta">job dir: <code>{html.escape(str(job_dir))}</code> · generated {dt.datetime.now().isoformat(timespec="seconds")}</div>
+<div class="meta">generated {dt.datetime.now().isoformat(timespec="seconds")}</div>
 
 <div class="stats">
   <div class="stat"><div class="label">Real-attempt pass rate</div><div class="value">{real_pass_pct:.1f}%</div><div class="meta">{len(passed)} / {len(real_attempts)} real trials</div></div>

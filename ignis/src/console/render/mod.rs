@@ -94,7 +94,16 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
             render_transcript(f, above, app);
         }
         let picker = app.inline_picker.as_ref().expect("still set");
-        if picker.has_any_preview() {
+        if picker.is_reviewing() {
+            let mut lines: Vec<Line> = Vec::new();
+            super::inline_picker::render_review(&mut lines, picker, picker_area.width);
+            f.render_widget(
+                Paragraph::new(Text::from(lines))
+                    .style(Style::default().bg(BG))
+                    .wrap(Wrap { trim: false }),
+                picker_area,
+            );
+        } else if picker.has_any_preview() {
             render_inline_picker_split(f, picker_area, picker);
         } else {
             let mut lines: Vec<Line> = Vec::new();

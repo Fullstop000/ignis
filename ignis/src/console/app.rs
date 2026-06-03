@@ -571,6 +571,10 @@ pub(crate) struct App {
     /// Auto-update-check result. `None` until the background check resolves;
     /// once `Some`, the footer renders a "new version available" segment.
     pub(crate) update_notice: Option<crate::cli::upgrade::UpdateNotice>,
+    /// Current git branch of `cwd` (oh-my-zsh-style footer segment), or `None`
+    /// when cwd isn't in a work tree. Computed at startup and refreshed on each
+    /// turn boundary so a mid-session `git checkout` is reflected.
+    pub(crate) git_branch: Option<String>,
     /// Shared external-subprocess hook registry — used by `/hooks reload`
     /// and (clone-handed) by the assistant-render seam in `runner.rs`.
     pub(crate) hooks: Option<crate::hooks::HookRegistry>,
@@ -578,6 +582,7 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn new(provider: String, model: String, session_id: String, cwd: PathBuf) -> Self {
+        let git_branch = super::git::branch(&cwd);
         Self {
             provider,
             model,
@@ -619,12 +624,19 @@ impl App {
             mcp: None,
             permissions: None,
             update_notice: None,
+            git_branch,
             hooks: None,
             transcript: Vec::new(),
             scroll_offset: 0,
             auto_follow: true,
             transcript_visible_rows: 0,
         }
+    }
+
+    /// Recompute the cached git branch from `cwd`. Called on each turn
+    /// boundary so the footer tracks a mid-session `git checkout`.
+    pub(crate) fn refresh_git_branch(&mut self) {
+        self.git_branch = super::git::branch(&self.cwd);
     }
 
     /// Append a chunk of finalized lines (welcome banner, a committed block,
