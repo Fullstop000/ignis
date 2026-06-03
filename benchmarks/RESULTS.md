@@ -20,6 +20,8 @@ Columns:
 - **Cache hit** — cache-read tokens ÷ input tokens.
 - **Report** — committed per-trial CSV in `terminal-bench/history/` + the rendered HTML on the Vercel host.
 
+Per-trial raw traces (agent stdout log, session JSONL, verifier output, all secret-redacted) live in a private repo: `Fullstop000/ignis-bench-traces`, one GitHub Release per run. Built via `scripts/bundle_traces.py`.
+
 | Date | Benchmark | Model @ effort | ignis | Score | Resolved% | Errored | Input tok | Output tok | Cache hit | Report | Notes |
 |------|-----------|----------------|-------|-------|----------:|--------:|----------:|-----------:|----------:|--------|-------|
 | 2026-06-03 | Terminal-Bench 2.1 (89) | `deepseek/deepseek-v4-flash@max` | v0.33.1 † | 50/89 · 56.2% | 61.7% | 8 | 328.2M | 3.13M | 99.0% | [csv](terminal-bench/history/tb21-deepseek-v4-flash-max-20260603.csv) · [html](https://ignis-bench-reports.vercel.app/reports/tb21-ds-v4-flash-max-20260603) | First TB 2.1 baseline for `deepseek-v4-flash@max`. Score 56.2% sits between TB 2.0 deepseek@max (60.7%) and TB 2.1 MiniMax-M3 (51.7%) — TB 2.1 is harder, drop is expected. Resolved% 61.7% essentially matches TB 2.0 deepseek@max (62.8%), so model capability is consistent. 31 failed = 26 verifier-reject + 5 `TimedOut`; 8 errored = 7 `ConnectionDropped` + 1 `VerifierTimeoutError`. Auto-retry (PR #97) is active in v0.33.1 binary, but `ConnectionDropped` still climbed to 7 here — deepseek's streaming endpoint appears flakier than MiniMax's OpenAI-protocol path. Input tokens 328M is by far the highest of the three runs (reasoning effort `@max` is generous), cache hit 99.0%. |
