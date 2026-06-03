@@ -18,11 +18,12 @@ Columns:
     trial                — full trial dir name (`<task>__<hash>`)
     bucket               — passed | failed | errored
     reward               — 1.0 / 0.0 / "" (no verifier result)
-    exception            — subtype tag when bucket==errored, else "".
-                           Possible values: AgentTimeoutError /
-                           VerifierTimeoutError / NonZeroAgentExitCodeError
-                           (and other harness exception types) /
-                           ConnectionDropped / RateLimited / Unknown.
+    exception            — subtype tag. For `failed`: `TimedOut` (agent burned
+                           its budget) or "" (verifier ran and rejected). For
+                           `errored`: `VerifierTimeoutError` /
+                           `NonZeroAgentExitCodeError` (and other harness
+                           exception types) / `ConnectionDropped` /
+                           `RateLimited` / `Unknown`. For `passed`: "".
     rate_limited         — true if the agent log shows kimi's rate_limit_reached_error
     duration_seconds     — wall time from harbor's timestamps
     n_input_tokens       — sum from synced ignis-projects/**/<session>.usage.json
@@ -34,8 +35,9 @@ Columns:
 
 Bucket precedence:
     reward == 1.0                                   → passed   (recovery counts)
-    reward == 0.0 with no other markers             → failed   (verifier gate failed)
-    everything else (exc / stream drop / rate-limit / missing-reward)
+    AgentTimeoutError                               → failed/TimedOut
+    reward == 0.0 with no other markers             → failed   (verifier rejected)
+    everything else (other exc / stream drop / rate-limit / missing-reward)
                                                      → errored  (exception subtype carries the why)
 """
 
@@ -93,16 +95,21 @@ def classify(
 ) -> str:
     """Bucket a trial into passed / failed / errored.
 
-    `failed` is reserved for the narrow case where the benchmark verifier
-    actually ran and rejected the agent's completed work. Everything else that
-    didn't pass — harness exceptions, provider stream drops, rate-limit cutoffs,
-    or a missing verifier verdict — is `errored`. The Exception column carries
-    the why; the bucket is just the high-level outcome.
+    `failed` is a model miss — either the verifier ran and rejected the work,
+    OR the agent burned through its full timeout budget (task author's
+    `timeout_sec` × our `--agent-timeout-multiplier`, ×2.0 by default) without
+    finishing. A stronger model finishes the same task faster, so timeouts are
+    a capability signal, not infra failure.
+
+    `errored` is reserved for cases where the model never got a fair shot:
+    network drops, provider rate-limits, harness crashes, sandbox exits.
     """
     if reward == 1.0:
         return "passed"
-    # Bare verifier-rejection only. Any signal that the agent didn't get a
-    # clean shot (exc / stream drop / rate-limit) pushes the row into errored.
+    if (exc or {}).get("exception_type") == "AgentTimeoutError":
+        return "failed"
+    # Bare verifier-rejection only. Any other signal that the agent didn't get
+    # a clean shot (other exc / stream drop / rate-limit) pushes into errored.
     if reward == 0.0 and not (exc or stream_dropped or rate_limited):
         return "failed"
     return "errored"
@@ -172,15 +179,20 @@ def walk_trials(job_dir: Path) -> list[dict[str, Any]]:
         n_in, n_out, n_cache = _sum_usage(trial_dir / "agent" / "ignis-projects")
         cache_rate = round(n_cache / n_in, 3) if n_in else ""
 
-        # Bucket and exception subtype. The bucket is just passed/failed/errored
-        # — the Exception column carries the reason a trial is errored. Order
-        # mirrors `classify`'s precedence: harness exception > stream drop >
-        # rate-limit > unknown (no reward and nothing else to say).
+        # Bucket and exception subtype. The bucket is passed/failed/errored —
+        # the Exception column distinguishes the sub-cause. For `failed`, the
+        # only sub-type is `TimedOut` (agent burned its budget) vs blank (the
+        # verifier ran and rejected). For `errored`, the order mirrors
+        # `classify`'s precedence: harness exception > stream drop > rate-limit
+        # > unknown (no reward and nothing else to say).
+        exc_type = (exc or {}).get("exception_type", "")
         bucket = classify(reward, exc, rate_limited, stream_dropped and reward != 1.0)
-        if bucket != "errored":
+        if bucket == "passed":
             exception_label = ""
+        elif bucket == "failed":
+            exception_label = "TimedOut" if exc_type == "AgentTimeoutError" else ""
         elif exc:
-            exception_label = (exc or {}).get("exception_type", "")
+            exception_label = exc_type
         elif stream_dropped and reward != 1.0:
             exception_label = "ConnectionDropped"
         elif rate_limited:
