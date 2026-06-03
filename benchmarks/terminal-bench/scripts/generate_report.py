@@ -430,8 +430,21 @@ def _render_main_table(trials: list[Trial]) -> str:
     sorted_trials = sorted(
         trials, key=lambda t: (bucket_order.get(t.bucket, 9), -(t.duration_seconds or 0))
     )
+    # `TimedOut` rows are missing usage data because harbor's sandbox-sync
+    # doesn't grab `agent/ignis-projects/*.usage.json` when ignis is SIGKILL'd
+    # mid-turn. Mark the row so hovering explains the gap instead of leaving
+    # the user wondering whether the report is broken.
+    timed_out_no_usage = (
+        'title="No usage data — sandbox killed by AgentTimeoutError before '
+        'ignis-projects/*.usage.json could sync."'
+    )
     for t in sorted_trials:
-        rows.append(f"""<tr class="{t.bucket}">
+        tr_attrs = (
+            timed_out_no_usage
+            if t.exception == "TimedOut" and not t.n_input_tokens
+            else ""
+        )
+        rows.append(f"""<tr class="{t.bucket}" {tr_attrs}>
   <td>{html.escape(t.task)}</td>
   <td data-sort="{bucket_order.get(t.bucket, 9)}">{_bucket_tag(t.bucket)}</td>
   <td class="num" data-sort="{t.reward if t.reward is not None else -1}">{_fmt_num(t.reward) if t.reward is not None else "—"}</td>
@@ -512,7 +525,7 @@ def render(trials: list[Trial], job_dir: Path) -> str:
 <html><head><meta charset="utf-8"><title>ignis {html.escape(suite)} report</title>
 <style>{_CSS}</style></head><body>
 <h1>ignis · {html.escape(suite)} report</h1>
-<div class="meta">job dir: <code>{html.escape(str(job_dir))}</code> · generated {dt.datetime.now().isoformat(timespec="seconds")}</div>
+<div class="meta">generated {dt.datetime.now().isoformat(timespec="seconds")}</div>
 
 <div class="stats">
   <div class="stat"><div class="label">Real-attempt pass rate</div><div class="value">{real_pass_pct:.1f}%</div><div class="meta">{len(passed)} / {len(real_attempts)} real trials</div></div>
