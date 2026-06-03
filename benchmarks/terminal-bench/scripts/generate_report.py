@@ -472,6 +472,22 @@ def _render_main_table(trials: list[Trial]) -> str:
 </table>"""
 
 
+def _model_label(job_dir: Path) -> str:
+    """Read the model name harbor recorded into the job-level config.
+
+    Lives at `<job_dir>/config.json -> .agents[0].model_name`. Returns ""
+    when missing (older harbor runs, or a partial dir) — the caller then
+    just leaves it out of the title.
+    """
+    cfg = _safe_load(job_dir / "config.json")
+    if not isinstance(cfg, dict):
+        return ""
+    agents = cfg.get("agents")
+    if not agents or not isinstance(agents[0], dict):
+        return ""
+    return str(agents[0].get("model_name") or "")
+
+
 def _suite_label(trials: list[Trial], job_dir: Path) -> str:
     """Derive the human-readable benchmark name from the trial source slugs.
 
@@ -510,6 +526,8 @@ def render(trials: list[Trial], job_dir: Path) -> str:
     total_cache = sum(t.n_cache_tokens for t in trials)
     cache_pct = (total_cache / total_in * 100) if total_in else 0.0
     suite = _suite_label(trials, job_dir)
+    model = _model_label(job_dir)
+    title = f"{suite} · {model}" if model else suite
 
     # Stacked bar segments (passed, failed, errored). Only three buckets now
     # — rate-limit and unknown previously had their own top-level entries but
@@ -522,9 +540,9 @@ def render(trials: list[Trial], job_dir: Path) -> str:
             bar_segs.append(f'<span class="{b}" style="flex:{c}">{c} {b}</span>')
 
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>ignis {html.escape(suite)} report</title>
+<html><head><meta charset="utf-8"><title>ignis · {html.escape(title)} report</title>
 <style>{_CSS}</style></head><body>
-<h1>ignis · {html.escape(suite)} report</h1>
+<h1>ignis · {html.escape(title)} report</h1>
 <div class="meta">generated {dt.datetime.now().isoformat(timespec="seconds")}</div>
 
 <div class="stats">
