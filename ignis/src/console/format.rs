@@ -37,6 +37,21 @@ pub(crate) fn format_duration(ms: u128) -> String {
     }
 }
 
+/// Running-clock format for the live "Thinking…" timer: largest non-zero unit
+/// down, seconds floored. `5s` · `1m 05s` · `1h 02m 05s`. (Tool durations keep
+/// `format_duration`'s sub-second `Xms`/`X.Ys`.)
+pub(crate) fn format_elapsed(ms: u128) -> String {
+    let secs = (ms / 1000) as u64;
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m {s:02}s")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
 /// Human-friendly token count: `999`, `1.5k`, `120k`.
 pub(crate) fn format_tokens(n: usize) -> String {
     if n < 1000 {
@@ -102,5 +117,21 @@ pub(crate) fn next_selection(current: usize, len: usize, direction: SelectionDir
             }
         }
         SelectionDirection::Next => (current + 1) % len,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_elapsed;
+
+    #[test]
+    fn elapsed_drops_leading_zero_units() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(999), "0s"); // sub-second floors to 0
+        assert_eq!(format_elapsed(5_000), "5s");
+        assert_eq!(format_elapsed(59_000), "59s");
+        assert_eq!(format_elapsed(65_000), "1m 05s");
+        assert_eq!(format_elapsed(600_000), "10m 00s");
+        assert_eq!(format_elapsed(3_725_000), "1h 02m 05s"); // 1h 2m 5s
     }
 }

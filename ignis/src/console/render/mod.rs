@@ -200,33 +200,25 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 }
 
 /// Largest scroll offset that still shows the last line of `total` in a
-/// `visible`-row viewport. When the transcript overflows the viewport a top
-/// hint ("↑ N more above") steals one content row, so the bottom is one
-/// position higher than `total - visible` — anchoring there lets the last
-/// `visible - 1` rows fit AND `end == total`, fulfilling "End to follow".
-/// Pre-fix `total - visible` left the final row clipped and the bottom hint
-/// stuck on a fully-followed view. Shared by `render_transcript` and
-/// `App::scroll_transcript_down` so PgDn and `End` agree on "the bottom".
+/// `visible`-row viewport: `total - visible` (0 when everything fits). Shared
+/// by `render_transcript`, the mouse wheel, PgDn, and `End` so they all agree
+/// on "the bottom".
 pub(crate) fn natural_max_offset(total: usize, visible: usize) -> usize {
-    if total > visible {
-        total - visible.saturating_sub(1).max(1)
-    } else {
-        0
-    }
+    total.saturating_sub(visible)
 }
 
 /// Render the in-app transcript into `area`. Honors `app.auto_follow`
 /// (recomputes scroll_offset to the natural bottom) and `app.scroll_offset`
-/// (sticky position when the user has scrolled up). Renders a `↑N more` /
-/// `↓N more` hint at the edges when content extends beyond the window.
+/// (sticky position when the user has scrolled up). No "N more lines" hints —
+/// the window is exactly the visible slice.
 fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
     if area.height == 0 {
         return;
     }
     let total = app.transcript.len();
     let visible = area.height as usize;
-    // Make the real visible-row count visible to PgDn so it can correctly
-    // detect "at the natural bottom" and re-enable auto-follow.
+    // Record the real visible-row count so PgDn / the mouse wheel can detect
+    // "at the natural bottom" and re-enable auto-follow.
     app.transcript_visible_rows = visible;
     let max_offset = natural_max_offset(total, visible);
     // Auto-follow recomputes offset each frame; manual scroll keeps the
@@ -239,36 +231,8 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let start = app.scroll_offset.min(total);
-    let show_top_hint = start > 0;
-    // Reserve one row for the top hint when present, then size content to
-    // fill the remainder. The bottom hint is needed iff content past the
-    // last visible row exists; at the natural bottom we drop it entirely so
-    // a followed view doesn't display a contradictory "more below" line.
-    let content_after_top = visible
-        .saturating_sub(if show_top_hint { 1 } else { 0 })
-        .max(1);
-    let end_without_bottom = (start + content_after_top).min(total);
-    let show_bottom_hint = end_without_bottom < total;
-    let content_rows = content_after_top
-        .saturating_sub(if show_bottom_hint { 1 } else { 0 })
-        .max(1);
-    let end = (start + content_rows).min(total);
-
-    let mut slice: Vec<Line> = Vec::with_capacity(end - start + 2);
-    if show_top_hint {
-        slice.push(Line::from(ratatui::text::Span::styled(
-            format!("  ↑ {} more lines above", start),
-            Style::default().fg(TEXT_DIM),
-        )));
-    }
-    slice.extend(app.transcript[start..end].iter().cloned());
-    let below = total.saturating_sub(end);
-    if below > 0 {
-        slice.push(Line::from(ratatui::text::Span::styled(
-            format!("  ↓ {} more lines below (End to follow)", below),
-            Style::default().fg(TEXT_DIM),
-        )));
-    }
+    let end = (start + visible).min(total);
+    let slice: Vec<Line> = app.transcript[start..end].to_vec();
 
     f.render_widget(
         Paragraph::new(Text::from(slice))
@@ -390,20 +354,18 @@ mod queue_render_tests {
     #[test]
     fn auto_follow_pins_view_to_bottom() {
         // App starts with auto_follow=true, scroll_offset=0. After several
-        // lines are committed, the renderer should pin scroll_offset to the
-        // natural bottom — which is `total - (visible - 1)` once content
-        // overflows (the top hint steals one row, so the bottom is one
-        // position higher than `total - visible`).
+        // lines are committed, the renderer pins scroll_offset to the natural
+        // bottom = `total - visible` (no hints reserve a row anymore).
         let mut a = app();
         for i in 0..20 {
             a.commit_transcript_lines(vec![Line::from(format!("line {i}"))]);
         }
-        // Simulate a render: visible=5, total=20 → max_offset = 20 - 4 = 16.
+        // Simulate a render: visible=5, total=20 → max_offset = 20 - 5 = 15.
         let max_offset = natural_max_offset(a.transcript.len(), 5);
         if a.auto_follow {
             a.scroll_offset = max_offset;
         }
-        assert_eq!(a.scroll_offset, 16);
+        assert_eq!(a.scroll_offset, 15);
         assert!(a.auto_follow);
     }
 
@@ -466,12 +428,11 @@ mod queue_render_tests {
         }
         a.scroll_offset = 5;
         a.auto_follow = false;
-        // visible=10, total=30 → natural max_offset = 30 - 9 = 21 (one row
-        // higher than `total - visible` to compensate for the top hint).
-        // PgDn(18) from offset 5 → next=23, which exceeds 21, so we snap to
-        // 21 and re-enable auto_follow.
+        // visible=10, total=30 → natural max_offset = 30 - 10 = 20.
+        // PgDn(18) from offset 5 → next=23, which exceeds 20, so we snap to
+        // 20 and re-enable auto_follow.
         a.scroll_transcript_down(18, 10);
-        assert_eq!(a.scroll_offset, 21);
+        assert_eq!(a.scroll_offset, 20);
         assert!(a.auto_follow);
     }
 
