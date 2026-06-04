@@ -1,4 +1,7 @@
-use super::{bytes_to_lines, Auth, LlmProvider, LlmResponseDelta, Resolved};
+use super::{
+    bytes_to_lines, prep_outbound_history, Auth, HistoryPolicy, LlmProvider, LlmResponseDelta,
+    Resolved,
+};
 use crate::Message;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -117,9 +120,15 @@ impl LlmProvider for AnthropicCompatible {
             })
             .collect();
 
+        // Apply the same context-trim policy the OpenAI-compat path uses
+        // (observation masking on stale tool results; reasoning-strip is a
+        // no-op here because the Anthropic mapping below doesn't carry
+        // `reasoning_content` into the outbound payload).
+        let trimmed = prep_outbound_history(messages, &HistoryPolicy::default());
+
         // Map messages
         let mut anthropic_messages = Vec::new();
-        for msg in messages {
+        for msg in &trimmed {
             match msg.role.as_str() {
                 "user" => {
                     anthropic_messages.push(serde_json::json!({
