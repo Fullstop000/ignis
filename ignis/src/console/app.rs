@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use super::{
-    format_duration, next_selection, slash_suggestions, SelectionDirection, SlashCommand, SPINNERS,
+    format_elapsed, next_selection, slash_suggestions, SelectionDirection, SlashCommand, SPINNERS,
     THINKING_VERBS,
 };
 use crate::AgentEvent;
@@ -778,7 +778,7 @@ impl App {
 
     pub(crate) fn elapsed_str(&self) -> String {
         match self.stream_start {
-            Some(t) => format_duration(t.elapsed().as_millis()),
+            Some(t) => format_elapsed(t.elapsed().as_millis()),
             None => String::new(),
         }
     }

@@ -29,7 +29,7 @@ pub(crate) use colors::{
     YELLOW,
 };
 pub(crate) use format::{
-    format_context, format_duration, format_tokens, next_selection, sanitize, truncate,
-    SelectionDirection,
+    format_context, format_duration, format_elapsed, format_tokens, next_selection, sanitize,
+    truncate, SelectionDirection,
 };
 pub(crate) use slash::{slash_suggestions, SlashCommand};

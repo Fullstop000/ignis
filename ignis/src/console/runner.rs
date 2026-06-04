@@ -3,7 +3,10 @@
 //! per-frame draw + key-poll cycle. Everything stateful about the live UI
 //! flows through here; `App` is the in-memory model the loop drives.
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -36,14 +39,24 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn install() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
         // Panic hook: a panic inside ratatui / the main loop would otherwise
         // print its message into the alt-screen the user can't see. Restore
         // the terminal first, then chain through to the prior hook.
         let prior_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+            let _ = execute!(
+                io::stdout(),
+                DisableMouseCapture,
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            );
             prior_hook(info);
         }));
         Ok(Self)
@@ -53,7 +66,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -410,6 +428,16 @@ pub async fn run_console(
                     .await;
                 }
                 Event::Paste(data) => crate::console::keys::handle_paste(&mut app, data),
+                // Mouse wheel scrolls the transcript (3 lines/notch). ScrollUp
+                // releases auto-follow; ScrollDown re-enables it at the bottom.
+                Event::Mouse(me) => match me.kind {
+                    MouseEventKind::ScrollUp => app.scroll_transcript_up(3),
+                    MouseEventKind::ScrollDown => {
+                        let visible = app.transcript_visible_rows.max(1);
+                        app.scroll_transcript_down(3, visible);
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
