@@ -319,14 +319,22 @@ pub(crate) fn parse_sse_line(line: &str) -> Option<LlmResponseDelta> {
 ///   (`reasoning_content` is *ignored* on non-tool turns when sent, mandatory
 ///   when adjacent to a tool call) and Anthropic's default behavior on Sonnet
 ///   ≤4.5 / Haiku via `clear_thinking_20251015`. Also strips inline
-///   `<think>...</think>` regions from `content` (MiniMax-M3 emits its
-///   reasoning that way, inline in the visible content stream — without this
-///   strip every prior turn's chain-of-thought is replayed verbatim and the
-///   input prompt grows monotonically).
+///   `<think>...</think>` regions from `content` on those text-only turns
+///   (MiniMax-M3 emits its reasoning that way, inline in the visible content
+///   stream).
+///
+/// - `strip_think_on_tool_call_turns` — additionally strip inline
+///   `<think>...</think>` regions from `content` of prior assistant turns
+///   that DID call a tool. Off by default. This widens the strip and is
+///   experimental: while the protocol contract is on the
+///   `reasoning_content` *field* (which we never touch on tool-call turns),
+///   model behavior on its own prior `<think>` chain isn't standardized —
+///   widen with empirical evidence, not from theory.
 #[derive(Clone, Copy, Debug)]
 pub struct HistoryPolicy {
     pub keep_live_tool_outputs: usize,
     pub strip_text_turn_reasoning: bool,
+    pub strip_think_on_tool_call_turns: bool,
 }
 
 impl HistoryPolicy {
@@ -338,10 +346,11 @@ impl HistoryPolicy {
         Self {
             keep_live_tool_outputs: 5,
             strip_text_turn_reasoning: true,
+            strip_think_on_tool_call_turns: false,
         }
     }
 
-    /// An identity policy — both levers off; [`prep_outbound_history`] becomes
+    /// An identity policy — every lever off; [`prep_outbound_history`] becomes
     /// a `to_vec()` of the input. Used by [`HistoryPolicy::default`] when
     /// `IGNIS_HISTORY_TRIM=off` is set in the process environment, for A/B
     /// benchmarking the trim's impact without rebuilding the binary.
@@ -349,6 +358,7 @@ impl HistoryPolicy {
         Self {
             keep_live_tool_outputs: 0,
             strip_text_turn_reasoning: false,
+            strip_think_on_tool_call_turns: false,
         }
     }
 
@@ -359,36 +369,102 @@ impl HistoryPolicy {
         Self {
             keep_live_tool_outputs: 5,
             strip_text_turn_reasoning: false,
+            strip_think_on_tool_call_turns: false,
         }
     }
 
     /// Lever 2 only — reasoning strip on text-only assistant turns, tool
-    /// outputs untouched. Used by `IGNIS_HISTORY_TRIM=strip-only` for
-    /// ablation experiments.
+    /// outputs untouched. The cache-stable narrow strip. Used by
+    /// `IGNIS_HISTORY_TRIM=strip-only`.
     pub fn strip_only() -> Self {
         Self {
             keep_live_tool_outputs: 0,
             strip_text_turn_reasoning: true,
+            strip_think_on_tool_call_turns: false,
+        }
+    }
+
+    /// Lever 2 widened — additionally strips inline `<think>...</think>` from
+    /// `content` on tool-calling assistant turns. The dedicated
+    /// `reasoning_content` field stays untouched on those turns (DeepSeek 400).
+    /// Used by `IGNIS_HISTORY_TRIM=strip-wide` to test whether widening the
+    /// strip past the text-only-turn boundary is safe in practice — model
+    /// behavior on its own prior `<think>` chain isn't standardized and the
+    /// cheap-but-honest validation is to run a real prompt under it.
+    pub fn strip_wide() -> Self {
+        Self {
+            keep_live_tool_outputs: 0,
+            strip_text_turn_reasoning: true,
+            strip_think_on_tool_call_turns: true,
         }
     }
 }
 
+/// Config-supplied override for the default history policy. Set once at
+/// startup by [`set_history_policy_from_config`] when the user's
+/// `~/.ignis/config.toml` includes a `[history] trim = "..."` line. The
+/// env var still trumps it (for runtime A/B benchmarking).
+static HISTORY_POLICY_FROM_CONFIG: std::sync::OnceLock<HistoryPolicy> = std::sync::OnceLock::new();
+
+/// Parse a `[history] trim` config value into a [`HistoryPolicy`]. Recognized
+/// values match the `IGNIS_HISTORY_TRIM` env var:
+/// `"off"`, `"mask-only"`, `"strip-only"`, `"strip-wide"`, `"both"` / `"on"`.
+/// Returns `Err` with a human-readable message for anything else.
+pub fn parse_history_trim(value: &str) -> Result<HistoryPolicy, String> {
+    match value {
+        "off" => Ok(HistoryPolicy::disabled()),
+        "mask-only" => Ok(HistoryPolicy::mask_only()),
+        "strip-only" => Ok(HistoryPolicy::strip_only()),
+        "strip-wide" => Ok(HistoryPolicy::strip_wide()),
+        "both" | "on" => Ok(HistoryPolicy::enabled_defaults()),
+        other => Err(format!(
+            "unrecognized history.trim = {other:?}; expected one of \
+             'off', 'mask-only', 'strip-only', 'strip-wide', 'both'",
+        )),
+    }
+}
+
+/// Set the default [`HistoryPolicy`] from a parsed config value, if recognized.
+/// First call wins (config is loaded once at startup); subsequent calls are
+/// no-ops. Returns `Ok(())` if the value was recognized and set, or `Err`
+/// describing the unrecognized value.
+pub fn set_history_policy_from_config(value: &str) -> Result<(), String> {
+    let policy = parse_history_trim(value)?;
+    let _ = HISTORY_POLICY_FROM_CONFIG.set(policy);
+    Ok(())
+}
+
 impl Default for HistoryPolicy {
-    /// `enabled_defaults()` by default. Flipped by `IGNIS_HISTORY_TRIM`:
-    ///   * `off`         → both levers disabled (identity transform)
-    ///   * `mask-only`   → only stale tool-output masking
-    ///   * `strip-only`  → only reasoning strip
-    ///   * anything else / unset → both levers on
+    /// Resolved in precedence order, highest first:
     ///
-    /// Read once per call so a single shell can flip arms between trials by
-    /// toggling the env in between, without restarting any long-lived process.
+    /// 1. `IGNIS_HISTORY_TRIM` env var (runtime A/B knob — wins over config).
+    ///    Values: `off`, `mask-only`, `strip-only`, `strip-wide`. Anything else
+    ///    (`on`, `both`, garbage) falls through to `enabled_defaults()` for
+    ///    back-compat with the earlier two-state env semantics.
+    /// 2. `[history] trim = "..."` from `~/.ignis/config.toml`, plumbed in
+    ///    once at startup via [`set_history_policy_from_config`].
+    /// 3. Built-in conservative fallback: [`HistoryPolicy::strip_only`].
+    ///    Cache-stable; never regressed in the validation A/B series that
+    ///    led to this default (PR #123). The mask lever stays available
+    ///    via `mask-only` / `both`, but isn't default until its rolling-window
+    ///    boundary is redesigned for cache stability.
+    ///
+    /// Env is re-read on every call so a single shell can flip arms between
+    /// trials by toggling the var, without restarting any long-lived process.
     fn default() -> Self {
-        match std::env::var("IGNIS_HISTORY_TRIM").as_deref() {
-            Ok("off") => Self::disabled(),
-            Ok("mask-only") => Self::mask_only(),
-            Ok("strip-only") => Self::strip_only(),
-            _ => Self::enabled_defaults(),
+        if let Ok(v) = std::env::var("IGNIS_HISTORY_TRIM") {
+            return match v.as_str() {
+                "off" => Self::disabled(),
+                "mask-only" => Self::mask_only(),
+                "strip-only" => Self::strip_only(),
+                "strip-wide" => Self::strip_wide(),
+                _ => Self::enabled_defaults(),
+            };
         }
+        if let Some(p) = HISTORY_POLICY_FROM_CONFIG.get() {
+            return *p;
+        }
+        Self::strip_only()
     }
 }
 
@@ -431,7 +507,7 @@ fn strip_think_blocks(s: &str) -> String {
 }
 
 /// Prepare a history `&[Message]` slice for outbound serialization, applying
-/// the two cost-reduction levers in [`HistoryPolicy`]. Returns a fresh `Vec` —
+/// the cost-reduction levers in [`HistoryPolicy`]. Returns a fresh `Vec` —
 /// the caller's history is never mutated. Identity transform on an empty
 /// policy / empty history.
 ///
@@ -441,28 +517,46 @@ fn strip_think_blocks(s: &str) -> String {
 /// - `tool_call_id` and `tool_calls` are never touched, so the
 ///   call→result linkage that providers (especially Anthropic) validate
 ///   remains intact.
-/// - An assistant turn that *did* call a tool keeps its reasoning verbatim —
-///   DeepSeek 400s otherwise, and Anthropic requires intra-turn thinking
-///   adjacency to its `tool_use` block.
+/// - The `reasoning_content` *field* is preserved on every tool-calling
+///   assistant turn. DeepSeek 400s otherwise, and Anthropic requires
+///   intra-turn thinking adjacency to its `tool_use` block. Inline
+///   `<think>...</think>` regions in `content` are a separate matter —
+///   they're a model-emitted tag, not a protocol field, so they can
+///   optionally be stripped on tool-calling turns too via
+///   `strip_think_on_tool_call_turns`.
 pub(crate) fn prep_outbound_history(messages: &[Message], policy: &HistoryPolicy) -> Vec<Message> {
     let mut out: Vec<Message> = messages.to_vec();
 
-    if policy.strip_text_turn_reasoning {
+    if policy.strip_text_turn_reasoning || policy.strip_think_on_tool_call_turns {
         for msg in out.iter_mut() {
             if msg.role != "assistant" {
                 continue;
             }
-            // Tool-calling assistant turns: keep reasoning intact.
-            if msg.tool_calls.as_ref().is_some_and(|tcs| !tcs.is_empty()) {
-                continue;
-            }
-            // Text-only assistant turn: drop the dedicated reasoning slot AND
-            // any inline `<think>...</think>` the content carried (MM3).
-            msg.reasoning_content = None;
-            if let Some(content) = msg.content.as_ref() {
-                if content.contains("<think>") {
-                    msg.content = Some(strip_think_blocks(content));
+            let is_tool_calling = msg.tool_calls.as_ref().is_some_and(|tcs| !tcs.is_empty());
+
+            // Decide whether to strip inline `<think>...</think>` from this turn.
+            // Text-only turns: gated by strip_text_turn_reasoning (current narrow strip).
+            // Tool-calling turns: gated by strip_think_on_tool_call_turns (the wider,
+            // experimental strip; off by default).
+            let strip_think = if is_tool_calling {
+                policy.strip_think_on_tool_call_turns
+            } else {
+                policy.strip_text_turn_reasoning
+            };
+            if strip_think {
+                if let Some(content) = msg.content.as_ref() {
+                    if content.contains("<think>") {
+                        msg.content = Some(strip_think_blocks(content));
+                    }
                 }
+            }
+
+            // The `reasoning_content` *field* is protocol-sensitive: DeepSeek 400s
+            // if we drop it from a tool-calling turn. So we only ever null it on
+            // text-only turns, regardless of how aggressively we strip the inline
+            // `<think>` tag.
+            if !is_tool_calling && policy.strip_text_turn_reasoning {
+                msg.reasoning_content = None;
             }
         }
     }
@@ -739,6 +833,7 @@ mod tests {
         let policy = HistoryPolicy {
             keep_live_tool_outputs: 3,
             strip_text_turn_reasoning: false,
+            strip_think_on_tool_call_turns: false,
         };
         let out = prep_outbound_history(&history, &policy);
         let tool_msgs: Vec<&Message> = out.iter().filter(|m| m.role == "tool").collect();
@@ -839,10 +934,74 @@ mod tests {
     }
 
     #[test]
+    fn prep_history_strip_wide_removes_think_on_tool_calling_turn_but_keeps_reasoning_content() {
+        // strip-wide widens the `<think>` strip to tool-calling turns too —
+        // but must leave the dedicated `reasoning_content` field intact on
+        // those turns (DeepSeek 400 contract).
+        let mut tool_turn = assistant_calling("<think>plan</think>running ls", None, "call_1");
+        tool_turn.reasoning_content = Some("deepseek-style reasoning".to_string());
+        let history = vec![user("ls"), tool_turn];
+        let out = prep_outbound_history(&history, &HistoryPolicy::strip_wide());
+        // Inline <think> is stripped:
+        assert_eq!(out[1].content.as_deref(), Some("running ls"));
+        // `reasoning_content` field is NOT stripped on this tool-calling turn:
+        assert_eq!(
+            out[1].reasoning_content.as_deref(),
+            Some("deepseek-style reasoning"),
+            "strip-wide must NOT drop reasoning_content from a tool-calling turn — DeepSeek 400 contract",
+        );
+    }
+
+    #[test]
+    fn parse_history_trim_recognized_values() {
+        assert_eq!(parse_history_trim("off").unwrap().keep_live_tool_outputs, 0);
+        assert!(!parse_history_trim("off").unwrap().strip_text_turn_reasoning);
+
+        let m = parse_history_trim("mask-only").unwrap();
+        assert_eq!(m.keep_live_tool_outputs, 5);
+        assert!(!m.strip_text_turn_reasoning);
+
+        let s = parse_history_trim("strip-only").unwrap();
+        assert_eq!(s.keep_live_tool_outputs, 0);
+        assert!(s.strip_text_turn_reasoning);
+        assert!(!s.strip_think_on_tool_call_turns);
+
+        let sw = parse_history_trim("strip-wide").unwrap();
+        assert!(sw.strip_text_turn_reasoning);
+        assert!(sw.strip_think_on_tool_call_turns);
+
+        for v in ["both", "on"] {
+            let b = parse_history_trim(v).unwrap();
+            assert_eq!(b.keep_live_tool_outputs, 5);
+            assert!(b.strip_text_turn_reasoning);
+        }
+    }
+
+    #[test]
+    fn parse_history_trim_rejects_unrecognized_value() {
+        let e = parse_history_trim("aggressive").unwrap_err();
+        assert!(e.contains("unrecognized"));
+        assert!(e.contains("aggressive"));
+    }
+
+    #[test]
+    fn prep_history_strip_wide_still_strips_text_only_turn_fully() {
+        // strip-wide should be a strict superset of strip-only: text-only
+        // turns still get both <think> and reasoning_content stripped.
+        let mut text_turn = assistant_text("<think>raw</think>final", Some("reasoning to drop"));
+        text_turn.reasoning_content = Some("reasoning to drop".to_string());
+        let history = vec![user("hi"), text_turn];
+        let out = prep_outbound_history(&history, &HistoryPolicy::strip_wide());
+        assert_eq!(out[1].content.as_deref(), Some("final"));
+        assert!(out[1].reasoning_content.is_none());
+    }
+
+    #[test]
     fn prep_history_with_strip_disabled_preserves_reasoning_and_think_tags() {
         let policy = HistoryPolicy {
             keep_live_tool_outputs: 0,
             strip_text_turn_reasoning: false,
+            strip_think_on_tool_call_turns: false,
         };
         let history = vec![
             user("hi"),
@@ -858,6 +1017,7 @@ mod tests {
         let policy = HistoryPolicy {
             keep_live_tool_outputs: 0,
             strip_text_turn_reasoning: false,
+            strip_think_on_tool_call_turns: false,
         };
         let mut history = vec![user("go")];
         for i in 0..5 {
@@ -925,10 +1085,14 @@ mod tests {
         assert_eq!(p.keep_live_tool_outputs, 5);
         assert!(p.strip_text_turn_reasoning);
 
+        // Env unset + no config override (the OnceLock is private to this
+        // module and untouched by tests in this file) → the conservative
+        // built-in fallback: strip-only.
         unsafe { std::env::remove_var("IGNIS_HISTORY_TRIM") };
         let p = HistoryPolicy::default();
-        assert_eq!(p.keep_live_tool_outputs, 5);
+        assert_eq!(p.keep_live_tool_outputs, 0);
         assert!(p.strip_text_turn_reasoning);
+        assert!(!p.strip_think_on_tool_call_turns);
 
         // Restore the prior value, if any.
         match prior {

@@ -85,3 +85,21 @@ api_key = "sk-cp-your-key"
 # auto = true                # auto-compact before a prompt when over threshold
 # threshold_tokens = 120000  # estimated-token trigger for auto-compaction
 # keep_recent_tokens = 16000 # recent history kept verbatim when compacting
+
+# Outbound history trim (optional). Trims prior-turn material before each
+# model call. Default if unset: "strip-only" (cache-stable; drops prior-turn
+# reasoning on text-only assistant turns — DeepSeek/Anthropic-safe). The env
+# var `IGNIS_HISTORY_TRIM` overrides this at runtime.
+# [history]
+# trim = "strip-only"
+#   # Values:
+#   #   "off"         — no trim (full history every turn)
+#   #   "strip-only"  — default; drops prior-turn reasoning on text-only turns
+#   #   "strip-wide"  — strip-only PLUS inline <think> on tool-calling turns
+#   #                   (experimental; preserves DeepSeek's reasoning_content
+#   #                   field on tool turns to avoid 400s)
+#   #   "mask-only"   — JetBrains-style observation masking only (rolling
+#   #                   5-turn window; churns provider prompt-cache prefix —
+#   #                   tune at your own risk)
+#   #   "both"        — strip-only + mask-only together (largest savings,
+#   #                   biggest cache churn)
