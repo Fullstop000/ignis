@@ -163,6 +163,30 @@ def _read_log_tail(path: Path, cap: int = _LOG_EMBED_CAP) -> tuple[str, int]:
     )
 
 
+def _count_tool_outcomes(path: Path) -> tuple[int, int, int]:
+    """Stream-scan agent/ignis.txt and count tool-call markers.
+
+    Returns `(n_calls, n_ok, n_err)`. Mirrors `aggregate_results._count_tool_outcomes`
+    — keep the marker prefixes in sync if either side moves. Whole-file scan, not
+    just the embedded tail, so the count is accurate on multi-GB runaway logs too.
+    """
+    if not path.exists():
+        return 0, 0, 0
+    n_calls = n_ok = n_err = 0
+    try:
+        with path.open("rb") as fh:
+            for raw in fh:
+                if raw.startswith(b">>> [Tool: "):
+                    n_calls += 1
+                elif raw.startswith(b"<<< [Tool OK ("):
+                    n_ok += 1
+                elif raw.startswith(b"<<< [Tool ERR ("):
+                    n_err += 1
+    except OSError:
+        return 0, 0, 0
+    return n_calls, n_ok, n_err
+
+
 def _file_contains(path: Path, needle: str, chunk: int = 1 << 20) -> bool:
     """Stream-scan a (possibly multi-GB) file for `needle` without loading it whole.
 
@@ -203,12 +227,21 @@ class Trial:
     log_full: str
     log_bytes: int = 0
     tool_calls: Counter[str] = field(default_factory=Counter)
+    n_tool_calls: int = 0
+    n_tool_ok: int = 0
+    n_tool_err: int = 0
     verifier_reward_raw: str = ""
     verifier_test_tail: str = ""
 
     @property
     def tool_call_total(self) -> int:
-        return sum(self.tool_calls.values())
+        # Prefer the whole-file count over the histogram (which is bounded by
+        # _LOG_EMBED_CAP). Falls back to the histogram for older callers.
+        return self.n_tool_calls or sum(self.tool_calls.values())
+
+    @property
+    def tool_ok_rate(self) -> float | None:
+        return (self.n_tool_ok / self.n_tool_calls) if self.n_tool_calls else None
 
 
 def walk_trials(job_dir: Path) -> list[Trial]:
@@ -245,6 +278,7 @@ def walk_trials(job_dir: Path) -> list[Trial]:
 
         n_in, n_out, n_cache = _sum_usage(trial_dir / "agent" / "ignis-projects")
         cache_rate = (n_cache / n_in) if n_in else None
+        n_tool_calls, n_tool_ok, n_tool_err = _count_tool_outcomes(agent_log_path)
 
         verifier_reward_p = trial_dir / "verifier" / "reward.txt"
         verifier_test_p = trial_dir / "verifier" / "test-stdout.txt"
@@ -290,6 +324,9 @@ def walk_trials(job_dir: Path) -> list[Trial]:
                 log_full=log_text,
                 log_bytes=log_bytes,
                 tool_calls=_parse_tool_calls(log_text),
+                n_tool_calls=n_tool_calls,
+                n_tool_ok=n_tool_ok,
+                n_tool_err=n_tool_err,
                 verifier_reward_raw=verifier_reward_raw,
                 verifier_test_tail=verifier_test_tail,
             )
@@ -402,6 +439,15 @@ def _render_trial_drilldown(t: Trial) -> str:
     else:
         tool_rows = '<div style="color:#999;font-size:12px">no tool calls parsed</div>'
 
+    if t.n_tool_calls:
+        outcome_line = (
+            f'<div style="font-size:11px;color:#666;margin:0.3rem 0 0.5rem">'
+            f'whole-log: {t.n_tool_ok}/{t.n_tool_calls} OK · {t.n_tool_err} err · '
+            f'{_fmt_pct(t.tool_ok_rate)}</div>'
+        )
+    else:
+        outcome_line = ""
+
     verifier_block = (
         f'<pre>{html.escape(t.verifier_test_tail) or "(no verifier output captured)"}</pre>'
     )
@@ -412,10 +458,15 @@ def _render_trial_drilldown(t: Trial) -> str:
     )
     log_size = t.log_bytes
 
+    ok_summary = (
+        f" · {t.n_tool_ok}/{t.n_tool_calls} OK ({_fmt_pct(t.tool_ok_rate)})"
+        if t.n_tool_calls
+        else ""
+    )
     return f"""<details>
-  <summary>drill-down · {tool_total} tool calls · verifier reward {reward_raw} · agent log {log_size:,} bytes</summary>
+  <summary>drill-down · {tool_total} tool calls{ok_summary} · verifier reward {reward_raw} · agent log {log_size:,} bytes</summary>
   <div class="drill-grid" style="margin-top:0.6rem">
-    <div><h4>tool call counts</h4>{tool_rows}</div>
+    <div><h4>tool call counts</h4>{outcome_line}{tool_rows}</div>
     <div><h4>verifier output (tail)</h4>{verifier_block}</div>
   </div>
   <h4 style="margin-top:0.8rem">agent log — tail if large</h4>
@@ -453,9 +504,10 @@ def _render_main_table(trials: list[Trial]) -> str:
   <td class="num" data-sort="{t.n_output_tokens}">{_fmt_num(t.n_output_tokens) if t.n_output_tokens else "—"}</td>
   <td class="num" data-sort="{t.cache_hit_rate or 0}">{_fmt_pct(t.cache_hit_rate)}</td>
   <td class="num" data-sort="{t.tool_call_total}">{t.tool_call_total or "—"}</td>
+  <td class="num" data-sort="{t.tool_ok_rate if t.tool_ok_rate is not None else -1}">{_fmt_pct(t.tool_ok_rate)}</td>
   <td>{html.escape(t.exception) or "—"}</td>
 </tr>
-<tr class="{t.bucket}"><td colspan="9" style="padding:0">{_render_trial_drilldown(t)}</td></tr>""")
+<tr class="{t.bucket}"><td colspan="10" style="padding:0">{_render_trial_drilldown(t)}</td></tr>""")
     return f"""<table id="trials">
   <thead><tr>
     <th onclick="sortTable(this)">Task</th>
@@ -466,6 +518,7 @@ def _render_main_table(trials: list[Trial]) -> str:
     <th onclick="sortTable(this)" class="num">Out tokens</th>
     <th onclick="sortTable(this)" class="num">Cache hit</th>
     <th onclick="sortTable(this)" class="num">Tool calls</th>
+    <th onclick="sortTable(this)" class="num">Tool OK%</th>
     <th onclick="sortTable(this)">Exception</th>
   </tr></thead>
   <tbody>{"".join(rows)}</tbody>
@@ -525,6 +578,10 @@ def render(trials: list[Trial], job_dir: Path) -> str:
     total_out = sum(t.n_output_tokens for t in trials)
     total_cache = sum(t.n_cache_tokens for t in trials)
     cache_pct = (total_cache / total_in * 100) if total_in else 0.0
+    total_tool_calls = sum(t.n_tool_calls for t in trials)
+    total_tool_ok = sum(t.n_tool_ok for t in trials)
+    total_tool_err = sum(t.n_tool_err for t in trials)
+    tool_ok_pct = (total_tool_ok / total_tool_calls * 100) if total_tool_calls else 0.0
     suite = _suite_label(trials, job_dir)
     model = _model_label(job_dir)
     title = f"{suite} · {model}" if model else suite
@@ -551,6 +608,7 @@ def render(trials: list[Trial], job_dir: Path) -> str:
   <div class="stat"><div class="label">Input tokens</div><div class="value">{_fmt_num(total_in)}</div></div>
   <div class="stat"><div class="label">Output tokens</div><div class="value">{_fmt_num(total_out)}</div></div>
   <div class="stat"><div class="label">Cache hit rate</div><div class="value">{cache_pct:.1f}%</div></div>
+  <div class="stat"><div class="label">Tool OK rate</div><div class="value">{tool_ok_pct:.1f}%</div><div class="meta">{total_tool_ok:,} / {total_tool_calls:,} calls · {total_tool_err:,} err</div></div>
 </div>
 
 <div class="bar">{"".join(bar_segs)}</div>
