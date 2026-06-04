@@ -163,27 +163,51 @@ def _read_log_tail(path: Path, cap: int = _LOG_EMBED_CAP) -> tuple[str, int]:
     )
 
 
-def _count_tool_outcomes(path: Path) -> tuple[int, int, int]:
-    """Stream-scan agent/ignis.txt and count tool-call markers.
+def _count_tool_outcomes(projects_dir: Path) -> tuple[int, int, int]:
+    """Count tool calls and OK/ERR outcomes from ignis's own session JSONL.
 
-    Returns `(n_calls, n_ok, n_err)`. Mirrors `aggregate_results._count_tool_outcomes`
-    — keep the marker prefixes in sync if either side moves. Whole-file scan, not
-    just the embedded tail, so the count is accurate on multi-GB runaway logs too.
+    Mirrors `aggregate_results._count_tool_outcomes` — keep both sides in
+    sync. Source of truth is `<trial>/agent/ignis-projects/**/*.jsonl`,
+    NOT the harbor stdout log, so the metric is portable across runners.
+
+    Counts:
+      - assistant `tool_calls` list lengths from `type=="message"` envelopes
+      - `type=="tool_result"` envelopes by `is_error` field
+
+    Returns `(0, 0, 0)` when the projects dir is missing (TimedOut trials
+    where the sandbox died before sync) — blank is honest.
     """
-    if not path.exists():
+    if not projects_dir.exists():
         return 0, 0, 0
     n_calls = n_ok = n_err = 0
-    try:
-        with path.open("rb") as fh:
-            for raw in fh:
-                if raw.startswith(b">>> [Tool: "):
-                    n_calls += 1
-                elif raw.startswith(b"<<< [Tool OK ("):
-                    n_ok += 1
-                elif raw.startswith(b"<<< [Tool ERR ("):
-                    n_err += 1
-    except OSError:
-        return 0, 0, 0
+    for jsonl in projects_dir.rglob("*.jsonl"):
+        try:
+            with jsonl.open("r", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        env = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    t = env.get("type")
+                    payload = env.get("payload") or {}
+                    if t == "message" and payload.get("role") == "assistant":
+                        n_calls += len(payload.get("tool_calls") or [])
+                    elif t == "tool_result":
+                        content = payload.get("content") or ""
+                        try:
+                            body = json.loads(content) if isinstance(content, str) else content
+                        except json.JSONDecodeError:
+                            n_err += 1
+                            continue
+                        if isinstance(body, dict) and body.get("is_error"):
+                            n_err += 1
+                        else:
+                            n_ok += 1
+        except OSError:
+            continue
     return n_calls, n_ok, n_err
 
 
@@ -278,7 +302,7 @@ def walk_trials(job_dir: Path) -> list[Trial]:
 
         n_in, n_out, n_cache = _sum_usage(trial_dir / "agent" / "ignis-projects")
         cache_rate = (n_cache / n_in) if n_in else None
-        n_tool_calls, n_tool_ok, n_tool_err = _count_tool_outcomes(agent_log_path)
+        n_tool_calls, n_tool_ok, n_tool_err = _count_tool_outcomes(trial_dir / "agent" / "ignis-projects")
 
         verifier_reward_p = trial_dir / "verifier" / "reward.txt"
         verifier_test_p = trial_dir / "verifier" / "test-stdout.txt"
@@ -442,11 +466,11 @@ def _render_trial_drilldown(t: Trial) -> str:
     if t.n_tool_calls:
         outcome_line = (
             f'<div style="font-size:11px;color:#666;margin:0.3rem 0 0.5rem">'
-            f'whole-log: {t.n_tool_ok}/{t.n_tool_calls} OK · {t.n_tool_err} err · '
+            f'ignis JSONL: {t.n_tool_ok}/{t.n_tool_calls} OK · {t.n_tool_err} err · '
             f'{_fmt_pct(t.tool_ok_rate)}</div>'
         )
     else:
-        outcome_line = ""
+        outcome_line = '<div style="font-size:11px;color:#999;margin:0.3rem 0 0.5rem">ignis session JSONL not synced (sandbox killed before flush)</div>'
 
     verifier_block = (
         f'<pre>{html.escape(t.verifier_test_tail) or "(no verifier output captured)"}</pre>'
