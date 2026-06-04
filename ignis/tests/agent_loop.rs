@@ -149,8 +149,8 @@ async fn agent_single_turn_no_tools() {
     session.prompt("Hi", tx).await.unwrap();
 
     let events = collect_events(&mut rx).await;
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::AgentStart)));
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::AgentEnd)));
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnStart)));
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnEnd)));
     assert_eq!(find_text(&events), "Hello world");
 }
 
@@ -209,7 +209,7 @@ async fn agent_executes_tool_and_continues() {
 
     // Final LLM text
     assert_eq!(find_text(&events), "Done");
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::AgentEnd)));
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnEnd)));
 }
 
 #[tokio::test]
@@ -625,7 +625,7 @@ async fn inject_on_final_round_keeps_turn_alive_one_more_round() {
 
 /// Provider whose first stream opens but drops before any delta arrives — a
 /// retryable, no-UI-state failure — then succeeds on the retry. Guards the
-/// `stream_turn_with_retry` seam: the loop must re-issue the request, surface
+/// `stream_run_with_retry` seam: the loop must re-issue the request, surface
 /// exactly one `Reconnecting`, and deliver the recovered turn's text without
 /// leaking the dropped attempt's error inline.
 struct DropOnceThenRecoverProvider {

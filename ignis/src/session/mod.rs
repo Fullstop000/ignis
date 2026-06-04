@@ -251,7 +251,7 @@ impl Session {
                 }
             })
         };
-        let turn_usage = self
+        let run_usage = self
             .agent
             .run(
                 &mut self.history,
@@ -264,8 +264,8 @@ impl Session {
                 }),
             )
             .await?;
-        if !turn_usage.is_zero() {
-            self.usage.add(&turn_usage);
+        if !run_usage.is_zero() {
+            self.usage.add(&run_usage);
             let _ = self.storage.save_usage(&self.id, &self.usage).await;
         }
         // Order the checkpoint write before the final persist. Without this

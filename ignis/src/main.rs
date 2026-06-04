@@ -239,7 +239,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     prefix, tool_call_id, result.content
                 );
             }
-            AgentEvent::AgentEnd => {
+            AgentEvent::TurnEnd => {
                 println!();
             }
             _ => {}
