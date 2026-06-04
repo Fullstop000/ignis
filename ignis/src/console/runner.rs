@@ -180,7 +180,7 @@ pub async fn run_console(
             let provider = match crate::config::build_provider(&agent_config) {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = agent_tx.send(AgentEvent::AgentEnd).await;
+                    let _ = agent_tx.send(AgentEvent::TurnEnd).await;
                     log::error!("Provider error: {}", e);
                     continue;
                 }
@@ -197,7 +197,7 @@ pub async fn run_console(
             {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = agent_tx.send(AgentEvent::AgentEnd).await;
+                    let _ = agent_tx.send(AgentEvent::TurnEnd).await;
                     log::error!("Session open error: {}", e);
                     continue;
                 }
@@ -264,19 +264,19 @@ pub async fn run_console(
                     tokio::select! {
                         result = session.prompt(&prompt, tx) => {
                             if let Err(e) = result {
-                                let _ = agent_tx.send(AgentEvent::AgentEnd).await;
+                                let _ = agent_tx.send(AgentEvent::TurnEnd).await;
                                 log::error!("Agent error: {}", e);
                             }
                         }
                         _ = cancel_rx.recv() => {
-                            let _ = agent_tx.send(AgentEvent::AgentEnd).await;
+                            let _ = agent_tx.send(AgentEvent::TurnEnd).await;
                         }
                     }
                     *active_inject_runner.lock().unwrap() = None;
                 }
                 None => {
                     // /compact: summarize earlier history and report a notice.
-                    let _ = agent_tx.send(AgentEvent::AgentStart).await;
+                    let _ = agent_tx.send(AgentEvent::TurnStart).await;
                     let notice = match session.compact().await {
                         Ok(0) => "Nothing to compact yet.".to_string(),
                         Ok(n) => format!("Compacted {n} earlier messages into a summary."),
@@ -297,7 +297,7 @@ pub async fn run_console(
                             message: notice_msg(&notice),
                         })
                         .await;
-                    let _ = agent_tx.send(AgentEvent::AgentEnd).await;
+                    let _ = agent_tx.send(AgentEvent::TurnEnd).await;
                 }
             }
         }
@@ -369,7 +369,7 @@ pub async fn run_console(
             }
         }
 
-        // Edge-triggered: exactly one queued line per turn-end (AgentEnd).
+        // Edge-triggered: exactly one queued line per turn-end (TurnEnd).
         // Route through the same dispatcher Enter uses so queued slash
         // commands (`/compact`, `/model`, …) actually execute — sending the
         // text as a raw `AgentRequest::Prompt` would deliver "/compact" to

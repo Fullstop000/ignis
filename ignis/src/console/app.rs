@@ -546,15 +546,15 @@ pub(crate) struct App {
     /// Prompts typed while busy, waiting to fire after the current turn (FIFO).
     pub(crate) queue: Vec<String>,
     /// Inject messages sent to the live turn but not yet confirmed via
-    /// `UserInjected`; reconciled on `AgentEnd` (leftovers → front of `queue`).
+    /// `UserInjected`; reconciled on `TurnEnd` (leftovers → front of `queue`).
     pub(crate) pending_injects: Vec<String>,
-    /// Set by `handle_event` on `AgentEnd`; the main loop drains one queued item
+    /// Set by `handle_event` on `TurnEnd`; the main loop drains one queued item
     /// per turn-end (edge-triggered, never level-triggered on `mode == Idle`).
     pub(crate) turn_just_ended: bool,
-    /// True from the moment a prompt/compact is dispatched until its `AgentEnd`.
+    /// True from the moment a prompt/compact is dispatched until its `TurnEnd`.
     /// Used to tell a real turn-end (drain the queue) from a stray/duplicate
-    /// `AgentEnd` — `mode` can't, since an early failure ends a turn that never
-    /// reached `AgentStart` (still `Idle`).
+    /// `TurnEnd` — `mode` can't, since an early failure ends a turn that never
+    /// reached `TurnStart` (still `Idle`).
     pub(crate) turn_in_flight: bool,
 
     /// Clipboard function, injectable for testing.
@@ -770,12 +770,12 @@ impl App {
 
     pub(crate) fn handle_event(&mut self, ev: AgentEvent) {
         match ev {
-            AgentEvent::AgentStart => {
+            AgentEvent::TurnStart => {
                 self.mode = Mode::Thinking;
                 self.stream_start = Some(Instant::now());
                 self.stream_chars = 0;
             }
-            AgentEvent::TurnStart => {}
+            AgentEvent::RunStart => {}
             AgentEvent::MessageStart { message } => {
                 // Contract with the agent loop: `reasoning_content: Some +
                 // content: None` opens a Reasoning block; anything else
@@ -850,19 +850,19 @@ impl App {
                 }
                 self.mode = Mode::Thinking;
             }
-            AgentEvent::TurnEnd => {}
+            AgentEvent::RunEnd => {}
             AgentEvent::Usage(usage) => {
                 // Real provider-reported usage for the latest turn.
                 self.last_usage = Some(usage);
             }
-            AgentEvent::AgentEnd => {
+            AgentEvent::TurnEnd => {
                 self.mode = Mode::Idle;
                 self.current_chunk_idx = None;
                 self.stream_start = None;
-                // Only the AgentEnd of a turn we actually dispatched drains the
-                // queue. This catches both a duplicate AgentEnd (e.g. a persist
+                // Only the TurnEnd of a turn we actually dispatched drains the
+                // queue. This catches both a duplicate TurnEnd (e.g. a persist
                 // error after the agent loop already emitted one) and a turn that
-                // ended *before* AgentStart (provider-build / session-open error,
+                // ended *before* TurnStart (provider-build / session-open error,
                 // which still leaves `mode == Idle`).
                 if self.turn_in_flight {
                     self.turn_in_flight = false;
@@ -1013,7 +1013,7 @@ impl App {
         }
     }
 
-    /// Read and clear the edge-trigger flag set on `AgentEnd`.
+    /// Read and clear the edge-trigger flag set on `TurnEnd`.
     pub(crate) fn take_turn_just_ended(&mut self) -> bool {
         std::mem::take(&mut self.turn_just_ended)
     }
@@ -2136,7 +2136,7 @@ mod tests {
         app.mode = Mode::Thinking;
         app.pending_injects = vec!["stranded".to_string()];
         app.queue = vec!["queued".to_string()];
-        app.handle_event(AgentEvent::AgentEnd);
+        app.handle_event(AgentEvent::TurnEnd);
         assert_eq!(app.mode, Mode::Idle);
         assert!(app.take_turn_just_ended());
         // Second take clears it.
@@ -2148,16 +2148,16 @@ mod tests {
 
     #[test]
     fn agent_end_drains_even_without_agent_start() {
-        // A provider-build / session-open error ends the turn *before* AgentStart,
-        // so `mode` is still Idle at AgentEnd. The drain must still fire (keyed on
+        // A provider-build / session-open error ends the turn *before* TurnStart,
+        // so `mode` is still Idle at TurnEnd. The drain must still fire (keyed on
         // turn_in_flight, not mode) or a queued prompt after a failed one stalls.
         let mut app = test_app();
-        app.turn_in_flight = true; // dispatched, but no AgentStart arrived
+        app.turn_in_flight = true; // dispatched, but no TurnStart arrived
         assert_eq!(app.mode, Mode::Idle);
-        app.handle_event(AgentEvent::AgentEnd);
+        app.handle_event(AgentEvent::TurnEnd);
         assert!(
             app.take_turn_just_ended(),
-            "a turn that failed before AgentStart still drains the queue"
+            "a turn that failed before TurnStart still drains the queue"
         );
     }
 
@@ -2175,17 +2175,17 @@ mod tests {
 
     #[test]
     fn duplicate_agent_end_does_not_double_drain() {
-        // A persistence error after the agent loop already emitted AgentEnd can
-        // produce a second AgentEnd. Only the first (dispatched turn) arms the
+        // A persistence error after the agent loop already emitted TurnEnd can
+        // produce a second TurnEnd. Only the first (dispatched turn) arms the
         // drain; the duplicate must not, or the queue would drain twice.
         let mut app = test_app();
         app.turn_in_flight = true;
-        app.handle_event(AgentEvent::AgentEnd);
+        app.handle_event(AgentEvent::TurnEnd);
         assert!(app.take_turn_just_ended(), "real turn-end arms the drain");
-        app.handle_event(AgentEvent::AgentEnd); // duplicate, no turn in flight
+        app.handle_event(AgentEvent::TurnEnd); // duplicate, no turn in flight
         assert!(
             !app.take_turn_just_ended(),
-            "duplicate AgentEnd must not re-arm the drain"
+            "duplicate TurnEnd must not re-arm the drain"
         );
     }
 

@@ -212,7 +212,7 @@ pub(crate) async fn handle_key(
             if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
         {
             app.clear_exit_hint();
-            // Only cancellable while a prompt run is live. The resulting AgentEnd
+            // Only cancellable while a prompt run is live. The resulting TurnEnd
             // drives the state transition + drain (keeps the queue).
             if active_inject.lock().unwrap().is_some() {
                 let _ = cancel_tx.try_send(());
@@ -247,7 +247,7 @@ pub(crate) async fn handle_key(
                         }
                     },
                     // Busy but no live prompt run (e.g. /compact): queue it — the
-                    // queue is visible while busy and drains at the next AgentEnd.
+                    // queue is visible while busy and drains at the next TurnEnd.
                     None => {
                         app.enqueue(text);
                         app.input.clear();
@@ -573,7 +573,7 @@ pub(crate) async fn handle_key(
 }
 
 /// Dispatch a submitted line — either typed at idle (Enter) or drained
-/// from the busy-mode queue at the next `AgentEnd`. Routes built-in slash
+/// from the busy-mode queue at the next `TurnEnd`. Routes built-in slash
 /// commands, skill commands, and plain prompts. Centralizing this is what
 /// lets queued slash commands (e.g. `/compact`, `/model`) actually run on
 /// drain instead of being sent to the LLM as a literal user message.

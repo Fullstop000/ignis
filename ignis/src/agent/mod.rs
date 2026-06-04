@@ -20,10 +20,10 @@ pub mod agents_md;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum AgentEvent {
-    #[serde(rename = "agent_start")]
-    AgentStart,
     #[serde(rename = "turn_start")]
     TurnStart,
+    #[serde(rename = "run_start")]
+    RunStart,
     #[serde(rename = "message_start")]
     MessageStart { message: Message },
     #[serde(rename = "message_update")]
@@ -41,12 +41,12 @@ pub enum AgentEvent {
         tool_call_id: String,
         result: ToolResult,
     },
-    #[serde(rename = "turn_end")]
-    TurnEnd,
+    #[serde(rename = "run_end")]
+    RunEnd,
     #[serde(rename = "usage")]
     Usage(Usage),
-    #[serde(rename = "agent_end")]
-    AgentEnd,
+    #[serde(rename = "turn_end")]
+    TurnEnd,
     #[serde(rename = "user_injected")]
     UserInjected { text: String },
     /// Streaming HTTP request to the model dropped mid-flight (e.g. provider
@@ -353,22 +353,22 @@ async fn before_tool_call_block(
     Some(tool_result_message(&tc.function.name, &tc.id, &blocked))
 }
 
-/// The accumulated result of consuming one streamed LLM turn.
-struct TurnStream {
+/// The accumulated result of consuming one streamed LLM run.
+struct RunStream {
     assistant_content: String,
     reasoning_content: String,
     tool_calls: Vec<ToolCall>,
     message_started: bool,
     reasoning_streaming: bool,
-    turn_usage: Usage,
+    run_usage: Usage,
     /// Sanitized provider error if the stream terminated abnormally mid-flight
     /// (the `Err` branch in the consume loop). `None` on clean completion.
     /// The caller decides whether to retry or surface the error to the user;
-    /// `consume_turn_stream` itself does not emit `[Error in stream: …]`.
+    /// `consume_run_stream` itself does not emit `[Error in stream: …]`.
     stream_error: Option<String>,
 }
 
-impl TurnStream {
+impl RunStream {
     /// `true` when no UI-visible state was produced. Used by the retry loop
     /// to decide whether re-issuing the request is safe: emitting any
     /// assistant/reasoning text or accumulating tool-call fragments means
@@ -383,25 +383,25 @@ impl TurnStream {
     }
 }
 
-/// Consume one streamed turn: accumulate text / reasoning / tool-call / usage
+/// Consume one streamed run: accumulate text / reasoning / tool-call / usage
 /// deltas, emitting `MessageStart`/`MessageUpdate`/`MessageEnd` for streamed
 /// text and reasoning blocks. Text and reasoning open as separate blocks; when
 /// the active kind flips (text-while-streaming-text → reasoning, or the
 /// reverse) the current block is closed and a fresh one opened, so
 /// `interleaved-thinking`-style streams render in order rather than getting
 /// glued together. Returns the accumulated content, the index-sorted tool
-/// calls, the streaming flags, and the turn's token usage.
-async fn consume_turn_stream(
+/// calls, the streaming flags, and the run's token usage.
+async fn consume_run_stream(
     mut stream: futures_util::stream::BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-) -> TurnStream {
+) -> RunStream {
     use futures_util::stream::StreamExt;
     let mut assistant_content = String::new();
     let mut reasoning_content = String::new();
     let mut pending_tool_calls: HashMap<usize, AccumulatingToolCall> = HashMap::new();
     let mut message_started = false;
     let mut reasoning_streaming = false;
-    let mut turn_usage = Usage::default();
+    let mut run_usage = Usage::default();
     let mut stream_error: Option<String> = None;
 
     while let Some(delta_result) = stream.next().await {
@@ -524,7 +524,7 @@ async fn consume_turn_stream(
                     entry.arguments.push_str(&arguments);
                 }
                 LlmResponseDelta::Usage(u) => {
-                    turn_usage.add(&u);
+                    run_usage.add(&u);
                 }
             },
         }
@@ -549,13 +549,13 @@ async fn consume_turn_stream(
         }
     }
 
-    TurnStream {
+    RunStream {
         assistant_content,
         reasoning_content,
         tool_calls,
         message_started,
         reasoning_streaming,
-        turn_usage,
+        run_usage,
         stream_error,
     }
 }
@@ -715,26 +715,26 @@ impl Agent {
         }
     }
 
-    /// Open one model stream and consume a single turn, retrying transient
+    /// Open one model stream and consume a single run, retrying transient
     /// failures up to `MAX_STREAM_RETRIES`. A failure is retryable iff no
-    /// UI-visible state was produced yet (see [`TurnStream::is_empty`]):
+    /// UI-visible state was produced yet (see [`RunStream::is_empty`]):
     ///
     ///   * `chat_stream` returns `Err` before any stream item — nothing was
     ///     emitted, always safe to retry.
     ///   * the stream opens but the body closes before any delta arrives —
-    ///     `consume_turn_stream` reports `stream_error: Some` with `is_empty()`.
+    ///     `consume_run_stream` reports `stream_error: Some` with `is_empty()`.
     ///
-    /// A turn that already streamed partial content returns `Ok(turn)` with
+    /// A run that already streamed partial content returns `Ok(run)` with
     /// `stream_error: Some`, leaving the caller to surface it inline. Each
     /// retry emits `AgentEvent::Reconnecting { attempt, max, reason }` and
     /// backs off via [`reconnect`].
-    async fn stream_turn_with_retry(
+    async fn stream_run_with_retry(
         &self,
         effective_prompt: &str,
         messages: &[Message],
         tool_schemas: &[serde_json::Value],
         tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-    ) -> Result<TurnStream, anyhow::Error> {
+    ) -> Result<RunStream, anyhow::Error> {
         let mut attempt: u32 = 0;
         loop {
             match self
@@ -753,13 +753,13 @@ impl Agent {
                 }
                 Err(err) => return Err(err),
                 Ok(stream) => {
-                    let turn = consume_turn_stream(stream, tx).await;
-                    match turn.stream_error.as_deref() {
-                        Some(reason) if attempt < MAX_STREAM_RETRIES && turn.is_empty() => {
+                    let run = consume_run_stream(stream, tx).await;
+                    match run.stream_error.as_deref() {
+                        Some(reason) if attempt < MAX_STREAM_RETRIES && run.is_empty() => {
                             attempt += 1;
                             reconnect(tx, attempt, reason.to_string()).await;
                         }
-                        _ => return Ok(turn),
+                        _ => return Ok(run),
                     }
                 }
             }
@@ -777,7 +777,7 @@ impl Agent {
         prompt_hooks: Option<&crate::hooks::HookRegistry>,
         hook_ctx: Option<crate::hooks::HookContext<'_>>,
     ) -> Result<Usage, anyhow::Error> {
-        let _ = tx.send(AgentEvent::AgentStart).await;
+        let _ = tx.send(AgentEvent::TurnStart).await;
         let mut total_usage = Usage::default();
         let effective_prompt = with_catalog(
             &self.system_prompt,
@@ -809,7 +809,7 @@ impl Agent {
                 hook_ctx,
             )
             .await;
-            let _ = tx.send(AgentEvent::TurnStart).await;
+            let _ = tx.send(AgentEvent::RunStart).await;
 
             // LLM request span. Captures wall-clock via construct→drop; final
             // attrs recorded after stream consumption (tokens, success).
@@ -830,13 +830,13 @@ impl Agent {
             // there is no AGENTS.md).
             let messages = agents_md::prepend(self.project_instructions.as_deref(), history);
 
-            // Open the stream and consume one turn, retrying transient drops
-            // that produced no UI state yet (see `stream_turn_with_retry`).
-            let turn_result = self
-                .stream_turn_with_retry(&effective_prompt, &messages, &tool_schemas, &tx)
+            // Open the stream and consume one run, retrying transient drops
+            // that produced no UI state yet (see `stream_run_with_retry`).
+            let run_result = self
+                .stream_run_with_retry(&effective_prompt, &messages, &tool_schemas, &tx)
                 .await;
 
-            let turn = match turn_result {
+            let run = match run_result {
                 Ok(t) => t,
                 Err(err) => {
                     // All retries exhausted with no stream ever opened.
@@ -887,15 +887,15 @@ impl Agent {
                 }
             };
 
-            let TurnStream {
+            let RunStream {
                 assistant_content,
                 reasoning_content,
                 tool_calls,
                 message_started,
                 reasoning_streaming,
-                turn_usage,
+                run_usage,
                 stream_error,
-            } = turn;
+            } = run;
 
             // Mid-stream error AFTER partial UI state was produced (so retry
             // was not safe). Surface the error inline as a MessageUpdate so
@@ -910,16 +910,16 @@ impl Agent {
             }
 
             // Record final LLM-request span attrs + duration metric. A
-            // mid-stream error that survived all retries means the turn
+            // mid-stream error that survived all retries means the run
             // produced partial-or-no content under an unhealthy stream —
             // count that as a failed request, mirroring the pre-stream
             // failure path's `success=false` book-keeping. Span drops at
             // the end of this loop iteration; record before drop.
             let success = stream_error.is_none();
             llm_span.record("success", success);
-            llm_span.record("input_tokens", turn_usage.input_tokens);
-            llm_span.record("output_tokens", turn_usage.output_tokens);
-            llm_span.record("reasoning_tokens", turn_usage.reasoning_tokens);
+            llm_span.record("input_tokens", run_usage.input_tokens);
+            llm_span.record("output_tokens", run_usage.output_tokens);
+            llm_span.record("reasoning_tokens", run_usage.reasoning_tokens);
             crate::telemetry::record_llm_request(
                 self.provider.provider_name(),
                 self.provider.model_id(),
@@ -927,15 +927,15 @@ impl Agent {
                 success,
             );
 
-            // Report this turn's real token usage (if the provider supplied it).
-            if !turn_usage.is_zero() {
+            // Report this run's real token usage (if the provider supplied it).
+            if !run_usage.is_zero() {
                 crate::telemetry::record_tokens(
-                    &turn_usage,
+                    &run_usage,
                     self.provider.provider_name(),
                     self.provider.model_id(),
                 );
-                total_usage.add(&turn_usage);
-                let _ = tx.send(AgentEvent::Usage(turn_usage)).await;
+                total_usage.add(&run_usage);
+                let _ = tx.send(AgentEvent::Usage(run_usage)).await;
             }
 
             let has_content = !assistant_content.is_empty();
@@ -972,7 +972,7 @@ impl Agent {
                         })
                         .await;
                 } else if has_tools {
-                    // No streamed content but the turn produced tool calls
+                    // No streamed content but the run produced tool calls
                     // — synthesize a Start/End pair so the UI's bookkeeping
                     // matches the persisted message. (`has_reasoning` can't
                     // reach here: any reasoning chunk would have flipped
@@ -995,7 +995,7 @@ impl Agent {
             if has_tools {
                 self.execute_tool_calls(&tool_calls, history, &tx).await;
 
-                let _ = tx.send(AgentEvent::TurnEnd).await;
+                let _ = tx.send(AgentEvent::RunEnd).await;
                 // Continue Turn loop since we provided tool results back to LLM
             } else {
                 // No tools: this round would end the turn. But if a steering
@@ -1009,18 +1009,18 @@ impl Agent {
                     hook_ctx,
                 )
                 .await;
-                let _ = tx.send(AgentEvent::TurnEnd).await;
+                let _ = tx.send(AgentEvent::RunEnd).await;
                 if injected == 0 {
                     break;
                 }
             }
         }
 
-        let _ = tx.send(AgentEvent::AgentEnd).await;
+        let _ = tx.send(AgentEvent::TurnEnd).await;
         Ok(total_usage)
     }
 
-    /// Run all tool calls for a turn and append their results to `history`.
+    /// Run all tool calls for a run and append their results to `history`.
     /// Honors `before_tool_call`/`after_tool_call` hooks, runs in parallel
     /// (bounded) unless any tool demands sequential execution, and re-aligns
     /// results to the original call order so history stays deterministic (with
@@ -1155,7 +1155,7 @@ mod tests {
         use futures_util::stream::StreamExt;
         // PR #55 invariant: a stream that re-yields the same transport error
         // doesn't spin — we stop after the first error. The retry refactor
-        // changed *where* the error surfaces: `consume_turn_stream` now
+        // changed *where* the error surfaces: `consume_run_stream` now
         // captures it in `stream_error` and emits nothing itself; the caller
         // (the retry loop in `Agent::run`) decides between re-issuing the
         // request and surfacing the error to the user. Both properties are
@@ -1169,7 +1169,7 @@ mod tests {
             .collect();
         let stream = futures_util::stream::iter(errs).boxed();
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-        let result = consume_turn_stream(stream, &tx).await;
+        let result = consume_run_stream(stream, &tx).await;
         drop(tx);
 
         let mut error_messages = 0;
@@ -1184,7 +1184,7 @@ mod tests {
         }
         assert_eq!(
             any_events, 0,
-            "consume_turn_stream should emit no events for a pure-error stream; \
+            "consume_run_stream should emit no events for a pure-error stream; \
              error surfacing is the caller's job"
         );
         assert_eq!(error_messages, 0);
@@ -1211,7 +1211,7 @@ mod tests {
         ];
         let stream = futures_util::stream::iter(deltas).boxed();
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-        let result = consume_turn_stream(stream, &tx).await;
+        let result = consume_run_stream(stream, &tx).await;
         drop(tx);
         // Drain so the channel doesn't leak warnings in test output.
         while rx.recv().await.is_some() {}
@@ -1222,13 +1222,13 @@ mod tests {
 
     #[test]
     fn turn_stream_is_empty_is_strict() {
-        let mut t = TurnStream {
+        let mut t = RunStream {
             assistant_content: String::new(),
             reasoning_content: String::new(),
             tool_calls: Vec::new(),
             message_started: false,
             reasoning_streaming: false,
-            turn_usage: crate::llm::Usage::default(),
+            run_usage: crate::llm::Usage::default(),
             stream_error: None,
         };
         assert!(t.is_empty());
