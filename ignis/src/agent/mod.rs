@@ -157,17 +157,16 @@ fn get_current_date() -> String {
         .unwrap_or_else(|_| "Unknown Date".to_string())
 }
 
-/// Drain any pending inject messages, run them through the
-/// `UserPromptSubmit` hook chain when a registry is installed, push the
-/// effective text to `history`, and emit a `UserInjected` event for
-/// each. Returns how many were drained.
+/// The `before_llm_call` lifecycle moment: drain any pending steering / inject
+/// messages, run them through the `UserPromptSubmit` hook chain when a registry
+/// is installed, push the effective text to `history`, and emit a `UserInjected`
+/// event for each. Returns how many were folded in.
 ///
-/// Block semantics match `Session::prompt`: a `Blocked` outcome drops
-/// the inject (no history push, no `UserInjected` event) — the chain
-/// already emitted a Warning. Without this, a steer message reaches
-/// the model untranslated / unfiltered, which is the bilingual hook's
-/// primary use case.
-async fn drain_injected(
+/// Block semantics match `Session::prompt`: a `Blocked` outcome drops the
+/// inject (no history push, no `UserInjected` event) — the chain already
+/// emitted a Warning. Without this, a steer message reaches the model
+/// untranslated / unfiltered, which is the bilingual hook's primary use case.
+async fn before_llm_call(
     inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     history: &mut Vec<Message>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
@@ -381,6 +380,14 @@ impl RunStream {
             && !self.message_started
             && !self.reasoning_streaming
     }
+}
+
+/// What one LLM run produced, handed back to the turn loop by
+/// [`Agent::after_llm_call`]: the run's token usage (to accumulate) and any
+/// tool calls it requested (empty when the run ended the turn).
+struct RunOutcome {
+    usage: Usage,
+    tool_calls: Vec<ToolCall>,
 }
 
 /// Consume one streamed run: accumulate text / reasoning / tool-call / usage
@@ -766,27 +773,10 @@ impl Agent {
         }
     }
 
-    /// Run the model + tool loop over `history`, appending assistant and tool
-    /// messages in place and emitting events. Does not load or persist; the
-    /// caller ([`crate::Session`]) owns history and storage.
-    pub async fn run(
-        &self,
-        history: &mut Vec<Message>,
-        tx: tokio::sync::mpsc::Sender<AgentEvent>,
-        mut inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
-        prompt_hooks: Option<&crate::hooks::HookRegistry>,
-        hook_ctx: Option<crate::hooks::HookContext<'_>>,
-    ) -> Result<Usage, anyhow::Error> {
-        let _ = tx.send(AgentEvent::TurnStart).await;
-        let mut total_usage = Usage::default();
-        let effective_prompt = with_catalog(
-            &self.system_prompt,
-            self.skills.as_deref(),
-            self.mcp.as_deref(),
-        );
-
-        let tool_schemas: Vec<serde_json::Value> = self
-            .tools
+    /// Build the JSON function-call schemas advertised to the provider, one
+    /// per registered tool.
+    fn tool_schemas(&self) -> Vec<serde_json::Value> {
+        self.tools
             .iter()
             .map(|t| {
                 serde_json::json!({
@@ -798,10 +788,238 @@ impl Agent {
                     }
                 })
             })
-            .collect();
+            .collect()
+    }
+
+    /// One LLM round: prepend project instructions, open the model stream (with
+    /// retry), and record the `ignis.llm_request` span + telemetry. Returns the
+    /// consumed run on success; on exhausted retries with no stream ever opened,
+    /// records the failed request and returns the error for the caller to
+    /// surface via [`Self::emit_fatal`].
+    async fn call_llm(
+        &self,
+        effective_prompt: &str,
+        history: &[Message],
+        tool_schemas: &[serde_json::Value],
+        tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<RunStream, anyhow::Error> {
+        // LLM request span. Captures wall-clock via construct→drop; final attrs
+        // recorded below once the stream is consumed.
+        let llm_span = tracing::info_span!(
+            "ignis.llm_request",
+            provider = %self.provider.provider_name(),
+            model = %self.provider.model_id(),
+            input_tokens = tracing::field::Empty,
+            output_tokens = tracing::field::Empty,
+            reasoning_tokens = tracing::field::Empty,
+            success = tracing::field::Empty,
+        );
+        let llm_start = std::time::Instant::now();
+
+        // Prepend the AGENTS.md project instructions as a synthetic first user
+        // turn when present. Kept out of `history` so it never persists or
+        // renders, and always reflects the current file (zero-copy when absent).
+        let messages = agents_md::prepend(self.project_instructions.as_deref(), history);
+        let result = self
+            .stream_run_with_retry(effective_prompt, &messages, tool_schemas, tx)
+            .await;
+
+        match &result {
+            Ok(run) => {
+                // A surviving mid-stream error (`stream_error: Some`) means the
+                // run produced partial-or-no content under an unhealthy stream —
+                // count it as a failed request, mirroring the pre-stream path.
+                let success = run.stream_error.is_none();
+                llm_span.record("success", success);
+                llm_span.record("input_tokens", run.run_usage.input_tokens);
+                llm_span.record("output_tokens", run.run_usage.output_tokens);
+                llm_span.record("reasoning_tokens", run.run_usage.reasoning_tokens);
+                crate::telemetry::record_llm_request(
+                    self.provider.provider_name(),
+                    self.provider.model_id(),
+                    llm_start.elapsed(),
+                    success,
+                );
+            }
+            Err(_) => {
+                llm_span.record("success", false);
+                crate::telemetry::record_llm_request(
+                    self.provider.provider_name(),
+                    self.provider.model_id(),
+                    llm_start.elapsed(),
+                    false,
+                );
+            }
+        }
+        result
+    }
+
+    /// After a run completes: surface any mid-stream error inline, report token
+    /// usage, assemble the assistant message into `history`, and emit its
+    /// message events. Returns the run's usage plus any tool calls it requested
+    /// (empty when the run ended the turn).
+    async fn after_llm_call(
+        &self,
+        history: &mut Vec<Message>,
+        run: RunStream,
+        tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> RunOutcome {
+        let RunStream {
+            assistant_content,
+            reasoning_content,
+            tool_calls,
+            message_started,
+            reasoning_streaming,
+            run_usage,
+            stream_error,
+        } = run;
+
+        // Mid-stream error AFTER partial UI state was produced (so retry was
+        // not safe). Surface the error inline as a MessageUpdate so the user
+        // sees the response was truncated.
+        if let Some(reason) = &stream_error {
+            let _ = tx
+                .send(AgentEvent::MessageUpdate {
+                    delta: format!("\n[Error in stream: {}]", reason),
+                })
+                .await;
+        }
+
+        // Report this run's real token usage (if the provider supplied it).
+        if !run_usage.is_zero() {
+            crate::telemetry::record_tokens(
+                &run_usage,
+                self.provider.provider_name(),
+                self.provider.model_id(),
+            );
+            let _ = tx.send(AgentEvent::Usage(run_usage)).await;
+        }
+
+        let has_content = !assistant_content.is_empty();
+        let has_reasoning = !reasoning_content.is_empty();
+        let has_tools = !tool_calls.is_empty();
+
+        if has_content || has_reasoning || has_tools {
+            let msg = Message {
+                role: "assistant".to_string(),
+                content: if has_content {
+                    Some(assistant_content.clone())
+                } else {
+                    None
+                },
+                reasoning_content: if has_reasoning {
+                    Some(reasoning_content.clone())
+                } else {
+                    None
+                },
+                name: None,
+                tool_call_id: None,
+                tool_calls: if has_tools {
+                    Some(tool_calls.clone())
+                } else {
+                    None
+                },
+                created_at_ms: Some(now_ms()),
+            };
+
+            if message_started || reasoning_streaming {
+                let _ = tx
+                    .send(AgentEvent::MessageEnd {
+                        message: msg.clone(),
+                    })
+                    .await;
+            } else if has_tools {
+                // No streamed content but the run produced tool calls —
+                // synthesize a Start/End pair so the UI bookkeeping matches the
+                // persisted message. (`has_reasoning` can't reach here: any
+                // reasoning chunk would have flipped `reasoning_streaming`.)
+                let _ = tx
+                    .send(AgentEvent::MessageStart {
+                        message: msg.clone(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(AgentEvent::MessageEnd {
+                        message: msg.clone(),
+                    })
+                    .await;
+            }
+
+            history.push(msg);
+        }
+
+        RunOutcome {
+            usage: run_usage,
+            tool_calls,
+        }
+    }
+
+    /// Emit the assistant `Error: …` message-pair shown when all stream retries
+    /// were exhausted before any stream opened. The failed request itself is
+    /// already recorded by [`Self::call_llm`]; this only surfaces the UI.
+    async fn emit_fatal(&self, err: anyhow::Error, tx: &tokio::sync::mpsc::Sender<AgentEvent>) {
+        let err_msg = Self::sanitize_and_truncate_error(&err.to_string());
+        let error_content = format!("Error: {}", err_msg);
+        let _ = tx
+            .send(AgentEvent::MessageStart {
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: Some(String::new()),
+                    reasoning_content: None,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                    created_at_ms: None,
+                },
+            })
+            .await;
+        let _ = tx
+            .send(AgentEvent::MessageUpdate {
+                delta: error_content.clone(),
+            })
+            .await;
+        let _ = tx
+            .send(AgentEvent::MessageEnd {
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: Some(error_content),
+                    reasoning_content: None,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                    created_at_ms: None,
+                },
+            })
+            .await;
+    }
+
+    /// Run the model + tool loop over `history` until the turn completes — the
+    /// model stops requesting tools and no steering remains — appending
+    /// assistant and tool messages in place and emitting events. This is the
+    /// stable turn skeleton; each lifecycle moment lives in its own method:
+    /// draining steering ([`before_llm_call`]), the LLM round
+    /// ([`Self::call_llm`]), assembling the reply ([`Self::after_llm_call`]),
+    /// and tool execution ([`Self::execute_tool_calls`]). Does not load or
+    /// persist; the caller ([`crate::Session`]) owns history and storage.
+    pub async fn run(
+        &self,
+        history: &mut Vec<Message>,
+        tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        mut inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+        prompt_hooks: Option<&crate::hooks::HookRegistry>,
+        hook_ctx: Option<crate::hooks::HookContext<'_>>,
+    ) -> Result<Usage, anyhow::Error> {
+        let _ = tx.send(AgentEvent::TurnStart).await;
+        let effective_prompt = with_catalog(
+            &self.system_prompt,
+            self.skills.as_deref(),
+            self.mcp.as_deref(),
+        );
+        let tool_schemas = self.tool_schemas();
+        let mut total_usage = Usage::default();
 
         loop {
-            drain_injected(
+            before_llm_call(
                 inject_rx.as_deref_mut(),
                 history,
                 &tx,
@@ -811,197 +1029,31 @@ impl Agent {
             .await;
             let _ = tx.send(AgentEvent::RunStart).await;
 
-            // LLM request span. Captures wall-clock via construct→drop; final
-            // attrs recorded after stream consumption (tokens, success).
-            let llm_span = tracing::info_span!(
-                "ignis.llm_request",
-                provider = %self.provider.provider_name(),
-                model = %self.provider.model_id(),
-                input_tokens = tracing::field::Empty,
-                output_tokens = tracing::field::Empty,
-                reasoning_tokens = tracing::field::Empty,
-                success = tracing::field::Empty,
-            );
-            let llm_start = std::time::Instant::now();
-
-            // Prepend the AGENTS.md project instructions as a synthetic first
-            // user turn when present. Kept out of `history` so it never persists
-            // or renders, and always reflects the current file (zero-copy when
-            // there is no AGENTS.md).
-            let messages = agents_md::prepend(self.project_instructions.as_deref(), history);
-
-            // Open the stream and consume one run, retrying transient drops
-            // that produced no UI state yet (see `stream_run_with_retry`).
-            let run_result = self
-                .stream_run_with_retry(&effective_prompt, &messages, &tool_schemas, &tx)
-                .await;
-
-            let run = match run_result {
-                Ok(t) => t,
+            let run = match self
+                .call_llm(&effective_prompt, history, &tool_schemas, &tx)
+                .await
+            {
+                Ok(run) => run,
                 Err(err) => {
                     // All retries exhausted with no stream ever opened.
-                    // Surface as an assistant `Error: …` message-pair (existing
-                    // pre-stream-error UX) and exit the turn loop.
-                    let err_msg = Self::sanitize_and_truncate_error(&err.to_string());
-                    llm_span.record("success", false);
-                    crate::telemetry::record_llm_request(
-                        self.provider.provider_name(),
-                        self.provider.model_id(),
-                        llm_start.elapsed(),
-                        false,
-                    );
-                    drop(llm_span);
-                    let error_content = format!("Error: {}", err_msg);
-                    let _ = tx
-                        .send(AgentEvent::MessageStart {
-                            message: Message {
-                                role: "assistant".to_string(),
-                                content: Some(String::new()),
-                                reasoning_content: None,
-                                name: None,
-                                tool_call_id: None,
-                                tool_calls: None,
-                                created_at_ms: None,
-                            },
-                        })
-                        .await;
-                    let _ = tx
-                        .send(AgentEvent::MessageUpdate {
-                            delta: error_content.clone(),
-                        })
-                        .await;
-                    let _ = tx
-                        .send(AgentEvent::MessageEnd {
-                            message: Message {
-                                role: "assistant".to_string(),
-                                content: Some(error_content),
-                                reasoning_content: None,
-                                name: None,
-                                tool_call_id: None,
-                                tool_calls: None,
-                                created_at_ms: None,
-                            },
-                        })
-                        .await;
+                    self.emit_fatal(err, &tx).await;
                     break;
                 }
             };
 
-            let RunStream {
-                assistant_content,
-                reasoning_content,
-                tool_calls,
-                message_started,
-                reasoning_streaming,
-                run_usage,
-                stream_error,
-            } = run;
+            let outcome = self.after_llm_call(history, run, &tx).await;
+            total_usage.add(&outcome.usage);
 
-            // Mid-stream error AFTER partial UI state was produced (so retry
-            // was not safe). Surface the error inline as a MessageUpdate so
-            // the user sees the response was truncated. The outer turn loop
-            // continues — same behavior as before the retry change.
-            if let Some(reason) = &stream_error {
-                let _ = tx
-                    .send(AgentEvent::MessageUpdate {
-                        delta: format!("\n[Error in stream: {}]", reason),
-                    })
+            if !outcome.tool_calls.is_empty() {
+                self.execute_tool_calls(&outcome.tool_calls, history, &tx)
                     .await;
-            }
-
-            // Record final LLM-request span attrs + duration metric. A
-            // mid-stream error that survived all retries means the run
-            // produced partial-or-no content under an unhealthy stream —
-            // count that as a failed request, mirroring the pre-stream
-            // failure path's `success=false` book-keeping. Span drops at
-            // the end of this loop iteration; record before drop.
-            let success = stream_error.is_none();
-            llm_span.record("success", success);
-            llm_span.record("input_tokens", run_usage.input_tokens);
-            llm_span.record("output_tokens", run_usage.output_tokens);
-            llm_span.record("reasoning_tokens", run_usage.reasoning_tokens);
-            crate::telemetry::record_llm_request(
-                self.provider.provider_name(),
-                self.provider.model_id(),
-                llm_start.elapsed(),
-                success,
-            );
-
-            // Report this run's real token usage (if the provider supplied it).
-            if !run_usage.is_zero() {
-                crate::telemetry::record_tokens(
-                    &run_usage,
-                    self.provider.provider_name(),
-                    self.provider.model_id(),
-                );
-                total_usage.add(&run_usage);
-                let _ = tx.send(AgentEvent::Usage(run_usage)).await;
-            }
-
-            let has_content = !assistant_content.is_empty();
-            let has_reasoning = !reasoning_content.is_empty();
-            let has_tools = !tool_calls.is_empty();
-
-            if has_content || has_reasoning || has_tools {
-                let msg = Message {
-                    role: "assistant".to_string(),
-                    content: if has_content {
-                        Some(assistant_content.clone())
-                    } else {
-                        None
-                    },
-                    reasoning_content: if has_reasoning {
-                        Some(reasoning_content.clone())
-                    } else {
-                        None
-                    },
-                    name: None,
-                    tool_call_id: None,
-                    tool_calls: if has_tools {
-                        Some(tool_calls.clone())
-                    } else {
-                        None
-                    },
-                    created_at_ms: Some(now_ms()),
-                };
-
-                if message_started || reasoning_streaming {
-                    let _ = tx
-                        .send(AgentEvent::MessageEnd {
-                            message: msg.clone(),
-                        })
-                        .await;
-                } else if has_tools {
-                    // No streamed content but the run produced tool calls
-                    // — synthesize a Start/End pair so the UI's bookkeeping
-                    // matches the persisted message. (`has_reasoning` can't
-                    // reach here: any reasoning chunk would have flipped
-                    // `reasoning_streaming` above.)
-                    let _ = tx
-                        .send(AgentEvent::MessageStart {
-                            message: msg.clone(),
-                        })
-                        .await;
-                    let _ = tx
-                        .send(AgentEvent::MessageEnd {
-                            message: msg.clone(),
-                        })
-                        .await;
-                }
-
-                history.push(msg.clone());
-            }
-
-            if has_tools {
-                self.execute_tool_calls(&tool_calls, history, &tx).await;
-
                 let _ = tx.send(AgentEvent::RunEnd).await;
-                // Continue Turn loop since we provided tool results back to LLM
+                // Continue the turn loop: tool results go back to the model.
             } else {
-                // No tools: this round would end the turn. But if a steering
-                // message arrived, fold it in and run one more round so the model
-                // actually responds to it (keep-the-turn-alive).
-                let injected = drain_injected(
+                // No tools: this run would end the turn. But if a steering
+                // message arrived, fold it in and run one more round so the
+                // model responds to it (keep-the-turn-alive).
+                let injected = before_llm_call(
                     inject_rx.as_deref_mut(),
                     history,
                     &tx,
