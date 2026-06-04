@@ -76,14 +76,7 @@ fn apply_edit_key(app: &mut App, key: KeyEvent) -> bool {
         }
         (KeyModifiers::CONTROL, KeyCode::Char('w')) if app.cursor > 0 => {
             app.clear_exit_hint();
-            let before = &app.input[..app.cursor];
-            let trimmed = before.trim_end();
-            let new_end = trimmed
-                .rfind(|c: char| c.is_whitespace())
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            app.input = format!("{}{}", &app.input[..new_end], &app.input[app.cursor..]);
-            app.cursor = new_end;
+            app.delete_word_back();
         }
         (m, KeyCode::Char('j'))
             if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
@@ -497,15 +490,7 @@ pub(crate) async fn handle_key(
         }
         (KeyModifiers::CONTROL, KeyCode::Char('w')) if app.cursor > 0 => {
             app.clear_exit_hint();
-            // Delete word backward
-            let before = &app.input[..app.cursor];
-            let trimmed = before.trim_end();
-            let new_end = trimmed
-                .rfind(|c: char| c.is_whitespace())
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            app.input = format!("{}{}", &app.input[..new_end], &app.input[app.cursor..]);
-            app.cursor = new_end;
+            app.delete_word_back();
         }
         (_, KeyCode::Up) if !app.slash_suggestions().is_empty() => {
             app.select_slash_suggestion(SelectionDirection::Previous);

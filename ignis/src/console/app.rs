@@ -965,11 +965,13 @@ impl App {
     }
 
     pub(crate) fn insert_char(&mut self, c: char) {
+        self.snap_out_of_chip();
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
     }
 
     pub(crate) fn insert_str(&mut self, s: &str) {
+        self.snap_out_of_chip();
         self.input.insert_str(self.cursor, s);
         self.cursor += s.len();
     }
@@ -978,24 +980,74 @@ impl App {
         if self.cursor == 0 {
             return;
         }
-        // A paste chip is atomic: if the cursor sits at a chip's right edge,
-        // delete the whole chip (and forget its content) rather than nibbling a
-        // bracket at a time, which would silently corrupt the placeholder so it
-        // no longer expands.
-        if let Some(i) = self
-            .pending_pastes
-            .iter()
-            .position(|p| self.input[..self.cursor].ends_with(&p.placeholder))
-        {
-            let len = self.pending_pastes[i].placeholder.len();
-            self.input.replace_range(self.cursor - len..self.cursor, "");
-            self.cursor -= len;
-            self.pending_pastes.remove(i);
+        let prev = self.prev_char_boundary();
+        if let Some((start, end, i)) = self.chip_overlapping(prev, self.cursor) {
+            self.remove_chip(start, end, i);
             return;
         }
-        let prev = self.prev_char_boundary();
         self.input.remove(prev);
         self.cursor = prev;
+    }
+
+    pub(crate) fn delete_forward(&mut self) {
+        if self.cursor >= self.input.len() {
+            return;
+        }
+        let next = self.next_char_boundary();
+        if let Some((start, end, i)) = self.chip_overlapping(self.cursor, next) {
+            self.remove_chip(start, end, i);
+            return;
+        }
+        self.input.remove(self.cursor);
+    }
+
+    /// Ctrl+W: delete the word before the cursor. A chip in the way is removed
+    /// whole rather than half-eaten into a fragment.
+    pub(crate) fn delete_word_back(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let before = &self.input[..self.cursor];
+        let trimmed = before.trim_end();
+        let new_end = trimmed
+            .rfind(|c: char| c.is_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if let Some((start, end, i)) = self.chip_overlapping(new_end, self.cursor) {
+            self.remove_chip(start, end, i);
+            return;
+        }
+        self.input.replace_range(new_end..self.cursor, "");
+        self.cursor = new_end;
+    }
+
+    /// A paste chip is atomic. If the buffer byte range `[lo, hi)` overlaps a
+    /// chip, return its full span `[start, end)` and `pending_pastes` index, so
+    /// an edit can remove the whole chip instead of leaving a corrupted
+    /// placeholder fragment — which would both silently drop the pasted content
+    /// and leak the partial chip text to the agent.
+    fn chip_overlapping(&self, lo: usize, hi: usize) -> Option<(usize, usize, usize)> {
+        self.pending_pastes.iter().enumerate().find_map(|(i, p)| {
+            let start = self.input.find(&p.placeholder)?;
+            let end = start + p.placeholder.len();
+            (start < hi && lo < end).then_some((start, end, i))
+        })
+    }
+
+    /// Remove the chip spanning `[start, end)` (pending index `i`); park the
+    /// cursor where the chip began.
+    fn remove_chip(&mut self, start: usize, end: usize, i: usize) {
+        self.input.replace_range(start..end, "");
+        self.cursor = start;
+        self.pending_pastes.remove(i);
+    }
+
+    /// If the cursor sits strictly inside a chip, move it to the chip's end so
+    /// an insert lands beside the chip rather than splitting the placeholder.
+    fn snap_out_of_chip(&mut self) {
+        if let Some((_, end, _)) = self.chip_overlapping(self.cursor, self.cursor) {
+            self.cursor = end;
+        }
     }
 
     /// Number of lines at or above which a paste collapses into a chip.
@@ -1033,12 +1085,6 @@ impl App {
             text = text.replace(&p.placeholder, &p.content);
         }
         text
-    }
-
-    pub(crate) fn delete_forward(&mut self) {
-        if self.cursor < self.input.len() {
-            self.input.remove(self.cursor);
-        }
     }
 
     pub(crate) fn move_left(&mut self) {
@@ -2512,5 +2558,50 @@ mod paste_tests {
         let _ = app.submit();
         app.handle_paste("e\nf\ng\nh".into());
         assert!(app.input.contains("#2"));
+    }
+
+    // --- atomic-edit guards: a chip is never half-deleted into a fragment that
+    // would leak to the agent and silently drop the pasted content. ---
+
+    #[test]
+    fn ctrl_w_removes_whole_chip_no_leak() {
+        let mut app = app();
+        app.handle_paste("a\nb\nc\nd".into()); // cursor at chip's right edge
+        app.delete_word_back();
+        assert_eq!(app.input, "");
+        assert!(app.pending_pastes.is_empty());
+        assert_eq!(app.expand_pastes(app.input.clone()), "");
+    }
+
+    #[test]
+    fn delete_forward_at_chip_start_removes_chip() {
+        let mut app = app();
+        app.handle_paste("a\nb\nc\nd".into());
+        app.cursor = 0;
+        app.delete_forward();
+        assert_eq!(app.input, "");
+        assert!(app.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn backspace_inside_chip_removes_whole_chip() {
+        let mut app = app();
+        app.handle_paste("a\nb\nc\nd".into());
+        app.cursor = 5; // mid-chip
+        app.backspace();
+        assert_eq!(app.input, "");
+        assert!(app.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn typing_inside_chip_snaps_and_keeps_chip_intact() {
+        let mut app = app();
+        app.handle_paste("a\nb\nc\nd".into());
+        let chip = app.input.clone();
+        app.cursor = 5; // mid-chip
+        app.insert_char('x');
+        assert_eq!(app.input, format!("{chip}x")); // x landed after the chip
+        assert_eq!(app.pending_pastes.len(), 1);
+        assert_eq!(app.submit().unwrap(), "a\nb\nc\ndx");
     }
 }
