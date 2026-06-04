@@ -86,15 +86,14 @@ api_key = "sk-cp-your-key"
 # threshold_tokens = 120000  # estimated-token trigger for auto-compaction
 # keep_recent_tokens = 16000 # recent history kept verbatim when compacting
 
-# Outbound history trim (optional). Trims prior-turn material before each
-# model call. Default if unset: "strip-only" (cache-stable; drops prior-turn
-# reasoning on text-only assistant turns — DeepSeek/Anthropic-safe). The env
-# var `IGNIS_HISTORY_TRIM` overrides this at runtime.
-# [history]
-# trim = "strip-only"
-#   # Values:
+# Miscellaneous agent settings (optional). The env var
+# `IGNIS_HISTORY_TRIM` overrides `history_trim` at runtime.
+# [settings]
+# history_trim = "strip-only"
+#   # Outbound history-trim policy. Values:
 #   #   "off"         — no trim (full history every turn)
 #   #   "strip-only"  — default; drops prior-turn reasoning on text-only turns
+#   #                   (cache-stable; DeepSeek- and Anthropic-safe)
 #   #   "strip-wide"  — strip-only PLUS inline <think> on tool-calling turns
 #   #                   (experimental; preserves DeepSeek's reasoning_content
 #   #                   field on tool turns to avoid 400s)

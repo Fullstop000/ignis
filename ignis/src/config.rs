@@ -39,16 +39,20 @@ impl Default for CompactionConfig {
     }
 }
 
-/// Outbound history-trim settings. Maps to the same string values as the
-/// `IGNIS_HISTORY_TRIM` env var: `"off"` / `"mask-only"` / `"strip-only"`
-/// (default — cache-stable; strips prior-turn reasoning on text-only assistant
-/// turns) / `"strip-wide"` (also strips inline `<think>` on tool-calling turns)
-/// / `"both"` (mask + strip — biggest savings, but the mask churns the
-/// provider's prompt-cache prefix at the rolling-5 boundary; tune at your own
-/// risk). The env var takes precedence over this when both are set.
+/// Miscellaneous agent settings — single-knob items that don't merit their
+/// own dedicated block. New knobs go here unless they have multiple related
+/// fields that read better as their own block (compaction, mcp, etc.).
 #[derive(Debug, Deserialize, Clone, Default)]
-pub struct HistoryConfig {
-    pub trim: Option<String>,
+pub struct SettingsConfig {
+    /// Outbound history-trim policy. Maps to the same string values as the
+    /// `IGNIS_HISTORY_TRIM` env var: `"off"` / `"mask-only"` / `"strip-only"`
+    /// (default — cache-stable; strips prior-turn reasoning on text-only
+    /// assistant turns) / `"strip-wide"` (also strips inline `<think>` on
+    /// tool-calling turns) / `"both"` (mask + strip — biggest savings, but
+    /// the mask churns the provider's prompt-cache prefix at the rolling-5
+    /// boundary; tune at your own risk). The env var takes precedence over
+    /// this when both are set.
+    pub history_trim: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -66,7 +70,7 @@ pub struct Config {
     #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
-    pub history: HistoryConfig,
+    pub settings: SettingsConfig,
     #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
@@ -448,9 +452,9 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
     // override slot. Done once at startup — the env var still takes
     // precedence at the per-call site. An unrecognized value here is a
     // config error worth surfacing rather than silently falling back.
-    if let Some(trim) = config.history.trim.as_deref() {
+    if let Some(trim) = config.settings.history_trim.as_deref() {
         crate::llm::protocols::set_history_policy_from_config(trim)
-            .map_err(|e| anyhow!("Bad `[history] trim` in {}: {}", path.display(), e))?;
+            .map_err(|e| anyhow!("Bad `[settings] history_trim` in {}: {}", path.display(), e))?;
     }
     config.apply_state(load_state());
     Ok(config)
