@@ -30,6 +30,12 @@ Columns:
     n_output_tokens
     n_cache_read_tokens
     cache_hit_rate       — n_cache_read_tokens / n_input_tokens (rounded to 3 dp)
+    n_tool_calls         — total tool calls ignis emitted (sum of assistant
+                           messages' tool_calls), from `agent/ignis-projects/**/*.jsonl`
+    n_tool_ok            — tool results with `is_error == false` from the same JSONL
+    n_tool_err           — tool results with `is_error == true`  (or unparseable result)
+    tool_ok_rate         — n_tool_ok / n_tool_calls (rounded to 3 dp; "" when no calls)
+                           Blank for TimedOut trials whose sandbox died before JSONL sync.
     started_at           — ISO 8601
     finished_at          — ISO 8601
 
@@ -154,6 +160,61 @@ def _agent_log_indicates_stream_drop(path: Path) -> bool:
         return False
 
 
+def _count_tool_outcomes(projects_dir: Path) -> tuple[int, int, int]:
+    """Count tool calls and OK/ERR outcomes from ignis's own session JSONL.
+
+    Source of truth is `<trial>/agent/ignis-projects/**/*.jsonl` — the
+    persistent session log ignis writes itself. Envelopes we care about:
+
+      - `{"type":"message","payload":{"role":"assistant","tool_calls":[...]}}`
+        → n_calls += len(tool_calls)
+      - `{"type":"tool_result","payload":{"content":"{\\"is_error\\":bool,...}"}}`
+        → n_ok / n_err depending on `is_error`
+
+    Returns `(0, 0, 0)` when the directory is absent — e.g. on TimedOut
+    trials where harbor's sandbox-sync didn't run because ignis was
+    SIGKILL'd. That blank is honest: no JSONL means no authoritative count.
+
+    Reading from ignis's JSONL rather than the harbor stdout log makes
+    this metric portable across runners — when we swap harbor for another
+    harness, this function keeps working unchanged.
+    """
+    if not projects_dir.exists():
+        return 0, 0, 0
+    n_calls = n_ok = n_err = 0
+    for jsonl in projects_dir.rglob("*.jsonl"):
+        try:
+            with jsonl.open("r", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        env = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    t = env.get("type")
+                    payload = env.get("payload") or {}
+                    if t == "message" and payload.get("role") == "assistant":
+                        tcs = payload.get("tool_calls") or []
+                        n_calls += len(tcs)
+                    elif t == "tool_result":
+                        content = payload.get("content") or ""
+                        try:
+                            body = json.loads(content) if isinstance(content, str) else content
+                        except json.JSONDecodeError:
+                            # Unparseable tool result — count as an error, not silently dropped.
+                            n_err += 1
+                            continue
+                        if isinstance(body, dict) and body.get("is_error"):
+                            n_err += 1
+                        else:
+                            n_ok += 1
+        except OSError:
+            continue
+    return n_calls, n_ok, n_err
+
+
 def walk_trials(job_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for trial_dir in sorted(p for p in job_dir.iterdir() if p.is_dir()):
@@ -178,6 +239,8 @@ def walk_trials(job_dir: Path) -> list[dict[str, Any]]:
 
         n_in, n_out, n_cache = _sum_usage(trial_dir / "agent" / "ignis-projects")
         cache_rate = round(n_cache / n_in, 3) if n_in else ""
+        n_calls, n_ok, n_err = _count_tool_outcomes(trial_dir / "agent" / "ignis-projects")
+        tool_ok_rate = round(n_ok / n_calls, 3) if n_calls else ""
 
         # Bucket and exception subtype. The bucket is passed/failed/errored —
         # the Exception column distinguishes the sub-cause. For `failed`, the
@@ -212,6 +275,10 @@ def walk_trials(job_dir: Path) -> list[dict[str, Any]]:
             "n_output_tokens": n_out or "",
             "n_cache_read_tokens": n_cache or "",
             "cache_hit_rate": cache_rate,
+            "n_tool_calls": n_calls or "",
+            "n_tool_ok": n_ok or "",
+            "n_tool_err": n_err or "",
+            "tool_ok_rate": tool_ok_rate,
             "started_at": result.get("started_at", ""),
             "finished_at": result.get("finished_at", ""),
         })
