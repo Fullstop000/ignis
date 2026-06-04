@@ -8,12 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- TUI — scroll the transcript with the mouse wheel. ([#125](https://github.com/Fullstop000/ignis/pull/125))
 - TUI — pasting a multi-line block (≥ 4 lines) now shows a compact `[ pasted-text#N M lines ]` chip in the composer instead of dumping the whole text inline; the chip expands back to the full content when you send. ([#124](https://github.com/Fullstop000/ignis/pull/124))
 - Benchmarks — bench pipeline records per-trial tool-call success rate (OK / total / err) sourced from ignis's own session JSONL, surfaced as a new "Tool OK rate" headline card, sortable "Tool OK%" column, and per-trial drill-down line. Harness-portable: no dependency on harbor stdout markers. ([#120](https://github.com/Fullstop000/ignis/pull/120))
 - `ask_user` shows a review-and-submit screen for multi-question batches — confirm every answer, or step back (Left / Shift-Tab) to revise one before submitting. ([#115](https://github.com/Fullstop000/ignis/pull/115))
 - Footer shows the current git branch (oh-my-zsh `git:(branch)` style) when the working directory is a git repo. ([#115](https://github.com/Fullstop000/ignis/pull/115))
 
 ### Changed
+- TUI — the live "Thinking…" timer now reads `5s` / `1m 05s` / `1h 02m 05s` instead of raw seconds. ([#125](https://github.com/Fullstop000/ignis/pull/125))
+- TUI — removed the `↑/↓ N more lines` transcript scroll hints. ([#125](https://github.com/Fullstop000/ignis/pull/125))
 - Tool-initiated pickers (`ask_user`, `permission`, `connect`, `afk`) now anchor to the bottom of the body above the input band — transcript stays visible above — matching the Claude Code / Codex convention. ([#107](https://github.com/Fullstop000/ignis/pull/107))
 - Internal — the TUI slash-command dispatcher (`submit_text`) is now a `match` on the command token instead of a 13-arm `if/else` ladder, with the no-provider gate hoisted to a single early return and the skill-command lookup deduplicated. No user-visible change. ([#111](https://github.com/Fullstop000/ignis/pull/111))
 - Internal — native tools now share one static metadata and call adapter; the agent loop's stream-retry and hook-block paths are factored into named helpers. No user-visible change. ([#119](https://github.com/Fullstop000/ignis/pull/119))
