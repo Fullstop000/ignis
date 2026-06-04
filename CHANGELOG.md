@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- Agent — outbound history trim before every model call. By default, prior-turn reasoning is dropped on assistant messages that did NOT call a tool (mirrors DeepSeek's documented non-tool-turn contract and strips inline `<think>...</think>` for MiniMax-M3); tool-calling turns are preserved verbatim. Cuts input-token bloat from replayed chain-of-thought without changing tool-call linkage or per-provider invariants. Configurable via `[settings] history_trim = ...` in `~/.ignis/config.toml` or the `IGNIS_HISTORY_TRIM` env var (`off` / `strip-think` (default) / `strip-wide` / `mask-only` / `both`). ([#123](https://github.com/Fullstop000/ignis/pull/123))
+- Agent — outbound history trim before every model call. By default, prior-turn reasoning is dropped on assistant messages that did NOT call a tool (mirrors DeepSeek's documented non-tool-turn contract and strips inline `<think>...</think>` for MiniMax-M3); tool-calling turns are preserved verbatim. Cuts input-token bloat from replayed chain-of-thought without changing tool-call linkage or per-provider invariants. Toggle with `[settings] strip-think = true|false` in `~/.ignis/config.toml`; experimental modes (`strip-wide` / `mask-only` / `both`) are reachable via the `IGNIS_HISTORY_TRIM` env var. ([#123](https://github.com/Fullstop000/ignis/pull/123))
 
 ### Added
 - TUI — pasting a multi-line block (≥ 4 lines) now shows a compact `[ pasted-text#N M lines ]` chip in the composer instead of dumping the whole text inline; the chip expands back to the full content when you send. ([#124](https://github.com/Fullstop000/ignis/pull/124))

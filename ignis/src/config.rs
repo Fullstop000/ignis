@@ -44,15 +44,15 @@ impl Default for CompactionConfig {
 /// fields that read better as their own block (compaction, mcp, etc.).
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct SettingsConfig {
-    /// Outbound history-trim policy. Maps to the same string values as the
-    /// `IGNIS_HISTORY_TRIM` env var: `"off"` / `"mask-only"` / `"strip-think"`
-    /// (default — cache-stable; strips prior-turn reasoning on text-only
-    /// assistant turns) / `"strip-wide"` (also strips inline `<think>` on
-    /// tool-calling turns) / `"both"` (mask + strip — biggest savings, but
-    /// the mask churns the provider's prompt-cache prefix at the rolling-5
-    /// boundary; tune at your own risk). The env var takes precedence over
-    /// this when both are set.
-    pub history_trim: Option<String>,
+    /// Strip prior-turn `<think>...</think>` (and the equivalent
+    /// `reasoning_content` field) from text-only assistant turns before each
+    /// outbound model call. Defaults to `true` when unset — cache-stable,
+    /// DeepSeek/Anthropic-safe. Set `false` to send the full history every
+    /// turn. The `IGNIS_HISTORY_TRIM` env var overrides this at runtime and
+    /// also exposes the experimental `strip-wide`, `mask-only`, and `both`
+    /// modes for benchmarking.
+    #[serde(rename = "strip-think")]
+    pub strip_think: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -448,13 +448,16 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
         validate_mcp_server_name(name)?;
         srv.validate(name)?;
     }
-    // Plumb the history-trim setting down into the protocol layer's static
+    // Plumb the single-bool config knob into the protocol layer's static
     // override slot. Done once at startup — the env var still takes
-    // precedence at the per-call site. An unrecognized value here is a
-    // config error worth surfacing rather than silently falling back.
-    if let Some(trim) = config.settings.history_trim.as_deref() {
-        crate::llm::protocols::set_history_policy_from_config(trim)
-            .map_err(|e| anyhow!("Bad `[settings] history_trim` in {}: {}", path.display(), e))?;
+    // precedence at the per-call site.
+    if let Some(strip) = config.settings.strip_think {
+        let policy = if strip {
+            crate::llm::protocols::HistoryPolicy::strip_think()
+        } else {
+            crate::llm::protocols::HistoryPolicy::disabled()
+        };
+        crate::llm::protocols::set_history_policy(policy);
     }
     config.apply_state(load_state());
     Ok(config)

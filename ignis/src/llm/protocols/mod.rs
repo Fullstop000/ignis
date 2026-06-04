@@ -401,15 +401,15 @@ impl HistoryPolicy {
 }
 
 /// Config-supplied override for the default history policy. Set once at
-/// startup by [`set_history_policy_from_config`] when the user's
-/// `~/.ignis/config.toml` includes a `[history] trim = "..."` line. The
-/// env var still trumps it (for runtime A/B benchmarking).
+/// startup by [`set_history_policy`] when the user's `~/.ignis/config.toml`
+/// includes a `[settings] strip-think = ...` line. The env var still trumps
+/// it (for runtime A/B benchmarking).
 static HISTORY_POLICY_FROM_CONFIG: std::sync::OnceLock<HistoryPolicy> = std::sync::OnceLock::new();
 
-/// Parse a `[history] trim` config value into a [`HistoryPolicy`]. Recognized
-/// values match the `IGNIS_HISTORY_TRIM` env var:
-/// `"off"`, `"mask-only"`, `"strip-think"`, `"strip-wide"`, `"both"` / `"on"`.
-/// Returns `Err` with a human-readable message for anything else.
+/// Parse the `IGNIS_HISTORY_TRIM` env var string into a [`HistoryPolicy`].
+/// The env var is the runtime A/B-benchmarking knob and exposes every mode,
+/// including the experimental `strip-wide`, `mask-only`, and `both`. Returns
+/// `Err` with a human-readable message for anything else.
 pub fn parse_history_trim(value: &str) -> Result<HistoryPolicy, String> {
     match value {
         "off" => Ok(HistoryPolicy::disabled()),
@@ -418,20 +418,17 @@ pub fn parse_history_trim(value: &str) -> Result<HistoryPolicy, String> {
         "strip-wide" => Ok(HistoryPolicy::strip_wide()),
         "both" | "on" => Ok(HistoryPolicy::enabled_defaults()),
         other => Err(format!(
-            "unrecognized history.trim = {other:?}; expected one of \
+            "unrecognized IGNIS_HISTORY_TRIM = {other:?}; expected one of \
              'off', 'mask-only', 'strip-think', 'strip-wide', 'both'",
         )),
     }
 }
 
-/// Set the default [`HistoryPolicy`] from a parsed config value, if recognized.
-/// First call wins (config is loaded once at startup); subsequent calls are
-/// no-ops. Returns `Ok(())` if the value was recognized and set, or `Err`
-/// describing the unrecognized value.
-pub fn set_history_policy_from_config(value: &str) -> Result<(), String> {
-    let policy = parse_history_trim(value)?;
+/// Set the config-derived default [`HistoryPolicy`]. Called once at startup
+/// from `load_config()`. First call wins; subsequent calls are no-ops. The
+/// `IGNIS_HISTORY_TRIM` env var still takes precedence at the per-call site.
+pub fn set_history_policy(policy: HistoryPolicy) {
     let _ = HISTORY_POLICY_FROM_CONFIG.set(policy);
-    Ok(())
 }
 
 impl Default for HistoryPolicy {
@@ -441,8 +438,8 @@ impl Default for HistoryPolicy {
     ///    Values: `off`, `mask-only`, `strip-think`, `strip-wide`. Anything else
     ///    (`on`, `both`, garbage) falls through to `enabled_defaults()` for
     ///    back-compat with the earlier two-state env semantics.
-    /// 2. `[history] trim = "..."` from `~/.ignis/config.toml`, plumbed in
-    ///    once at startup via [`set_history_policy_from_config`].
+    /// 2. `[settings] strip-think = ...` from `~/.ignis/config.toml`, plumbed in
+    ///    once at startup via [`set_history_policy`].
     /// 3. Built-in conservative fallback: [`HistoryPolicy::strip_think`].
     ///    Cache-stable; never regressed in the validation A/B series that
     ///    led to this default (PR #123). The mask lever stays available

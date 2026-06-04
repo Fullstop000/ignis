@@ -86,19 +86,13 @@ api_key = "sk-cp-your-key"
 # threshold_tokens = 120000  # estimated-token trigger for auto-compaction
 # keep_recent_tokens = 16000 # recent history kept verbatim when compacting
 
-# Miscellaneous agent settings (optional). The env var
-# `IGNIS_HISTORY_TRIM` overrides `history_trim` at runtime.
+# Miscellaneous agent settings (optional).
 # [settings]
-# history_trim = "strip-think"
-#   # Outbound history-trim policy. Values:
-#   #   "off"         — no trim (full history every turn)
-#   #   "strip-think"  — default; drops prior-turn reasoning on text-only turns
-#   #                   (cache-stable; DeepSeek- and Anthropic-safe)
-#   #   "strip-wide"  — strip-think PLUS inline <think> on tool-calling turns
-#   #                   (experimental; preserves DeepSeek's reasoning_content
-#   #                   field on tool turns to avoid 400s)
-#   #   "mask-only"   — JetBrains-style observation masking only (rolling
-#   #                   5-turn window; churns provider prompt-cache prefix —
-#   #                   tune at your own risk)
-#   #   "both"        — strip-think + mask-only together (largest savings,
-#   #                   biggest cache churn)
+# strip-think = true   # default. Drops prior-turn <think>...</think> (and the
+#                      # equivalent reasoning_content field) on text-only
+#                      # assistant turns before each model call. Cache-stable;
+#                      # DeepSeek- and Anthropic-safe. Set false to send the
+#                      # full history every turn.
+#
+# Experimental modes (strip-wide / mask-only / both) are available via the
+# `IGNIS_HISTORY_TRIM` env var, which overrides this knob at runtime.
