@@ -1,6 +1,5 @@
-use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
+use crate::{StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use serde_json::json;
 use std::path::{Path, PathBuf};
 
 pub struct ReadFileTool {
@@ -13,6 +12,31 @@ impl ReadFileTool {
             cwd: cwd.to_path_buf(),
         }
     }
+}
+
+#[async_trait]
+impl StaticTool for ReadFileTool {
+    const NAME: &'static str = "read_file";
+    const DESCRIPTION: &'static str =
+        "Read the contents of a file. Supports optional line offset and limit.";
+    const PARAMETERS: &'static [ToolParam] = &[
+        ToolParam {
+            name: "path",
+            ty: "string",
+            description: "Path to the file to read",
+        },
+        ToolParam {
+            name: "offset",
+            ty: "integer",
+            description: "Line offset to start reading from (0-based)",
+        },
+        ToolParam {
+            name: "limit",
+            ty: "integer",
+            description: "Maximum number of lines to read",
+        },
+    ];
+    const REQUIRED: &'static [&'static str] = &["path"];
 
     async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let path = args.require_str("path")?;
@@ -34,40 +58,11 @@ impl ReadFileTool {
     }
 }
 
-#[async_trait]
-impl AgentTool for ReadFileTool {
-    fn name(&self) -> &str {
-        "read_file"
-    }
-
-    fn description(&self) -> &str {
-        "Read the contents of a file. Supports optional line offset and limit."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Path to the file to read" },
-                "offset": { "type": "integer", "description": "Line offset to start reading from (0-based)" },
-                "limit": { "type": "integer", "description": "Maximum number of lines to read" }
-            },
-            "required": ["path"]
-        })
-    }
-
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Parallel
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        self.run(args).await.into_tool_result()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentTool;
+    use serde_json::json;
 
     #[tokio::test]
     async fn test_read_file_basic() {

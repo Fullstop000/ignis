@@ -1,6 +1,5 @@
-use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
+use crate::{StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use serde_json::json;
 use std::time::Duration;
 
 /// Cap on returned text so a large page can't blow up the context.
@@ -27,6 +26,20 @@ impl WebFetchTool {
             .unwrap_or_default();
         Self { client }
     }
+}
+
+#[async_trait]
+impl StaticTool for WebFetchTool {
+    const NAME: &'static str = "web_fetch";
+    const DESCRIPTION: &'static str =
+        "Fetch a URL over HTTP(S) and return its readable text (HTML is stripped \
+         to plain text). Use after web_search, or for known doc/API URLs.";
+    const PARAMETERS: &'static [ToolParam] = &[ToolParam {
+        name: "url",
+        ty: "string",
+        description: "Absolute http(s) URL to fetch",
+    }];
+    const REQUIRED: &'static [&'static str] = &["url"];
 
     async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let url = args.require_str("url")?;
@@ -71,36 +84,6 @@ impl WebFetchTool {
             ""
         };
         Ok(format!("{out}{suffix}"))
-    }
-}
-
-#[async_trait]
-impl AgentTool for WebFetchTool {
-    fn name(&self) -> &str {
-        "web_fetch"
-    }
-
-    fn description(&self) -> &str {
-        "Fetch a URL over HTTP(S) and return its readable text (HTML is stripped \
-         to plain text). Use after web_search, or for known doc/API URLs."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "url": { "type": "string", "description": "Absolute http(s) URL to fetch" }
-            },
-            "required": ["url"]
-        })
-    }
-
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Parallel
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        self.run(args).await.into_tool_result()
     }
 }
 
@@ -184,6 +167,7 @@ fn decode_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentTool;
     use serde_json::json;
 
     #[test]

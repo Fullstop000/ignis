@@ -1,6 +1,5 @@
-use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
+use crate::{ExecutionMode, StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use serde_json::json;
 use std::path::{Path, PathBuf};
 
 pub struct EditFileTool {
@@ -15,6 +14,32 @@ impl EditFileTool {
             cwd: cwd.to_path_buf(),
         }
     }
+}
+
+#[async_trait]
+impl StaticTool for EditFileTool {
+    const NAME: &'static str = "edit_file";
+    const DESCRIPTION: &'static str =
+        "Edit a file by replacing the first occurrence of old_text with new_text.";
+    const PARAMETERS: &'static [ToolParam] = &[
+        ToolParam {
+            name: "path",
+            ty: "string",
+            description: "Path to the file to edit",
+        },
+        ToolParam {
+            name: "old_text",
+            ty: "string",
+            description: "The exact text to find and replace",
+        },
+        ToolParam {
+            name: "new_text",
+            ty: "string",
+            description: "The replacement text",
+        },
+    ];
+    const REQUIRED: &'static [&'static str] = &["path", "old_text", "new_text"];
+    const EXECUTION_MODE: ExecutionMode = ExecutionMode::Sequential;
 
     async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let path = args.require_str("path")?;
@@ -35,37 +60,6 @@ impl EditFileTool {
             .await
             .map_err(|e| format!("Failed to write file: {e}"))?;
         Ok(render_edit_diff(old_text, new_text))
-    }
-}
-
-#[async_trait]
-impl AgentTool for EditFileTool {
-    fn name(&self) -> &str {
-        Self::NAME
-    }
-
-    fn description(&self) -> &str {
-        "Edit a file by replacing the first occurrence of old_text with new_text."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Path to the file to edit" },
-                "old_text": { "type": "string", "description": "The exact text to find and replace" },
-                "new_text": { "type": "string", "description": "The replacement text" }
-            },
-            "required": ["path", "old_text", "new_text"]
-        })
-    }
-
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Sequential
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        self.run(args).await.into_tool_result()
     }
 }
 
@@ -101,6 +95,8 @@ fn push_diff_side(out: &mut String, text: &str, sign: char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentTool;
+    use serde_json::json;
 
     #[tokio::test]
     async fn test_edit_file_success() {

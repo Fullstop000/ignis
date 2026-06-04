@@ -1,6 +1,5 @@
-use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
+use crate::{ExecutionMode, StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use serde_json::json;
 use std::path::{Path, PathBuf};
 
 pub struct CreateFileTool {
@@ -15,6 +14,27 @@ impl CreateFileTool {
             cwd: cwd.to_path_buf(),
         }
     }
+}
+
+#[async_trait]
+impl StaticTool for CreateFileTool {
+    const NAME: &'static str = "create_file";
+    const DESCRIPTION: &'static str =
+        "Create a new file with the given content. Creates parent directories if needed.";
+    const PARAMETERS: &'static [ToolParam] = &[
+        ToolParam {
+            name: "path",
+            ty: "string",
+            description: "Path to the file to create",
+        },
+        ToolParam {
+            name: "content",
+            ty: "string",
+            description: "Content to write to the file",
+        },
+    ];
+    const REQUIRED: &'static [&'static str] = &["path", "content"];
+    const EXECUTION_MODE: ExecutionMode = ExecutionMode::Sequential;
 
     async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let path = args.require_str("path")?;
@@ -33,39 +53,11 @@ impl CreateFileTool {
     }
 }
 
-#[async_trait]
-impl AgentTool for CreateFileTool {
-    fn name(&self) -> &str {
-        Self::NAME
-    }
-
-    fn description(&self) -> &str {
-        "Create a new file with the given content. Creates parent directories if needed."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Path to the file to create" },
-                "content": { "type": "string", "description": "Content to write to the file" }
-            },
-            "required": ["path", "content"]
-        })
-    }
-
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Sequential
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        self.run(args).await.into_tool_result()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentTool;
+    use serde_json::json;
 
     #[tokio::test]
     async fn test_create_file() {

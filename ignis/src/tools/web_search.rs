@@ -1,4 +1,4 @@
-use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
+use crate::{StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -89,6 +89,19 @@ impl WebSearchTool {
             .map_err(|e| format!("Failed to parse response: {e}"))?;
         Ok(parse_tavily(&json))
     }
+}
+
+#[async_trait]
+impl StaticTool for WebSearchTool {
+    const NAME: &'static str = "web_search";
+    const DESCRIPTION: &'static str =
+        "Search the web and return result titles, URLs, and snippets.";
+    const PARAMETERS: &'static [ToolParam] = &[ToolParam {
+        name: "query",
+        ty: "string",
+        description: "The search query",
+    }];
+    const REQUIRED: &'static [&'static str] = &["query"];
 
     async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let query = args.require_str("query")?;
@@ -132,35 +145,6 @@ impl WebSearchTool {
     }
 }
 
-#[async_trait]
-impl AgentTool for WebSearchTool {
-    fn name(&self) -> &str {
-        "web_search"
-    }
-
-    fn description(&self) -> &str {
-        "Search the web and return result titles, URLs, and snippets."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "The search query" }
-            },
-            "required": ["query"]
-        })
-    }
-
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Parallel
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        self.run(args).await.into_tool_result()
-    }
-}
-
 fn parse_brave(json: &serde_json::Value) -> Vec<SearchResult> {
     json["web"]["results"]
         .as_array()
@@ -192,6 +176,7 @@ fn truncate(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentTool;
 
     #[test]
     fn backend_resolves_known_names_only() {

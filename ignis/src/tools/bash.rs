@@ -1,6 +1,5 @@
-use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
+use crate::{ExecutionMode, StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use serde_json::json;
 use std::path::{Path, PathBuf};
 
 pub struct BashTool {
@@ -13,6 +12,26 @@ impl BashTool {
             cwd: cwd.to_path_buf(),
         }
     }
+}
+
+#[async_trait]
+impl StaticTool for BashTool {
+    const NAME: &'static str = "bash";
+    const DESCRIPTION: &'static str = "Run a shell command via bash and return its output.";
+    const PARAMETERS: &'static [ToolParam] = &[
+        ToolParam {
+            name: "command",
+            ty: "string",
+            description: "The shell command to execute",
+        },
+        ToolParam {
+            name: "timeout_secs",
+            ty: "integer",
+            description: "Timeout in seconds (default: 60)",
+        },
+    ];
+    const REQUIRED: &'static [&'static str] = &["command"];
+    const EXECUTION_MODE: ExecutionMode = ExecutionMode::Sequential;
 
     async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let command = args.require_str("command")?;
@@ -81,39 +100,11 @@ fn truncate_on_char_boundary(s: &mut String, limit: usize) {
     s.truncate(end);
 }
 
-#[async_trait]
-impl AgentTool for BashTool {
-    fn name(&self) -> &str {
-        "bash"
-    }
-
-    fn description(&self) -> &str {
-        "Run a shell command via bash and return its output."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": { "type": "string", "description": "The shell command to execute" },
-                "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default: 60)" }
-            },
-            "required": ["command"]
-        })
-    }
-
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Sequential
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        self.run(args).await.into_tool_result()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentTool;
+    use serde_json::json;
 
     #[tokio::test]
     async fn test_bash_success() {

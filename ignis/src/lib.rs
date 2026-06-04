@@ -24,5 +24,6 @@ pub use mcp::{McpRegistry, McpServerEntry, McpStatus};
 pub use session::Session;
 pub use skills::{Skill, SkillRegistry, SkillScope};
 pub use tools::tool::{
-    AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolHooks, ToolOutcome, ToolResult,
+    AgentTool, ExecutionMode, IntoToolResult, StaticTool, ToolArgs, ToolHooks, ToolOutcome,
+    ToolParam, ToolResult,
 };

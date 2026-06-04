@@ -84,6 +84,73 @@ pub trait AgentTool: Send + Sync + 'static {
     async fn call(&self, args: serde_json::Value) -> ToolResult;
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ToolParam {
+    pub name: &'static str,
+    pub ty: &'static str,
+    pub description: &'static str,
+}
+
+/// Shared adapter for native tools whose public interface is static metadata
+/// plus a domain-level `run`.
+#[async_trait]
+pub trait StaticTool: Send + Sync + 'static {
+    const NAME: &'static str;
+    const DESCRIPTION: &'static str;
+    const PARAMETERS: &'static [ToolParam];
+    const REQUIRED: &'static [&'static str];
+    const EXECUTION_MODE: ExecutionMode = ExecutionMode::Parallel;
+
+    async fn run(&self, args: serde_json::Value) -> ToolOutcome;
+
+    fn schema() -> serde_json::Value {
+        let properties = Self::PARAMETERS
+            .iter()
+            .map(|param| {
+                (
+                    param.name.to_string(),
+                    serde_json::json!({
+                        "type": param.ty,
+                        "description": param.description
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+
+        serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "required": Self::REQUIRED
+        })
+    }
+}
+
+#[async_trait]
+impl<T> AgentTool for T
+where
+    T: StaticTool,
+{
+    fn name(&self) -> &str {
+        T::NAME
+    }
+
+    fn description(&self) -> &str {
+        T::DESCRIPTION
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        T::schema()
+    }
+
+    fn execution_mode(&self) -> ExecutionMode {
+        T::EXECUTION_MODE
+    }
+
+    async fn call(&self, args: serde_json::Value) -> ToolResult {
+        self.run(args).await.into_tool_result()
+    }
+}
+
 /// Optional hooks for tool call lifecycle.
 #[async_trait]
 pub trait ToolHooks: Send + Sync + 'static {

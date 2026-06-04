@@ -301,21 +301,56 @@ async fn execute_single_tool(
         })
         .await;
 
-    // Build tool result message — send content as JSON for consistency.
+    tool_result_message(&tool_name, &tc_id, &result)
+}
+
+/// Build the `role:"tool"` history message for a finished tool call, wrapping
+/// the result as the `{result, is_error}` JSON envelope the rest of the loop
+/// expects. Shared by the normal execution path and the hook-blocked path.
+fn tool_result_message(name: &str, call_id: &str, result: &ToolResult) -> Message {
     let result_json = serde_json::json!({
         "result": result.content,
-        "is_error": result.is_error
+        "is_error": result.is_error,
     });
-
     Message {
         role: "tool".to_string(),
         content: Some(result_json.to_string()),
         reasoning_content: None,
-        name: Some(tool_name),
-        tool_call_id: Some(tc_id),
+        name: Some(name.to_string()),
+        tool_call_id: Some(call_id.to_string()),
         tool_calls: None,
         created_at_ms: Some(now_ms()),
     }
+}
+
+/// Run the `before_tool_call` hook for `tc`. When a hook blocks the call, emit
+/// the `ToolExecutionStart`/`End` event pair (so a blocked call renders like
+/// any other) and return the `role:"tool"` message carrying the block reason.
+/// `None` means the call is allowed to proceed.
+async fn before_tool_call_block(
+    tc: &ToolCall,
+    hooks: Option<&dyn ToolHooks>,
+    tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) -> Option<Message> {
+    let h = hooks?;
+    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+    let reason = h.before_tool_call(&tc.function.name, &args).await.err()?;
+
+    let blocked = ToolResult::error(format!("Blocked by hook: {}", reason));
+    let _ = tx
+        .send(AgentEvent::ToolExecutionStart {
+            tool_call_id: tc.id.clone(),
+            tool_name: tc.function.name.clone(),
+            arguments: tc.function.arguments.clone(),
+        })
+        .await;
+    let _ = tx
+        .send(AgentEvent::ToolExecutionEnd {
+            tool_call_id: tc.id.clone(),
+            result: blocked.clone(),
+        })
+        .await;
+    Some(tool_result_message(&tc.function.name, &tc.id, &blocked))
 }
 
 /// The accumulated result of consuming one streamed LLM turn.
@@ -560,6 +595,20 @@ fn retry_backoff_ms(attempt: u32) -> u64 {
         .min(MAX_BACKOFF_MS)
 }
 
+/// Emit `Reconnecting { attempt, max }` and back off before the next stream
+/// attempt. Shared by both retry triggers (pre-stream error, empty mid-stream
+/// drop) so the reconnect-and-sleep sequence lives in exactly one place.
+async fn reconnect(tx: &tokio::sync::mpsc::Sender<AgentEvent>, attempt: u32, reason: String) {
+    let _ = tx
+        .send(AgentEvent::Reconnecting {
+            attempt,
+            max: MAX_STREAM_RETRIES,
+            reason,
+        })
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(retry_backoff_ms(attempt))).await;
+}
+
 /// Compose the effective system prompt: base + the enabled-skills catalog +
 /// the connected-MCP-servers' `instructions` block.
 fn with_catalog(base: &str, skills: Option<&SkillRegistry>, mcp: Option<&McpRegistry>) -> String {
@@ -666,6 +715,57 @@ impl Agent {
         }
     }
 
+    /// Open one model stream and consume a single turn, retrying transient
+    /// failures up to `MAX_STREAM_RETRIES`. A failure is retryable iff no
+    /// UI-visible state was produced yet (see [`TurnStream::is_empty`]):
+    ///
+    ///   * `chat_stream` returns `Err` before any stream item — nothing was
+    ///     emitted, always safe to retry.
+    ///   * the stream opens but the body closes before any delta arrives —
+    ///     `consume_turn_stream` reports `stream_error: Some` with `is_empty()`.
+    ///
+    /// A turn that already streamed partial content returns `Ok(turn)` with
+    /// `stream_error: Some`, leaving the caller to surface it inline. Each
+    /// retry emits `AgentEvent::Reconnecting { attempt, max, reason }` and
+    /// backs off via [`reconnect`].
+    async fn stream_turn_with_retry(
+        &self,
+        effective_prompt: &str,
+        messages: &[Message],
+        tool_schemas: &[serde_json::Value],
+        tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<TurnStream, anyhow::Error> {
+        let mut attempt: u32 = 0;
+        loop {
+            match self
+                .provider
+                .chat_stream(effective_prompt, messages, tool_schemas)
+                .await
+            {
+                Err(err) if attempt < MAX_STREAM_RETRIES => {
+                    attempt += 1;
+                    reconnect(
+                        tx,
+                        attempt,
+                        Self::sanitize_and_truncate_error(&err.to_string()),
+                    )
+                    .await;
+                }
+                Err(err) => return Err(err),
+                Ok(stream) => {
+                    let turn = consume_turn_stream(stream, tx).await;
+                    match turn.stream_error.as_deref() {
+                        Some(reason) if attempt < MAX_STREAM_RETRIES && turn.is_empty() => {
+                            attempt += 1;
+                            reconnect(tx, attempt, reason.to_string()).await;
+                        }
+                        _ => return Ok(turn),
+                    }
+                }
+            }
+        }
+    }
+
     /// Run the model + tool loop over `history`, appending assistant and tool
     /// messages in place and emitting events. Does not load or persist; the
     /// caller ([`crate::Session`]) owns history and storage.
@@ -730,74 +830,11 @@ impl Agent {
             // there is no AGENTS.md).
             let messages = agents_md::prepend(self.project_instructions.as_deref(), history);
 
-            // Auto-retry seam. Each iteration of the inner loop is one attempt
-            // at "open the stream, consume one turn." A failure is retryable
-            // iff (a) attempts remain in the budget AND (b) the failure is
-            // safe to retry — meaning *no UI state* has been produced yet for
-            // this attempt. Two failure shapes feed in:
-            //   * `chat_stream(...)` returns Err before any stream items
-            //     — always safe to retry, no events were sent.
-            //   * `consume_turn_stream` returns a TurnStream with
-            //     `stream_error: Some` AND `is_empty()` — the request opened
-            //     but the response body closed before any delta arrived.
-            // Anything else (partial content / partial tool-call already
-            // streamed to the user) falls through to the existing post-turn
-            // handling, which surfaces the error inline and lets the turn loop
-            // continue. Retries emit `AgentEvent::Reconnecting { attempt, max,
-            // reason }` so the UI can show "Reconnecting (1/2): …".
-            let turn_result: Result<TurnStream, anyhow::Error> = {
-                let mut attempt: u32 = 0;
-                loop {
-                    match self
-                        .provider
-                        .chat_stream(&effective_prompt, &messages, &tool_schemas)
-                        .await
-                    {
-                        Err(err) => {
-                            if attempt < MAX_STREAM_RETRIES {
-                                let next = attempt + 1;
-                                let reason = Self::sanitize_and_truncate_error(&err.to_string());
-                                let _ = tx
-                                    .send(AgentEvent::Reconnecting {
-                                        attempt: next,
-                                        max: MAX_STREAM_RETRIES,
-                                        reason,
-                                    })
-                                    .await;
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    retry_backoff_ms(next),
-                                ))
-                                .await;
-                                attempt = next;
-                                continue;
-                            }
-                            break Err(err);
-                        }
-                        Ok(stream) => {
-                            let turn = consume_turn_stream(stream, &tx).await;
-                            match turn.stream_error.as_deref() {
-                                Some(reason) if attempt < MAX_STREAM_RETRIES && turn.is_empty() => {
-                                    let next = attempt + 1;
-                                    let _ = tx
-                                        .send(AgentEvent::Reconnecting {
-                                            attempt: next,
-                                            max: MAX_STREAM_RETRIES,
-                                            reason: reason.to_string(),
-                                        })
-                                        .await;
-                                    tokio::time::sleep(std::time::Duration::from_millis(
-                                        retry_backoff_ms(next),
-                                    ))
-                                    .await;
-                                    attempt = next;
-                                    continue;
-                                }
-                                _ => break Ok(turn),
-                            }
-                        }
-                    }
-                }
-            };
+            // Open the stream and consume one turn, retrying transient drops
+            // that produced no UI state yet (see `stream_turn_with_retry`).
+            let turn_result = self
+                .stream_turn_with_retry(&effective_prompt, &messages, &tool_schemas, &tx)
+                .await;
 
             let turn = match turn_result {
                 Ok(t) => t,
@@ -1017,91 +1054,27 @@ impl Agent {
             // Sequential execution
             let mut results = Vec::new();
             for tc in tool_calls_owned {
-                // Run beforeToolCall hook
-                let args_val: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                if let Some(h) = hooks {
-                    if let Err(reason) = h.before_tool_call(&tc.function.name, &args_val).await {
-                        let _ = tx_clone
-                            .send(AgentEvent::ToolExecutionStart {
-                                tool_call_id: tc.id.clone(),
-                                tool_name: tc.function.name.clone(),
-                                arguments: tc.function.arguments.clone(),
-                            })
-                            .await;
-                        let blocked_result =
-                            ToolResult::error(format!("Blocked by hook: {}", reason));
-                        let _ = tx_clone
-                            .send(AgentEvent::ToolExecutionEnd {
-                                tool_call_id: tc.id.clone(),
-                                result: blocked_result.clone(),
-                            })
-                            .await;
-                        let result_json = serde_json::json!({
-                            "result": blocked_result.content,
-                            "is_error": blocked_result.is_error
-                        });
-                        results.push(Message {
-                            role: "tool".to_string(),
-                            content: Some(result_json.to_string()),
-                            reasoning_content: None,
-                            name: Some(tc.function.name),
-                            tool_call_id: Some(tc.id),
-                            tool_calls: None,
-                            created_at_ms: Some(now_ms()),
-                        });
-                        continue;
+                match before_tool_call_block(&tc, hooks.as_deref(), &tx_clone).await {
+                    Some(blocked) => results.push(blocked),
+                    None => {
+                        results.push(
+                            execute_single_tool(tc, tools_map.clone(), tx_clone.clone()).await,
+                        );
                     }
                 }
-                let msg = execute_single_tool(tc, tools_map.clone(), tx_clone.clone()).await;
-                results.push(msg);
             }
             results
         } else {
-            // Parallel execution — run beforeToolCall hooks first sequentially
+            // Parallel execution — run before_tool_call hooks first
+            // sequentially, then fan out the allowed calls.
             let mut allowed_calls = Vec::new();
-            let mut blocked_results = Vec::new();
+            let mut blocked_results: Vec<Message> = Vec::new();
 
             for tc in &tool_calls_owned {
-                let args_val: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                if let Some(h) = hooks {
-                    if let Err(reason) = h.before_tool_call(&tc.function.name, &args_val).await {
-                        let _ = tx_clone
-                            .send(AgentEvent::ToolExecutionStart {
-                                tool_call_id: tc.id.clone(),
-                                tool_name: tc.function.name.clone(),
-                                arguments: tc.function.arguments.clone(),
-                            })
-                            .await;
-                        let blocked_result =
-                            ToolResult::error(format!("Blocked by hook: {}", reason));
-                        let _ = tx_clone
-                            .send(AgentEvent::ToolExecutionEnd {
-                                tool_call_id: tc.id.clone(),
-                                result: blocked_result.clone(),
-                            })
-                            .await;
-                        let result_json = serde_json::json!({
-                            "result": blocked_result.content,
-                            "is_error": blocked_result.is_error
-                        });
-                        blocked_results.push((
-                            tc.id.clone(),
-                            Message {
-                                role: "tool".to_string(),
-                                content: Some(result_json.to_string()),
-                                reasoning_content: None,
-                                name: Some(tc.function.name.clone()),
-                                tool_call_id: Some(tc.id.clone()),
-                                tool_calls: None,
-                                created_at_ms: Some(now_ms()),
-                            },
-                        ));
-                        continue;
-                    }
+                match before_tool_call_block(tc, hooks.as_deref(), &tx_clone).await {
+                    Some(blocked) => blocked_results.push(blocked),
+                    None => allowed_calls.push(tc.clone()),
                 }
-                allowed_calls.push(tc.clone());
             }
 
             let tool_futures = allowed_calls
@@ -1113,10 +1086,7 @@ impl Agent {
                 .collect::<Vec<Message>>()
                 .await;
 
-            // Merge blocked results
-            for (_id, msg) in blocked_results {
-                parallel_results.push(msg);
-            }
+            parallel_results.append(&mut blocked_results);
             parallel_results
         };
 

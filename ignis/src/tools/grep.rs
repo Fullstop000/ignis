@@ -1,8 +1,7 @@
-use crate::{AgentTool, ExecutionMode, IntoToolResult, ToolArgs, ToolOutcome, ToolResult};
+use crate::{StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use regex::Regex;
-use serde_json::json;
 use std::path::{Path, PathBuf};
 
 /// Maximum matches returned before truncating, to keep results readable.
@@ -22,6 +21,32 @@ impl GrepTool {
             cwd: cwd.to_path_buf(),
         }
     }
+}
+
+#[async_trait]
+impl StaticTool for GrepTool {
+    const NAME: &'static str = "grep";
+    const DESCRIPTION: &'static str =
+        "Search file contents with a regular expression, respecting .gitignore. \
+         Returns matching `path:line:text`. Prefer this over running grep via bash.";
+    const PARAMETERS: &'static [ToolParam] = &[
+        ToolParam {
+            name: "pattern",
+            ty: "string",
+            description: "Regular expression to search for",
+        },
+        ToolParam {
+            name: "path",
+            ty: "string",
+            description: "Directory or file to search (default: project root)",
+        },
+        ToolParam {
+            name: "glob",
+            ty: "string",
+            description: "Only search files whose name matches this glob, e.g. *.rs",
+        },
+    ];
+    const REQUIRED: &'static [&'static str] = &["pattern"];
 
     async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let pattern = args.require_str("pattern")?;
@@ -84,41 +109,11 @@ impl GrepTool {
     }
 }
 
-#[async_trait]
-impl AgentTool for GrepTool {
-    fn name(&self) -> &str {
-        "grep"
-    }
-
-    fn description(&self) -> &str {
-        "Search file contents with a regular expression, respecting .gitignore. \
-         Returns matching `path:line:text`. Prefer this over running grep via bash."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": { "type": "string", "description": "Regular expression to search for" },
-                "path": { "type": "string", "description": "Directory or file to search (default: project root)" },
-                "glob": { "type": "string", "description": "Only search files whose name matches this glob, e.g. *.rs" }
-            },
-            "required": ["pattern"]
-        })
-    }
-
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Parallel
-    }
-
-    async fn call(&self, args: serde_json::Value) -> ToolResult {
-        self.run(args).await.into_tool_result()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentTool;
+    use serde_json::json;
 
     #[tokio::test]
     async fn grep_finds_matches_with_glob_filter() {

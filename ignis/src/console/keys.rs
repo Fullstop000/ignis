@@ -1105,7 +1105,6 @@ mod tests {
             Some("Unknown command `/nope`.")
         );
     }
-
     #[tokio::test]
     async fn connect_bypasses_no_provider_gate_even_when_a_connect_skill_exists() {
         // Regression: the hoisted gate must not block /connect when the user
