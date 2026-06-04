@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- Agent — outbound history trim before every model call: bodies of older tool-result messages are replaced with a short stub once five newer results exist (JetBrains "observation masking", arxiv 2508.21433), and prior-turn reasoning is dropped on assistant messages that did NOT call a tool (mirrors DeepSeek's documented non-tool-turn contract and strips inline `<think>...</think>` for MiniMax-M3). Cuts input-token bloat on long multi-tool sessions without changing tool-call linkage or current-turn behavior. ([#XXX](https://github.com/Fullstop000/ignis/pull/XXX))
+- Agent — outbound history trim before every model call: bodies of older tool-result messages are replaced with a short stub once five newer results exist (JetBrains "observation masking", arxiv 2508.21433), and prior-turn reasoning is dropped on assistant messages that did NOT call a tool (mirrors DeepSeek's documented non-tool-turn contract and strips inline `<think>...</think>` for MiniMax-M3). Cuts input-token bloat on long multi-tool sessions without changing tool-call linkage or current-turn behavior. ([#123](https://github.com/Fullstop000/ignis/pull/123))
 
 ### Added
 - TUI — pasting a multi-line block (≥ 4 lines) now shows a compact `[ pasted-text#N M lines ]` chip in the composer instead of dumping the whole text inline; the chip expands back to the full content when you send. ([#124](https://github.com/Fullstop000/ignis/pull/124))
