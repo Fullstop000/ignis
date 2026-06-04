@@ -63,6 +63,7 @@ fn apply_edit_key(app: &mut App, key: KeyEvent) -> bool {
             app.clear_exit_hint();
             app.input.clear();
             app.cursor = 0;
+            app.pending_pastes.clear();
             app.reset_slash_selection();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
@@ -75,14 +76,7 @@ fn apply_edit_key(app: &mut App, key: KeyEvent) -> bool {
         }
         (KeyModifiers::CONTROL, KeyCode::Char('w')) if app.cursor > 0 => {
             app.clear_exit_hint();
-            let before = &app.input[..app.cursor];
-            let trimmed = before.trim_end();
-            let new_end = trimmed
-                .rfind(|c: char| c.is_whitespace())
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            app.input = format!("{}{}", &app.input[..new_end], &app.input[app.cursor..]);
-            app.cursor = new_end;
+            app.delete_word_back();
         }
         (m, KeyCode::Char('j'))
             if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
@@ -125,6 +119,17 @@ fn apply_edit_key(app: &mut App, key: KeyEvent) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Route a bracketed-paste event. An open inline picker (e.g. an API key typed
+/// into `/connect`) takes the text inline; otherwise it goes to the composer,
+/// where a multi-line block collapses into a `[ pasted-text#N … ]` chip.
+pub(crate) fn handle_paste(app: &mut App, data: String) {
+    if let Some(picker) = app.inline_picker.as_mut() {
+        picker.paste_text(&data);
+    } else {
+        app.handle_paste(data);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -228,7 +233,7 @@ pub(crate) async fn handle_key(
     // never falls through to the idle handler and types a literal 's'.
     if matches!(key.code, KeyCode::Char('s')) && key.modifiers.contains(KeyModifiers::CONTROL) {
         if app.mode != Mode::Idle {
-            let text = app.input.trim().to_string();
+            let text = app.expand_pastes(app.input.trim().to_string());
             if !text.is_empty() {
                 let sender = active_inject.lock().unwrap().clone();
                 match sender {
@@ -237,6 +242,7 @@ pub(crate) async fn handle_key(
                             app.pending_injects.push(text);
                             app.input.clear();
                             app.cursor = 0;
+                            app.pending_pastes.clear();
                             app.reset_slash_selection();
                         }
                         Err(_) => {
@@ -252,6 +258,7 @@ pub(crate) async fn handle_key(
                         app.enqueue(text);
                         app.input.clear();
                         app.cursor = 0;
+                        app.pending_pastes.clear();
                         app.reset_slash_selection();
                     }
                 }
@@ -271,11 +278,12 @@ pub(crate) async fn handle_key(
                 if let Some(cmd) = app.selected_slash_command() {
                     app.input = cmd;
                 }
-                let text = app.input.trim().to_string();
+                let text = app.expand_pastes(app.input.trim().to_string());
                 if !text.is_empty() {
                     app.enqueue(text);
                     app.input.clear();
                     app.cursor = 0;
+                    app.pending_pastes.clear();
                     app.reset_slash_selection();
                 }
             }
@@ -469,6 +477,7 @@ pub(crate) async fn handle_key(
             app.clear_exit_hint();
             app.input.clear();
             app.cursor = 0;
+            app.pending_pastes.clear();
             app.reset_slash_selection();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
@@ -481,15 +490,7 @@ pub(crate) async fn handle_key(
         }
         (KeyModifiers::CONTROL, KeyCode::Char('w')) if app.cursor > 0 => {
             app.clear_exit_hint();
-            // Delete word backward
-            let before = &app.input[..app.cursor];
-            let trimmed = before.trim_end();
-            let new_end = trimmed
-                .rfind(|c: char| c.is_whitespace())
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            app.input = format!("{}{}", &app.input[..new_end], &app.input[app.cursor..]);
-            app.cursor = new_end;
+            app.delete_word_back();
         }
         (_, KeyCode::Up) if !app.slash_suggestions().is_empty() => {
             app.select_slash_suggestion(SelectionDirection::Previous);
