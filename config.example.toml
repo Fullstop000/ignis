@@ -89,16 +89,16 @@ api_key = "sk-cp-your-key"
 # Miscellaneous agent settings (optional). The env var
 # `IGNIS_HISTORY_TRIM` overrides `history_trim` at runtime.
 # [settings]
-# history_trim = "strip-only"
+# history_trim = "strip-think"
 #   # Outbound history-trim policy. Values:
 #   #   "off"         — no trim (full history every turn)
-#   #   "strip-only"  — default; drops prior-turn reasoning on text-only turns
+#   #   "strip-think"  — default; drops prior-turn reasoning on text-only turns
 #   #                   (cache-stable; DeepSeek- and Anthropic-safe)
-#   #   "strip-wide"  — strip-only PLUS inline <think> on tool-calling turns
+#   #   "strip-wide"  — strip-think PLUS inline <think> on tool-calling turns
 #   #                   (experimental; preserves DeepSeek's reasoning_content
 #   #                   field on tool turns to avoid 400s)
 #   #   "mask-only"   — JetBrains-style observation masking only (rolling
 #   #                   5-turn window; churns provider prompt-cache prefix —
 #   #                   tune at your own risk)
-#   #   "both"        — strip-only + mask-only together (largest savings,
+#   #   "both"        — strip-think + mask-only together (largest savings,
 #   #                   biggest cache churn)

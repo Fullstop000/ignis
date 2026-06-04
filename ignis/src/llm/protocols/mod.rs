@@ -375,8 +375,8 @@ impl HistoryPolicy {
 
     /// Lever 2 only — reasoning strip on text-only assistant turns, tool
     /// outputs untouched. The cache-stable narrow strip. Used by
-    /// `IGNIS_HISTORY_TRIM=strip-only`.
-    pub fn strip_only() -> Self {
+    /// `IGNIS_HISTORY_TRIM=strip-think`.
+    pub fn strip_think() -> Self {
         Self {
             keep_live_tool_outputs: 0,
             strip_text_turn_reasoning: true,
@@ -408,18 +408,18 @@ static HISTORY_POLICY_FROM_CONFIG: std::sync::OnceLock<HistoryPolicy> = std::syn
 
 /// Parse a `[history] trim` config value into a [`HistoryPolicy`]. Recognized
 /// values match the `IGNIS_HISTORY_TRIM` env var:
-/// `"off"`, `"mask-only"`, `"strip-only"`, `"strip-wide"`, `"both"` / `"on"`.
+/// `"off"`, `"mask-only"`, `"strip-think"`, `"strip-wide"`, `"both"` / `"on"`.
 /// Returns `Err` with a human-readable message for anything else.
 pub fn parse_history_trim(value: &str) -> Result<HistoryPolicy, String> {
     match value {
         "off" => Ok(HistoryPolicy::disabled()),
         "mask-only" => Ok(HistoryPolicy::mask_only()),
-        "strip-only" => Ok(HistoryPolicy::strip_only()),
+        "strip-think" => Ok(HistoryPolicy::strip_think()),
         "strip-wide" => Ok(HistoryPolicy::strip_wide()),
         "both" | "on" => Ok(HistoryPolicy::enabled_defaults()),
         other => Err(format!(
             "unrecognized history.trim = {other:?}; expected one of \
-             'off', 'mask-only', 'strip-only', 'strip-wide', 'both'",
+             'off', 'mask-only', 'strip-think', 'strip-wide', 'both'",
         )),
     }
 }
@@ -438,12 +438,12 @@ impl Default for HistoryPolicy {
     /// Resolved in precedence order, highest first:
     ///
     /// 1. `IGNIS_HISTORY_TRIM` env var (runtime A/B knob — wins over config).
-    ///    Values: `off`, `mask-only`, `strip-only`, `strip-wide`. Anything else
+    ///    Values: `off`, `mask-only`, `strip-think`, `strip-wide`. Anything else
     ///    (`on`, `both`, garbage) falls through to `enabled_defaults()` for
     ///    back-compat with the earlier two-state env semantics.
     /// 2. `[history] trim = "..."` from `~/.ignis/config.toml`, plumbed in
     ///    once at startup via [`set_history_policy_from_config`].
-    /// 3. Built-in conservative fallback: [`HistoryPolicy::strip_only`].
+    /// 3. Built-in conservative fallback: [`HistoryPolicy::strip_think`].
     ///    Cache-stable; never regressed in the validation A/B series that
     ///    led to this default (PR #123). The mask lever stays available
     ///    via `mask-only` / `both`, but isn't default until its rolling-window
@@ -456,7 +456,7 @@ impl Default for HistoryPolicy {
             return match v.as_str() {
                 "off" => Self::disabled(),
                 "mask-only" => Self::mask_only(),
-                "strip-only" => Self::strip_only(),
+                "strip-think" => Self::strip_think(),
                 "strip-wide" => Self::strip_wide(),
                 _ => Self::enabled_defaults(),
             };
@@ -464,7 +464,7 @@ impl Default for HistoryPolicy {
         if let Some(p) = HISTORY_POLICY_FROM_CONFIG.get() {
             return *p;
         }
-        Self::strip_only()
+        Self::strip_think()
     }
 }
 
@@ -961,7 +961,7 @@ mod tests {
         assert_eq!(m.keep_live_tool_outputs, 5);
         assert!(!m.strip_text_turn_reasoning);
 
-        let s = parse_history_trim("strip-only").unwrap();
+        let s = parse_history_trim("strip-think").unwrap();
         assert_eq!(s.keep_live_tool_outputs, 0);
         assert!(s.strip_text_turn_reasoning);
         assert!(!s.strip_think_on_tool_call_turns);
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn prep_history_strip_wide_still_strips_text_only_turn_fully() {
-        // strip-wide should be a strict superset of strip-only: text-only
+        // strip-wide should be a strict superset of strip-think: text-only
         // turns still get both <think> and reasoning_content stripped.
         let mut text_turn = assistant_text("<think>raw</think>final", Some("reasoning to drop"));
         text_turn.reasoning_content = Some("reasoning to drop".to_string());
@@ -1075,7 +1075,7 @@ mod tests {
         assert_eq!(p.keep_live_tool_outputs, 5);
         assert!(!p.strip_text_turn_reasoning);
 
-        unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", "strip-only") };
+        unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", "strip-think") };
         let p = HistoryPolicy::default();
         assert_eq!(p.keep_live_tool_outputs, 0);
         assert!(p.strip_text_turn_reasoning);
@@ -1087,7 +1087,7 @@ mod tests {
 
         // Env unset + no config override (the OnceLock is private to this
         // module and untouched by tests in this file) → the conservative
-        // built-in fallback: strip-only.
+        // built-in fallback: strip-think.
         unsafe { std::env::remove_var("IGNIS_HISTORY_TRIM") };
         let p = HistoryPolicy::default();
         assert_eq!(p.keep_live_tool_outputs, 0);

@@ -45,7 +45,7 @@ impl Default for CompactionConfig {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct SettingsConfig {
     /// Outbound history-trim policy. Maps to the same string values as the
-    /// `IGNIS_HISTORY_TRIM` env var: `"off"` / `"mask-only"` / `"strip-only"`
+    /// `IGNIS_HISTORY_TRIM` env var: `"off"` / `"mask-only"` / `"strip-think"`
     /// (default — cache-stable; strips prior-turn reasoning on text-only
     /// assistant turns) / `"strip-wide"` (also strips inline `<think>` on
     /// tool-calling turns) / `"both"` (mask + strip — biggest savings, but
