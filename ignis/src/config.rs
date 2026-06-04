@@ -39,6 +39,22 @@ impl Default for CompactionConfig {
     }
 }
 
+/// Miscellaneous agent settings — single-knob items that don't merit their
+/// own dedicated block. New knobs go here unless they have multiple related
+/// fields that read better as their own block (compaction, mcp, etc.).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SettingsConfig {
+    /// Strip prior-turn `<think>...</think>` (and the equivalent
+    /// `reasoning_content` field) from text-only assistant turns before each
+    /// outbound model call. Defaults to `true` when unset — cache-stable,
+    /// DeepSeek/Anthropic-safe. Set `false` to send the full history every
+    /// turn. The `IGNIS_HISTORY_TRIM` env var overrides this at runtime and
+    /// also exposes the experimental `strip-wide`, `mask-only`, and `both`
+    /// modes for benchmarking.
+    #[serde(rename = "strip-think")]
+    pub strip_think: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct Config {
     /// The active selection as `"provider/model"` (e.g. `"deepseek/deepseek-v4-pro"`).
@@ -53,6 +69,8 @@ pub struct Config {
     pub web_search: WebSearchConfig,
     #[serde(default)]
     pub compaction: CompactionConfig,
+    #[serde(default)]
+    pub settings: SettingsConfig,
     #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
@@ -429,6 +447,17 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
     for (name, srv) in &config.mcp.servers {
         validate_mcp_server_name(name)?;
         srv.validate(name)?;
+    }
+    // Plumb the single-bool config knob into the protocol layer's static
+    // override slot. Done once at startup — the env var still takes
+    // precedence at the per-call site.
+    if let Some(strip) = config.settings.strip_think {
+        let policy = if strip {
+            crate::llm::protocols::HistoryPolicy::strip_think()
+        } else {
+            crate::llm::protocols::HistoryPolicy::disabled()
+        };
+        crate::llm::protocols::set_history_policy(policy);
     }
     config.apply_state(load_state());
     Ok(config)
