@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- TUI — pasting a multi-line block (≥ 4 lines) now shows a compact `[ pasted-text#N M lines ]` chip in the composer instead of dumping the whole text inline; the chip expands back to the full content when you send. ([#124](https://github.com/Fullstop000/ignis/pull/124))
 - Benchmarks — bench pipeline records per-trial tool-call success rate (OK / total / err) sourced from ignis's own session JSONL, surfaced as a new "Tool OK rate" headline card, sortable "Tool OK%" column, and per-trial drill-down line. Harness-portable: no dependency on harbor stdout markers. ([#120](https://github.com/Fullstop000/ignis/pull/120))
 - `ask_user` shows a review-and-submit screen for multi-question batches — confirm every answer, or step back (Left / Shift-Tab) to revise one before submitting. ([#115](https://github.com/Fullstop000/ignis/pull/115))
 - Footer shows the current git branch (oh-my-zsh `git:(branch)` style) when the working directory is a git repo. ([#115](https://github.com/Fullstop000/ignis/pull/115))
