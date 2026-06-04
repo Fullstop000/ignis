@@ -7,8 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- Agent — outbound history trim before every model call. By default, prior-turn reasoning is dropped on assistant messages that did NOT call a tool (mirrors DeepSeek's documented non-tool-turn contract and strips inline `<think>...</think>` for MiniMax-M3); tool-calling turns are preserved verbatim. Cuts input-token bloat from replayed chain-of-thought without changing tool-call linkage or per-provider invariants. Toggle with `[settings] strip-think = true|false` in `~/.ignis/config.toml`; experimental modes (`strip-wide` / `mask-only` / `both`) are reachable via the `IGNIS_HISTORY_TRIM` env var. ([#123](https://github.com/Fullstop000/ignis/pull/123))
+## [0.34.0] - 2026-06-05
 
 ### Added
 - TUI — scroll the transcript with the mouse wheel. ([#125](https://github.com/Fullstop000/ignis/pull/125))
@@ -18,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Footer shows the current git branch (oh-my-zsh `git:(branch)` style) when the working directory is a git repo. ([#115](https://github.com/Fullstop000/ignis/pull/115))
 
 ### Changed
+- Agent — outbound history trim before every model call. Prior-turn reasoning is dropped on assistant messages that did NOT call a tool (mirrors DeepSeek's documented non-tool-turn contract and strips inline `<think>...</think>` for MiniMax-M3); tool-calling turns are preserved verbatim. Cuts input-token bloat from replayed chain-of-thought without changing tool-call linkage or per-provider invariants. Toggle with `[settings] strip-think = true|false` in `~/.ignis/config.toml`; `IGNIS_HISTORY_TRIM=off` disables it at runtime. ([#123](https://github.com/Fullstop000/ignis/pull/123))
 - TUI — the live "Thinking…" timer now reads `5s` / `1m 05s` / `1h 02m 05s` instead of raw seconds. ([#125](https://github.com/Fullstop000/ignis/pull/125))
 - TUI — removed the `↑/↓ N more lines` transcript scroll hints. ([#125](https://github.com/Fullstop000/ignis/pull/125))
 - Tool-initiated pickers (`ask_user`, `permission`, `connect`, `afk`) now anchor to the bottom of the body above the input band — transcript stays visible above — matching the Claude Code / Codex convention. ([#107](https://github.com/Fullstop000/ignis/pull/107))
@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Internal — native tools now share one static metadata and call adapter; the agent loop's stream-retry and hook-block paths are factored into named helpers. No user-visible change. ([#119](https://github.com/Fullstop000/ignis/pull/119))
 - Internal — renamed agent-loop events so a `Turn` is the whole user exchange and a `Run` is one LLM round (`AgentStart`/`AgentEnd` → `TurnStart`/`TurnEnd`; old `TurnStart`/`TurnEnd` → `RunStart`/`RunEnd`). No user-visible change. ([#121](https://github.com/Fullstop000/ignis/pull/121))
 - Internal — `Agent::run` is now a stable control-flow skeleton over named lifecycle moments (`before_llm_call`, `call_llm`, `after_llm_call`, `emit_fatal`); telemetry, hooks, and message assembly moved out of the loop body. No user-visible change. ([#122](https://github.com/Fullstop000/ignis/pull/122))
+- Internal — dropped the experimental `IGNIS_HISTORY_TRIM` modes (`mask-only`, `strip-wide`, `both`) and the unused tool-result mask path. The only knob is now `strip-think` (TOML) / `IGNIS_HISTORY_TRIM=off|<anything>` (env). No user-visible change for the shipped default. ([#126](https://github.com/Fullstop000/ignis/pull/126))
 
 ### Fixed
 - TUI message queue now routes queued slash commands through the same dispatcher Enter uses, so `/compact`, `/model`, and other commands typed while the agent is busy actually run on drain instead of being sent to the LLM as literal user messages. Slash-command autocomplete is also surfaced while busy so the queued line can be completed from the dropdown. ([#106](https://github.com/Fullstop000/ignis/pull/106))

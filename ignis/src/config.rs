@@ -48,9 +48,9 @@ pub struct SettingsConfig {
     /// `reasoning_content` field) from text-only assistant turns before each
     /// outbound model call. Defaults to `true` when unset — cache-stable,
     /// DeepSeek/Anthropic-safe. Set `false` to send the full history every
-    /// turn. The `IGNIS_HISTORY_TRIM` env var overrides this at runtime and
-    /// also exposes the experimental `strip-wide`, `mask-only`, and `both`
-    /// modes for benchmarking.
+    /// turn. The `IGNIS_HISTORY_TRIM` env var overrides this at runtime
+    /// (`off` disables; any other value enables) for A/B benchmarking
+    /// without a rebuild.
     #[serde(rename = "strip-think")]
     pub strip_think: Option<bool>,
 }
@@ -452,12 +452,9 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
     // override slot. Done once at startup — the env var still takes
     // precedence at the per-call site.
     if let Some(strip) = config.settings.strip_think {
-        let policy = if strip {
-            crate::llm::protocols::HistoryPolicy::strip_think()
-        } else {
-            crate::llm::protocols::HistoryPolicy::disabled()
-        };
-        crate::llm::protocols::set_history_policy(policy);
+        crate::llm::protocols::set_history_policy(crate::llm::protocols::HistoryPolicy {
+            strip_think: strip,
+        });
     }
     config.apply_state(load_state());
     Ok(config)

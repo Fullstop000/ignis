@@ -93,6 +93,3 @@ api_key = "sk-cp-your-key"
 #                      # assistant turns before each model call. Cache-stable;
 #                      # DeepSeek- and Anthropic-safe. Set false to send the
 #                      # full history every turn.
-#
-# Experimental modes (strip-wide / mask-only / both) are available via the
-# `IGNIS_HISTORY_TRIM` env var, which overrides this knob at runtime.
