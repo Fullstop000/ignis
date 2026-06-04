@@ -329,11 +329,38 @@ pub struct HistoryPolicy {
     pub strip_text_turn_reasoning: bool,
 }
 
-impl Default for HistoryPolicy {
-    fn default() -> Self {
+impl HistoryPolicy {
+    /// The literature-recommended defaults: `keep_live_tool_outputs = 5`,
+    /// `strip_text_turn_reasoning = true`. Used by [`HistoryPolicy::default`]
+    /// when the env override is absent or anything other than `off`.
+    pub fn enabled_defaults() -> Self {
         Self {
             keep_live_tool_outputs: 5,
             strip_text_turn_reasoning: true,
+        }
+    }
+
+    /// An identity policy — both levers off; [`prep_outbound_history`] becomes
+    /// a `to_vec()` of the input. Used by [`HistoryPolicy::default`] when
+    /// `IGNIS_HISTORY_TRIM=off` is set in the process environment, for A/B
+    /// benchmarking the trim's impact without rebuilding the binary.
+    pub fn disabled() -> Self {
+        Self {
+            keep_live_tool_outputs: 0,
+            strip_text_turn_reasoning: false,
+        }
+    }
+}
+
+impl Default for HistoryPolicy {
+    /// `enabled_defaults()` by default; flipped to `disabled()` when the
+    /// process env carries `IGNIS_HISTORY_TRIM=off`. Read once per call so a
+    /// single shell can run masked-vs-unmasked trials by toggling the env in
+    /// between, without restarting any long-lived process.
+    fn default() -> Self {
+        match std::env::var("IGNIS_HISTORY_TRIM").as_deref() {
+            Ok("off") => Self::disabled(),
+            _ => Self::enabled_defaults(),
         }
     }
 }
@@ -835,5 +862,41 @@ mod tests {
     #[test]
     fn prep_history_identity_on_empty_input() {
         assert!(prep_outbound_history(&[], &HistoryPolicy::default()).is_empty());
+    }
+
+    /// Env-var override read by `HistoryPolicy::default`. Uses a `Mutex` to
+    /// serialize the test (process env is global) and a guard to restore the
+    /// prior value so an aborted test doesn't poison sibling tests in the same
+    /// binary.
+    #[test]
+    fn history_policy_default_honors_env_off_switch() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prior = std::env::var("IGNIS_HISTORY_TRIM").ok();
+
+        // SAFETY: env mutation; the static Mutex above serializes every test
+        // in this module that touches IGNIS_HISTORY_TRIM, so no concurrent
+        // get/set in this process can race.
+        unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", "off") };
+        let p = HistoryPolicy::default();
+        assert_eq!(p.keep_live_tool_outputs, 0);
+        assert!(!p.strip_text_turn_reasoning);
+
+        unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", "on") };
+        let p = HistoryPolicy::default();
+        assert_eq!(p.keep_live_tool_outputs, 5);
+        assert!(p.strip_text_turn_reasoning);
+
+        unsafe { std::env::remove_var("IGNIS_HISTORY_TRIM") };
+        let p = HistoryPolicy::default();
+        assert_eq!(p.keep_live_tool_outputs, 5);
+        assert!(p.strip_text_turn_reasoning);
+
+        // Restore the prior value, if any.
+        match prior {
+            Some(v) => unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", v) },
+            None => unsafe { std::env::remove_var("IGNIS_HISTORY_TRIM") },
+        }
     }
 }
