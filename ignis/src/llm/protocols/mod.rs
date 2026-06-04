@@ -303,6 +303,135 @@ pub(crate) fn parse_sse_line(line: &str) -> Option<LlmResponseDelta> {
     None
 }
 
+/// Policy for trimming prior-turn material from a `history` before serializing
+/// it out to the model. Two independent levers, both grounded in published
+/// agent-efficiency work:
+///
+/// - `keep_live_tool_outputs` — JetBrains "complexity-trap" observation-masking
+///   (arxiv 2508.21433). Halves agent-context cost on SWE-bench Verified with
+///   no solve-rate loss vs LLM summarization, by blanking the *bodies* of stale
+///   tool-result messages while keeping their existence in the transcript. We
+///   keep the N most recent tool results intact and replace older bodies with
+///   a tiny stub. `0` disables masking.
+///
+/// - `strip_text_turn_reasoning` — drop prior-turn reasoning on assistant
+///   messages that did NOT call a tool. Mirrors DeepSeek's documented contract
+///   (`reasoning_content` is *ignored* on non-tool turns when sent, mandatory
+///   when adjacent to a tool call) and Anthropic's default behavior on Sonnet
+///   ≤4.5 / Haiku via `clear_thinking_20251015`. Also strips inline
+///   `<think>...</think>` regions from `content` (MiniMax-M3 emits its
+///   reasoning that way, inline in the visible content stream — without this
+///   strip every prior turn's chain-of-thought is replayed verbatim and the
+///   input prompt grows monotonically).
+#[derive(Clone, Copy, Debug)]
+pub struct HistoryPolicy {
+    pub keep_live_tool_outputs: usize,
+    pub strip_text_turn_reasoning: bool,
+}
+
+impl Default for HistoryPolicy {
+    fn default() -> Self {
+        Self {
+            keep_live_tool_outputs: 5,
+            strip_text_turn_reasoning: true,
+        }
+    }
+}
+
+/// Stub body that replaces a masked tool result. Kept short so the savings
+/// dominate; includes the tool name when known so the model still has cheap
+/// context about *what* was elided (a `bash` vs a `read_file` matters even
+/// when the body is gone).
+fn masked_tool_stub(tool_name: Option<&str>) -> String {
+    match tool_name {
+        Some(n) if !n.is_empty() => format!("[{n} output elided to save context]"),
+        _ => "[older tool output elided to save context]".to_string(),
+    }
+}
+
+/// Strip every `<think>...</think>` region from `s` (case-sensitive, multi-line,
+/// non-greedy). MiniMax-M3 emits chain-of-thought as inline `<think>...</think>`
+/// in the visible content stream rather than via the `reasoning_content` field,
+/// so without this strip every prior turn's CoT is replayed verbatim on every
+/// subsequent turn — pushing the actual work past the timeout budget (we
+/// observed this on 12/12 TimedOut MM3 trials in TB 2.1 06-03). Idempotent.
+fn strip_think_blocks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open) = rest.find("<think>") {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + "<think>".len()..];
+        if let Some(close) = after_open.find("</think>") {
+            rest = &after_open[close + "</think>".len()..];
+        } else {
+            // Unclosed tag — keep the tail intact rather than dropping it
+            // silently. A stream-truncated `<think>` will surface as visible
+            // text on next replay, which is the safe-degrade behavior.
+            out.push_str("<think>");
+            out.push_str(after_open);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Prepare a history `&[Message]` slice for outbound serialization, applying
+/// the two cost-reduction levers in [`HistoryPolicy`]. Returns a fresh `Vec` —
+/// the caller's history is never mutated. Identity transform on an empty
+/// policy / empty history.
+///
+/// Invariants we preserve:
+/// - Message ordering and count are unchanged. Only individual `content` /
+///   `reasoning_content` fields are blanked or stripped.
+/// - `tool_call_id` and `tool_calls` are never touched, so the
+///   call→result linkage that providers (especially Anthropic) validate
+///   remains intact.
+/// - An assistant turn that *did* call a tool keeps its reasoning verbatim —
+///   DeepSeek 400s otherwise, and Anthropic requires intra-turn thinking
+///   adjacency to its `tool_use` block.
+pub(crate) fn prep_outbound_history(messages: &[Message], policy: &HistoryPolicy) -> Vec<Message> {
+    let mut out: Vec<Message> = messages.to_vec();
+
+    if policy.strip_text_turn_reasoning {
+        for msg in out.iter_mut() {
+            if msg.role != "assistant" {
+                continue;
+            }
+            // Tool-calling assistant turns: keep reasoning intact.
+            if msg.tool_calls.as_ref().is_some_and(|tcs| !tcs.is_empty()) {
+                continue;
+            }
+            // Text-only assistant turn: drop the dedicated reasoning slot AND
+            // any inline `<think>...</think>` the content carried (MM3).
+            msg.reasoning_content = None;
+            if let Some(content) = msg.content.as_ref() {
+                if content.contains("<think>") {
+                    msg.content = Some(strip_think_blocks(content));
+                }
+            }
+        }
+    }
+
+    if policy.keep_live_tool_outputs > 0 {
+        let tool_idxs: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "tool")
+            .map(|(i, _)| i)
+            .collect();
+        if tool_idxs.len() > policy.keep_live_tool_outputs {
+            let cutoff = tool_idxs.len() - policy.keep_live_tool_outputs;
+            for &idx in &tool_idxs[..cutoff] {
+                let name = out[idx].name.clone();
+                out[idx].content = Some(masked_tool_stub(name.as_deref()));
+            }
+        }
+    }
+
+    out
+}
+
 /// Stream a chat completion from an OpenAI-compatible endpoint. The only
 /// provider-specific knob is `request_headers`: built-in provider declarations
 /// can add headers such as Kimi's whitelisted `User-Agent`. All response parsing
@@ -320,6 +449,7 @@ pub(crate) async fn openai_compatible_chat_stream(
     messages: &[Message],
     tools: &[serde_json::Value],
 ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error> {
+    let history = prep_outbound_history(messages, &HistoryPolicy::default());
     let mut request_messages = vec![Message {
         role: "system".to_string(),
         content: Some(system_prompt.to_string()),
@@ -329,7 +459,7 @@ pub(crate) async fn openai_compatible_chat_stream(
         tool_calls: None,
         created_at_ms: None,
     }];
-    request_messages.extend_from_slice(messages);
+    request_messages.extend(history);
 
     let req_body = ChatCompletionsRequest {
         model,
@@ -477,5 +607,233 @@ mod tests {
             r#"data: {"choices":[{"delta":{"content":"a","reasoning_content":"b"}}]}"#,
         );
         assert!(matches!(d, Some(LlmResponseDelta::Text(t)) if t == "a"));
+    }
+
+    // ---- prep_outbound_history: stale tool-output masking + reasoning strip ----
+    //
+    // Constructor helpers — kept private to the test module so each assertion
+    // reads as plain narrative without struct-literal noise.
+
+    fn user(text: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: Some(text.to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        }
+    }
+
+    fn assistant_text(text: &str, reasoning: Option<&str>) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Some(text.to_string()),
+            reasoning_content: reasoning.map(str::to_string),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        }
+    }
+
+    fn assistant_calling(text: &str, reasoning: Option<&str>, call_id: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Some(text.to_string()),
+            reasoning_content: reasoning.map(str::to_string),
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: call_id.to_string(),
+                r#type: "function".to_string(),
+                function: ToolCallFunction {
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"ls"}"#.to_string(),
+                },
+            }]),
+            created_at_ms: None,
+        }
+    }
+
+    fn tool_result(call_id: &str, name: &str, body: &str) -> Message {
+        Message {
+            role: "tool".to_string(),
+            content: Some(body.to_string()),
+            reasoning_content: None,
+            name: Some(name.to_string()),
+            tool_call_id: Some(call_id.to_string()),
+            tool_calls: None,
+            created_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn prep_history_masks_stale_tool_outputs_keeps_latest_n() {
+        // Eight tool results, keep_live = 3 → first five are masked, last three intact.
+        let mut history = Vec::new();
+        history.push(user("do many things"));
+        for i in 0..8 {
+            history.push(assistant_calling("", None, &format!("call_{i}")));
+            history.push(tool_result(
+                &format!("call_{i}"),
+                "bash",
+                &format!("result body number {i}"),
+            ));
+        }
+        let policy = HistoryPolicy {
+            keep_live_tool_outputs: 3,
+            strip_text_turn_reasoning: false,
+        };
+        let out = prep_outbound_history(&history, &policy);
+        let tool_msgs: Vec<&Message> = out.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(tool_msgs.len(), 8);
+        // First five tool results are masked (stub includes the tool name).
+        for (i, m) in tool_msgs.iter().take(5).enumerate() {
+            let body = m.content.as_deref().unwrap_or("");
+            assert!(
+                body.contains("bash") && body.contains("elided"),
+                "tool result #{i} should be masked, got: {body:?}"
+            );
+            // tool_call_id linkage stays intact — that's the hard invariant.
+            assert_eq!(
+                m.tool_call_id.as_deref(),
+                Some(format!("call_{i}").as_str())
+            );
+        }
+        // Last three tool results keep their real bodies.
+        for (offset, m) in tool_msgs.iter().skip(5).enumerate() {
+            let i = 5 + offset;
+            let expected = format!("result body number {i}");
+            assert_eq!(m.content.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
+    fn prep_history_strips_reasoning_on_text_only_assistant_turn() {
+        let history = vec![
+            user("question"),
+            assistant_text("the answer is 42", Some("first I considered ...")),
+        ];
+        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        assert!(
+            out[1].reasoning_content.is_none(),
+            "reasoning should be stripped"
+        );
+        assert_eq!(
+            out[1].content.as_deref(),
+            Some("the answer is 42"),
+            "content untouched"
+        );
+    }
+
+    #[test]
+    fn prep_history_keeps_reasoning_on_tool_calling_assistant_turn() {
+        // DeepSeek 400s if reasoning is dropped on a turn whose assistant message
+        // performed a tool call; Anthropic requires intra-turn thinking adjacency.
+        let history = vec![
+            user("please run ls"),
+            assistant_calling("I'll run ls.", Some("plan: list /app"), "call_1"),
+            tool_result("call_1", "bash", "app/  README.md"),
+        ];
+        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        assert_eq!(
+            out[1].reasoning_content.as_deref(),
+            Some("plan: list /app"),
+            "tool-calling turn must keep its reasoning",
+        );
+    }
+
+    #[test]
+    fn prep_history_strips_inline_think_blocks_from_mm3_text_turn() {
+        // MM3 emits chain-of-thought inline as `<think>...</think>` in `content`.
+        let history = vec![
+            user("hi"),
+            assistant_text(
+                "<think>let me think about this\nmulti-line</think>here is my answer",
+                None,
+            ),
+        ];
+        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        assert_eq!(out[1].content.as_deref(), Some("here is my answer"));
+    }
+
+    #[test]
+    fn prep_history_strips_multiple_think_blocks_on_text_turn() {
+        let history = vec![
+            user("hi"),
+            assistant_text("<think>A</think>x<think>B\nC</think>y", None),
+        ];
+        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        assert_eq!(out[1].content.as_deref(), Some("xy"));
+    }
+
+    #[test]
+    fn prep_history_keeps_think_blocks_on_tool_calling_turn() {
+        // Strip only applies to text-only assistant turns — tool-calling turns
+        // keep their content verbatim so per-provider adjacency invariants hold.
+        let history = vec![
+            user("ls"),
+            assistant_calling("<think>plan</think>running ls", None, "call_1"),
+        ];
+        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        assert_eq!(
+            out[1].content.as_deref(),
+            Some("<think>plan</think>running ls")
+        );
+    }
+
+    #[test]
+    fn prep_history_with_strip_disabled_preserves_reasoning_and_think_tags() {
+        let policy = HistoryPolicy {
+            keep_live_tool_outputs: 0,
+            strip_text_turn_reasoning: false,
+        };
+        let history = vec![
+            user("hi"),
+            assistant_text("<think>raw</think>answer", Some("kept reasoning")),
+        ];
+        let out = prep_outbound_history(&history, &policy);
+        assert_eq!(out[1].reasoning_content.as_deref(), Some("kept reasoning"));
+        assert_eq!(out[1].content.as_deref(), Some("<think>raw</think>answer"));
+    }
+
+    #[test]
+    fn prep_history_masking_disabled_keeps_all_tool_bodies() {
+        let policy = HistoryPolicy {
+            keep_live_tool_outputs: 0,
+            strip_text_turn_reasoning: false,
+        };
+        let mut history = vec![user("go")];
+        for i in 0..5 {
+            history.push(assistant_calling("", None, &format!("c{i}")));
+            history.push(tool_result(&format!("c{i}"), "bash", &format!("body {i}")));
+        }
+        let out = prep_outbound_history(&history, &policy);
+        for (i, m) in out.iter().filter(|m| m.role == "tool").enumerate() {
+            let expected = format!("body {i}");
+            assert_eq!(m.content.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
+    fn prep_history_unclosed_think_tag_preserved_on_text_turn() {
+        // Safe-degrade: if a `<think>` was never closed (stream truncation),
+        // keep the tail intact rather than dropping the rest of the content.
+        let history = vec![
+            user("hi"),
+            assistant_text("ok<think>truncated and no closer", None),
+        ];
+        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        assert_eq!(
+            out[1].content.as_deref(),
+            Some("ok<think>truncated and no closer")
+        );
+    }
+
+    #[test]
+    fn prep_history_identity_on_empty_input() {
+        assert!(prep_outbound_history(&[], &HistoryPolicy::default()).is_empty());
     }
 }
