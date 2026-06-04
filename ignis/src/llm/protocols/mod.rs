@@ -332,7 +332,8 @@ pub struct HistoryPolicy {
 impl HistoryPolicy {
     /// The literature-recommended defaults: `keep_live_tool_outputs = 5`,
     /// `strip_text_turn_reasoning = true`. Used by [`HistoryPolicy::default`]
-    /// when the env override is absent or anything other than `off`.
+    /// when the env override is absent or anything other than a recognized
+    /// value.
     pub fn enabled_defaults() -> Self {
         Self {
             keep_live_tool_outputs: 5,
@@ -350,16 +351,42 @@ impl HistoryPolicy {
             strip_text_turn_reasoning: false,
         }
     }
+
+    /// Lever 1 only — observation masking at the default `keep_live = 5`,
+    /// reasoning replay untouched. Used by `IGNIS_HISTORY_TRIM=mask-only`
+    /// for ablation experiments that isolate which lever drove a regression.
+    pub fn mask_only() -> Self {
+        Self {
+            keep_live_tool_outputs: 5,
+            strip_text_turn_reasoning: false,
+        }
+    }
+
+    /// Lever 2 only — reasoning strip on text-only assistant turns, tool
+    /// outputs untouched. Used by `IGNIS_HISTORY_TRIM=strip-only` for
+    /// ablation experiments.
+    pub fn strip_only() -> Self {
+        Self {
+            keep_live_tool_outputs: 0,
+            strip_text_turn_reasoning: true,
+        }
+    }
 }
 
 impl Default for HistoryPolicy {
-    /// `enabled_defaults()` by default; flipped to `disabled()` when the
-    /// process env carries `IGNIS_HISTORY_TRIM=off`. Read once per call so a
-    /// single shell can run masked-vs-unmasked trials by toggling the env in
-    /// between, without restarting any long-lived process.
+    /// `enabled_defaults()` by default. Flipped by `IGNIS_HISTORY_TRIM`:
+    ///   * `off`         → both levers disabled (identity transform)
+    ///   * `mask-only`   → only stale tool-output masking
+    ///   * `strip-only`  → only reasoning strip
+    ///   * anything else / unset → both levers on
+    ///
+    /// Read once per call so a single shell can flip arms between trials by
+    /// toggling the env in between, without restarting any long-lived process.
     fn default() -> Self {
         match std::env::var("IGNIS_HISTORY_TRIM").as_deref() {
             Ok("off") => Self::disabled(),
+            Ok("mask-only") => Self::mask_only(),
+            Ok("strip-only") => Self::strip_only(),
             _ => Self::enabled_defaults(),
         }
     }
@@ -882,6 +909,16 @@ mod tests {
         let p = HistoryPolicy::default();
         assert_eq!(p.keep_live_tool_outputs, 0);
         assert!(!p.strip_text_turn_reasoning);
+
+        unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", "mask-only") };
+        let p = HistoryPolicy::default();
+        assert_eq!(p.keep_live_tool_outputs, 5);
+        assert!(!p.strip_text_turn_reasoning);
+
+        unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", "strip-only") };
+        let p = HistoryPolicy::default();
+        assert_eq!(p.keep_live_tool_outputs, 0);
+        assert!(p.strip_text_turn_reasoning);
 
         unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", "on") };
         let p = HistoryPolicy::default();
