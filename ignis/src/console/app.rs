@@ -466,6 +466,14 @@ pub(crate) enum Mode {
     ToolRunning, // tool execution in progress
 }
 
+/// A pasted block collapsed into a chip. The `placeholder` text lives inline in
+/// the composer buffer; `expand_pastes` swaps it back for `content` at commit so
+/// the agent never sees the chip. Placeholders are unique (monotonic counter).
+pub(crate) struct PendingPaste {
+    pub(crate) placeholder: String,
+    pub(crate) content: String,
+}
+
 pub(crate) struct App {
     pub(crate) provider: String,
     pub(crate) model: String,
@@ -477,6 +485,11 @@ pub(crate) struct App {
     pub(crate) blocks: Vec<UIBlock>,
     pub(crate) input: String,
     pub(crate) cursor: usize,
+    /// Collapsed paste blocks (chip ↔ full content) currently in the composer.
+    pub(crate) pending_pastes: Vec<PendingPaste>,
+    /// Monotonic `#N` counter for paste chips. Never reset, so numbering keeps
+    /// climbing across messages and every placeholder string stays unique.
+    pub(crate) paste_counter: usize,
     pub(crate) history: Vec<String>,
     pub(crate) history_idx: Option<usize>,
     pub(crate) saved_input: String, // saved input when browsing history
@@ -592,6 +605,8 @@ impl App {
             blocks: Vec::new(),
             input: String::new(),
             cursor: 0,
+            pending_pastes: Vec::new(),
+            paste_counter: 0,
             history: Vec::new(),
             history_idx: None,
             saved_input: String::new(),
@@ -954,13 +969,70 @@ impl App {
         self.cursor += c.len_utf8();
     }
 
+    pub(crate) fn insert_str(&mut self, s: &str) {
+        self.input.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
     pub(crate) fn backspace(&mut self) {
         if self.cursor == 0 {
+            return;
+        }
+        // A paste chip is atomic: if the cursor sits at a chip's right edge,
+        // delete the whole chip (and forget its content) rather than nibbling a
+        // bracket at a time, which would silently corrupt the placeholder so it
+        // no longer expands.
+        if let Some(i) = self
+            .pending_pastes
+            .iter()
+            .position(|p| self.input[..self.cursor].ends_with(&p.placeholder))
+        {
+            let len = self.pending_pastes[i].placeholder.len();
+            self.input.replace_range(self.cursor - len..self.cursor, "");
+            self.cursor -= len;
+            self.pending_pastes.remove(i);
             return;
         }
         let prev = self.prev_char_boundary();
         self.input.remove(prev);
         self.cursor = prev;
+    }
+
+    /// Number of lines at or above which a paste collapses into a chip.
+    const PASTE_COLLAPSE_MIN_LINES: usize = 4;
+
+    /// Insert pasted text at the cursor. A multi-line block (>= 4 lines)
+    /// collapses into a `[ pasted-text#N M lines ]` chip whose full content is
+    /// stashed in `pending_pastes` and restored at commit; smaller pastes go in
+    /// inline like ordinary typing.
+    pub(crate) fn handle_paste(&mut self, pasted: String) {
+        self.clear_exit_hint();
+        // Normalize line endings so the chip's line count and the agent message
+        // are clean regardless of where the text was copied from.
+        let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
+        let lines = pasted.split('\n').count();
+        if lines >= Self::PASTE_COLLAPSE_MIN_LINES {
+            self.paste_counter += 1;
+            let placeholder = format!("[ pasted-text#{} {} lines ]", self.paste_counter, lines);
+            self.insert_str(&placeholder);
+            self.pending_pastes.push(PendingPaste {
+                placeholder,
+                content: pasted,
+            });
+        } else {
+            self.insert_str(&pasted);
+        }
+        self.reset_slash_selection();
+    }
+
+    /// Swap every paste chip back for its full content. Placeholders are unique,
+    /// so a plain replace is unambiguous; a chip the user deleted is simply
+    /// absent and replaces nothing.
+    pub(crate) fn expand_pastes(&self, mut text: String) -> String {
+        for p in &self.pending_pastes {
+            text = text.replace(&p.placeholder, &p.content);
+        }
+        text
     }
 
     pub(crate) fn delete_forward(&mut self) {
@@ -1023,11 +1095,15 @@ impl App {
         if text.is_empty() || self.mode != Mode::Idle {
             return None;
         }
+        // Swap paste chips back for their full content before the text leaves the
+        // composer — the agent must see what was pasted, not the placeholder.
+        let text = self.expand_pastes(text);
         // Don't push the user block from the typed buffer — `Session::prompt`
         // emits `UserPromptCommitted` after the hook chain runs so the
         // visible block matches what hit history. Just clear the input.
         self.input.clear();
         self.cursor = 0;
+        self.pending_pastes.clear();
         Some(text)
     }
 
@@ -2358,5 +2434,83 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         std::fs::remove_dir_all(&tmp).ok();
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::App;
+    use std::path::PathBuf;
+
+    fn app() -> App {
+        App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"))
+    }
+
+    #[test]
+    fn block_paste_collapses_to_chip() {
+        let mut app = app();
+        app.handle_paste("a\nb\nc\nd\ne".into()); // 5 lines >= 4
+        assert_eq!(app.input, "[ pasted-text#1 5 lines ]");
+        assert_eq!(app.pending_pastes.len(), 1);
+        assert_eq!(app.pending_pastes[0].content, "a\nb\nc\nd\ne");
+    }
+
+    #[test]
+    fn small_paste_inserts_inline() {
+        let mut app = app();
+        app.handle_paste("a\nb\nc".into()); // 3 lines < 4
+        assert_eq!(app.input, "a\nb\nc");
+        assert!(app.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn crlf_is_normalized_in_count_and_content() {
+        let mut app = app();
+        app.handle_paste("a\r\nb\r\nc\r\nd".into()); // 4 lines after normalize
+        assert_eq!(app.input, "[ pasted-text#1 4 lines ]");
+        assert_eq!(app.pending_pastes[0].content, "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn submit_expands_chip_and_clears_pending() {
+        let mut app = app();
+        app.handle_paste("w\nx\ny\nz".into()); // 4 lines
+        app.insert_str(" review this");
+        let out = app.submit().unwrap();
+        assert_eq!(out, "w\nx\ny\nz review this");
+        assert!(app.input.is_empty());
+        assert!(app.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn two_pastes_number_and_both_expand() {
+        let mut app = app();
+        app.handle_paste("a\nb\nc\nd".into());
+        app.insert_str(" ");
+        app.handle_paste("e\nf\ng\nh\ni".into());
+        assert!(app.input.contains("#1"));
+        assert!(app.input.contains("#2"));
+        let out = app.submit().unwrap();
+        assert!(out.contains("a\nb\nc\nd"));
+        assert!(out.contains("e\nf\ng\nh\ni"));
+    }
+
+    #[test]
+    fn backspace_removes_whole_chip() {
+        let mut app = app();
+        app.handle_paste("a\nb\nc\nd".into());
+        assert_eq!(app.pending_pastes.len(), 1);
+        app.backspace(); // cursor at chip's right edge
+        assert_eq!(app.input, "");
+        assert!(app.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn paste_counter_stays_monotonic_across_commits() {
+        let mut app = app();
+        app.handle_paste("a\nb\nc\nd".into());
+        let _ = app.submit();
+        app.handle_paste("e\nf\ng\nh".into());
+        assert!(app.input.contains("#2"));
     }
 }

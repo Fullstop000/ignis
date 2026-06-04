@@ -12,10 +12,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::console::app::{App, Mode};
+use crate::console::app::{App, Mode, PendingPaste};
 use crate::console::{
-    format_tokens, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, RED, SUBTEXT, SURFACE,
-    SURFACE_2, TEXT, TEXT_DIM, YELLOW,
+    format_tokens, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, PEACH, RED, SUBTEXT,
+    SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
 };
 
 /// Max queued rows shown before collapsing to a "+N more" row.
@@ -232,6 +232,53 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Render one composer line, painting any paste-chip placeholder in PEACH so it
+/// reads as a token instead of literal brackets. Placeholders never contain a
+/// newline, so each chip lives within a single rendered line.
+fn input_line(line: &str, pastes: &[PendingPaste]) -> Line<'static> {
+    if pastes.is_empty() || !line.contains('[') {
+        return Line::from(Span::styled(line.to_string(), Style::default().fg(TEXT)));
+    }
+    // Locate each chip on this line; placeholders are unique so each matches at
+    // most once. Sort by start to walk left-to-right.
+    let mut ranges: Vec<(usize, usize)> = pastes
+        .iter()
+        .filter_map(|p| {
+            line.find(&p.placeholder)
+                .map(|s| (s, s + p.placeholder.len()))
+        })
+        .collect();
+    if ranges.is_empty() {
+        return Line::from(Span::styled(line.to_string(), Style::default().fg(TEXT)));
+    }
+    ranges.sort_by_key(|r| r.0);
+    let mut spans: Vec<Span> = Vec::new();
+    let mut pos = 0;
+    for (start, end) in ranges {
+        if start < pos {
+            continue; // overlap guard — shouldn't happen with unique chips
+        }
+        if start > pos {
+            spans.push(Span::styled(
+                line[pos..start].to_string(),
+                Style::default().fg(TEXT),
+            ));
+        }
+        spans.push(Span::styled(
+            line[start..end].to_string(),
+            Style::default().fg(PEACH),
+        ));
+        pos = end;
+    }
+    if pos < line.len() {
+        spans.push(Span::styled(
+            line[pos..].to_string(),
+            Style::default().fg(TEXT),
+        ));
+    }
+    Line::from(spans)
+}
+
 pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     let idle = app.mode == Mode::Idle;
     let border_color = if idle { BORDER_ACTIVE } else { BORDER };
@@ -247,7 +294,7 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         Text::from(
             app.input
                 .split('\n')
-                .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(TEXT))))
+                .map(|l| input_line(l, &app.pending_pastes))
                 .collect::<Vec<_>>(),
         )
     };

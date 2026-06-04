@@ -3,7 +3,7 @@
 //! per-frame draw + key-poll cycle. Everything stateful about the live UI
 //! flows through here; `App` is the in-memory model the loop drives.
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -36,14 +36,14 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn install() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
         // Panic hook: a panic inside ratatui / the main loop would otherwise
         // print its message into the alt-screen the user can't see. Restore
         // the terminal first, then chain through to the prior hook.
         let prior_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
             prior_hook(info);
         }));
         Ok(Self)
@@ -53,7 +53,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -395,18 +395,22 @@ pub async fn run_console(
         }
 
         while event::poll(std::time::Duration::ZERO)? {
-            if let Event::Key(key) = event::read()? {
-                handle_key(
-                    &mut app,
-                    key,
-                    &prompt_tx,
-                    &cancel_tx,
-                    &active_inject,
-                    &ui_storage_dir,
-                    &picker_tx,
-                    &notice_tx,
-                )
-                .await;
+            match event::read()? {
+                Event::Key(key) => {
+                    handle_key(
+                        &mut app,
+                        key,
+                        &prompt_tx,
+                        &cancel_tx,
+                        &active_inject,
+                        &ui_storage_dir,
+                        &picker_tx,
+                        &notice_tx,
+                    )
+                    .await;
+                }
+                Event::Paste(data) => crate::console::keys::handle_paste(&mut app, data),
+                _ => {}
             }
         }
 

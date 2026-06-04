@@ -118,6 +118,25 @@ impl InlinePickerState {
     pub(crate) fn other_focused(&self) -> bool {
         self.cursor == self.current_question().options.len()
     }
+
+    /// Append pasted text to the free-text buffer (text-input or focused-Other
+    /// rows only), mirroring the per-char rules: skip control chars, respect the
+    /// length cap. Bracketed paste now arrives as one event, so without this an
+    /// API key pasted into `/connect` would be dropped.
+    pub(crate) fn paste_text(&mut self, s: &str) {
+        if !(self.is_text_input() || self.other_focused()) {
+            return;
+        }
+        for c in s.chars() {
+            if c.is_control() {
+                continue;
+            }
+            if self.other_buf.len() + c.len_utf8() > MAX_OTHER_LEN {
+                break;
+            }
+            self.other_buf.push(c);
+        }
+    }
     /// True if any option in the current question carries a `preview` field.
     /// Triggers the split layout — the preview block lives in a bordered pane
     /// on the right, with the option list on the left.
