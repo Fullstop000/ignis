@@ -7,9 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- Agent — outbound history trim before every model call. By default, prior-turn reasoning is dropped on assistant messages that did NOT call a tool (mirrors DeepSeek's documented non-tool-turn contract and strips inline `<think>...</think>` for MiniMax-M3); tool-calling turns are preserved verbatim. Cuts input-token bloat from replayed chain-of-thought without changing tool-call linkage or per-provider invariants. Toggle with `[settings] strip-think = true|false` in `~/.ignis/config.toml`; experimental modes (`strip-wide` / `mask-only` / `both`) are reachable via the `IGNIS_HISTORY_TRIM` env var. ([#123](https://github.com/Fullstop000/ignis/pull/123))
-
 ### Added
 - TUI — scroll the transcript with the mouse wheel. ([#125](https://github.com/Fullstop000/ignis/pull/125))
 - TUI — pasting a multi-line block (≥ 4 lines) now shows a compact `[ pasted-text#N M lines ]` chip in the composer instead of dumping the whole text inline; the chip expands back to the full content when you send. ([#124](https://github.com/Fullstop000/ignis/pull/124))
@@ -18,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Footer shows the current git branch (oh-my-zsh `git:(branch)` style) when the working directory is a git repo. ([#115](https://github.com/Fullstop000/ignis/pull/115))
 
 ### Changed
+- Agent — outbound history trim before every model call. Prior-turn reasoning is dropped on assistant messages that did NOT call a tool (mirrors DeepSeek's documented non-tool-turn contract and strips inline `<think>...</think>` for MiniMax-M3); tool-calling turns are preserved verbatim. Cuts input-token bloat from replayed chain-of-thought without changing tool-call linkage or per-provider invariants. Toggle with `[settings] strip-think = true|false` in `~/.ignis/config.toml`; `IGNIS_HISTORY_TRIM=off` disables it at runtime. ([#123](https://github.com/Fullstop000/ignis/pull/123))
 - TUI — the live "Thinking…" timer now reads `5s` / `1m 05s` / `1h 02m 05s` instead of raw seconds. ([#125](https://github.com/Fullstop000/ignis/pull/125))
 - TUI — removed the `↑/↓ N more lines` transcript scroll hints. ([#125](https://github.com/Fullstop000/ignis/pull/125))
 - Tool-initiated pickers (`ask_user`, `permission`, `connect`, `afk`) now anchor to the bottom of the body above the input band — transcript stays visible above — matching the Claude Code / Codex convention. ([#107](https://github.com/Fullstop000/ignis/pull/107))
