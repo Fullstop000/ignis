@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- Agent — outbound history trim before every model call: bodies of older tool-result messages are replaced with a short stub once five newer results exist (JetBrains "observation masking", arxiv 2508.21433), and prior-turn reasoning is dropped on assistant messages that did NOT call a tool (mirrors DeepSeek's documented non-tool-turn contract and strips inline `<think>...</think>` for MiniMax-M3). Cuts input-token bloat on long multi-tool sessions without changing tool-call linkage or current-turn behavior. ([#XXX](https://github.com/Fullstop000/ignis/pull/XXX))
+- Agent — outbound history trim before every model call: bodies of older tool-result messages are replaced with a short stub once five newer results exist (JetBrains "observation masking", arxiv 2508.21433), and prior-turn reasoning is dropped on assistant messages that did NOT call a tool (mirrors DeepSeek's documented non-tool-turn contract and strips inline `<think>...</think>` for MiniMax-M3). Cuts input-token bloat on long multi-tool sessions without changing tool-call linkage or current-turn behavior. ([#123](https://github.com/Fullstop000/ignis/pull/123))
 
 ### Added
 - Benchmarks — bench pipeline records per-trial tool-call success rate (OK / total / err) sourced from ignis's own session JSONL, surfaced as a new "Tool OK rate" headline card, sortable "Tool OK%" column, and per-trial drill-down line. Harness-portable: no dependency on harbor stdout markers. ([#120](https://github.com/Fullstop000/ignis/pull/120))
