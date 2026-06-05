@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - TUI — `/hooks` (and the alias `/hooks list`) now prints the in-memory hook chains — one block per event, each entry showing the program path, its argv tail, and the per-hook timeout — and still re-reads `~/.ignis/hooks.json` from disk under `/hooks reload`. An empty registry prints a single `[info] no hooks registered` line pointing at the file and the reload action. ([#127](https://github.com/Fullstop000/ignis/pull/127))
 
+### Fixed
+- Interrupting a turn with `Ctrl+C` no longer breaks the next message — an interrupted tool call is closed out so the conversation continues instead of being rejected by the provider. ([#129](https://github.com/Fullstop000/ignis/pull/129))
+
 ## [0.34.0] - 2026-06-05
 
 ### Added

@@ -851,3 +851,121 @@ async fn user_prompt_submit_block_short_circuits_turn() {
         "must not announce a committed prompt on block"
     );
 }
+
+/// Records the message history handed to the provider on its first call, so a
+/// test can assert exactly what would have hit the wire.
+struct CapturingProvider {
+    seen: Arc<std::sync::Mutex<Vec<Message>>>,
+}
+
+#[async_trait]
+impl LlmProvider for CapturingProvider {
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+    async fn chat_stream(
+        &self,
+        _system_prompt: &str,
+        messages: &[Message],
+        _tools: &[serde_json::Value],
+    ) -> Result<BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>, anyhow::Error> {
+        if self.seen.lock().unwrap().is_empty() {
+            *self.seen.lock().unwrap() = messages.to_vec();
+        }
+        Ok(stream::iter(vec![Ok(LlmResponseDelta::Text("ok".to_string()))]).boxed())
+    }
+}
+
+/// Every `tool_calls` id on an assistant message must be answered by a later
+/// `tool` message — the call→result linkage Anthropic rejects when broken.
+fn assert_tool_calls_balanced(messages: &[Message]) {
+    let answered: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    for m in messages.iter().filter(|m| m.role == "assistant") {
+        for tc in m.tool_calls.iter().flatten() {
+            assert!(
+                answered.contains(tc.id.as_str()),
+                "dangling tool_call {} has no matching tool_result; outbound history is invalid",
+                tc.id
+            );
+        }
+    }
+}
+
+/// End-to-end regression for the Ctrl+C consistency bug: a session resumed from
+/// a turn interrupted mid-tool-execution (assistant `tool_calls` with no
+/// `tool_result`) must NOT send that dangling history to the provider on the
+/// next prompt. The interrupted in-memory state is reproduced by seeding
+/// storage with it and re-opening — `Session::open` loads it into `history`
+/// exactly as a dropped `prompt` future would have left it.
+#[tokio::test]
+async fn resuming_after_interrupted_tool_turn_sends_balanced_history() {
+    let storage = InMemoryStorage::new();
+    let interrupted = vec![
+        Message {
+            role: "user".to_string(),
+            content: Some("do the thing".to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: None,
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![ignis::ToolCall {
+                id: "call_1".to_string(),
+                r#type: "function".to_string(),
+                function: ignis::ToolCallFunction {
+                    name: "echo".to_string(),
+                    arguments: r#"{"message":"hi"}"#.to_string(),
+                },
+            }]),
+            created_at_ms: None,
+        },
+    ];
+    storage
+        .save_session("c", &interrupted, Some("/tmp"))
+        .await
+        .unwrap();
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = CapturingProvider { seen: seen.clone() };
+    let mut session = Session::open(
+        "c".to_string(),
+        "system".to_string(),
+        Box::new(provider),
+        Box::new(storage),
+        "/tmp".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    session.prompt("continue", tx).await.unwrap();
+    let _ = collect_events(&mut rx).await;
+
+    // What the provider actually received must be a valid call→result chain.
+    let outbound = seen.lock().unwrap().clone();
+    assert_tool_calls_balanced(&outbound);
+    // And the synthetic result is an error envelope flagged as interrupted.
+    let healed = outbound
+        .iter()
+        .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_1"))
+        .expect("interrupted call must be answered by a synthetic tool result");
+    let v: serde_json::Value = serde_json::from_str(healed.content.as_deref().unwrap()).unwrap();
+    assert_eq!(v["is_error"], serde_json::json!(true));
+
+    // The persisted history is likewise balanced (no divergence carried forward).
+    assert_tool_calls_balanced(session.history());
+}

@@ -173,6 +173,12 @@ impl Session {
             tracing::Span::current().record("prompt.text", text);
         }
 
+        // Heal a turn the user interrupted with Ctrl+C: the dropped future can
+        // leave the last assistant message holding `tool_calls` with no matching
+        // `tool_result`, which providers reject. Close out the orphans before we
+        // build on this history (and before compaction walks it).
+        heal_interrupted_tool_calls(&mut self.history);
+
         // Auto-compact when the estimated context grows past the threshold.
         // Best-effort: a compaction failure must not block the user's prompt.
         if self.compaction.auto && estimate_tokens(&self.history) > self.compaction.threshold_tokens
@@ -343,6 +349,66 @@ impl Session {
         self.storage
             .save_session(&self.id, &self.history, Some(&self.start_dir))
             .await
+    }
+}
+
+/// Close out tool calls orphaned by a turn the user interrupted with Ctrl+C.
+///
+/// Cancellation drops the in-flight `prompt` future (the runner's
+/// `tokio::select!` against the cancel channel). If the drop lands inside
+/// `Agent::execute_tool_calls`, the trailing assistant message is left holding
+/// `tool_calls` whose matching `tool_result`s were never pushed (the results
+/// are appended only after every tool finishes). Providers — Anthropic
+/// strictly — reject a `tool_use` with no `tool_result`, so the *next* prompt
+/// would send an invalid history and fail. Before resuming, synthesize an
+/// `is_error` "interrupted" result for each unanswered call.
+///
+/// No-op when the history is already balanced. Only the final assistant
+/// tool-turn can be orphaned: a completed turn always pushed all its results,
+/// and any `user`/`assistant` message after the turn means we are already past
+/// it. The partial-interrupt case (some results pushed before the cancel) is
+/// handled by filling only the ids not already answered.
+fn heal_interrupted_tool_calls(history: &mut Vec<Message>) {
+    let Some(a) = history
+        .iter()
+        .rposition(|m| m.role == "assistant" && m.tool_calls.is_some())
+    else {
+        return;
+    };
+    if history[a + 1..]
+        .iter()
+        .any(|m| m.role == "user" || m.role == "assistant")
+    {
+        return;
+    }
+    let calls = history[a].tool_calls.clone().unwrap_or_default();
+    let missing: Vec<crate::ToolCall> = {
+        let answered: std::collections::HashSet<&str> = history[a + 1..]
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        calls
+            .into_iter()
+            .filter(|tc| !answered.contains(tc.id.as_str()))
+            .collect()
+    };
+    for tc in missing {
+        let envelope = serde_json::json!({
+            "result": "Tool call interrupted by user (Ctrl+C) before it completed.",
+            "is_error": true,
+        });
+        history.push(
+            Message {
+                role: "tool".to_string(),
+                content: Some(envelope.to_string()),
+                reasoning_content: None,
+                name: Some(tc.function.name),
+                tool_call_id: Some(tc.id),
+                tool_calls: None,
+                created_at_ms: None,
+            }
+            .stamp_now(),
+        );
     }
 }
 
@@ -813,5 +879,130 @@ mod tests {
         assert_eq!(sessions[0].start_dir.as_deref(), Some("/home/project"));
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn call(id: &str, name: &str) -> crate::ToolCall {
+        crate::ToolCall {
+            id: id.to_string(),
+            r#type: "function".to_string(),
+            function: crate::ToolCallFunction {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    fn assistant_calls(calls: Vec<crate::ToolCall>) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: None,
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(calls),
+            created_at_ms: None,
+        }
+    }
+
+    fn tool_result(id: &str, name: &str, is_error: bool) -> Message {
+        Message {
+            role: "tool".to_string(),
+            content: Some(format!("{{\"result\":\"ok\",\"is_error\":{is_error}}}")),
+            reasoning_content: None,
+            name: Some(name.to_string()),
+            tool_call_id: Some(id.to_string()),
+            tool_calls: None,
+            created_at_ms: None,
+        }
+    }
+
+    fn tool_ids(history: &[Message]) -> Vec<&str> {
+        history
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect()
+    }
+
+    /// The Ctrl+C bug: a turn interrupted while tools were running leaves the
+    /// assistant `tool_calls` with no matching `tool_result`s. Heal must close
+    /// every orphaned call so the next prompt sends a valid call→result chain.
+    #[test]
+    fn heal_synthesizes_results_for_every_interrupted_call() {
+        let mut history = vec![
+            Message {
+                role: "user".to_string(),
+                content: Some("go".to_string()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                created_at_ms: None,
+            },
+            assistant_calls(vec![call("c1", "bash"), call("c2", "read")]),
+        ];
+
+        heal_interrupted_tool_calls(&mut history);
+
+        assert_eq!(tool_ids(&history), vec!["c1", "c2"]);
+        for m in history.iter().filter(|m| m.role == "tool") {
+            let v: serde_json::Value = serde_json::from_str(m.content.as_deref().unwrap()).unwrap();
+            assert_eq!(v["is_error"], serde_json::json!(true));
+        }
+    }
+
+    /// Partial interrupt: one tool finished and pushed its result before the
+    /// cancel. Heal must fill only the missing call and keep the real result.
+    #[test]
+    fn heal_fills_only_missing_results() {
+        let mut history = vec![
+            assistant_calls(vec![call("c1", "bash"), call("c2", "read")]),
+            tool_result("c1", "bash", false),
+        ];
+
+        heal_interrupted_tool_calls(&mut history);
+
+        assert_eq!(tool_ids(&history), vec!["c1", "c2"]);
+        let c1: serde_json::Value =
+            serde_json::from_str(history[1].content.as_deref().unwrap()).unwrap();
+        assert_eq!(c1["is_error"], serde_json::json!(false)); // real result kept
+        let c2: serde_json::Value =
+            serde_json::from_str(history[2].content.as_deref().unwrap()).unwrap();
+        assert_eq!(c2["is_error"], serde_json::json!(true)); // synthesized
+    }
+
+    /// A fully balanced history (normal completion) must be left untouched.
+    #[test]
+    fn heal_is_noop_when_balanced() {
+        let mut history = vec![
+            assistant_calls(vec![call("c1", "bash")]),
+            tool_result("c1", "bash", false),
+        ];
+        let before = history.clone();
+        heal_interrupted_tool_calls(&mut history);
+        assert_eq!(history.len(), before.len());
+        assert_eq!(tool_ids(&history), vec!["c1"]);
+    }
+
+    /// A completed prior tool-turn followed by a later user message must not be
+    /// retro-healed — it is already past and balanced.
+    #[test]
+    fn heal_ignores_earlier_completed_tool_turns() {
+        let mut history = vec![
+            assistant_calls(vec![call("c1", "bash")]),
+            tool_result("c1", "bash", false),
+            Message {
+                role: "user".to_string(),
+                content: Some("next".to_string()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                created_at_ms: None,
+            },
+        ];
+        let before_len = history.len();
+        heal_interrupted_tool_calls(&mut history);
+        assert_eq!(history.len(), before_len);
     }
 }
