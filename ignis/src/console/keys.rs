@@ -730,8 +730,7 @@ async fn list_hooks(app: &mut App) {
         app.add_assistant_notice("[err] hooks registry unavailable in this session.".to_string());
         return;
     };
-    let cfg = reg.snapshot().await;
-    app.add_assistant_notice(crate::hooks::format_list(&cfg));
+    app.add_assistant_notice(reg.format_list().await);
 }
 
 /// Reload `~/.ignis/hooks.json` into the shared registry. Posts an

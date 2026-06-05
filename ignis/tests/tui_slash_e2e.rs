@@ -331,16 +331,24 @@ fn hooks_command_lists_registered_chains() {
     tui.wait_for("[info] 2 hooks registered");
 
     // Edit the file (drop one hook, add a longer one) and `/hooks reload`.
-    std::fs::write(
-        ignis_home.join("hooks.json"),
-        format!(
+    // `sync_all` flushes the write to disk so the child process is
+    // guaranteed to read the new bytes regardless of OS buffering — the
+    // unit-level reload test in `hooks/mod.rs` exercises the same path
+    // in a single-process context, but a PTY spawn has its own caching.
+    let hooks_path = ignis_home.join("hooks.json");
+    {
+        let mut f = std::fs::File::create(&hooks_path).unwrap();
+        use std::io::Write as _;
+        write!(
+            f,
             r#"{{"hooks": {{"UserPromptSubmit": [
                 {{"command": "{}", "timeout_ms": 9999}}
             ]}}}}"#,
             prompt_hook.display()
-        ),
-    )
-    .unwrap();
+        )
+        .unwrap();
+        f.sync_all().unwrap();
+    }
     tui.send("/hooks reload\r");
     tui.wait_for("[info] reloaded 1 hook");
 
@@ -354,4 +362,9 @@ fn hooks_command_lists_registered_chains() {
     // the first listing, so we can't assert against that — but we CAN
     // assert the prompt chain shrank to a single entry.
     tui.wait_for("UserPromptSubmit (1):");
+
+    // Unknown subcommand falls through to the usage line. Pins that the
+    // new dispatcher doesn't silently accept arbitrary tokens.
+    tui.send("/hooks bogus\r");
+    tui.wait_for("Usage: /hooks [list] | /hooks reload");
 }

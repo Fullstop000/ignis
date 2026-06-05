@@ -130,6 +130,16 @@ impl HookRegistry {
         self.inner.read().await.clone()
     }
 
+    /// Format the current chains into a single multi-line notice. Holds
+    /// the read lock only across the sync `format_list` call — no
+    /// `.await` is nested, so the lock is dropped before this returns.
+    /// Prefer this over `snapshot() + format_list(&cfg)` to avoid cloning
+    /// two `Vec<HookSpec>` per call.
+    pub async fn format_list(&self) -> String {
+        let cfg = self.inner.read().await;
+        format_list(&cfg)
+    }
+
     /// `UserPromptSubmit` chain — same body as the render chain except
     /// that `Blocked` is honoured (returns `PromptHookResult::Blocked`)
     /// instead of being degraded to a Warning. Kept separate so the
@@ -274,16 +284,28 @@ pub(crate) fn format_list(cfg: &HooksConfig) -> String {
         return "[info] no hooks registered · edit ~/.ignis/hooks.json, then /hooks reload"
             .to_string();
     }
+    // Compute the widest display name across every chain so the program
+    // column starts at a fixed offset regardless of how long any single
+    // hook's filename is. `display_name()` is the file_stem — long
+    // project-prefixed names like `translate-to-french-v2` would
+    // otherwise push the program column right and break alignment for
+    // shorter names in the same chain.
+    let name_width = HookEvent::ALL
+        .iter()
+        .flat_map(|ev| {
+            cfg.for_event(*ev)
+                .iter()
+                .map(|s| s.display_name().chars().count())
+        })
+        .max()
+        .unwrap_or(0);
     let mut out = String::new();
     out.push_str(&format!(
         "[info] {total} hook{total_plural} registered · /hooks reload to re-read · run unsandboxed; audit before installing:",
         total_plural = if total == 1 { "" } else { "s" },
     ));
-    for event in [
-        HookEvent::UserPromptSubmit,
-        HookEvent::AssistantMessageRender,
-    ] {
-        let chain = cfg.for_event(event);
+    for event in HookEvent::ALL {
+        let chain = cfg.for_event(*event);
         if chain.is_empty() {
             continue;
         }
@@ -301,7 +323,7 @@ pub(crate) fn format_list(cfg: &HooksConfig) -> String {
             out.push_str(&format!(
                 "\n    \u{00b7} {name:<width$}  {prog}{argv}  (timeout {ms}ms)",
                 name = spec.display_name(),
-                width = 16,
+                width = name_width,
                 prog = spec.program.display(),
                 ms = spec.timeout_ms,
             ));
@@ -659,6 +681,82 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         };
         let out = format_list(&cfg);
         assert!(!out.contains("UserPromptSubmit"));
+        assert!(out.contains("AssistantMessageRender (1):"));
+    }
+
+    #[test]
+    fn format_list_aligns_columns_when_names_have_different_lengths() {
+        // Regression: a long `display_name()` (the file_stem of the
+        // program) co-existing with a short one would, with a fixed
+        // `:16` width, push the program column right for the long name
+        // and leave stray spaces for the short one. The formatter now
+        // computes the max width across the call, so both program
+        // paths line up. We assert by checking the *byte* offset of the
+        // program path on each line — they should all be equal.
+        //
+        // `display_name()` is the file_stem of the program, not any
+        // parent directory component — so we put the long name in the
+        // file name itself: `…/translate-to-french-v2.py` (stem is
+        // `translate-to-french-v2`, 22 chars) vs. `…/redact.sh` (stem
+        // is `redact`, 6 chars).
+        let cfg = HooksConfig {
+            user_prompt_submit: vec![
+                HookSpec {
+                    program: PathBuf::from("/opt/translate-to-french-v2.py"),
+                    args: vec![],
+                    timeout_ms: 10_000,
+                },
+                HookSpec {
+                    program: PathBuf::from("/opt/redact.sh"),
+                    args: vec![],
+                    timeout_ms: 10_000,
+                },
+            ],
+            assistant_message_render: vec![],
+        };
+        let out = format_list(&cfg);
+        // Expected max name width: "translate-to-french-v2" == 22 chars.
+        // Each hook line has the prefix "    \u{00b7} " (4-space indent +
+        // bullet + space) == 7 bytes (the bullet is 2 bytes in UTF-8),
+        // then a name left-padded to 22, then "  " (2 spaces) before the
+        // program. So the program column starts at byte 7 + 22 + 2 == 31
+        // for every line.
+        let expected_prog_col = 7 + "translate-to-french-v2".chars().count() + 2;
+        let hook_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("· ") && l.contains("(timeout"))
+            .collect();
+        assert_eq!(hook_lines.len(), 2, "got: {out}");
+        for line in &hook_lines {
+            assert!(
+                line[expected_prog_col..].starts_with("/opt/"),
+                "program column mis-aligned: `{line}` (len={}, expected prog at byte {expected_prog_col})",
+                line.len()
+            );
+        }
+    }
+
+    #[test]
+    fn format_list_iterates_all_known_events() {
+        // Pin the "list of events" surface: formatter iterates the same
+        // slice the registry is typed against, so adding a new event
+        // variant to `HookEvent::ALL` automatically appears in the
+        // listing without touching this function.
+        assert_eq!(HookEvent::ALL.len(), 2);
+        let cfg = HooksConfig {
+            user_prompt_submit: vec![HookSpec {
+                program: PathBuf::from("/a"),
+                args: vec![],
+                timeout_ms: 1_000,
+            }],
+            assistant_message_render: vec![HookSpec {
+                program: PathBuf::from("/b"),
+                args: vec![],
+                timeout_ms: 1_000,
+            }],
+        };
+        let out = format_list(&cfg);
+        assert!(out.contains("UserPromptSubmit (1):"));
         assert!(out.contains("AssistantMessageRender (1):"));
     }
 }

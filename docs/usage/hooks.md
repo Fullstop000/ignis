@@ -132,16 +132,22 @@ SIGTERM grace window before the SIGKILL.
 Type `/hooks` (or its explicit alias `/hooks list`) to print the
 chains that the running session is actually using — one block per
 event, each entry showing the program path, its argv tail, and the
-per-hook timeout:
+per-hook timeout. The leftmost column is the hook's `display_name()`
+(its program file's stem, no directory or extension):
 
 ```
 [info] 3 hooks registered · /hooks reload to re-read · run unsandboxed; audit before installing:
   UserPromptSubmit (2):
-    · translate-en     ~/.ignis/hooks/translate-en/run.py  (timeout 10000ms)
-    · redact           /opt/ignis/hooks/redact.sh  --strict  (timeout 30000ms)
+    · translate-en  ~/.ignis/hooks/translate-en/run.py  (timeout 10000ms)
+    · redact        /opt/ignis/hooks/redact.sh --strict  (timeout 30000ms)
   AssistantMessageRender (1):
-    · translate-en     ~/.ignis/hooks/translate-en/run.py  (timeout 10000ms)
+    · translate-en  ~/.ignis/hooks/translate-en/run.py  (timeout 10000ms)
 ```
+
+(The `translate-en` in the name column there assumes your program
+lives at `…/translate-en/run` — the name is the stem, not the
+directory. If your hook is `…/translate-en/translate.py`, the column
+will show `translate`.)
 
 When no hooks are registered, the command prints a single
 `[info] no hooks registered` line pointing at the file path and the
