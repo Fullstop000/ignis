@@ -177,15 +177,34 @@ fn wrap_line(line: &Line<'static>, width: u16, indent_cols: usize) -> Vec<Line<'
             .iter()
             .map(|(c, _)| UnicodeWidthChar::width(*c).unwrap_or(0))
             .sum();
-        let floor = if first_row { 0 } else { indent_cols };
-        if cur_w + word_w > width && cur_w > floor {
-            rows.push(std::mem::take(&mut cur));
-            first_row = false;
-            cur = indent_row();
-            cur_w = indent_cols;
+        if word_w <= width {
+            // Word fits on a row — soft-wrap to a fresh row if it won't fit here.
+            let floor = if first_row { 0 } else { indent_cols };
+            if cur_w + word_w > width && cur_w > floor {
+                rows.push(std::mem::take(&mut cur));
+                first_row = false;
+                cur = indent_row();
+                cur_w = indent_cols;
+            }
+            cur.extend_from_slice(word);
+            cur_w += word_w;
+        } else {
+            // Word is wider than a whole row — a space-less run (CJK text, a long
+            // URL). Hard-break it at the column boundary so no line exceeds
+            // `width`; otherwise it re-wraps at render and clips the transcript.
+            for &cell in word {
+                let cw = UnicodeWidthChar::width(cell.0).unwrap_or(0);
+                let floor = if first_row { 0 } else { indent_cols };
+                if cur_w + cw > width && cur_w > floor {
+                    rows.push(std::mem::take(&mut cur));
+                    first_row = false;
+                    cur = indent_row();
+                    cur_w = indent_cols;
+                }
+                cur.push(cell);
+                cur_w += cw;
+            }
         }
-        cur.extend_from_slice(word);
-        cur_w += word_w;
         // Trailing run of spaces; keep only if it still fits the row.
         let ss = i;
         while i < n && cells[i].0 == ' ' {
@@ -261,6 +280,34 @@ mod tests {
             .iter()
             .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
             .sum()
+    }
+
+    /// A space-less run wider than a row (CJK text, a long URL) must be
+    /// hard-broken so no line exceeds width. Pre-fix `wrap_line` only broke on
+    /// ASCII spaces, so CJK — which has none — stayed over-wide, re-wrapped at
+    /// render, and clipped the transcript (the bilingual ask_user case).
+    #[test]
+    fn wrap_line_hard_breaks_spaceless_run() {
+        let width: u16 = 10;
+        let original = "汉字汉字汉字汉字abcdefghij"; // 16 + 10 = 26 cols, no spaces
+        let rows = wrap_line(&Line::from(original), width, 2);
+        assert!(rows.len() > 1, "expected the run to break across rows");
+        for (i, r) in rows.iter().enumerate() {
+            assert!(
+                line_cols(r) <= width as usize,
+                "row {i} is {} cols, exceeds width {width}",
+                line_cols(r),
+            );
+        }
+        let joined: String = rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert_eq!(
+            joined.replace(' ', ""),
+            original,
+            "content must round-trip (only synthetic indent spaces added)",
+        );
     }
 
     /// `render_transcript` slices the transcript one logical `Line` per visible

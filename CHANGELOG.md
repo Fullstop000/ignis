@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Interrupting a turn with `Ctrl+C` no longer breaks the next message — an interrupted tool call is closed out so the conversation continues instead of being rejected by the provider. ([#129](https://github.com/Fullstop000/ignis/pull/129))
+- TUI — a long `ask_user` question (including CJK and other space-less text) no longer overruns its row and hides the newest transcript lines behind the status bar. ([#130](https://github.com/Fullstop000/ignis/pull/130))
 
 ## [0.34.0] - 2026-06-05
 
