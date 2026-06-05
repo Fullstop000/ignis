@@ -81,7 +81,13 @@ pub(crate) fn block_lines(
             // on session resume — the live trace is ephemeral — so build a
             // compact trace from the persisted entry instead.
             if entry.name == "ask_user" {
-                lines.extend(ask_user_resume_trace(entry));
+                // Wrap to width like every other block: render_transcript slices
+                // one logical line per row, so an over-wide trace line would
+                // re-wrap at render and clip the transcript bottom behind the band.
+                for line in ask_user_resume_trace(entry) {
+                    let indent = leading_space_cols(&line);
+                    lines.extend(wrap_line(&line, width, indent));
+                }
                 return lines;
             }
             let mut raw: Vec<Line<'static>> = Vec::new();
@@ -171,15 +177,34 @@ fn wrap_line(line: &Line<'static>, width: u16, indent_cols: usize) -> Vec<Line<'
             .iter()
             .map(|(c, _)| UnicodeWidthChar::width(*c).unwrap_or(0))
             .sum();
-        let floor = if first_row { 0 } else { indent_cols };
-        if cur_w + word_w > width && cur_w > floor {
-            rows.push(std::mem::take(&mut cur));
-            first_row = false;
-            cur = indent_row();
-            cur_w = indent_cols;
+        if word_w <= width {
+            // Word fits on a row — soft-wrap to a fresh row if it won't fit here.
+            let floor = if first_row { 0 } else { indent_cols };
+            if cur_w + word_w > width && cur_w > floor {
+                rows.push(std::mem::take(&mut cur));
+                first_row = false;
+                cur = indent_row();
+                cur_w = indent_cols;
+            }
+            cur.extend_from_slice(word);
+            cur_w += word_w;
+        } else {
+            // Word is wider than a whole row — a space-less run (CJK text, a long
+            // URL). Hard-break it at the column boundary so no line exceeds
+            // `width`; otherwise it re-wraps at render and clips the transcript.
+            for &cell in word {
+                let cw = UnicodeWidthChar::width(cell.0).unwrap_or(0);
+                let floor = if first_row { 0 } else { indent_cols };
+                if cur_w + cw > width && cur_w > floor {
+                    rows.push(std::mem::take(&mut cur));
+                    first_row = false;
+                    cur = indent_row();
+                    cur_w = indent_cols;
+                }
+                cur.push(cell);
+                cur_w += cw;
+            }
         }
-        cur.extend_from_slice(word);
-        cur_w += word_w;
         // Trailing run of spaces; keep only if it still fits the row.
         let ss = i;
         while i < n && cells[i].0 == ' ' {
@@ -241,4 +266,82 @@ pub(crate) fn welcome_lines(app: &App) -> Vec<Line<'static>> {
         ])
     };
     vec![Line::from(""), title, info_line, Line::from("")]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::console::app::{ToolCallEntry, ToolStatus, UIBlock};
+    use std::time::Instant;
+    use unicode_width::UnicodeWidthStr;
+
+    fn line_cols(line: &Line) -> usize {
+        line.spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum()
+    }
+
+    /// A space-less run wider than a row (CJK text, a long URL) must be
+    /// hard-broken so no line exceeds width. Pre-fix `wrap_line` only broke on
+    /// ASCII spaces, so CJK — which has none — stayed over-wide, re-wrapped at
+    /// render, and clipped the transcript (the bilingual ask_user case).
+    #[test]
+    fn wrap_line_hard_breaks_spaceless_run() {
+        let width: u16 = 10;
+        let original = "汉字汉字汉字汉字abcdefghij"; // 16 + 10 = 26 cols, no spaces
+        let rows = wrap_line(&Line::from(original), width, 2);
+        assert!(rows.len() > 1, "expected the run to break across rows");
+        for (i, r) in rows.iter().enumerate() {
+            assert!(
+                line_cols(r) <= width as usize,
+                "row {i} is {} cols, exceeds width {width}",
+                line_cols(r),
+            );
+        }
+        let joined: String = rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert_eq!(
+            joined.replace(' ', ""),
+            original,
+            "content must round-trip (only synthetic indent spaces added)",
+        );
+    }
+
+    /// `render_transcript` slices the transcript one logical `Line` per visible
+    /// row and renders with `Wrap`. That only holds if every committed line is
+    /// ≤ width. A long `ask_user` question must therefore be wrapped at commit
+    /// time, not left as one over-wide line that re-wraps (and over-runs the
+    /// area) at render — which is what hid chat history behind the status band.
+    #[test]
+    fn ask_user_trace_lines_fit_width() {
+        let width: u16 = 40;
+        let result = serde_json::json!({
+            "answers": [{
+                "question": "PR #127 green. Two feat: commits since v0.34.0. \
+                             Add to [Unreleased], or bump to v0.35.0 and cut a release?",
+                "answer": "Bump to v0.35.0 and cut a release"
+            }]
+        })
+        .to_string();
+        let block = UIBlock::Tool(ToolCallEntry {
+            id: "1".into(),
+            name: "ask_user".into(),
+            arguments: "{}".into(),
+            status: ToolStatus::Success(result),
+            started_at: Instant::now(),
+            elapsed_ms: 0,
+        });
+        let lines = block_lines(&block, 0, Path::new("/tmp"), width);
+        for (i, l) in lines.iter().enumerate() {
+            assert!(
+                line_cols(l) <= width as usize,
+                "ask_user trace line {i} is {} cols, exceeds width {width} — \
+                 it will re-wrap at render and clip the transcript bottom",
+                line_cols(l),
+            );
+        }
+    }
 }
