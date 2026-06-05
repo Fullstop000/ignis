@@ -353,25 +353,18 @@ mod queue_render_tests {
         App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"))
     }
 
-    /// Regression: a long `ask_user` trace once re-wrapped at render while
-    /// being counted as a single row, pushing the newest transcript line off
-    /// the bottom — it read as "the running status bar covers the chat
-    /// history". With the trace wrapped at commit time, the newest line stays
-    /// visible. Exercises the real block_lines → transcript → render path.
+    /// Regression: a long `ask_user` trace once produced rows wider than the
+    /// viewport. Inline rendering blits `block_lines` rows verbatim into
+    /// scrollback (no render-time re-wrap), so an over-width row would be
+    /// truncated. `block_lines` must therefore hard-break over-wide words so
+    /// every row fits the width.
     #[test]
-    fn long_ask_user_trace_keeps_newest_line_visible() {
+    fn long_ask_user_trace_wraps_within_width() {
         use crate::console::app::{ToolCallEntry, ToolStatus, UIBlock};
-        use ratatui::{backend::TestBackend, text::Line, Terminal};
         use std::time::Instant;
+        use unicode_width::UnicodeWidthStr;
 
-        // Viewport SHORTER than the transcript so auto-follow pins to the
-        // bottom — the condition under which an over-wide line's render-time
-        // re-wrap pushes the newest row off the bottom.
-        let (width, height) = (40u16, 4u16);
-        let mut a = app();
-        for i in 0..6 {
-            a.commit_transcript_lines(vec![Line::from(format!("ctx{i}"))]);
-        }
+        let width = 40u16;
         let result = serde_json::json!({
             "answers": [{
                 "question": "PR #127 green. Two feat: commits since v0.34.0. \
@@ -389,26 +382,17 @@ mod queue_render_tests {
             elapsed_ms: 0,
         });
         let lines = blocks::block_lines(&block, 0, std::path::Path::new("/tmp"), width);
-        a.commit_transcript_lines(lines);
-        a.commit_transcript_lines(vec![Line::from("NEWEST_SENTINEL")]);
-
-        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
-        term.draw(|f| {
-            let area = f.size();
-            super::render_transcript(f, area, &mut a);
-        })
-        .unwrap();
-        let rendered: String = term
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(
-            rendered.contains("NEWEST_SENTINEL"),
-            "newest transcript line was clipped behind the band:\n{rendered}"
-        );
+        for line in &lines {
+            let cols: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(
+                cols <= width as usize,
+                "ask_user trace row exceeds width {width} ({cols} cols): {line:?}"
+            );
+        }
     }
 
     #[test]
