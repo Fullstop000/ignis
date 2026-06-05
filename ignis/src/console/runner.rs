@@ -438,6 +438,13 @@ pub async fn run_console(
                     }
                     _ => {}
                 },
+                // A SIGWINCH reaches us as Resize — fired on a real resize AND
+                // on a tmux/screen detach→reattach, which re-sends the window
+                // size even when it's unchanged. ratatui's autoresize only
+                // repaints when the size *changed*, so a same-size reattach
+                // would leave the alt-screen blank (history "lost"). Force a
+                // full redraw from `app.transcript` on the next draw.
+                Event::Resize(_, _) => terminal.clear()?,
                 _ => {}
             }
         }
