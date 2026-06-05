@@ -95,7 +95,8 @@ pub async fn run_console(
     // A fixed-height band stays pinned at the bottom. `_term_guard` restores raw
     // mode on early-return or panic.
     let _term_guard = TerminalGuard::install()?;
-    let mut viewport_rows = render::viewport_height(&app, crossterm::terminal::size()?.1);
+    let init_size = crossterm::terminal::size()?;
+    let mut viewport_rows = render::viewport_height(&app, init_size.0, init_size.1);
     let mut terminal = make_terminal(viewport_rows)?;
 
     // Welcome banner: pushed into scrollback above the band, like any block.
@@ -493,7 +494,7 @@ pub async fn run_console(
             // scrollback (#77); taking over with clear()+fresh viewport on any
             // size change re-anchors cleanly.
             let term_size = crossterm::terminal::size()?;
-            let want_rows = render::viewport_height(&app, term_size.1);
+            let want_rows = render::viewport_height(&app, term_size.0, term_size.1);
             let resized = term_size != last_term_size;
             if want_rows != viewport_rows || resized {
                 if resized {

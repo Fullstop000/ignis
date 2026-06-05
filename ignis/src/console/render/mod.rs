@@ -36,6 +36,12 @@ pub(crate) use widgets::{
 /// suggestions + input box + footer. Independent of the transcript above it.
 pub(crate) fn band_height(app: &App, term_rows: u16) -> u16 {
     let cap = term_rows.saturating_sub(1).max(3);
+    // While a picker is open the user is answering, not typing — the band
+    // collapses to status + footer and the picker takes the room above
+    // (it replaces the input region rather than sitting beside an empty box).
+    if picker_open(app) {
+        return 2.min(cap);
+    }
     let input_h = input_height(app, cap);
     let sugg = app.slash_suggestions();
     let sugg_h = if !sugg.is_empty() {
@@ -64,17 +70,30 @@ fn picker_open(app: &App) -> bool {
         || app.mcp_picker.is_some()
 }
 
-/// Height (rows) of the inline viewport: just the band in the common case, or
-/// (nearly) the whole terminal when a picker is open so it has room above the
-/// band. The runner rebuilds the `Terminal` whenever this changes — which, with
-/// a fixed band, is only on picker open/close or multi-line input growth.
-pub(crate) fn viewport_height(app: &App, term_rows: u16) -> u16 {
+/// Height (rows) of the inline viewport. The runner rebuilds the `Terminal`
+/// whenever this changes — which, with a fixed band, is only on picker
+/// open/close or multi-line input growth.
+///
+/// - `ask_user` (a tool-initiated `inline_picker`): just the picker + the
+///   status/footer band, so the conversation stays visible in native scrollback
+///   *above* the picker (it replaces the input region, CC-style).
+/// - slash-command pickers (`/model`, `/sessions`, …): the whole terminal, since
+///   they're entered intentionally and benefit from the room.
+/// - otherwise: just the band.
+pub(crate) fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 {
     let cap = term_rows.saturating_sub(1).max(3);
-    if picker_open(app) {
-        cap
-    } else {
-        band_height(app, term_rows).min(cap)
+    if let Some(p) = &app.inline_picker {
+        let picker_h = super::inline_picker::picker_height(p, term_cols);
+        return (picker_h + 2).min(cap); // picker + status + footer
     }
+    if app.model_picker.is_some()
+        || app.session_picker.is_some()
+        || app.skill_picker.is_some()
+        || app.mcp_picker.is_some()
+    {
+        return cap;
+    }
+    band_height(app, term_rows).min(cap)
 }
 
 /// Blit pre-wrapped `lines` (one `Line` per visual row — `block_lines` already
@@ -198,6 +217,22 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     }
     // No picker → `body_area` is zero-height; the band fills the viewport and
     // the conversation is in native scrollback above it.
+
+    // Band: status … footer. While a picker is open the band is just status +
+    // footer (no input box / slash / queued) — the picker above is the input.
+    if picker_open(app) {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(band_area);
+        draw_loading(f, split[0], app);
+        draw_footer(f, split[2], app);
+        return;
+    }
 
     // Band: laid out from the top of `band_area` down. Order is the same as
     // the legacy inline band — status, queued, slash, input, footer.
