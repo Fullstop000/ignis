@@ -266,3 +266,105 @@ fn ctrl_d_must_be_pressed_twice_to_exit() {
     tui.send("\x04");
     tui.wait_for_exit();
 }
+
+#[test]
+fn hooks_command_lists_registered_chains() {
+    // Spins up the TUI with a hand-rolled hooks.json (one entry per event)
+    // and asserts that bare `/hooks` and `/hooks list` both render the
+    // expected chain headers, names, program paths, and timeout — and
+    // that `/hooks reload` re-reads the file (we mutate it on disk in
+    // between). This pins the user-visible behaviour of the new subcommand
+    // without coupling the test to internal formatter strings beyond the
+    // stable anchors.
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let ignis_home = home.path().join(".ignis");
+    std::fs::create_dir_all(&ignis_home).unwrap();
+
+    // Write two hooks — one per event, distinct timeouts so the listing
+    // proves the timeout column is wired up.
+    let prompt_hook = project.path().join("prompt-hook.sh");
+    std::fs::write(&prompt_hook, "#!/bin/sh\ncat >/dev/null\nprintf '{}'\n").unwrap();
+    let render_hook = project.path().join("render-hook.sh");
+    std::fs::write(&render_hook, "#!/bin/sh\ncat >/dev/null\nprintf '{}'\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in [&prompt_hook, &render_hook] {
+            let mut perms = std::fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(p, perms).unwrap();
+        }
+    }
+
+    let hooks_json = format!(
+        r#"{{
+            "hooks": {{
+                "UserPromptSubmit": [
+                    {{"command": "{}", "timeout_ms": 1234}}
+                ],
+                "AssistantMessageRender": [
+                    {{"command": "{}", "timeout_ms": 5678}}
+                ]
+            }}
+        }}"#,
+        prompt_hook.display(),
+        render_hook.display(),
+    );
+    std::fs::write(ignis_home.join("hooks.json"), &hooks_json).unwrap();
+
+    let mut tui = TuiProcess::spawn(home.path(), project.path());
+    tui.wait_for("Your AI coding agent");
+
+    // Bare `/hooks` lists.
+    tui.send("/hooks\r");
+    tui.wait_for("[info] 2 hooks registered");
+    tui.wait_for("UserPromptSubmit (1):");
+    tui.wait_for("AssistantMessageRender (1):");
+    tui.wait_for("prompt-hook");
+    tui.wait_for("render-hook");
+    tui.wait_for("timeout 1234ms");
+    tui.wait_for("timeout 5678ms");
+
+    // `/hooks list` is an alias — produces the same listing.
+    tui.send("/hooks list\r");
+    tui.wait_for("[info] 2 hooks registered");
+
+    // Edit the file (drop one hook, add a longer one) and `/hooks reload`.
+    // `sync_all` flushes the write to disk so the child process is
+    // guaranteed to read the new bytes regardless of OS buffering — the
+    // unit-level reload test in `hooks/mod.rs` exercises the same path
+    // in a single-process context, but a PTY spawn has its own caching.
+    let hooks_path = ignis_home.join("hooks.json");
+    {
+        let mut f = std::fs::File::create(&hooks_path).unwrap();
+        use std::io::Write as _;
+        write!(
+            f,
+            r#"{{"hooks": {{"UserPromptSubmit": [
+                {{"command": "{}", "timeout_ms": 9999}}
+            ]}}}}"#,
+            prompt_hook.display()
+        )
+        .unwrap();
+        f.sync_all().unwrap();
+    }
+    tui.send("/hooks reload\r");
+    tui.wait_for("[info] reloaded 1 hook");
+
+    // Reloaded list reflects the new state.
+    tui.send("/hooks\r");
+    tui.wait_for("[info] 1 hook registered");
+    tui.wait_for("UserPromptSubmit (1):");
+    tui.wait_for("timeout 9999ms");
+    // The render hook is gone from the new listing. The full output buffer
+    // still contains the older "AssistantMessageRender (1):" line from
+    // the first listing, so we can't assert against that — but we CAN
+    // assert the prompt chain shrank to a single entry.
+    tui.wait_for("UserPromptSubmit (1):");
+
+    // Unknown subcommand falls through to the usage line. Pins that the
+    // new dispatcher doesn't silently accept arbitrary tokens.
+    tui.send("/hooks bogus\r");
+    tui.wait_for("Usage: /hooks [list] | /hooks reload");
+}

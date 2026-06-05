@@ -122,6 +122,24 @@ impl HookRegistry {
         !self.inner.read().await.for_event(event).is_empty()
     }
 
+    /// Cheap clone of the in-memory `HooksConfig`. Used by `/hooks` to
+    /// render the currently-registered chains without re-reading disk.
+    /// The list reflects the last `reload()` (or initial load) — it is
+    /// not a live probe of the filesystem.
+    pub async fn snapshot(&self) -> HooksConfig {
+        self.inner.read().await.clone()
+    }
+
+    /// Format the current chains into a single multi-line notice. Holds
+    /// the read lock only across the sync `format_list` call — no
+    /// `.await` is nested, so the lock is dropped before this returns.
+    /// Prefer this over `snapshot() + format_list(&cfg)` to avoid cloning
+    /// two `Vec<HookSpec>` per call.
+    pub async fn format_list(&self) -> String {
+        let cfg = self.inner.read().await;
+        format_list(&cfg)
+    }
+
     /// `UserPromptSubmit` chain — same body as the render chain except
     /// that `Blocked` is honoured (returns `PromptHookResult::Blocked`)
     /// instead of being degraded to a Warning. Kept separate so the
@@ -241,7 +259,6 @@ pub enum PromptHookResult {
     /// MUST NOT push the prompt to history or call the agent.
     Blocked { stderr: String },
 }
-
 async fn emit_warning(tx: &EventSender, event: HookEvent, message: &str) {
     let _ = tx
         .send(AgentEvent::Warning {
@@ -254,6 +271,65 @@ async fn emit_warning(tx: &EventSender, event: HookEvent, message: &str) {
 fn trim_one_line(s: &str) -> String {
     let one = s.replace('\n', " ").trim().to_string();
     truncate_chars(&one, 200)
+}
+
+/// Render the in-memory `HooksConfig` as a multi-line notice suitable for
+/// `add_assistant_notice`. Always returns at least one line; the empty
+/// case is rendered as a single `[info]` line so the user gets feedback
+/// rather than a silent no-op. The list reflects the last `reload()` —
+/// it is not a live probe of `~/.ignis/hooks.json`.
+pub(crate) fn format_list(cfg: &HooksConfig) -> String {
+    let total = cfg.total_len();
+    if total == 0 {
+        return "[info] no hooks registered · edit ~/.ignis/hooks.json, then /hooks reload"
+            .to_string();
+    }
+    // Compute the widest display name across every chain so the program
+    // column starts at a fixed offset regardless of how long any single
+    // hook's filename is. `display_name()` is the file_stem — long
+    // project-prefixed names like `translate-to-french-v2` would
+    // otherwise push the program column right and break alignment for
+    // shorter names in the same chain.
+    let name_width = HookEvent::ALL
+        .iter()
+        .flat_map(|ev| {
+            cfg.for_event(*ev)
+                .iter()
+                .map(|s| s.display_name().chars().count())
+        })
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "[info] {total} hook{total_plural} registered · /hooks reload to re-read · run unsandboxed; audit before installing:",
+        total_plural = if total == 1 { "" } else { "s" },
+    ));
+    for event in HookEvent::ALL {
+        let chain = cfg.for_event(*event);
+        if chain.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "\n  {event_name} ({n}):",
+            event_name = event.as_str(),
+            n = chain.len(),
+        ));
+        for spec in chain {
+            let argv = if spec.args.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", spec.args.join(" "))
+            };
+            out.push_str(&format!(
+                "\n    \u{00b7} {name:<width$}  {prog}{argv}  (timeout {ms}ms)",
+                name = spec.display_name(),
+                width = name_width,
+                prog = spec.program.display(),
+                ms = spec.timeout_ms,
+            ));
+        }
+    }
+    out
 }
 
 /// Char-boundary-safe truncation. Returns at most `n` chars from `s`,
@@ -506,5 +582,181 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         assert_eq!(reg.inner.read().await.total_len(), 1);
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn snapshot_clones_current_config() {
+        // `/hooks` listing is driven by `snapshot()` — pins that it returns
+        // the in-memory state (not a disk probe) and is decoupled from any
+        // concurrent `run_*` chain.
+        let cfg = HooksConfig {
+            user_prompt_submit: vec![HookSpec {
+                program: PathBuf::from("/a/hook.sh"),
+                args: vec!["--flag".to_string()],
+                timeout_ms: 7_000,
+            }],
+            assistant_message_render: vec![],
+        };
+        let reg = HookRegistry::from_config(cfg.clone());
+        let snap = reg.snapshot().await;
+        assert_eq!(snap, cfg);
+    }
+
+    #[test]
+    fn format_list_empty_registry_prompts_to_install() {
+        let out = format_list(&HooksConfig::default());
+        assert!(out.starts_with("[info]"));
+        assert!(out.contains("no hooks registered"));
+        // The hint mentions both the file path and the reload action so a
+        // user who just typed `/hooks` knows what to do next.
+        assert!(out.contains("~/.ignis/hooks.json"));
+        assert!(out.contains("/hooks reload"));
+    }
+
+    #[test]
+    fn format_list_one_hook_per_event_uses_singular_wording() {
+        let cfg = HooksConfig {
+            user_prompt_submit: vec![HookSpec {
+                program: PathBuf::from("/opt/translate/run.py"),
+                args: vec![],
+                timeout_ms: 10_000,
+            }],
+            assistant_message_render: vec![],
+        };
+        let out = format_list(&cfg);
+        assert!(out.contains("1 hook registered "), "got: {out}");
+        assert!(!out.contains("1 hooks"), "got: {out}");
+        assert!(out.contains("UserPromptSubmit (1):"));
+        assert!(out.contains("translate")); // file_stem of run.py
+        assert!(out.contains("/opt/translate/run.py"));
+        assert!(out.contains("timeout 10000ms"));
+        // No args tail when argv is empty.
+        assert!(!out.contains("--"));
+    }
+
+    #[test]
+    fn format_list_multi_hook_renders_each_chain_and_argv() {
+        let cfg = HooksConfig {
+            user_prompt_submit: vec![
+                HookSpec {
+                    program: PathBuf::from("/opt/translate/run.py"),
+                    args: vec!["--source".to_string(), "en".to_string()],
+                    timeout_ms: 30_000,
+                },
+                HookSpec {
+                    program: PathBuf::from("/opt/redact.sh"),
+                    args: vec![],
+                    timeout_ms: 5_000,
+                },
+            ],
+            assistant_message_render: vec![HookSpec {
+                program: PathBuf::from("/opt/translate/run.py"),
+                args: vec![],
+                timeout_ms: 10_000,
+            }],
+        };
+        let out = format_list(&cfg);
+        // Plural wording, both event headers, both hooks in the prompt
+        // chain, the single render hook, and the argv tail all appear.
+        assert!(out.contains("3 hooks registered "), "got: {out}");
+        assert!(out.contains("UserPromptSubmit (2):"));
+        assert!(out.contains("AssistantMessageRender (1):"));
+        assert!(out.contains("translate"));
+        assert!(out.contains("redact"));
+        assert!(out.contains("--source en"), "argv tail missing in: {out}");
+        assert!(out.contains("timeout 30000ms"));
+    }
+
+    #[test]
+    fn format_list_omits_empty_event_chains() {
+        // If only AssistantMessageRender is configured, the UserPromptSubmit
+        // header must not be rendered as `(0):` — that's noise.
+        let cfg = HooksConfig {
+            user_prompt_submit: vec![],
+            assistant_message_render: vec![HookSpec {
+                program: PathBuf::from("/opt/render.sh"),
+                args: vec![],
+                timeout_ms: 1_000,
+            }],
+        };
+        let out = format_list(&cfg);
+        assert!(!out.contains("UserPromptSubmit"));
+        assert!(out.contains("AssistantMessageRender (1):"));
+    }
+
+    #[test]
+    fn format_list_aligns_columns_when_names_have_different_lengths() {
+        // Regression: a long `display_name()` (the file_stem of the
+        // program) co-existing with a short one would, with a fixed
+        // `:16` width, push the program column right for the long name
+        // and leave stray spaces for the short one. The formatter now
+        // computes the max width across the call, so both program
+        // paths line up. We assert by checking the *byte* offset of the
+        // program path on each line — they should all be equal.
+        //
+        // `display_name()` is the file_stem of the program, not any
+        // parent directory component — so we put the long name in the
+        // file name itself: `…/translate-to-french-v2.py` (stem is
+        // `translate-to-french-v2`, 22 chars) vs. `…/redact.sh` (stem
+        // is `redact`, 6 chars).
+        let cfg = HooksConfig {
+            user_prompt_submit: vec![
+                HookSpec {
+                    program: PathBuf::from("/opt/translate-to-french-v2.py"),
+                    args: vec![],
+                    timeout_ms: 10_000,
+                },
+                HookSpec {
+                    program: PathBuf::from("/opt/redact.sh"),
+                    args: vec![],
+                    timeout_ms: 10_000,
+                },
+            ],
+            assistant_message_render: vec![],
+        };
+        let out = format_list(&cfg);
+        // Expected max name width: "translate-to-french-v2" == 22 chars.
+        // Each hook line has the prefix "    \u{00b7} " (4-space indent +
+        // bullet + space) == 7 bytes (the bullet is 2 bytes in UTF-8),
+        // then a name left-padded to 22, then "  " (2 spaces) before the
+        // program. So the program column starts at byte 7 + 22 + 2 == 31
+        // for every line.
+        let expected_prog_col = 7 + "translate-to-french-v2".chars().count() + 2;
+        let hook_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("· ") && l.contains("(timeout"))
+            .collect();
+        assert_eq!(hook_lines.len(), 2, "got: {out}");
+        for line in &hook_lines {
+            assert!(
+                line[expected_prog_col..].starts_with("/opt/"),
+                "program column mis-aligned: `{line}` (len={}, expected prog at byte {expected_prog_col})",
+                line.len()
+            );
+        }
+    }
+
+    #[test]
+    fn format_list_iterates_all_known_events() {
+        // Pin the "list of events" surface: formatter iterates the same
+        // slice the registry is typed against, so adding a new event
+        // variant to `HookEvent::ALL` automatically appears in the
+        // listing without touching this function.
+        assert_eq!(HookEvent::ALL.len(), 2);
+        let cfg = HooksConfig {
+            user_prompt_submit: vec![HookSpec {
+                program: PathBuf::from("/a"),
+                args: vec![],
+                timeout_ms: 1_000,
+            }],
+            assistant_message_render: vec![HookSpec {
+                program: PathBuf::from("/b"),
+                args: vec![],
+                timeout_ms: 1_000,
+            }],
+        };
+        let out = format_list(&cfg);
+        assert!(out.contains("UserPromptSubmit (1):"));
+        assert!(out.contains("AssistantMessageRender (1):"));
     }
 }

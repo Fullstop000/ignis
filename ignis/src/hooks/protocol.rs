@@ -22,6 +22,15 @@ impl HookEvent {
             HookEvent::AssistantMessageRender => "AssistantMessageRender",
         }
     }
+
+    /// Stable declaration order for the `/hooks` listing and any other
+    /// consumer that needs to iterate every event. Adding a new variant
+    /// is a two-line change (this slice + the `as_str` arm); the listing
+    /// will pick it up automatically.
+    pub const ALL: &'static [HookEvent] = &[
+        HookEvent::UserPromptSubmit,
+        HookEvent::AssistantMessageRender,
+    ];
 }
 
 /// JSON written to the hook subprocess's stdin. Fields use camelCase /

@@ -53,7 +53,9 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: Cow::Borrowed("/hooks"),
-        description: Cow::Borrowed("Reload ~/.ignis/hooks.json (`/hooks reload`)"),
+        description: Cow::Borrowed(
+            "List registered hooks (`/hooks`) or reload ~/.ignis/hooks.json (`/hooks reload`)",
+        ),
     },
 ];
 
