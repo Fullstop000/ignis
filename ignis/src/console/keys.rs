@@ -535,19 +535,6 @@ pub(crate) async fn handle_key(
             app.clear_exit_hint();
             app.move_right();
         }
-        (m, KeyCode::Home) if m.contains(KeyModifiers::CONTROL) => {
-            app.scroll_transcript_to_top();
-        }
-        (m, KeyCode::End) if m.contains(KeyModifiers::CONTROL) => {
-            app.scroll_transcript_to_bottom();
-        }
-        // Empty input → End follows the transcript to the bottom (matches the
-        // "(End to follow)" hint in `render_transcript`); PgUp/PgDn-when-empty
-        // uses the same idea. Falls through to cursor-end when the user is
-        // editing input.
-        (_, KeyCode::End) if app.input.is_empty() => {
-            app.scroll_transcript_to_bottom();
-        }
         (_, KeyCode::Home) => {
             app.clear_exit_hint();
             app.cursor = 0;
@@ -556,19 +543,9 @@ pub(crate) async fn handle_key(
             app.clear_exit_hint();
             app.cursor = app.input.len();
         }
-        // Scroll the transcript when the input is empty so PgUp/PgDn don't
-        // collide with multi-line editing. 10 lines per press matches CC.
-        (_, KeyCode::PageUp) if app.input.is_empty() => {
-            app.scroll_transcript_up(10);
-        }
-        (_, KeyCode::PageDown) if app.input.is_empty() => {
-            // 10 lines per press matches CC. Pass the real visible-row count
-            // (last-recorded by render_transcript) so the "at natural bottom"
-            // detection in scroll_transcript_down re-enables auto-follow
-            // correctly on tall terminals.
-            let visible = app.transcript_visible_rows.max(1);
-            app.scroll_transcript_down(10, visible);
-        }
+        // PgUp/PgDn/Ctrl+Home/End are left to the terminal — inline rendering
+        // puts the conversation in native scrollback, so the terminal's own
+        // scroll (mouse wheel, Shift+PgUp) handles history.
         _ => {}
     }
 }

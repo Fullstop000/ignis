@@ -111,35 +111,19 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let body_area = outer[0];
     let band_area = outer[1];
 
-    // Body area: tool-initiated pickers (ask_user / permission / connect /
-    // afk) anchor to the BOTTOM of the body — same convention Claude Code
-    // and Codex use — with the transcript still visible above. Sized to the
-    // picker's natural height, capped at 70% so context behind it stays in
-    // view. Slash-command pickers (model/session/skill/mcp) continue to take
-    // the full body since they're entered intentionally and benefit from the
-    // room.
-    if app.inline_picker.is_some() {
-        // Compute the bottom picker slice in a scope holding only an
-        // immutable borrow, so render_transcript can take `&mut app` after.
-        // The picker takes exactly its natural height (clamped to body) and
-        // whatever's left becomes transcript context above — no proactive
-        // share cap. Capping was clipping the input/footer of tiny pickers
-        // (e.g. a 7-row text-input picker on an 8-row body) even when the
-        // full body could have shown them.
-        let (picker_area, above) = {
-            let picker = app.inline_picker.as_ref().expect("checked above");
-            let desired = super::inline_picker::picker_height(picker, body_area.width);
-            let h = desired.min(body_area.height).max(1);
-            let split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(h)])
-                .split(body_area);
-            (split[1], split[0])
-        };
-        if above.height > 0 {
-            render_transcript(f, above, app);
-        }
-        let picker = app.inline_picker.as_ref().expect("still set");
+    // Body area: a tool-initiated picker (ask_user / permission / connect /
+    // afk) anchors to the BOTTOM of the body at its natural height. The area
+    // above it stays blank — the conversation is in native scrollback above
+    // the whole inline viewport. Slash-command pickers (model/session/skill/
+    // mcp) take the full body since they're entered intentionally.
+    if let Some(picker) = &app.inline_picker {
+        let desired = super::inline_picker::picker_height(picker, body_area.width);
+        let h = desired.min(body_area.height).max(1);
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(h)])
+            .split(body_area);
+        let picker_area = split[1];
         if picker.is_reviewing() {
             let mut lines: Vec<Line> = Vec::new();
             super::inline_picker::render_review(&mut lines, picker, picker_area.width);
@@ -206,9 +190,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
                 .wrap(Wrap { trim: false }),
             body_area,
         );
-    } else {
-        render_transcript(f, body_area, app);
     }
+    // No picker → `body_area` is zero-height; the band fills the viewport and
+    // the conversation is in native scrollback above it.
 
     // Band: laid out from the top of `band_area` down. Order is the same as
     // the legacy inline band — status, queued, slash, input, footer.
@@ -245,48 +229,6 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     draw_footer(f, band_layout[4], app);
 }
 
-/// Largest scroll offset that still shows the last line of `total` in a
-/// `visible`-row viewport: `total - visible` (0 when everything fits). Shared
-/// by `render_transcript`, the mouse wheel, PgDn, and `End` so they all agree
-/// on "the bottom".
-pub(crate) fn natural_max_offset(total: usize, visible: usize) -> usize {
-    total.saturating_sub(visible)
-}
-
-/// Render the in-app transcript into `area`. Honors `app.auto_follow`
-/// (recomputes scroll_offset to the natural bottom) and `app.scroll_offset`
-/// (sticky position when the user has scrolled up). No "N more lines" hints —
-/// the window is exactly the visible slice.
-fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
-    if area.height == 0 {
-        return;
-    }
-    let total = app.transcript.len();
-    let visible = area.height as usize;
-    // Record the real visible-row count so PgDn / the mouse wheel can detect
-    // "at the natural bottom" and re-enable auto-follow.
-    app.transcript_visible_rows = visible;
-    let max_offset = natural_max_offset(total, visible);
-    // Auto-follow recomputes offset each frame; manual scroll keeps the
-    // user's offset, clamped to the current max in case content shrunk.
-    if app.auto_follow || app.scroll_offset > max_offset {
-        app.scroll_offset = max_offset;
-    }
-    if total == 0 {
-        return;
-    }
-
-    let start = app.scroll_offset.min(total);
-    let end = (start + visible).min(total);
-    let slice: Vec<Line> = app.transcript[start..end].to_vec();
-
-    f.render_widget(
-        Paragraph::new(Text::from(slice))
-            .style(Style::default().bg(BG))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
 /// Split-layout render for the `ask_user` picker when at least one option
 /// carries a `preview`. The band is divided:
 ///   - top: blank + header strip + question (3 rows)
@@ -453,91 +395,6 @@ mod queue_render_tests {
         assert_eq!(picker_window(2, 8, 5), (0, 5));
         // empty list returns an empty window.
         assert_eq!(picker_window(0, 5, 0), (0, 0));
-    }
-
-    #[test]
-    fn auto_follow_pins_view_to_bottom() {
-        // App starts with auto_follow=true, scroll_offset=0. After several
-        // lines are committed, the renderer pins scroll_offset to the natural
-        // bottom = `total - visible` (no hints reserve a row anymore).
-        let mut a = app();
-        for i in 0..20 {
-            a.commit_transcript_lines(vec![Line::from(format!("line {i}"))]);
-        }
-        // Simulate a render: visible=5, total=20 → max_offset = 20 - 5 = 15.
-        let max_offset = natural_max_offset(a.transcript.len(), 5);
-        if a.auto_follow {
-            a.scroll_offset = max_offset;
-        }
-        assert_eq!(a.scroll_offset, 15);
-        assert!(a.auto_follow);
-    }
-
-    #[test]
-    fn scroll_up_disables_auto_follow_when_offset_moves() {
-        let mut a = app();
-        for i in 0..30 {
-            a.commit_transcript_lines(vec![Line::from(format!("line {i}"))]);
-        }
-        a.scroll_offset = 20;
-        a.scroll_transcript_up(8);
-        assert_eq!(a.scroll_offset, 12);
-        assert!(!a.auto_follow, "real scroll must release auto-follow");
-        // Walking further up clamps at 0, never underflows.
-        a.scroll_transcript_up(100);
-        assert_eq!(a.scroll_offset, 0);
-        assert!(!a.auto_follow);
-    }
-
-    #[test]
-    fn scroll_up_at_top_preserves_auto_follow() {
-        // codex P2: PgUp at offset 0 (already at the top, or before the
-        // transcript grew past the viewport) is a no-op; it must NOT silently
-        // flip auto_follow off — that would un-pin the view from the bottom
-        // when later content arrives.
-        let mut a = app();
-        a.commit_transcript_lines(vec![Line::from("a"), Line::from("b")]);
-        assert_eq!(a.scroll_offset, 0);
-        assert!(a.auto_follow);
-        a.scroll_transcript_up(10);
-        assert_eq!(a.scroll_offset, 0);
-        assert!(a.auto_follow, "no-move PgUp must keep follow on");
-    }
-
-    #[test]
-    fn new_session_clears_transcript_and_resets_scroll() {
-        // codex P3: switching sessions used to leave the previous session's
-        // rendered lines in `transcript`, since only `blocks`/`committed`
-        // got reset. New session output then appeared *below* the stale tail.
-        let mut a = app();
-        a.commit_transcript_lines(vec![Line::from("old line 1"), Line::from("old line 2")]);
-        a.scroll_offset = 1;
-        a.auto_follow = false;
-
-        a.start_new_session("sess-new".to_string());
-
-        // Only the "Started new session" notice is in `blocks` — `transcript`
-        // is reset until the runner flushes the new session's blocks.
-        assert!(a.transcript.is_empty());
-        assert_eq!(a.scroll_offset, 0);
-        assert!(a.auto_follow);
-        assert_eq!(a.session_id, "sess-new");
-    }
-
-    #[test]
-    fn scroll_down_to_bottom_resumes_auto_follow() {
-        let mut a = app();
-        for i in 0..30 {
-            a.commit_transcript_lines(vec![Line::from(format!("line {i}"))]);
-        }
-        a.scroll_offset = 5;
-        a.auto_follow = false;
-        // visible=10, total=30 → natural max_offset = 30 - 10 = 20.
-        // PgDn(18) from offset 5 → next=23, which exceeds 20, so we snap to
-        // 20 and re-enable auto_follow.
-        a.scroll_transcript_down(18, 10);
-        assert_eq!(a.scroll_offset, 20);
-        assert!(a.auto_follow);
     }
 
     #[test]
@@ -1477,75 +1334,6 @@ mod tests {
         assert!(
             content.contains("hi there"),
             "should show assistant message"
-        );
-    }
-
-    #[test]
-    fn inline_picker_anchors_to_bottom_with_transcript_above() {
-        use crate::console::picker::{PickerOption, PickerQuestion};
-        let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
-            "default".to_string(),
-            PathBuf::from("/tmp"),
-        );
-        // Fill scrollback so something is pinned just above the picker via
-        // auto-follow — that's the regression we're guarding: tool-initiated
-        // pickers used to wipe the transcript and take the full body.
-        for i in 0..40 {
-            app.commit_transcript_lines(vec![Line::from(format!("FILLER_{i}"))]);
-        }
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        app.inline_picker = Some(crate::console::inline_picker::InlinePickerState::new(
-            crate::console::picker::PickerRequest {
-                questions: vec![PickerQuestion {
-                    question: "PICKER_QUESTION".into(),
-                    kind: "permission".into(),
-                    header: "Allow?".into(),
-                    multi_select: false,
-                    allow_other: false,
-                    text_input: false,
-                    mask: false,
-                    options: vec![
-                        PickerOption {
-                            label: "Approve once".into(),
-                            description: "Run this command and continue.".into(),
-                            preview: None,
-                        },
-                        PickerOption {
-                            label: "Deny".into(),
-                            description: "Reject this tool call.".into(),
-                            preview: None,
-                        },
-                    ],
-                }],
-                reply: tx,
-            },
-        ));
-        let mut term = test_terminal(80, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = term.backend().buffer();
-        let w = buf.area.width as usize;
-        let h = buf.area.height as usize;
-        let row_text = |y: usize| -> String {
-            buf.content[y * w..(y + 1) * w]
-                .iter()
-                .map(|c| c.symbol())
-                .collect()
-        };
-        let picker_row = (0..h)
-            .find(|y| row_text(*y).contains("PICKER_QUESTION"))
-            .expect("picker question must render");
-        let filler_row = (0..h)
-            .find(|y| row_text(*y).contains("FILLER_"))
-            .expect("transcript must still be visible above the picker");
-        assert!(
-            filler_row < picker_row,
-            "transcript row {filler_row} should sit ABOVE picker row {picker_row}",
-        );
-        assert!(
-            picker_row >= h / 3,
-            "picker should anchor toward bottom (question at row {picker_row} of {h})",
         );
     }
 

@@ -71,7 +71,12 @@ pub(crate) fn stable_prefix(text: &str) -> &str {
 /// text prefix, rendered exactly as the final block will render it. Returns an
 /// empty Vec for block kinds that aren't streamed incrementally (tool calls,
 /// user prompts): the caller commits those whole when they finalize.
-pub(crate) fn stable_rows(block: &UIBlock, tick: u64, cwd: &Path, width: u16) -> Vec<Line<'static>> {
+pub(crate) fn stable_rows(
+    block: &UIBlock,
+    tick: u64,
+    cwd: &Path,
+    width: u16,
+) -> Vec<Line<'static>> {
     let stable = match block {
         UIBlock::Assistant(t) => UIBlock::Assistant(stable_prefix(t).to_string()),
         UIBlock::Reasoning(t) => UIBlock::Reasoning(stable_prefix(t).to_string()),
