@@ -82,6 +82,11 @@ pub(crate) fn viewport_height(app: &App, term_rows: u16) -> u16 {
 /// is the inline path that pushes finalized blocks into native scrollback.
 pub(crate) fn render_block_into(buf: &mut Buffer, lines: &[Line]) {
     let area = buf.area;
+    // Paint the whole buffer with the app background first: insert_before cells
+    // otherwise default to the terminal's own bg, leaving the scrollback a
+    // different shade than the band. Spans rarely set a bg, so this fill shows
+    // through everywhere except explicit code-bg spans.
+    buf.set_style(area, Style::default().bg(BG));
     for (i, line) in lines.iter().enumerate() {
         let y = area.y.saturating_add(i as u16);
         if y >= area.y.saturating_add(area.height) {
