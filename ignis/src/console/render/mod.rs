@@ -17,6 +17,7 @@ use crate::console::{BG, BORDER, TEXT_DIM};
 
 pub(crate) mod blocks;
 pub(crate) mod pickers;
+pub(crate) mod stream_commit;
 pub(crate) mod tool_block;
 pub(crate) mod widgets;
 

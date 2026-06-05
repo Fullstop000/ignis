@@ -320,6 +320,12 @@ pub async fn run_console(
     // slow terminals (e.g. Windows Terminal over WSL2).
     let frame = std::time::Duration::from_millis(33); // ~30fps cap
     let mut last_draw = std::time::Instant::now();
+    // Rows of the in-progress block (`app.blocks[app.committed]`) already
+    // streamed into scrollback. Reset to 0 each time `committed` advances.
+    let mut committed_active_rows = 0usize;
+    // Last terminal size, to detect resizes (which ratatui 0.26 inline doesn't
+    // repaint cleanly — see the rebuild in the draw section).
+    let mut last_term_size = crossterm::terminal::size()?;
     terminal.draw(|f| draw(f, &mut app))?;
 
     loop {
@@ -431,31 +437,66 @@ pub async fn run_console(
             break;
         }
 
-        // Push newly-finalized blocks into the terminal's native scrollback via
-        // insert_before. They land above the live band; the terminal owns them
-        // from there (native scroll + copy + tmux-reattach persistence). The
-        // `ask_user` trace rides the same path (block_lines special-cases it).
+        // Push settled rows into the terminal's native scrollback via
+        // insert_before — the terminal owns them from there (native scroll +
+        // copy + tmux-reattach persistence). Finalized blocks flush whole; the
+        // in-progress assistant/reasoning block streams its *stable* rows as
+        // they settle (stream_commit), so text flows smoothly into scrollback
+        // rather than appearing all at once. A pending tool block waits.
         let width = terminal.size()?.width;
-        while app.committed < app.blocks.len() && app.block_done(app.committed) {
-            let lines = render::block_lines(&app.blocks[app.committed], app.tick, &app.cwd, width);
-            if !lines.is_empty() {
-                let h = lines.len() as u16;
-                terminal.insert_before(h, |buf| render::render_block_into(buf, &lines))?;
+        while app.committed < app.blocks.len() {
+            let block = &app.blocks[app.committed];
+            let done = app.block_done(app.committed);
+            let rows = if done {
+                render::block_lines(block, app.tick, &app.cwd, width)
+            } else if render::stream_commit::is_streamed(block) {
+                render::stream_commit::stable_rows(block, app.tick, &app.cwd, width)
+            } else {
+                break; // pending tool: nothing to commit until it finalizes
+            };
+            let start = committed_active_rows.min(rows.len());
+            let new = &rows[start..];
+            if !new.is_empty() {
+                let h = new.len() as u16;
+                terminal.insert_before(h, |buf| render::render_block_into(buf, new))?;
             }
-            app.committed += 1;
+            if done {
+                app.committed += 1;
+                committed_active_rows = 0;
+            } else {
+                committed_active_rows += new.len();
+                break; // in-progress block is last; nothing after it yet
+            }
         }
 
         // Coalesced redraw of the live band: at most once per frame interval.
         if last_draw.elapsed() >= frame {
             app.tick_update();
-            // Rebuild the inline viewport only when the band height changes
-            // (e.g. a picker opens/closes, multi-line input). A fixed band in
-            // the common case → no rebuild → no mid-screen float / stale rows.
-            let want_rows = render::viewport_height(&app, crossterm::terminal::size()?.1);
-            if want_rows != viewport_rows {
-                terminal.clear()?;
+            // Rebuild the inline viewport when the band height changes (picker
+            // open/close, multi-line input) OR the terminal itself resized.
+            // ratatui 0.26's inline autoresize leaves the old band stranded in
+            // scrollback (#77); taking over with clear()+fresh viewport on any
+            // size change re-anchors cleanly.
+            let term_size = crossterm::terminal::size()?;
+            let want_rows = render::viewport_height(&app, term_size.1);
+            let resized = term_size != last_term_size;
+            if want_rows != viewport_rows || resized {
+                if resized {
+                    // ratatui's inline clear() only scrubs downward, so on a
+                    // resize the old band (reflowed by the terminal above the
+                    // new anchor) is left stranded (#77). Wipe the whole screen
+                    // and re-anchor fresh; committed scrollback stays in history.
+                    execute!(
+                        io::stdout(),
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                        crossterm::cursor::MoveTo(0, 0)
+                    )?;
+                } else {
+                    terminal.clear()?;
+                }
                 terminal = make_terminal(want_rows)?;
                 viewport_rows = want_rows;
+                last_term_size = term_size;
             }
             terminal.draw(|f| draw(f, &mut app))?;
             last_draw = std::time::Instant::now();
