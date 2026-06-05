@@ -127,6 +127,28 @@ SIGTERM grace window before the SIGKILL.
   and no log noise. A malformed file is a startup error — ignis exits
   before the first prompt (same posture as a broken `config.toml`).
 
+### Inspecting the active chains — `/hooks` (or `/hooks list`)
+
+Type `/hooks` (or its explicit alias `/hooks list`) to print the
+chains that the running session is actually using — one block per
+event, each entry showing the program path, its argv tail, and the
+per-hook timeout:
+
+```
+[info] 3 hooks registered · /hooks reload to re-read · run unsandboxed; audit before installing:
+  UserPromptSubmit (2):
+    · translate-en     ~/.ignis/hooks/translate-en/run.py  (timeout 10000ms)
+    · redact           /opt/ignis/hooks/redact.sh  --strict  (timeout 30000ms)
+  AssistantMessageRender (1):
+    · translate-en     ~/.ignis/hooks/translate-en/run.py  (timeout 10000ms)
+```
+
+When no hooks are registered, the command prints a single
+`[info] no hooks registered` line pointing at the file path and the
+`/hooks reload` action. The list reflects the in-memory state — the
+last successful load or `/hooks reload` — not a live disk probe, so
+`/hooks reload` first if you just edited the file.
+
 ### Hot-reload — `/hooks reload`
 
 Type `/hooks reload` in the TUI after editing `hooks.json`. The parsed

@@ -698,21 +698,47 @@ pub(crate) async fn submit_text(
     }
 }
 
-/// `/hooks` — currently only the `reload` subcommand. Re-reads
-/// `~/.ignis/hooks.json`, swaps the parsed config into the shared
-/// registry, and posts an `[info]` or `[err]` line to scrollback. The
-/// security reminder rides along on success so the user keeps noticing
-/// it every time they touch the file.
+/// `/hooks` — list or reload the in-memory hook registry.
+///
+///   `/hooks`        list every registered hook (the chain for each
+///                    event, the program + argv, and the per-hook timeout)
+///   `/hooks list`   alias of bare `/hooks`
+///   `/hooks reload` re-read `~/.ignis/hooks.json` from disk
+///
+/// Listing reflects the registry as it stands in memory (i.e. what the
+/// session is actually running) — it is not a live probe of the JSON
+/// file. Reload first if you just edited it.
 async fn handle_hooks_command(app: &mut App, text: &str) {
     let mut parts = text.split_whitespace();
     let _ = parts.next(); // "/hooks"
     let sub = parts.next().unwrap_or("");
-    if sub != "reload" {
-        app.add_assistant_notice(
-            "Usage: /hooks reload — re-reads ~/.ignis/hooks.json into memory.".to_string(),
-        );
-        return;
+
+    match sub {
+        "" | "list" => list_hooks(app).await,
+        "reload" => reload_hooks(app).await,
+        _ => app.add_assistant_notice(
+            "Usage: /hooks [list] | /hooks reload — list the in-memory hook \
+             chains or re-read ~/.ignis/hooks.json from disk."
+                .to_string(),
+        ),
     }
+}
+
+/// Render the current hook chains into a single multi-line notice.
+async fn list_hooks(app: &mut App) {
+    let Some(reg) = app.hooks.clone() else {
+        app.add_assistant_notice("[err] hooks registry unavailable in this session.".to_string());
+        return;
+    };
+    let cfg = reg.snapshot().await;
+    app.add_assistant_notice(crate::hooks::format_list(&cfg));
+}
+
+/// Reload `~/.ignis/hooks.json` into the shared registry. Posts an
+/// `[info]` or `[err]` line to scrollback. The security reminder rides
+/// along on success so the user keeps noticing it every time they
+/// touch the file.
+async fn reload_hooks(app: &mut App) {
     let Some(reg) = app.hooks.clone() else {
         app.add_assistant_notice("[err] hooks registry unavailable in this session.".to_string());
         return;
