@@ -4,6 +4,7 @@
 //! carry previews. Everything else is delegated to one of the submodules
 //! below.
 use ratatui::{
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
@@ -51,13 +52,57 @@ fn input_height(app: &App, cap: u16) -> u16 {
     (lines + 2).clamp(3, cap.saturating_sub(2).max(3))
 }
 
+/// Whether any picker is currently open (tool-initiated `ask_user` or a
+/// slash-command picker). When one is, the inline viewport grows to give it
+/// room above the band.
+fn picker_open(app: &App) -> bool {
+    app.inline_picker.is_some()
+        || app.model_picker.is_some()
+        || app.session_picker.is_some()
+        || app.skill_picker.is_some()
+        || app.mcp_picker.is_some()
+}
+
+/// Height (rows) of the inline viewport: just the band in the common case, or
+/// (nearly) the whole terminal when a picker is open so it has room above the
+/// band. The runner rebuilds the `Terminal` whenever this changes — which, with
+/// a fixed band, is only on picker open/close or multi-line input growth.
+pub(crate) fn viewport_height(app: &App, term_rows: u16) -> u16 {
+    let cap = term_rows.saturating_sub(1).max(3);
+    if picker_open(app) {
+        cap
+    } else {
+        band_height(app, term_rows).min(cap)
+    }
+}
+
+/// Blit pre-wrapped `lines` (one `Line` per visual row — `block_lines` already
+/// wraps to width) into the `insert_before` scratch buffer, one row each. This
+/// is the inline path that pushes finalized blocks into native scrollback.
+pub(crate) fn render_block_into(buf: &mut Buffer, lines: &[Line]) {
+    let area = buf.area;
+    for (i, line) in lines.iter().enumerate() {
+        let y = area.y.saturating_add(i as u16);
+        if y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        buf.set_line(area.x, y, line, area.width);
+    }
+}
+
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let size = f.size();
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
-    // Fullscreen layout: transcript (or whatever picker has taken the area)
-    // fills the top; the input band sits permanently at the bottom.
-    let band_h = band_height(app, size.height);
+    // Inline layout: `size` IS the viewport. With no picker the band fills it
+    // entirely (the conversation is in native scrollback above). With a picker
+    // open the viewport is grown by `viewport_height`, and the picker takes the
+    // top while the band stays pinned at the bottom.
+    let band_h = if picker_open(app) {
+        band_height(app, size.height)
+    } else {
+        size.height
+    };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(band_h)])

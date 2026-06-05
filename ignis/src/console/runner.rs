@@ -3,14 +3,11 @@
 //! per-frame draw + key-poll cycle. Everything stateful about the live UI
 //! flows through here; `App` is the in-memory model the loop drives.
 use crossterm::{
-    event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, MouseEventKind,
-    },
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, Terminal, TerminalOptions, Viewport};
 use std::io;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -22,41 +19,37 @@ use crate::console::keys::{handle_key, ActiveInject};
 use crate::console::render::{self, draw};
 use crate::{AgentEvent, Message, Session};
 
-/// Create a fullscreen (alternate-screen) terminal over stdout. ratatui's
-/// default Viewport::Fullscreen owns the whole frame and reflows on resize
-/// automatically — no per-band height bookkeeping, no rebuild loop.
-fn make_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+/// Create an inline-viewport terminal over stdout: a fixed `viewport_rows`-tall
+/// live band pinned at the bottom of the normal buffer. Finalized conversation
+/// blocks are pushed into the terminal's real scrollback via `insert_before`,
+/// so native copy, native scroll, and tmux detach/reattach all work. The band
+/// height is fixed per `Terminal`; it is rebuilt only when the band needs to
+/// grow/shrink (e.g. a picker opens).
+fn make_terminal(viewport_rows: u16) -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     let backend = CrosstermBackend::new(io::stdout());
-    Terminal::new(backend)
+    Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(viewport_rows.max(2)),
+        },
+    )
 }
 
-/// RAII guard for the alternate-screen + raw-mode pair. On drop (Err-bubble,
-/// panic, or clean exit) it restores the user's prior terminal state.
-/// Without this, any `?` after `EnterAlternateScreen` would strand the user
-/// in an empty alt screen with no way back to their shell prompt.
+/// RAII guard for raw-mode + bracketed paste. On drop (Err-bubble, panic, or
+/// clean exit) it restores the user's prior terminal state. Inline rendering
+/// stays in the *normal* buffer (no alternate screen) so the conversation
+/// remains in native scrollback after exit; no mouse capture, so click-drag
+/// selection works.
 struct TerminalGuard;
 
 impl TerminalGuard {
     fn install() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableMouseCapture
-        )?;
-        // Panic hook: a panic inside ratatui / the main loop would otherwise
-        // print its message into the alt-screen the user can't see. Restore
-        // the terminal first, then chain through to the prior hook.
+        execute!(io::stdout(), EnableBracketedPaste)?;
         let prior_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                DisableMouseCapture,
-                DisableBracketedPaste,
-                LeaveAlternateScreen
-            );
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
             prior_hook(info);
         }));
         Ok(Self)
@@ -66,12 +59,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -102,17 +90,22 @@ pub async fn run_console(
     app.set_model_options(config.model_options(&catalog), config.active_effort());
     tokio::spawn(crate::llm::catalog::refresh_if_stale());
 
-    // Render fullscreen in the alternate-screen buffer: the whole terminal is
-    // ours, native scrollback is preserved across the session, and quit/exit
-    // restores whatever was on the user's terminal before launch. Transcript
-    // history lives in `app.transcript` and scrolls in-app. `_term_guard`
-    // restores the user's terminal on early-return or panic.
+    // Render inline in the normal buffer: finalized blocks are pushed into the
+    // terminal's real scrollback, so native copy/scroll/tmux-reattach all work.
+    // A fixed-height band stays pinned at the bottom. `_term_guard` restores raw
+    // mode on early-return or panic.
     let _term_guard = TerminalGuard::install()?;
-    let mut terminal = make_terminal()?;
+    let mut viewport_rows = render::viewport_height(&app, crossterm::terminal::size()?.1);
+    let mut terminal = make_terminal(viewport_rows)?;
 
-    // Welcome banner: first lines of the in-app transcript. Scrolls with the
-    // conversation rather than being pinned chrome.
-    app.commit_transcript_lines(render::welcome_lines(&app));
+    // Welcome banner: pushed into scrollback above the band, like any block.
+    {
+        let welcome = render::welcome_lines(&app);
+        let h = welcome.len() as u16;
+        if h > 0 {
+            terminal.insert_before(h, |buf| render::render_block_into(buf, &welcome))?;
+        }
+    }
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
@@ -428,16 +421,8 @@ pub async fn run_console(
                     .await;
                 }
                 Event::Paste(data) => crate::console::keys::handle_paste(&mut app, data),
-                // Mouse wheel scrolls the transcript (3 lines/notch). ScrollUp
-                // releases auto-follow; ScrollDown re-enables it at the bottom.
-                Event::Mouse(me) => match me.kind {
-                    MouseEventKind::ScrollUp => app.scroll_transcript_up(3),
-                    MouseEventKind::ScrollDown => {
-                        let visible = app.transcript_visible_rows.max(1);
-                        app.scroll_transcript_down(3, visible);
-                    }
-                    _ => {}
-                },
+                // No mouse capture in inline mode — wheel scroll and click-drag
+                // selection are handled natively by the terminal/scrollback.
                 _ => {}
             }
         }
@@ -446,35 +431,41 @@ pub async fn run_console(
             break;
         }
 
-        // Fullscreen viewport reflows on resize automatically — no rebuild loop.
-        // Append newly-finalized blocks to the in-app transcript buffer.
+        // Push newly-finalized blocks into the terminal's native scrollback via
+        // insert_before. They land above the live band; the terminal owns them
+        // from there (native scroll + copy + tmux-reattach persistence). The
+        // `ask_user` trace rides the same path (block_lines special-cases it).
         let width = terminal.size()?.width;
         while app.committed < app.blocks.len() && app.block_done(app.committed) {
             let lines = render::block_lines(&app.blocks[app.committed], app.tick, &app.cwd, width);
             if !lines.is_empty() {
-                app.commit_transcript_lines(lines);
+                let h = lines.len() as u16;
+                terminal.insert_before(h, |buf| render::render_block_into(buf, &lines))?;
             }
             app.committed += 1;
         }
 
-        // The `ask_user` trace is committed via the usual block flush above
-        // (block_lines special-cases UIBlock::Tool{name:"ask_user"} into a
-        // compact trace via ask_user_resume_trace). No separate live-flush
-        // path — that used to double-emit.
-
         // Coalesced redraw of the live band: at most once per frame interval.
         if last_draw.elapsed() >= frame {
             app.tick_update();
+            // Rebuild the inline viewport only when the band height changes
+            // (e.g. a picker opens/closes, multi-line input). A fixed band in
+            // the common case → no rebuild → no mid-screen float / stale rows.
+            let want_rows = render::viewport_height(&app, crossterm::terminal::size()?.1);
+            if want_rows != viewport_rows {
+                terminal.clear()?;
+                terminal = make_terminal(want_rows)?;
+                viewport_rows = want_rows;
+            }
             terminal.draw(|f| draw(f, &mut app))?;
             last_draw = std::time::Instant::now();
         }
     }
 
-    // The terminal cursor was hidden by ratatui at construction; restore it
-    // before the guard drops so it's visible after exit. `_term_guard`
-    // (TerminalGuard::install above) then runs LeaveAlternateScreen +
-    // disable_raw_mode on the way out, covering this clean-exit path, all
-    // `?`-bubbled Err returns, and panics in the main loop.
+    // Restore the cursor before the guard drops. The band stays in the normal
+    // buffer, so the conversation remains in scrollback after exit. `_term_guard`
+    // disables raw mode + bracketed paste on the way out (clean exit, `?`-bubbled
+    // Err returns, and panics).
     terminal.show_cursor()?;
     Ok(())
 }
