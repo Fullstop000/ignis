@@ -325,6 +325,64 @@ mod queue_render_tests {
         App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"))
     }
 
+    /// Regression: a long `ask_user` trace once re-wrapped at render while
+    /// being counted as a single row, pushing the newest transcript line off
+    /// the bottom — it read as "the running status bar covers the chat
+    /// history". With the trace wrapped at commit time, the newest line stays
+    /// visible. Exercises the real block_lines → transcript → render path.
+    #[test]
+    fn long_ask_user_trace_keeps_newest_line_visible() {
+        use crate::console::app::{ToolCallEntry, ToolStatus, UIBlock};
+        use ratatui::{backend::TestBackend, text::Line, Terminal};
+        use std::time::Instant;
+
+        // Viewport SHORTER than the transcript so auto-follow pins to the
+        // bottom — the condition under which an over-wide line's render-time
+        // re-wrap pushes the newest row off the bottom.
+        let (width, height) = (40u16, 4u16);
+        let mut a = app();
+        for i in 0..6 {
+            a.commit_transcript_lines(vec![Line::from(format!("ctx{i}"))]);
+        }
+        let result = serde_json::json!({
+            "answers": [{
+                "question": "PR #127 green. Two feat: commits since v0.34.0. \
+                             Add to [Unreleased], or bump to v0.35.0 and cut a release?",
+                "answer": "Bump and cut a release"
+            }]
+        })
+        .to_string();
+        let block = UIBlock::Tool(ToolCallEntry {
+            id: "1".into(),
+            name: "ask_user".into(),
+            arguments: "{}".into(),
+            status: ToolStatus::Success(result),
+            started_at: Instant::now(),
+            elapsed_ms: 0,
+        });
+        let lines = blocks::block_lines(&block, 0, std::path::Path::new("/tmp"), width);
+        a.commit_transcript_lines(lines);
+        a.commit_transcript_lines(vec![Line::from("NEWEST_SENTINEL")]);
+
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| {
+            let area = f.size();
+            super::render_transcript(f, area, &mut a);
+        })
+        .unwrap();
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            rendered.contains("NEWEST_SENTINEL"),
+            "newest transcript line was clipped behind the band:\n{rendered}"
+        );
+    }
+
     #[test]
     fn slash_window_keeps_selection_visible() {
         // Within the first window → no scroll.
