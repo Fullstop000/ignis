@@ -437,6 +437,21 @@ pub async fn run_console(
             break;
         }
 
+        // Session reset (`/clear`, `/resume`): wipe the visible screen AND the
+        // scrollback history, then re-anchor a fresh viewport, so old output
+        // doesn't linger when scrolling up. `committed`/`committed_rows` were
+        // already reset in App, so the new session's blocks commit from the top.
+        if app.pending_screen_clear {
+            execute!(
+                io::stdout(),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
+                crossterm::cursor::MoveTo(0, 0)
+            )?;
+            terminal = make_terminal(viewport_rows)?;
+            app.pending_screen_clear = false;
+        }
+
         // Push settled rows into the terminal's native scrollback via
         // insert_before — the terminal owns them from there (native scroll +
         // copy + tmux-reattach persistence). Finalized blocks flush whole; the

@@ -532,6 +532,11 @@ pub(crate) struct App {
     /// streamed into scrollback. Reset to 0 whenever `committed` is reset, so
     /// the runner's incremental commit can never desync after `/clear`.
     pub(crate) committed_rows: usize,
+    /// Set on a session reset (`/clear`, `/resume`). The runner wipes the
+    /// terminal screen + scrollback history and re-anchors the band before
+    /// committing the new session's blocks, so old output doesn't linger in
+    /// scroll-up history. Cleared by the runner once handled.
+    pub(crate) pending_screen_clear: bool,
 
     pub(crate) should_quit: bool,
     pub(crate) error_flash: Option<(String, Instant)>,
@@ -614,6 +619,7 @@ impl App {
             last_usage: None,
             committed: 0,
             committed_rows: 0,
+            pending_screen_clear: false,
             should_quit: false,
             error_flash: None,
             exit_pending: false,
@@ -1107,9 +1113,11 @@ impl App {
     }
 
     /// Reset the incremental-commit cursor on session reset paths (`/clear`,
-    /// `/resume`) so the new session's blocks stream out from row 0.
+    /// `/resume`) so the new session's blocks stream out from row 0, and ask
+    /// the runner to wipe the terminal screen + scrollback first.
     fn reset_transcript_view(&mut self) {
         self.committed_rows = 0;
+        self.pending_screen_clear = true;
     }
 
     pub(crate) fn show_session_picker(
