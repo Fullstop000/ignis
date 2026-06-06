@@ -321,9 +321,9 @@ pub async fn run_console(
     // slow terminals (e.g. Windows Terminal over WSL2).
     let frame = std::time::Duration::from_millis(33); // ~30fps cap
     let mut last_draw = std::time::Instant::now();
-    // Rows of the in-progress block (`app.blocks[app.committed]`) already
-    // streamed into scrollback. Reset to 0 each time `committed` advances.
-    let mut committed_active_rows = 0usize;
+    // The in-progress block's already-streamed row count lives on `app`
+    // (`app.committed_rows`) so a session reset (`/clear`, `/resume`) resets it
+    // in lockstep with `app.committed` — see reset_transcript_view.
     // Last terminal size, to detect resizes (which ratatui 0.26 inline doesn't
     // repaint cleanly — see the rebuild in the draw section).
     let mut last_term_size = crossterm::terminal::size()?;
@@ -470,7 +470,7 @@ pub async fn run_console(
             } else {
                 break; // pending tool: nothing to commit until it finalizes
             };
-            let start = committed_active_rows.min(rows.len());
+            let start = app.committed_rows.min(rows.len());
             let new = &rows[start..];
             if !new.is_empty() {
                 let h = new.len() as u16;
@@ -478,9 +478,9 @@ pub async fn run_console(
             }
             if done {
                 app.committed += 1;
-                committed_active_rows = 0;
+                app.committed_rows = 0;
             } else {
-                committed_active_rows += new.len();
+                app.committed_rows += new.len();
                 break; // in-progress block is last; nothing after it yet
             }
         }

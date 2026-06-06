@@ -1916,6 +1916,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_reset_zeroes_the_streaming_commit_cursor() {
+        // Regression: `/clear` while a reply was streaming must reset the
+        // incremental-commit cursor in lockstep with `committed`, or the runner
+        // skips the first rows of the new session's output.
+        let mut app = App::new(
+            "p".into(),
+            "m".into(),
+            "s".into(),
+            std::path::PathBuf::from("/"),
+        );
+        app.committed = 7;
+        app.committed_rows = 5;
+        app.start_new_session("sess-2".into());
+        assert_eq!(app.committed, 0);
+        assert_eq!(
+            app.committed_rows, 0,
+            "streaming cursor must reset on /clear"
+        );
+    }
+
+    #[test]
     fn slash_suggestions_show_all_commands_for_slash() {
         let suggestions = slash_suggestions("/", None);
 
