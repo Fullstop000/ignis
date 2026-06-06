@@ -661,7 +661,7 @@ mod tests {
             user("question"),
             assistant_text("the answer is 42", Some("first I considered ...")),
         ];
-        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        let out = prep_outbound_history(&history, &HistoryPolicy { strip_think: true });
         assert!(
             out[1].reasoning_content.is_none(),
             "reasoning should be stripped"
@@ -682,7 +682,7 @@ mod tests {
             assistant_calling("I'll run ls.", Some("plan: list /app"), "call_1"),
             tool_result("call_1", "bash", "app/  README.md"),
         ];
-        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        let out = prep_outbound_history(&history, &HistoryPolicy { strip_think: true });
         assert_eq!(
             out[1].reasoning_content.as_deref(),
             Some("plan: list /app"),
@@ -700,7 +700,7 @@ mod tests {
                 None,
             ),
         ];
-        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        let out = prep_outbound_history(&history, &HistoryPolicy { strip_think: true });
         assert_eq!(out[1].content.as_deref(), Some("here is my answer"));
     }
 
@@ -710,7 +710,7 @@ mod tests {
             user("hi"),
             assistant_text("<think>A</think>x<think>B\nC</think>y", None),
         ];
-        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        let out = prep_outbound_history(&history, &HistoryPolicy { strip_think: true });
         assert_eq!(out[1].content.as_deref(), Some("xy"));
     }
 
@@ -722,7 +722,7 @@ mod tests {
             user("ls"),
             assistant_calling("<think>plan</think>running ls", None, "call_1"),
         ];
-        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        let out = prep_outbound_history(&history, &HistoryPolicy { strip_think: true });
         assert_eq!(
             out[1].content.as_deref(),
             Some("<think>plan</think>running ls")
@@ -749,7 +749,7 @@ mod tests {
             user("hi"),
             assistant_text("ok<think>truncated and no closer", None),
         ];
-        let out = prep_outbound_history(&history, &HistoryPolicy::default());
+        let out = prep_outbound_history(&history, &HistoryPolicy { strip_think: true });
         assert_eq!(
             out[1].content.as_deref(),
             Some("ok<think>truncated and no closer")
@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn prep_history_identity_on_empty_input() {
-        assert!(prep_outbound_history(&[], &HistoryPolicy::default()).is_empty());
+        assert!(prep_outbound_history(&[], &HistoryPolicy { strip_think: true }).is_empty());
     }
 
     /// Env-var override read by `HistoryPolicy::default`. Uses a `Mutex` to

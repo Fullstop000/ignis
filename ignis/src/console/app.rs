@@ -523,27 +523,20 @@ pub(crate) struct App {
     /// Real token usage from the most recent completed turn (provider-reported).
     pub(crate) last_usage: Option<crate::Usage>,
 
-    /// Number of leading blocks already appended to `transcript` as
-    /// finalized output. The rest are still mutating; they render live in the
-    /// transcript region via `block_lines` and only get committed (and frozen)
-    /// once `block_done(idx)` is true.
+    /// Number of leading blocks already pushed into the terminal's native
+    /// scrollback (via `insert_before`). The rest are still mutating; the
+    /// in-progress block streams its stable rows out incrementally and the
+    /// block is fully committed once `block_done(idx)` is true.
     pub(crate) committed: usize,
-
-    /// Frozen transcript lines — the in-app scrollable history rendered
-    /// above the input band in fullscreen mode. Grows monotonically; the
-    /// transcript widget renders a windowed slice of this each frame.
-    pub(crate) transcript: Vec<ratatui::text::Line<'static>>,
-    /// First line of `transcript` currently visible. `auto_follow == true`
-    /// means the view tracks the bottom; `false` means the user scrolled up
-    /// and we should stay put even as new content arrives.
-    pub(crate) scroll_offset: usize,
-    /// View follows the latest content when true (default). Flipped to false
-    /// when the user scrolls up; flipped back when they jump to bottom.
-    pub(crate) auto_follow: bool,
-    /// Last-rendered transcript-area row count, set by `render_transcript`
-    /// each frame. PgDn reads this so it can correctly detect "I'm now at
-    /// the natural bottom — re-enable auto-follow" even on tall terminals.
-    pub(crate) transcript_visible_rows: usize,
+    /// Visual rows of the in-progress block (`blocks[committed]`) already
+    /// streamed into scrollback. Reset to 0 whenever `committed` is reset, so
+    /// the runner's incremental commit can never desync after `/clear`.
+    pub(crate) committed_rows: usize,
+    /// Set on a session reset (`/clear`, `/resume`). The runner wipes the
+    /// terminal screen + scrollback history and re-anchors the band before
+    /// committing the new session's blocks, so old output doesn't linger in
+    /// scroll-up history. Cleared by the runner once handled.
+    pub(crate) pending_screen_clear: bool,
 
     pub(crate) should_quit: bool,
     pub(crate) error_flash: Option<(String, Instant)>,
@@ -625,6 +618,8 @@ impl App {
             stream_chars: 0,
             last_usage: None,
             committed: 0,
+            committed_rows: 0,
+            pending_screen_clear: false,
             should_quit: false,
             error_flash: None,
             exit_pending: false,
@@ -641,10 +636,6 @@ impl App {
             update_notice: None,
             git_branch,
             hooks: None,
-            transcript: Vec::new(),
-            scroll_offset: 0,
-            auto_follow: true,
-            transcript_visible_rows: 0,
         }
     }
 
@@ -652,57 +643,6 @@ impl App {
     /// boundary so the footer tracks a mid-session `git checkout`.
     pub(crate) fn refresh_git_branch(&mut self) {
         self.git_branch = super::git::branch(&self.cwd);
-    }
-
-    /// Append a chunk of finalized lines (welcome banner, a committed block,
-    /// etc.) to the in-app transcript. Auto-follow keeps the view stuck to
-    /// the bottom; if the user has scrolled up, their position is preserved
-    /// and they'll see a `↓N more` hint until they return.
-    pub(crate) fn commit_transcript_lines(&mut self, lines: Vec<ratatui::text::Line<'static>>) {
-        if lines.is_empty() {
-            return;
-        }
-        self.transcript.extend(lines);
-        // scroll_offset is recomputed by the renderer each frame from
-        // `auto_follow` + the visible area; nothing to do here.
-    }
-
-    /// Scroll the transcript up by `rows` lines. Releases auto-follow only
-    /// when the offset actually decreased — PgUp at the top (or before the
-    /// transcript is taller than the viewport) is a no-op and must NOT
-    /// silently disable auto-follow, else later content stops pinning to
-    /// the bottom (codex P2).
-    pub(crate) fn scroll_transcript_up(&mut self, rows: usize) {
-        let next = self.scroll_offset.saturating_sub(rows);
-        if next < self.scroll_offset {
-            self.scroll_offset = next;
-            self.auto_follow = false;
-        }
-    }
-
-    /// Scroll the transcript down by `rows` lines. If the new offset lands
-    /// at or past the natural bottom, re-enable auto-follow.
-    pub(crate) fn scroll_transcript_down(&mut self, rows: usize, visible: usize) {
-        let max_offset = crate::console::render::natural_max_offset(self.transcript.len(), visible);
-        let next = self.scroll_offset.saturating_add(rows);
-        if next >= max_offset {
-            self.scroll_offset = max_offset;
-            self.auto_follow = true;
-        } else {
-            self.scroll_offset = next;
-        }
-    }
-
-    /// Jump to the top of the transcript. Disables auto-follow.
-    pub(crate) fn scroll_transcript_to_top(&mut self) {
-        self.auto_follow = false;
-        self.scroll_offset = 0;
-    }
-
-    /// Jump to the bottom and re-enable auto-follow.
-    pub(crate) fn scroll_transcript_to_bottom(&mut self) {
-        self.auto_follow = true;
-        // Renderer recomputes the exact offset from `auto_follow`.
     }
 
     pub(crate) fn set_context_window(&mut self, window: usize) {
@@ -1172,13 +1112,12 @@ impl App {
         self.add_assistant_notice(format!("Started new session `{}`.", self.session_id));
     }
 
-    /// Drop the in-app transcript buffer and reset scroll state. Used on
-    /// session reset paths (`/clear`, `/resume`) so the new session doesn't
-    /// inherit the previous session's rendered lines (codex P3).
+    /// Reset the incremental-commit cursor on session reset paths (`/clear`,
+    /// `/resume`) so the new session's blocks stream out from row 0, and ask
+    /// the runner to wipe the terminal screen + scrollback first.
     fn reset_transcript_view(&mut self) {
-        self.transcript.clear();
-        self.scroll_offset = 0;
-        self.auto_follow = true;
+        self.committed_rows = 0;
+        self.pending_screen_clear = true;
     }
 
     pub(crate) fn show_session_picker(
@@ -1975,6 +1914,27 @@ mod connect_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_reset_zeroes_the_streaming_commit_cursor() {
+        // Regression: `/clear` while a reply was streaming must reset the
+        // incremental-commit cursor in lockstep with `committed`, or the runner
+        // skips the first rows of the new session's output.
+        let mut app = App::new(
+            "p".into(),
+            "m".into(),
+            "s".into(),
+            std::path::PathBuf::from("/"),
+        );
+        app.committed = 7;
+        app.committed_rows = 5;
+        app.start_new_session("sess-2".into());
+        assert_eq!(app.committed, 0);
+        assert_eq!(
+            app.committed_rows, 0,
+            "streaming cursor must reset on /clear"
+        );
+    }
 
     #[test]
     fn slash_suggestions_show_all_commands_for_slash() {
