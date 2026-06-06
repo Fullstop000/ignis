@@ -12,6 +12,8 @@ use ratatui::{
     Frame,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::console::app::App;
 use crate::console::{BG, BORDER, TEXT_DIM};
 
@@ -112,6 +114,33 @@ pub(crate) fn render_block_into(buf: &mut Buffer, lines: &[Line]) {
             break;
         }
         buf.set_line(area.x, y, line, area.width);
+    }
+    blank_wide_char_continuations(buf);
+}
+
+/// Empty the cell that follows each double-width glyph (CJK, emoji).
+///
+/// `Terminal::insert_before` flushes *every* buffer cell to the backend — it
+/// skips the `diff` step that, in a normal draw, drops the blank continuation
+/// cell after a wide glyph. The backend then prints that blank `" "` at the
+/// column the wide glyph already advanced past, leaving a stray space after
+/// every wide char. Clearing the continuation symbol makes the backend print
+/// nothing there, so the glyph keeps its natural two columns.
+fn blank_wide_char_continuations(buf: &mut Buffer) {
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        let mut x = area.left();
+        while x < area.right() {
+            let w = UnicodeWidthStr::width(buf.get(x, y).symbol());
+            if w >= 2 {
+                if x + 1 < area.right() {
+                    buf.get_mut(x + 1, y).set_symbol("");
+                }
+                x += 2;
+            } else {
+                x += 1;
+            }
+        }
     }
 }
 
@@ -393,6 +422,25 @@ mod queue_render_tests {
                 "ask_user trace row exceeds width {width} ({cols} cols): {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn render_block_into_blanks_wide_char_continuation() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::text::Line;
+        // "🔥 x": fire (width 2) at cell 0, its continuation at cell 1, space at
+        // 2, 'x' at 3. The continuation must be an EMPTY symbol so insert_before
+        // doesn't flush it as a stray space (which would push 'x' to cell 4).
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+        super::render_block_into(&mut buf, &[Line::from("🔥 x")]);
+        assert_eq!(
+            buf.get(1, 0).symbol(),
+            "",
+            "wide-char continuation must be blank"
+        );
+        assert_eq!(buf.get(2, 0).symbol(), " ");
+        assert_eq!(buf.get(3, 0).symbol(), "x");
     }
 
     #[test]
