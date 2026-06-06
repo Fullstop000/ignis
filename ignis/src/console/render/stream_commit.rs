@@ -47,7 +47,10 @@ pub(crate) fn stable_prefix(text: &str) -> &str {
     let mut start = 0usize;
     let mut lines: Vec<(usize, bool)> = Vec::new();
     for line in text[..complete_end].split_inclusive('\n') {
-        let is_fence_delim = line.trim_start().starts_with("```");
+        // Match render_md_block's detection exactly (it checks the line head
+        // with no trim): an *indented* ``` is not a fence delimiter there, so
+        // we must not treat it as one either, or committed rows could diverge.
+        let is_fence_delim = line.starts_with("```");
         let held = !in_fence && !is_fence_delim && is_table_row(line);
         lines.push((start, held));
         if is_fence_delim {
@@ -143,6 +146,15 @@ mod tests {
         // `| x |` inside a fence is code (append-only), not a table row.
         let t = "```\n| x |\n";
         assert_eq!(stable_prefix(t), t);
+    }
+
+    #[test]
+    fn indented_backticks_are_not_treated_as_a_fence() {
+        // render_md_block only treats a line-leading ``` as a fence, so an
+        // indented ``` must NOT open one here — otherwise a following table
+        // would be committed as "code" while the renderer boxes it (divergence).
+        let t = "  ```\n| a | b |\n|---|---|\n";
+        assert_eq!(stable_prefix(t), "  ```\n");
     }
 
     #[test]
