@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-06-08
+
 ### Added
 - TUI — the input bar shows a `❯` prompt at its left edge. ([#133](https://github.com/Fullstop000/ignis/pull/133))
 
