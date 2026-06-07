@@ -204,9 +204,18 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
             );
         }
     } else if let Some(picker) = &app.model_picker {
-        let max_rows = (body_area.height as usize).saturating_sub(4).max(1);
+        // Model picker renders as bare text at the top of the body area —
+        // not a popup, not a full-area takeover. `viewport_height` grows the
+        // TUI to ~the full terminal when this picker opens, so the band
+        // (status + footer) stays pinned at the bottom and the conversation
+        // in native scrollback above the TUI is unaffected.
+        let options = &app.model_options;
+        // Subtract 4 for blank + header + above/below hints + footer. Cap at
+        // 15 so a tall body area doesn't grow the picker unboundedly; the
+        // renderer's `↑/↓ N more` hints cover the rest.
+        let max_rows = (body_area.height as usize).saturating_sub(4).clamp(1, 15);
         let mut lines: Vec<Line> = Vec::new();
-        render_model_picker(&mut lines, picker, &app.model_options, max_rows);
+        render_model_picker(&mut lines, picker, options, max_rows);
         f.render_widget(
             Paragraph::new(Text::from(lines))
                 .style(Style::default().bg(BG))
