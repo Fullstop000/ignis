@@ -584,6 +584,12 @@ pub(crate) struct App {
     /// Shared external-subprocess hook registry — used by `/hooks reload`
     /// and (clone-handed) by the assistant-render seam in `runner.rs`.
     pub(crate) hooks: Option<crate::hooks::HookRegistry>,
+    /// Compact text to render for the next committed user prompt, in place of
+    /// the prompt actually sent to the model. Set when a `/skill-name` command
+    /// expands its full body into the prompt — the transcript shows the typed
+    /// command, the model still receives the body. `take()`-consumed on commit;
+    /// cleared at turn-end so a hook-blocked turn can't carry it into the next.
+    pub(crate) pending_user_display: Option<String>,
 }
 
 impl App {
@@ -636,6 +642,7 @@ impl App {
             update_notice: None,
             git_branch,
             hooks: None,
+            pending_user_display: None,
         }
     }
 
@@ -860,7 +867,13 @@ impl App {
                 // into history — render it so scrollback matches what the
                 // model received. With no hooks installed, `text` equals
                 // what the user typed; the user perceives no delay.
-                self.push_user_prompt(text);
+                //
+                // A `/skill-name` command is the exception: it commits the full
+                // skill body to history but sets `pending_user_display` to the
+                // typed command, so the transcript shows the compact invocation
+                // instead of the expansion (CC/Codex behavior).
+                let shown = self.pending_user_display.take().unwrap_or(text);
+                self.push_user_prompt(shown);
             }
             AgentEvent::Warning { source, message } => {
                 // Surfaces hook-chain failures (and any other ignis-side
@@ -1108,6 +1121,7 @@ impl App {
         self.current_chunk_idx = None;
         self.history_idx = None;
         self.last_usage = None;
+        self.pending_user_display = None;
         self.session_picker = None;
         self.add_assistant_notice(format!("Started new session `{}`.", self.session_id));
     }
@@ -1419,6 +1433,7 @@ impl App {
         self.current_chunk_idx = None;
         self.session_picker = None;
         self.last_usage = None;
+        self.pending_user_display = None;
 
         if messages.is_empty() {
             self.add_assistant_notice(format!("Resumed empty session `{}`.", session_id));
@@ -2282,6 +2297,36 @@ mod tests {
         });
         assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "from-start"));
         assert_eq!(app.history.last().map(|s| s.as_str()), Some("from-start"));
+    }
+
+    #[test]
+    fn skill_commit_renders_typed_command_not_expanded_body() {
+        // A /skill-name turn commits the full skill body to history but sets
+        // `pending_user_display` to the typed command. The transcript must show
+        // the compact invocation, not the expansion (CC/Codex behavior).
+        let mut app = test_app();
+        app.pending_user_display = Some("/brainstorming fix the bug".to_string());
+        app.handle_event(AgentEvent::UserPromptCommitted {
+            text: "The \"brainstorming\" skill is now active … (full body)".to_string(),
+        });
+        assert!(
+            matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "/brainstorming fix the bug"),
+            "transcript shows the typed command, not the skill body"
+        );
+        // Consumed, so the next normal prompt renders its own committed text.
+        assert!(app.pending_user_display.is_none());
+    }
+
+    #[test]
+    fn normal_commit_renders_committed_text_verbatim() {
+        // Regression guard on the `unwrap_or`: with no override, the committed
+        // (post-hook) text renders unchanged.
+        let mut app = test_app();
+        assert!(app.pending_user_display.is_none());
+        app.handle_event(AgentEvent::UserPromptCommitted {
+            text: "hello world".to_string(),
+        });
+        assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "hello world"));
     }
 
     #[test]

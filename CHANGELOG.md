@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - TUI — the input bar shows a `❯` prompt at its left edge. ([#133](https://github.com/Fullstop000/ignis/pull/133))
 
+### Changed
+- TUI — invoking a skill (`/skill-name` or the `skill` tool) shows a compact line in the transcript instead of the full skill body. ([#136](https://github.com/Fullstop000/ignis/pull/136))
+
 ## [0.35.0] - 2026-06-06
 
 ### Added

@@ -567,6 +567,12 @@ pub(crate) async fn submit_text(
     let command = text.split_whitespace().next().unwrap_or("");
     let arg_count = text.split_whitespace().count();
 
+    // Each newly-dispatched line starts with no display override. Only the
+    // `/skill-name` branch sets one; clearing here drops any override stranded
+    // by a prior turn whose `UserPromptCommitted` never fired (a blocked
+    // `UserPromptSubmit` hook), so it can't mislabel this line.
+    app.pending_user_display = None;
+
     // No-provider gate: block anything that would talk to the LLM (plain
     // prompts, the built-in LLM commands, skill commands) until /connect runs.
     // PROVIDER_GATE_EXEMPT commands bypass it even when a same-named skill is
@@ -647,6 +653,11 @@ pub(crate) async fn submit_text(
                 if let Some(note) = skill.resources_note() {
                     prompt.push_str(&note);
                 }
+                // The model gets the full skill body (`prompt`); the transcript
+                // shows the command the user typed. Without this override the
+                // committed prompt — the whole body — would render as the user
+                // turn (CC/Codex show the compact invocation, not the expansion).
+                app.pending_user_display = Some(text.trim().to_string());
                 app.turn_in_flight = true;
                 let _ = prompt_tx
                     .send(AgentRequest::Prompt {
@@ -1032,6 +1043,79 @@ mod tests {
             _ => panic!("expected Prompt"),
         }
         assert!(app.turn_in_flight);
+    }
+
+    fn app_with_skill(name: &str, body: &str) -> App {
+        let tmp = crate::util::unique_temp_dir("ignis-keys-skill");
+        let cwd = tmp.join("proj");
+        let dir = cwd.join(".ignis/skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\n---\n{body}"),
+        )
+        .unwrap();
+        let reg = crate::skills::SkillRegistry::load(None, &cwd, std::collections::HashSet::new());
+        std::fs::remove_dir_all(&tmp).ok();
+        let mut app = test_app();
+        app.skills = Some(std::sync::Arc::new(reg));
+        app
+    }
+
+    #[tokio::test]
+    async fn skill_command_sends_full_body_but_displays_typed_command() {
+        // The model must receive the expanded skill body; the transcript must
+        // show only the compact `/skill-name args` the user typed.
+        let mut app = app_with_skill("react", "React body instructions.");
+        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        submit_text(
+            &mut app,
+            "/react fix it".to_string(),
+            &p_tx,
+            &pk_tx,
+            &n_tx,
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        match p_rx.try_recv().expect("expected a Prompt request") {
+            AgentRequest::Prompt { prompt, .. } => assert!(
+                prompt.contains("React body instructions."),
+                "model receives the full expanded skill body"
+            ),
+            _ => panic!("expected Prompt"),
+        }
+        assert_eq!(
+            app.pending_user_display.as_deref(),
+            Some("/react fix it"),
+            "transcript will render the typed command, not the body"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_display_override_is_cleared_on_next_dispatch() {
+        // If a prior /skill turn's UserPromptCommitted never fired (a blocked
+        // UserPromptSubmit hook), its override must not survive to mislabel the
+        // next prompt. Dispatch clears it up front.
+        let mut app = test_app();
+        app.pending_user_display = Some("/react stale".to_string());
+        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        submit_text(
+            &mut app,
+            "hello".to_string(),
+            &p_tx,
+            &pk_tx,
+            &n_tx,
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+        assert!(
+            app.pending_user_display.is_none(),
+            "a stale override is cleared at the top of dispatch"
+        );
+        match p_rx.try_recv().expect("expected a Prompt request") {
+            AgentRequest::Prompt { prompt, .. } => assert_eq!(prompt, "hello"),
+            _ => panic!("expected Prompt"),
+        }
     }
 
     fn last_notice(app: &App) -> Option<String> {

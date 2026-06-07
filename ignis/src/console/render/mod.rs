@@ -778,6 +778,53 @@ mod tests {
     }
 
     #[test]
+    fn render_skill_tool_collapses_body_to_one_line() {
+        // The skill tool returns the whole skill body wrapped in <skill name>.
+        // The block must show a single "loaded skill instructions" line, never
+        // the wrapper or the body (model reads it, not the user).
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        app.blocks.push(UIBlock::Tool(ToolCallEntry {
+            id: "s1".to_string(),
+            name: "skill".to_string(),
+            arguments: r#"{"name":"brainstorming"}"#.to_string(),
+            status: ToolStatus::Success(
+                "<skill name=\"brainstorming\">\nSECRET_BODY_LINE_ONE\nSECRET_BODY_LINE_TWO\n</skill>"
+                    .to_string(),
+            ),
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 3,
+        }));
+
+        let term = render_blocks(&app, 80, 24);
+        let content = buffer_content(&term);
+        assert!(
+            content.contains("skill"),
+            "header still shows the tool name"
+        );
+        assert!(
+            content.contains("loaded skill instructions"),
+            "skill block shows the one-line confirmation"
+        );
+        assert!(
+            !content.contains("SECRET_BODY_LINE_ONE"),
+            "the skill body must not spill into the transcript"
+        );
+        assert!(
+            !content.contains("<skill name"),
+            "the <skill> wrapper must not render"
+        );
+        assert!(
+            !content.contains("more lines"),
+            "no '… N more lines' tail for the collapsed skill block"
+        );
+    }
+
+    #[test]
     fn render_edit_file_shows_diff_lines() {
         let mut app = App::new(
             "test".to_string(),
