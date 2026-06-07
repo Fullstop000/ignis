@@ -30,7 +30,7 @@ pub(crate) use pickers::{
     render_mcp_picker, render_model_picker, render_session_picker, render_skill_picker,
 };
 pub(crate) use widgets::{
-    draw_footer, draw_input, draw_loading, draw_queued, draw_slash_suggestions,
+    draw_footer, draw_input, draw_loading, draw_queued, draw_slash_suggestions, picker_window,
     queued_region_height, MAX_SLASH_ROWS,
 };
 
@@ -79,8 +79,10 @@ fn picker_open(app: &App) -> bool {
 /// - `ask_user` (a tool-initiated `inline_picker`): just the picker + the
 ///   status/footer band, so the conversation stays visible in native scrollback
 ///   *above* the picker (it replaces the input region, CC-style).
-/// - slash-command pickers (`/model`, `/sessions`, …): the whole terminal, since
-///   they're entered intentionally and benefit from the room.
+/// - `/model`: just the picker + band, anchored above the input so the
+///   conversation remains visible in scrollback.
+/// - slash-command pickers (`/sessions`, `/skills`, `/mcp`): the whole terminal,
+///   since they're entered intentionally and benefit from the room.
 /// - otherwise: just the band.
 pub(crate) fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 {
     let cap = term_rows.saturating_sub(1).max(3);
@@ -88,14 +90,37 @@ pub(crate) fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 
         let picker_h = super::inline_picker::picker_height(p, term_cols);
         return (picker_h + 2).min(cap); // picker + status + footer
     }
-    if app.model_picker.is_some()
-        || app.session_picker.is_some()
-        || app.skill_picker.is_some()
-        || app.mcp_picker.is_some()
-    {
+    if let Some(picker) = &app.model_picker {
+        let ph = model_picker_height(picker, &app.model_options);
+        let bh = band_height(app, term_rows);
+        return (ph + bh).min(cap);
+    }
+    if app.session_picker.is_some() || app.skill_picker.is_some() || app.mcp_picker.is_some() {
         return cap;
     }
     band_height(app, term_rows).min(cap)
+}
+
+/// Natural height (rows) of the `/model` picker content. Used by
+/// `viewport_height` so the picker only takes the room it needs instead
+/// of consuming the whole terminal.
+const MODEL_PICKER_MAX_OPTION_ROWS: usize = 15;
+
+fn model_picker_height(
+    picker: &crate::console::app::ModelPicker,
+    options: &[crate::llm::ModelOption],
+) -> u16 {
+    if options.is_empty() {
+        return 3; // blank + header + "No models configured."
+    }
+    let sel = picker.selected.min(options.len() - 1);
+    let has_effort = !options[sel].effort_levels.is_empty();
+    let (start, end) = picker_window(sel, MODEL_PICKER_MAX_OPTION_ROWS, options.len());
+    let visible = (end - start) as u16;
+    let above = (start > 0) as u16;
+    let below = (options.len() - end > 0) as u16;
+    // blank + header + effort? + above? + visible + below? + footer
+    2 + has_effort as u16 + above + visible + below + 1
 }
 
 /// Blit pre-wrapped `lines` (one `Line` per visual row — `block_lines` already
@@ -204,23 +229,26 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
             );
         }
     } else if let Some(picker) = &app.model_picker {
-        // Model picker renders as bare text at the top of the body area —
-        // not a popup, not a full-area takeover. `viewport_height` grows the
-        // TUI to ~the full terminal when this picker opens, so the band
-        // (status + footer) stays pinned at the bottom and the conversation
-        // in native scrollback above the TUI is unaffected.
+        // Model picker anchors to the bottom of the body area — like the
+        // inline ask_user picker — so the conversation in native scrollback
+        // above the TUI is visible. `viewport_height` only grows the TUI by
+        // the picker's natural height, not the whole terminal.
         let options = &app.model_options;
-        // Subtract 4 for blank + header + above/below hints + footer. Cap at
-        // 15 so a tall body area doesn't grow the picker unboundedly; the
-        // renderer's `↑/↓ N more` hints cover the rest.
-        let max_rows = (body_area.height as usize).saturating_sub(4).clamp(1, 15);
+        let max_rows = MODEL_PICKER_MAX_OPTION_ROWS;
         let mut lines: Vec<Line> = Vec::new();
         render_model_picker(&mut lines, picker, options, max_rows);
+        let desired = lines.len() as u16;
+        let h = desired.min(body_area.height).max(1);
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(h)])
+            .split(body_area);
+        let picker_area = split[1];
         f.render_widget(
             Paragraph::new(Text::from(lines))
                 .style(Style::default().bg(BG))
                 .wrap(Wrap { trim: false }),
-            body_area,
+            picker_area,
         );
     } else if let Some(picker) = &app.session_picker {
         let max_rows = (body_area.height as usize).saturating_sub(3).max(1);
