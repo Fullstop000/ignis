@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::tools::tool::{ToolHooks, ToolResult};
 use crate::AgentEvent;
@@ -60,6 +60,29 @@ pub type EventSender = mpsc::Sender<AgentEvent>;
 pub struct HookRegistry {
     inner: Arc<RwLock<HooksConfig>>,
     session: Arc<RwLock<SessionEnvelopeContext>>,
+    /// FIFO queue of `additionalContext` strings emitted by hooks that
+    /// returned [`HookOutcome::InjectContext`]. The agent loop drains
+    /// this between tool batches and prepends each entry as a
+    /// `<system-reminder>` block before the next LLM call. Queue is
+    /// shared across the session (same posture as the config) so a
+    /// hook firing inside one tool batch can deliver context to the
+    /// next.
+    pending_injections: Arc<Mutex<Vec<PendingInjection>>>,
+}
+
+/// One queued context injection. The `source` is the hook's display
+/// name so the system reminder rendered to the model carries enough
+/// provenance for a user reading the transcript to know which hook
+/// fired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInjection {
+    /// The `additional_context` text the hook returned.
+    pub text: String,
+    /// `display_name()` of the hook that produced it (the file stem).
+    pub source: String,
+    /// The event class that produced it (e.g. `PostToolUse`). Lets the
+    /// renderer label the reminder ("hook PostToolUse: ...").
+    pub event: HookEvent,
 }
 
 /// Per-session envelope context — what subprocess hooks see in their
@@ -79,6 +102,7 @@ impl HookRegistry {
         Ok(Self {
             inner: Arc::new(RwLock::new(cfg)),
             session: Arc::new(RwLock::new(SessionEnvelopeContext::default())),
+            pending_injections: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -93,7 +117,32 @@ impl HookRegistry {
         Self {
             inner: Arc::new(RwLock::new(cfg)),
             session: Arc::new(RwLock::new(SessionEnvelopeContext::default())),
+            pending_injections: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Take everything queued by hooks that returned
+    /// `additional_context`. Called by the agent loop after each tool
+    /// batch to flush pending injections into the history as
+    /// `<system-reminder>` blocks before the next LLM call. FIFO order
+    /// is preserved so a `PostToolUse` hook in one batch reaches the
+    /// next LLM call in the order it fired.
+    pub async fn drain_injections(&self) -> Vec<PendingInjection> {
+        let mut g = self.pending_injections.lock().await;
+        std::mem::take(&mut *g)
+    }
+
+    /// Number of injections currently queued. Read-only — for tests
+    /// and the `/hooks` listing's drift detection.
+    pub async fn pending_injection_count(&self) -> usize {
+        self.pending_injections.lock().await.len()
+    }
+
+    /// Internal: queue an injection. Used by the `ToolHooks` impl when
+    /// a `PostToolUse` (or, in commit 5, any inject-context event)
+    /// returns `additional_context`.
+    async fn queue_injection(&self, inj: PendingInjection) {
+        self.pending_injections.lock().await.push(inj);
     }
 
     /// Set the session-level envelope context. Called once by
@@ -542,14 +591,16 @@ impl ToolHooks for HookRegistry {
             match outcome {
                 HookOutcome::PassThrough => {}
                 HookOutcome::InjectContext(text) => {
-                    // The system-reminder insertion path lands in a
-                    // follow-up commit; for now record the intent in a
-                    // span field so users can see the hook fired.
-                    tracing::debug!(
-                        hook = %spec.display_name(),
-                        injection_len = text.len(),
-                        "PostToolUse hook returned additional_context (insertion path TBD)"
-                    );
+                    // Queue the context for the next LLM call. The agent
+                    // loop drains `pending_injections` after each tool
+                    // batch and prepends each entry as a
+                    // `<system-reminder>` block (wired in commit 5).
+                    self.queue_injection(PendingInjection {
+                        text,
+                        source: spec.display_name(),
+                        event: HookEvent::PostToolUse,
+                    })
+                    .await;
                 }
                 HookOutcome::Blocked { reason, stderr } => {
                     // CC posture: a PostToolUse "block" frames the tool
@@ -1164,6 +1215,65 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "reason must be appended: {}",
             out.content
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn tool_hooks_post_tool_use_inject_context_queues_for_next_llm_call() {
+        // A PostToolUse hook returning `additional_context` doesn't
+        // change the tool result — the text is queued as a
+        // `PendingInjection` for the agent loop to flush as a
+        // `<system-reminder>` before the next LLM call (commit 5
+        // consumer). Order matches firing order.
+        let tmp = crate::util::unique_temp_dir("ignis-th-inject");
+        let s1 = write_script(
+            &tmp,
+            "inject1.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"additionalContext\":\"alpha\"}}'\n",
+        );
+        let s2 = write_script(
+            &tmp,
+            "inject2.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"additionalContext\":\"beta\"}}'\n",
+        );
+        let cfg = HooksConfig {
+            post_tool_use: vec![
+                HookSpec {
+                    program: s1,
+                    args: vec![],
+                    timeout_ms: 5_000,
+                    matcher: None,
+                },
+                HookSpec {
+                    program: s2,
+                    args: vec![],
+                    timeout_ms: 5_000,
+                    matcher: None,
+                },
+            ],
+            ..HooksConfig::default()
+        };
+        let reg = HookRegistry::from_config(cfg);
+        let args = serde_json::json!({});
+        let result = ToolResult {
+            content: "ran".to_string(),
+            is_error: false,
+        };
+        let out = reg.after_tool_call("Bash", &args, result.clone()).await;
+        // Tool result is unchanged — InjectContext does NOT mutate
+        // `result`, only enqueues context for the next turn.
+        assert_eq!(out.content, "ran");
+        assert!(!out.is_error);
+        // Queue carries both injections in order with provenance.
+        let drained = reg.drain_injections().await;
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].text, "alpha");
+        assert_eq!(drained[0].event, HookEvent::PostToolUse);
+        assert!(drained[0].source.contains("inject1"));
+        assert_eq!(drained[1].text, "beta");
+        assert!(drained[1].source.contains("inject2"));
+        // Second drain is empty — `drain_injections` consumes.
+        assert_eq!(reg.pending_injection_count().await, 0);
         std::fs::remove_dir_all(&tmp).ok();
     }
 
