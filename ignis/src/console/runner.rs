@@ -35,6 +35,57 @@ fn make_terminal(viewport_rows: u16) -> io::Result<Terminal<CrosstermBackend<io:
     )
 }
 
+/// True for crossterm's transient "cursor position could not be read within a
+/// normal duration" error. Re-anchoring the inline viewport (on a rebuild or a
+/// resize) queries the cursor row via a DSR (`ESC[6n`) and waits up to ~2s for
+/// the terminal to reply; under output backpressure on a slow pty (WSL2, tmux)
+/// that reply can land late. It's recoverable — skip this frame's rebuild/draw
+/// and retry next tick — so it must NOT be `?`-bubbled into tearing down the
+/// whole TUI and losing the live session. `ErrorKind::Other` + the message text
+/// is the only signal crossterm 0.27 gives; any other I/O error stays fatal.
+fn transient_cursor_read_error(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Other && e.to_string().contains("cursor position could not be read")
+}
+
+/// Rebuild the inline-viewport terminal at `rows`, tolerating the transient
+/// cursor-read timeout. `Ok(true)` = rebuilt (caller commits the new size);
+/// `Ok(false)` = the terminal didn't answer in time, so the old viewport is
+/// kept and the caller should leave its size state untouched to retry next
+/// frame; `Err` = a real I/O failure that should propagate.
+fn try_rebuild(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    rows: u16,
+) -> io::Result<bool> {
+    match make_terminal(rows) {
+        Ok(t) => {
+            *terminal = t;
+            Ok(true)
+        }
+        Err(e) if transient_cursor_read_error(&e) => {
+            log::warn!("inline viewport rebuild skipped (cursor read timeout): {e}");
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Draw the live band, tolerating the transient cursor-read timeout (a resize
+/// racing `draw`'s autoresize can trigger a DSR). Swallows only that specific
+/// timeout — every other draw error propagates.
+fn draw_tolerant(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> io::Result<()> {
+    match terminal.draw(|f| draw(f, app)) {
+        Ok(_) => Ok(()),
+        Err(e) if transient_cursor_read_error(&e) => {
+            log::warn!("inline draw skipped (cursor read timeout): {e}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// RAII guard for raw-mode + bracketed paste. On drop (Err-bubble, panic, or
 /// clean exit) it restores the user's prior terminal state. Inline rendering
 /// stays in the *normal* buffer (no alternate screen) so the conversation
@@ -449,8 +500,11 @@ pub async fn run_console(
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
                 crossterm::cursor::MoveTo(0, 0)
             )?;
-            terminal = make_terminal(viewport_rows)?;
-            app.pending_screen_clear = false;
+            // Leave `pending_screen_clear` set if the rebuild's DSR times out,
+            // so the re-anchor is retried next frame instead of crashing.
+            if try_rebuild(&mut terminal, viewport_rows)? {
+                app.pending_screen_clear = false;
+            }
         }
 
         // Push settled rows into the terminal's native scrollback via
@@ -510,11 +564,14 @@ pub async fn run_console(
                 } else {
                     terminal.clear()?;
                 }
-                terminal = make_terminal(want_rows)?;
-                viewport_rows = want_rows;
-                last_term_size = term_size;
+                // Commit the new band size only if the re-anchor succeeded; a
+                // timed-out DSR keeps the old viewport and retries next frame.
+                if try_rebuild(&mut terminal, want_rows)? {
+                    viewport_rows = want_rows;
+                    last_term_size = term_size;
+                }
             }
-            terminal.draw(|f| draw(f, &mut app))?;
+            draw_tolerant(&mut terminal, &mut app)?;
             last_draw = std::time::Instant::now();
         }
     }
@@ -697,6 +754,27 @@ mod tests {
             tool_calls: None,
             created_at_ms: None,
         }
+    }
+
+    #[test]
+    fn cursor_read_timeout_is_classified_transient() {
+        // The exact string crossterm 0.27 returns when a DSR (`ESC[6n`) reply
+        // doesn't arrive within its ~2s window. This must be treated as
+        // recoverable so a slow-pty hiccup skips a frame instead of killing
+        // the whole TUI.
+        let e =
+            std::io::Error::other("The cursor position could not be read within a normal duration");
+        assert!(transient_cursor_read_error(&e));
+    }
+
+    #[test]
+    fn real_io_errors_stay_fatal() {
+        // A genuinely broken terminal/pipe must still propagate — only the
+        // cursor-read timeout is swallowed.
+        let pipe = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        assert!(!transient_cursor_read_error(&pipe));
+        let other = std::io::Error::other("some other backend failure");
+        assert!(!transient_cursor_read_error(&other));
     }
 
     #[tokio::test]

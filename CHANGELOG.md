@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - TUI — invoking a skill (`/skill-name` or the `skill` tool) shows a compact line in the transcript instead of the full skill body. ([#136](https://github.com/Fullstop000/ignis/pull/136))
 
+### Fixed
+- TUI — a momentarily unresponsive terminal no longer crashes the session mid-render; the inline view rides out the hiccup and recovers. ([#135](https://github.com/Fullstop000/ignis/pull/135))
+
 ## [0.35.0] - 2026-06-06
 
 ### Added
