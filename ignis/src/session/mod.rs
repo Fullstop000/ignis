@@ -1,6 +1,6 @@
 use crate::agent::Agent;
 use crate::config::CompactionConfig;
-use crate::hooks::{HookContext, HookRegistry, PromptHookResult};
+use crate::hooks::{ChainedToolHooks, HookContext, HookRegistry, PromptHookResult};
 use crate::llm::LlmProvider;
 use crate::storage::SessionStorage;
 use crate::tools::tool::{AgentTool, ToolHooks};
@@ -73,6 +73,15 @@ impl Session {
             Some(home) => HookRegistry::from_config_dir(&home)?,
             None => HookRegistry::empty(),
         };
+        // Seed the registry's envelope context so PreToolUse / PostToolUse
+        // (and the lifecycle events landing in commit 6) carry the real
+        // session id + cwd in their JSON envelopes. Set before any hook
+        // can fire — the registry is then used by both the prompt-hook
+        // path (UserPromptSubmit / AssistantMessageRender) and, once
+        // `set_hooks` is called, the chained ToolHooks path.
+        hooks
+            .set_envelope_context(id.clone(), PathBuf::from(&start_dir))
+            .await;
         // The registry is plumbed into each `agent.run` call in
         // `Session::prompt` rather than stored on the Agent; that keeps a
         // single source of truth (the Session's `hooks` field) and makes
@@ -109,8 +118,15 @@ impl Session {
         self.agent.register_tool(tool);
     }
 
-    pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
-        self.agent.set_hooks(hooks);
+    /// Install the in-tree policy gate. The session always wraps it
+    /// with the subprocess `HookRegistry` so user-authored
+    /// `PreToolUse` / `PostToolUse` hooks fire on the same path — see
+    /// [`ChainedToolHooks`]. The policy gate runs first; only allowed
+    /// calls reach user hooks. A second call replaces the previous
+    /// policy gate but keeps the registry wired.
+    pub fn set_hooks(&mut self, policy: Box<dyn ToolHooks>) {
+        let chained = ChainedToolHooks::wrap(policy, self.hooks.clone());
+        self.agent.set_hooks(chained);
     }
 
     /// Apply the shared skill registry to this session's agent (enables the

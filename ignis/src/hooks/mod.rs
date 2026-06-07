@@ -552,6 +552,10 @@ impl ToolHooks for HookRegistry {
         }
     }
 
+    async fn drain_pending_context(&self) -> Vec<PendingInjection> {
+        self.drain_injections().await
+    }
+
     async fn after_tool_call(
         &self,
         tool_name: &str,
@@ -634,6 +638,95 @@ impl ToolHooks for HookRegistry {
         }
         current
     }
+}
+
+/// Compose multiple `ToolHooks` impls into a single dispatch point. The
+/// agent loop calls only ONE `ToolHooks` impl; this wrapper lets the
+/// in-tree policy gate (`PermissionChecker`) and the subprocess
+/// `HookRegistry` both fire from the same path.
+///
+/// Order matters:
+/// * `before_tool_call` runs children left-to-right. Each child sees
+///   the args produced by the previous child. The first `Err` short-
+///   circuits the chain — typical layering puts the policy gate
+///   first so a denied call never reaches user-authored hooks.
+/// * `after_tool_call` runs children left-to-right over a folding
+///   `ToolResult`. Each child sees what the previous child produced.
+/// * `drain_pending_context` concatenates all children's drains in
+///   declaration order.
+pub struct ChainedToolHooks {
+    children: Vec<Box<dyn ToolHooks>>,
+}
+
+impl ChainedToolHooks {
+    pub fn new(children: Vec<Box<dyn ToolHooks>>) -> Self {
+        Self { children }
+    }
+
+    /// Convenience: wrap a single existing impl plus a `HookRegistry`
+    /// behind a `ChainedToolHooks`. Used by `Session::set_hooks` to
+    /// fold the subprocess registry into whatever policy gate the
+    /// runner installs (typically `PermissionChecker`).
+    pub fn wrap(policy: Box<dyn ToolHooks>, registry: HookRegistry) -> Box<dyn ToolHooks> {
+        Box::new(Self::new(vec![policy, Box::new(registry)]))
+    }
+}
+
+#[async_trait]
+impl ToolHooks for ChainedToolHooks {
+    async fn before_tool_call(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let original = args.clone();
+        let mut current = args.clone();
+        for child in &self.children {
+            match child.before_tool_call(tool_name, &current).await? {
+                None => {}
+                Some(rewritten) => current = rewritten,
+            }
+        }
+        if current == original {
+            Ok(None)
+        } else {
+            Ok(Some(current))
+        }
+    }
+
+    async fn after_tool_call(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        result: ToolResult,
+    ) -> ToolResult {
+        let mut current = result;
+        for child in &self.children {
+            current = child.after_tool_call(tool_name, args, current).await;
+        }
+        current
+    }
+
+    async fn drain_pending_context(&self) -> Vec<PendingInjection> {
+        let mut out = Vec::new();
+        for child in &self.children {
+            out.extend(child.drain_pending_context().await);
+        }
+        out
+    }
+}
+
+/// Render a queued [`PendingInjection`] as the `<system-reminder>`
+/// block text the agent loop prepends before the next LLM call.
+/// Single source of truth for the framing so dashboards and tests can
+/// pin the wire shape.
+pub fn render_injection_as_system_reminder(inj: &PendingInjection) -> String {
+    format!(
+        "<system-reminder>\nhook {} ({}): {}\n</system-reminder>",
+        inj.event.as_str(),
+        inj.source,
+        inj.text
+    )
 }
 
 #[cfg(test)]
@@ -1275,6 +1368,122 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         // Second drain is empty — `drain_injections` consumes.
         assert_eq!(reg.pending_injection_count().await, 0);
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ---- ChainedToolHooks ----
+
+    struct AllowAll;
+    struct AlwaysBlock(&'static str);
+    struct ConstantRewrite(serde_json::Value);
+
+    #[async_trait]
+    impl ToolHooks for AllowAll {}
+
+    #[async_trait]
+    impl ToolHooks for AlwaysBlock {
+        async fn before_tool_call(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Err(self.0.to_string())
+        }
+    }
+
+    #[async_trait]
+    impl ToolHooks for ConstantRewrite {
+        async fn before_tool_call(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn chained_first_block_short_circuits_chain() {
+        // Policy gate denies → registry must never be consulted. Pins
+        // the layering invariant used by Session::set_hooks.
+        let chain = ChainedToolHooks::new(vec![
+            Box::new(AlwaysBlock("policy denied")),
+            Box::new(ConstantRewrite(serde_json::json!({"never": "ran"}))),
+        ]);
+        let res = chain.before_tool_call("Bash", &serde_json::json!({})).await;
+        assert_eq!(res, Err("policy denied".to_string()));
+    }
+
+    #[tokio::test]
+    async fn chained_rewrites_thread_through_next_child() {
+        // First child rewrites → second child sees rewrite. Final args
+        // are the second child's output if any. Tests the
+        // ChainedToolHooks args-threading contract.
+        let chain = ChainedToolHooks::new(vec![
+            Box::new(ConstantRewrite(serde_json::json!({"step": 1}))),
+            Box::new(ConstantRewrite(serde_json::json!({"step": 2}))),
+        ]);
+        let res = chain
+            .before_tool_call("Bash", &serde_json::json!({"step": 0}))
+            .await
+            .unwrap();
+        assert_eq!(res, Some(serde_json::json!({"step": 2})));
+    }
+
+    #[tokio::test]
+    async fn chained_drain_aggregates_in_order() {
+        // Two HookRegistry impls queued with different injections —
+        // the chain returns both, registry-A entries before registry-B.
+        let reg_a = HookRegistry::empty();
+        reg_a
+            .queue_injection(PendingInjection {
+                text: "from a".to_string(),
+                source: "a".to_string(),
+                event: HookEvent::PostToolUse,
+            })
+            .await;
+        let reg_b = HookRegistry::empty();
+        reg_b
+            .queue_injection(PendingInjection {
+                text: "from b".to_string(),
+                source: "b".to_string(),
+                event: HookEvent::PostToolUse,
+            })
+            .await;
+        let chain = ChainedToolHooks::new(vec![Box::new(reg_a), Box::new(reg_b)]);
+        let drained = chain.drain_pending_context().await;
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].text, "from a");
+        assert_eq!(drained[1].text, "from b");
+        // Second drain is empty — children consumed.
+        assert_eq!(chain.drain_pending_context().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn render_injection_as_system_reminder_wraps_with_provenance() {
+        // Pin the rendered shape: the wire format consumed by both
+        // dashboards and the agent loop's history.push.
+        let inj = PendingInjection {
+            text: "tests are still failing".to_string(),
+            source: "auto-test".to_string(),
+            event: HookEvent::PostToolUse,
+        };
+        let rendered = render_injection_as_system_reminder(&inj);
+        assert!(rendered.starts_with("<system-reminder>"));
+        assert!(rendered.ends_with("</system-reminder>"));
+        assert!(rendered.contains("hook PostToolUse (auto-test): tests are still failing"));
+    }
+
+    #[tokio::test]
+    async fn chained_wrap_helper_runs_policy_then_registry() {
+        // Smoke test for Session::set_hooks's wiring: wrap(policy,
+        // registry) → policy fires first; if it allows, registry sees
+        // the args.
+        let registry = HookRegistry::empty();
+        let chained = ChainedToolHooks::wrap(Box::new(AllowAll), registry);
+        let args = serde_json::json!({"command": "ls"});
+        // No registry hooks declared → Ok(None).
+        let res = chained.before_tool_call("Bash", &args).await;
+        assert_eq!(res, Ok(None));
     }
 
     #[tokio::test]

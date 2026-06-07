@@ -1238,6 +1238,27 @@ impl Agent {
         for msg in orphans.drain(..) {
             push_with_hook(history, hooks.as_deref(), &null_args, msg).await;
         }
+
+        // Flush any `additionalContext` queued by PostToolUse hooks
+        // (and, eventually, the other inject-context events). Each
+        // pending injection becomes a synthetic `role:"user"` message
+        // wrapping a `<system-reminder>` block — the next LLM call
+        // reads it like any other reminder. Rendered via the single
+        // helper in `hooks::render_injection_as_system_reminder` so
+        // wire format stays consistent with tests and dashboards.
+        if let Some(h) = hooks.as_deref() {
+            for inj in h.drain_pending_context().await {
+                history.push(Message {
+                    role: "user".to_string(),
+                    content: Some(crate::hooks::render_injection_as_system_reminder(&inj)),
+                    reasoning_content: None,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                    created_at_ms: Some(now_ms()),
+                });
+            }
+        }
     }
 }
 

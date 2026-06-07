@@ -193,4 +193,18 @@ pub trait ToolHooks: Send + Sync + 'static {
     ) -> ToolResult {
         result
     }
+
+    /// Drain any pending context strings hooks have produced via the
+    /// `additionalContext` channel since the last call. The agent loop
+    /// flushes the result as `<system-reminder>` messages prepended
+    /// before the next LLM call — that's the consumer side of the
+    /// `PostToolUse` (and, in future, `SessionStart` / `PreCompact` /
+    /// `PostCompact` / `Stop`) injection path.
+    ///
+    /// Default returns empty. Only impls that produce
+    /// `additional_context` (today: `HookRegistry`, and the chained
+    /// wrapper that fans across multiple impls) override this.
+    async fn drain_pending_context(&self) -> Vec<crate::hooks::PendingInjection> {
+        Vec::new()
+    }
 }
