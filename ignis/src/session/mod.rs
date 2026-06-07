@@ -82,6 +82,26 @@ impl Session {
         hooks
             .set_envelope_context(id.clone(), PathBuf::from(&start_dir))
             .await;
+        // SessionStart fires before any user turn is processed so its
+        // `additionalContext` reaches the very first LLM call via the
+        // pending-injection queue. Empty registry → zero overhead. The
+        // tx channel is created here only because run_session_start
+        // takes one for emitting [warn] lines on soft failures —
+        // there's no live event consumer at this moment, so the channel
+        // dies with this scope; warnings are silently dropped, which
+        // matches "session-start is best-effort".
+        let (tmp_tx, _tmp_rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+        let source = if history.is_empty() { "new" } else { "resume" };
+        hooks
+            .run_session_start(
+                source,
+                HookContext {
+                    session_id: &id,
+                    cwd: &start_dir,
+                },
+                &tmp_tx,
+            )
+            .await;
         // The registry is plumbed into each `agent.run` call in
         // `Session::prompt` rather than stored on the Agent; that keeps a
         // single source of truth (the Session's `hooks` field) and makes

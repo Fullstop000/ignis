@@ -1125,6 +1125,45 @@ impl Agent {
                 .await;
                 let _ = tx.send(AgentEvent::RunEnd).await;
                 if injected == 0 {
+                    // Stop hook chain — fires on the clean-exit branch
+                    // (NOT on `emit_fatal`). CC inversion: a hook
+                    // returning `decision: "block"` (mapped to
+                    // `KeepLooping` in dispatch) tells the loop to
+                    // continue instead of stopping. Any
+                    // `additional_context` is queued for the next-LLM-
+                    // call drain — but if we ARE keep-looping, the next
+                    // LLM call will drain it; if we're stopping, the
+                    // queue is naturally GC'd with the session.
+                    let keep_looping = match (prompt_hooks, hook_ctx) {
+                        (Some(reg), Some(ctx)) => {
+                            // No transcript path is plumbed yet — empty
+                            // string is the documented placeholder
+                            // until persistence wires it through.
+                            reg.run_stop("", ctx, &tx).await
+                        }
+                        _ => false,
+                    };
+                    if keep_looping {
+                        // Drain the just-queued KeepLooping reminder so
+                        // the next LLM call sees it. The same drain path
+                        // execute_tool_calls uses, applied here too.
+                        if let Some(reg) = prompt_hooks {
+                            for inj in reg.drain_injections().await {
+                                history.push(Message {
+                                    role: "user".to_string(),
+                                    content: Some(
+                                        crate::hooks::render_injection_as_system_reminder(&inj),
+                                    ),
+                                    reasoning_content: None,
+                                    name: None,
+                                    tool_call_id: None,
+                                    tool_calls: None,
+                                    created_at_ms: Some(now_ms()),
+                                });
+                            }
+                        }
+                        continue;
+                    }
                     break;
                 }
             }

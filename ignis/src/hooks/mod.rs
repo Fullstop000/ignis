@@ -95,6 +95,25 @@ struct SessionEnvelopeContext {
     cwd: PathBuf,
 }
 
+/// Internal carrier used by `run_inject_only_event` so the per-event
+/// builders can hand back both the payload (lifetime-bound to the
+/// event-specific args) and an owned `display_name()` label for the
+/// `PendingInjection` provenance. Closures can't easily return two
+/// values with different lifetimes, so we bundle them here.
+struct PayloadWithLabel<'a> {
+    payload: dispatch::HookPayload<'a>,
+    label: String,
+}
+
+impl<'a> dispatch::HookPayload<'a> {
+    fn with_spec_label(self, label: String) -> PayloadWithLabel<'a> {
+        PayloadWithLabel {
+            payload: self,
+            label,
+        }
+    }
+}
+
 impl HookRegistry {
     /// Load `~/.ignis/hooks.json` into a fresh registry.
     pub fn from_config_dir(home: &Path) -> anyhow::Result<Self> {
@@ -274,6 +293,168 @@ impl HookRegistry {
             }
         }
         current
+    }
+
+    /// Run the `SessionStart` chain — fires once when a session opens
+    /// (whether new or resumed). Source carries `"new"` / `"resume"` /
+    /// `"subagent"`. The only meaningful outcome is `additionalContext`
+    /// (queued for the next-LLM-call drain) or pass-through; rewrite
+    /// variants and `decision: "block"` are logged at debug and
+    /// otherwise ignored — a session has to start.
+    pub async fn run_session_start(&self, source: &str, ctx: HookContext<'_>, tx: &EventSender) {
+        self.run_inject_only_event(HookEvent::SessionStart, ctx, tx, |spec| {
+            dispatch::HookPayload::SessionStart { source }.with_spec_label(spec.display_name())
+        })
+        .await;
+    }
+
+    /// Run the `Stop` chain — fires on the clean-exit branch of the
+    /// agent loop (NOT on `emit_fatal`). The CC inversion applies:
+    /// `decision: "block"` becomes [`HookOutcome::KeepLooping`] inside
+    /// dispatch, surfaced here as a queued `<system-reminder>` framing
+    /// the loop-keep-alive reason. The caller decides whether to honour
+    /// the keep-loop by reading the returned `bool` (`true` =
+    /// continue the loop).
+    pub async fn run_stop(
+        &self,
+        transcript_path: &str,
+        ctx: HookContext<'_>,
+        tx: &EventSender,
+    ) -> bool {
+        let event = HookEvent::Stop;
+        let specs: Vec<HookSpec> = {
+            let guard = self.inner.read().await;
+            guard.for_event(event).to_vec()
+        };
+        if specs.is_empty() {
+            return false;
+        }
+        let dispatch_ctx = DispatchContext {
+            session_id: ctx.session_id,
+            cwd: ctx.cwd,
+        };
+        let mut keep_looping = false;
+        for spec in &specs {
+            let payload = dispatch::HookPayload::Stop { transcript_path };
+            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            match outcome {
+                HookOutcome::PassThrough => {}
+                HookOutcome::InjectContext(text) => {
+                    self.queue_injection(PendingInjection {
+                        text,
+                        source: spec.display_name(),
+                        event,
+                    })
+                    .await;
+                }
+                HookOutcome::KeepLooping { reason } => {
+                    // CC inversion: surface the reason as a queued
+                    // system reminder framing the keep-alive, and tell
+                    // the caller to continue the loop.
+                    self.queue_injection(PendingInjection {
+                        text: format!("stopped continuation: {reason}"),
+                        source: spec.display_name(),
+                        event,
+                    })
+                    .await;
+                    keep_looping = true;
+                }
+                HookOutcome::SoftFailed { reason } => {
+                    emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
+                    break;
+                }
+                HookOutcome::Blocked { stderr, reason } => {
+                    // Non-inverted block on Stop shouldn't happen
+                    // (dispatch normalises `decision: "block"` to
+                    // KeepLooping for Stop); the exit-2 path is the
+                    // exception and is also inverted to KeepLooping
+                    // there. If we somehow see a Blocked, treat it as
+                    // KeepLooping for safety + log a debug note.
+                    let why = reason.unwrap_or_else(|| trim_one_line(&stderr));
+                    tracing::debug!(
+                        hook = %spec.display_name(),
+                        "Stop hook returned Blocked outside the dispatcher's inversion path; treating as KeepLooping"
+                    );
+                    self.queue_injection(PendingInjection {
+                        text: format!("stopped continuation: {why}"),
+                        source: spec.display_name(),
+                        event,
+                    })
+                    .await;
+                    keep_looping = true;
+                }
+                // Rewrite variants don't apply to Stop.
+                HookOutcome::Mutated(_) | HookOutcome::MutatedJson(_) => {
+                    tracing::debug!(
+                        hook = %spec.display_name(),
+                        "Stop hook returned a rewrite outcome that does not apply; ignoring"
+                    );
+                }
+            }
+        }
+        keep_looping
+    }
+
+    /// Shared scaffolding for events where the only meaningful outcome
+    /// is `additional_context` → queued. Called by `run_session_start`
+    /// today and (once compaction wiring lands) by `PreCompact` /
+    /// `PostCompact`. Centralises the warn-on-block / drop-rewrites
+    /// posture so the per-event functions stay short.
+    async fn run_inject_only_event<'a, F>(
+        &self,
+        event: HookEvent,
+        ctx: HookContext<'a>,
+        tx: &EventSender,
+        mut build_payload: F,
+    ) where
+        F: for<'b> FnMut(&'b HookSpec) -> PayloadWithLabel<'a>,
+    {
+        let specs: Vec<HookSpec> = {
+            let guard = self.inner.read().await;
+            guard.for_event(event).to_vec()
+        };
+        if specs.is_empty() {
+            return;
+        }
+        let dispatch_ctx = DispatchContext {
+            session_id: ctx.session_id,
+            cwd: ctx.cwd,
+        };
+        for spec in &specs {
+            let pwl = build_payload(spec);
+            let outcome = dispatch::run_hook(spec, pwl.payload, &dispatch_ctx).await;
+            match outcome {
+                HookOutcome::PassThrough => {}
+                HookOutcome::InjectContext(text) => {
+                    self.queue_injection(PendingInjection {
+                        text,
+                        source: pwl.label.clone(),
+                        event,
+                    })
+                    .await;
+                }
+                HookOutcome::SoftFailed { reason } => {
+                    emit_warning(tx, event, &format!("{} ({})", reason, pwl.label)).await;
+                    break;
+                }
+                HookOutcome::Blocked { .. } => {
+                    emit_warning(
+                        tx,
+                        event,
+                        &format!("{} returned `decision: \"block\"` (ignored)", pwl.label),
+                    )
+                    .await;
+                }
+                other => {
+                    tracing::debug!(
+                        hook = %pwl.label,
+                        event = event.as_str(),
+                        outcome = ?other,
+                        "hook returned outcome that does not apply; ignoring"
+                    );
+                }
+            }
+        }
     }
 
     /// Run the `AssistantMessageRender` chain. Same semantics as
@@ -1447,6 +1628,86 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         assert!(drained[1].source.contains("inject2"));
         // Second drain is empty — `drain_injections` consumes.
         assert_eq!(reg.pending_injection_count().await, 0);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ---- SessionStart ----
+
+    #[tokio::test]
+    async fn session_start_no_hooks_is_noop() {
+        let reg = HookRegistry::empty();
+        let (tx, _rx) = mpsc::channel(8);
+        reg.run_session_start("new", ctx(), &tx).await;
+        // No queue, no warnings — just a no-op.
+        assert_eq!(reg.pending_injection_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn session_start_inject_context_queues_for_first_llm_call() {
+        let tmp = crate::util::unique_temp_dir("ignis-ss-inject");
+        let s = write_script(
+            &tmp,
+            "ss.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"additionalContext\":\"welcome back\"}}'\n",
+        );
+        let cfg = HooksConfig {
+            session_start: vec![HookSpec {
+                program: s,
+                args: vec![],
+                timeout_ms: 5_000,
+                matcher: None,
+            }],
+            ..HooksConfig::default()
+        };
+        let reg = HookRegistry::from_config(cfg);
+        let (tx, _rx) = mpsc::channel(8);
+        reg.run_session_start("resume", ctx(), &tx).await;
+        let drained = reg.drain_injections().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].text, "welcome back");
+        assert_eq!(drained[0].event, HookEvent::SessionStart);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ---- Stop ----
+
+    #[tokio::test]
+    async fn stop_no_hooks_returns_false() {
+        let reg = HookRegistry::empty();
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(!reg.run_stop("/tmp/transcript", ctx(), &tx).await);
+    }
+
+    #[tokio::test]
+    async fn stop_decision_block_returns_keep_looping_true_and_queues_reminder() {
+        // CC inversion: a Stop hook returning `decision:"block"` tells
+        // the loop to continue instead of terminating. Dispatch maps
+        // this to KeepLooping; run_stop returns true and queues the
+        // reason as a system reminder for the next LLM call.
+        let tmp = crate::util::unique_temp_dir("ignis-stop-keep");
+        let s = write_script(
+            &tmp,
+            "stop.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"decision\":\"block\",\"reason\":\"tests still failing\"}'\n",
+        );
+        let cfg = HooksConfig {
+            stop: vec![HookSpec {
+                program: s,
+                args: vec![],
+                timeout_ms: 5_000,
+                matcher: None,
+            }],
+            ..HooksConfig::default()
+        };
+        let reg = HookRegistry::from_config(cfg);
+        let (tx, _rx) = mpsc::channel(8);
+        let keep = reg.run_stop("/tmp/t", ctx(), &tx).await;
+        assert!(keep, "decision:block on Stop must return KeepLooping");
+        let drained = reg.drain_injections().await;
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].text.contains("tests still failing"));
+        assert!(drained[0].text.contains("stopped continuation"));
+        assert_eq!(drained[0].event, HookEvent::Stop);
         std::fs::remove_dir_all(&tmp).ok();
     }
 
