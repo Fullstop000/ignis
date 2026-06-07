@@ -18,12 +18,14 @@ pub mod config;
 pub mod dispatch;
 pub mod protocol;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
+use crate::tools::tool::{ToolHooks, ToolResult};
 use crate::AgentEvent;
 
 pub use config::{HookSpec, HooksConfig, DEFAULT_TIMEOUT_MS};
@@ -45,9 +47,29 @@ pub type EventSender = mpsc::Sender<AgentEvent>;
 /// The registered hook chains, loaded once at session start and swappable
 /// via `/hooks reload`. The wrapper holds an `Arc<RwLock<…>>` so the swap
 /// is cheap and reload doesn't tear down outstanding references.
+///
+/// `session` stores the per-session envelope context (`session_id`, `cwd`)
+/// that subprocess hooks see in their JSON envelope. It is set once by
+/// `Session::open` after the session id is known. Before it's set, hooks
+/// fire with empty `session_id` and `cwd` of `/` — harmless but
+/// undescriptive; the warning logged at first such call points the
+/// operator at the missing wire-up. The lock is independent of `inner`
+/// so a `/hooks reload` (which writes `inner`) cannot stall a tool call
+/// that reads `session`.
 #[derive(Debug, Default, Clone)]
 pub struct HookRegistry {
     inner: Arc<RwLock<HooksConfig>>,
+    session: Arc<RwLock<SessionEnvelopeContext>>,
+}
+
+/// Per-session envelope context — what subprocess hooks see in their
+/// JSON envelope. Mutated once at session start, read once per hook
+/// dispatch. Owned `String`/`PathBuf` so the lifetime is independent of
+/// any caller stack frame.
+#[derive(Debug, Clone, Default)]
+struct SessionEnvelopeContext {
+    session_id: String,
+    cwd: PathBuf,
 }
 
 impl HookRegistry {
@@ -56,6 +78,7 @@ impl HookRegistry {
         let cfg = HooksConfig::from_home(home)?;
         Ok(Self {
             inner: Arc::new(RwLock::new(cfg)),
+            session: Arc::new(RwLock::new(SessionEnvelopeContext::default())),
         })
     }
 
@@ -69,7 +92,28 @@ impl HookRegistry {
     pub fn from_config(cfg: HooksConfig) -> Self {
         Self {
             inner: Arc::new(RwLock::new(cfg)),
+            session: Arc::new(RwLock::new(SessionEnvelopeContext::default())),
         }
+    }
+
+    /// Set the session-level envelope context. Called once by
+    /// `Session::open` (and any place that re-binds a registry to a
+    /// new session) after the session id and cwd are known.
+    pub async fn set_envelope_context(&self, session_id: String, cwd: PathBuf) {
+        let mut guard = self.session.write().await;
+        guard.session_id = session_id;
+        guard.cwd = cwd;
+    }
+
+    /// Read the current envelope context as owned strings. Tool-hook
+    /// dispatch paths use this to build the `DispatchContext` once per
+    /// chain, holding the lock for the read only.
+    async fn envelope_context(&self) -> (String, String) {
+        let guard = self.session.read().await;
+        (
+            guard.session_id.clone(),
+            guard.cwd.to_string_lossy().to_string(),
+        )
     }
 
     /// Rebuild the registry from disk in place. Returns the new hook count
@@ -359,6 +403,186 @@ pub(crate) fn truncate_chars(s: &str, n: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// `ToolHooks` implementation that fires `PreToolUse` / `PostToolUse`
+/// subprocess hooks. Composes with the in-process policy gate
+/// (`PermissionChecker`) via the agent loop's `before_tool_call_block` —
+/// the policy gate runs first; only allowed calls reach this impl.
+///
+/// The `before_tool_call` semantics:
+///
+/// * No `PreToolUse` hooks declared → `Ok(None)`.
+/// * Hook returns `MutatedJson(v)` → the registry threads `v` through
+///   subsequent chain members and returns `Ok(Some(final))` if any hook
+///   rewrote.
+/// * Hook returns `Blocked { reason }` → registry surfaces `reason` as
+///   the error string; the agent loop emits a `role:"tool"` block
+///   message carrying it.
+/// * `PassThrough` / `SoftFailed` (or text/inject-context outcomes that
+///   don't apply to `PreToolUse`) → continue with the current args.
+///
+/// The `after_tool_call` semantics:
+///
+/// * No `PostToolUse` hooks declared → the result passes through
+///   unchanged.
+/// * Hook returns `InjectContext(text)` → the text is queued for the
+///   system-reminder insertion path (wired in a follow-up commit) and
+///   the result is unchanged.
+/// * Hook returns `Blocked { reason }` → CC's posture: the model sees
+///   the hook's rejection as a tool error. The `ToolResult` is
+///   transformed to carry `is_error: true` with the reason appended;
+///   the original result content is preserved so the model can react.
+/// * `PassThrough` / `SoftFailed` → continue with the current result.
+///
+/// Subprocess hooks fire even when the registry's session envelope
+/// context is unset (logged at `debug` once). Production wiring sets
+/// it via `set_envelope_context` in `Session::open`.
+#[async_trait]
+impl ToolHooks for HookRegistry {
+    async fn before_tool_call(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let specs: Vec<HookSpec> = {
+            let guard = self.inner.read().await;
+            guard.pre_tool_use.clone()
+        };
+        if specs.is_empty() {
+            return Ok(None);
+        }
+        let (session_id, cwd) = self.envelope_context().await;
+        let dispatch_ctx = DispatchContext {
+            session_id: &session_id,
+            cwd: &cwd,
+        };
+
+        let original = args.clone();
+        let mut current = args.clone();
+        for spec in &specs {
+            if !spec.applies_to_tool(tool_name) {
+                continue;
+            }
+            let payload = dispatch::HookPayload::PreToolUse {
+                tool_name,
+                tool_input: &current,
+            };
+            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            match outcome {
+                HookOutcome::PassThrough => {}
+                HookOutcome::MutatedJson(v) => current = v,
+                HookOutcome::Blocked { reason, stderr } => {
+                    return Err(reason.unwrap_or_else(|| trim_one_line(&stderr)));
+                }
+                HookOutcome::SoftFailed { reason } => {
+                    tracing::debug!(
+                        hook = %spec.display_name(),
+                        reason,
+                        "PreToolUse hook soft-failed; continuing chain"
+                    );
+                }
+                // Variants that don't apply to PreToolUse semantics.
+                // `Mutated(String)` would be a text rewrite for the
+                // wrong event; `InjectContext`/`KeepLooping` are
+                // post-tool / Stop concerns. Drop with a debug log so
+                // misuse is visible without crashing the loop.
+                other => {
+                    tracing::debug!(
+                        hook = %spec.display_name(),
+                        outcome = ?other,
+                        "PreToolUse hook returned outcome that does not apply; ignoring"
+                    );
+                }
+            }
+        }
+        if current == original {
+            Ok(None)
+        } else {
+            Ok(Some(current))
+        }
+    }
+
+    async fn after_tool_call(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        result: ToolResult,
+    ) -> ToolResult {
+        let specs: Vec<HookSpec> = {
+            let guard = self.inner.read().await;
+            guard.post_tool_use.clone()
+        };
+        if specs.is_empty() {
+            return result;
+        }
+        let (session_id, cwd) = self.envelope_context().await;
+        let dispatch_ctx = DispatchContext {
+            session_id: &session_id,
+            cwd: &cwd,
+        };
+
+        // The tool_response shape mirrors CC: { success, content }.
+        let tool_response = serde_json::json!({
+            "success": !result.is_error,
+            "content": result.content,
+        });
+
+        let mut current = result;
+        for spec in &specs {
+            if !spec.applies_to_tool(tool_name) {
+                continue;
+            }
+            let payload = dispatch::HookPayload::PostToolUse {
+                tool_name,
+                tool_input: args,
+                tool_response: &tool_response,
+            };
+            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            match outcome {
+                HookOutcome::PassThrough => {}
+                HookOutcome::InjectContext(text) => {
+                    // The system-reminder insertion path lands in a
+                    // follow-up commit; for now record the intent in a
+                    // span field so users can see the hook fired.
+                    tracing::debug!(
+                        hook = %spec.display_name(),
+                        injection_len = text.len(),
+                        "PostToolUse hook returned additional_context (insertion path TBD)"
+                    );
+                }
+                HookOutcome::Blocked { reason, stderr } => {
+                    // CC posture: a PostToolUse "block" frames the tool
+                    // result as an error the model should react to. The
+                    // original content is preserved alongside the reason
+                    // so the model sees both what ran and why it was
+                    // rejected.
+                    let why = reason.unwrap_or_else(|| trim_one_line(&stderr));
+                    current = ToolResult {
+                        content: format!("{}\n[hook rejection: {}]", current.content, why),
+                        is_error: true,
+                    };
+                }
+                HookOutcome::SoftFailed { reason } => {
+                    tracing::debug!(
+                        hook = %spec.display_name(),
+                        reason,
+                        "PostToolUse hook soft-failed; continuing chain"
+                    );
+                }
+                // Text rewrite / object rewrite / keep-looping don't
+                // apply to PostToolUse.
+                other => {
+                    tracing::debug!(
+                        hook = %spec.display_name(),
+                        outcome = ?other,
+                        "PostToolUse hook returned outcome that does not apply; ignoring"
+                    );
+                }
+            }
+        }
+        current
+    }
 }
 
 #[cfg(test)]
@@ -800,5 +1024,170 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         let out = format_list(&cfg);
         assert!(out.contains("UserPromptSubmit (1):"));
         assert!(out.contains("AssistantMessageRender (1):"));
+    }
+
+    // -------- ToolHooks impl for HookRegistry --------
+
+    #[tokio::test]
+    async fn tool_hooks_before_with_no_hooks_returns_ok_none() {
+        let reg = HookRegistry::empty();
+        let args = serde_json::json!({"command": "ls"});
+        assert_eq!(reg.before_tool_call("Bash", &args).await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn tool_hooks_pre_tool_use_rewrites_args() {
+        // PreToolUse hook returns `updatedInput: {…}` — registry threads
+        // the rewritten object back as `Ok(Some(new_args))`.
+        let tmp = crate::util::unique_temp_dir("ignis-th-rewrite");
+        let s = write_script(
+            &tmp,
+            "rewrite.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"updatedInput\":{\"command\":\"ls -la\"}}}'\n",
+        );
+        let cfg = HooksConfig {
+            pre_tool_use: vec![HookSpec {
+                program: s,
+                args: vec![],
+                timeout_ms: 5_000,
+                matcher: None,
+            }],
+            ..HooksConfig::default()
+        };
+        let reg = HookRegistry::from_config(cfg);
+        let args = serde_json::json!({"command": "ls"});
+        let out = reg.before_tool_call("Bash", &args).await.unwrap();
+        let rewritten = out.expect("expected rewrite");
+        assert_eq!(rewritten["command"], "ls -la");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn tool_hooks_pre_tool_use_block_returns_err_with_reason() {
+        let tmp = crate::util::unique_temp_dir("ignis-th-block");
+        let s = write_script(
+            &tmp,
+            "block.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"decision\":\"block\",\"reason\":\"rm -rf is destructive\"}'\n",
+        );
+        let cfg = HooksConfig {
+            pre_tool_use: vec![HookSpec {
+                program: s,
+                args: vec![],
+                timeout_ms: 5_000,
+                matcher: None,
+            }],
+            ..HooksConfig::default()
+        };
+        let reg = HookRegistry::from_config(cfg);
+        let args = serde_json::json!({"command": "rm -rf /"});
+        match reg.before_tool_call("Bash", &args).await {
+            Err(reason) => assert_eq!(reason, "rm -rf is destructive"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn tool_hooks_matcher_skips_non_matching_tool() {
+        // Matcher `Bash` — when called with `Edit` the hook must not
+        // spawn. Pins the matcher fast-path so the registry doesn't pay
+        // a process fork for every-event-every-tool dispatch.
+        let tmp = crate::util::unique_temp_dir("ignis-th-matcher");
+        // The "block" hook would Err if it fired; if matcher works it
+        // never runs and the call returns Ok(None).
+        let s = write_script(
+            &tmp,
+            "block.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf 'wrong tool' >&2\nexit 2\n",
+        );
+        let raw = format!(
+            r#"{{"hooks":{{"PreToolUse":[{{"command":"{}","matcher":"Bash"}}]}}}}"#,
+            s.to_string_lossy()
+        );
+        let cfg = HooksConfig::from_str(&raw, std::path::Path::new("/h")).unwrap();
+        let reg = HookRegistry::from_config(cfg);
+        let args = serde_json::json!({"file_path": "/a"});
+        // `Edit` doesn't match `Bash` — hook is skipped, result Ok(None).
+        assert_eq!(reg.before_tool_call("Edit", &args).await, Ok(None));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn tool_hooks_after_with_no_hooks_returns_result_unchanged() {
+        let reg = HookRegistry::empty();
+        let args = serde_json::json!({});
+        let result = ToolResult {
+            content: "ok".to_string(),
+            is_error: false,
+        };
+        let out = reg.after_tool_call("Bash", &args, result.clone()).await;
+        assert_eq!(out.content, "ok");
+        assert!(!out.is_error);
+    }
+
+    #[tokio::test]
+    async fn tool_hooks_post_tool_use_block_appends_reason_and_flags_error() {
+        // CC posture for PostToolUse Block: the result still flows to the
+        // model, but is_error flips to true and the hook's reason is
+        // appended so the model can react.
+        let tmp = crate::util::unique_temp_dir("ignis-th-post-block");
+        let s = write_script(
+            &tmp,
+            "post.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"decision\":\"block\",\"reason\":\"tests still failing\"}'\n",
+        );
+        let cfg = HooksConfig {
+            post_tool_use: vec![HookSpec {
+                program: s,
+                args: vec![],
+                timeout_ms: 5_000,
+                matcher: None,
+            }],
+            ..HooksConfig::default()
+        };
+        let reg = HookRegistry::from_config(cfg);
+        let args = serde_json::json!({});
+        let result = ToolResult {
+            content: "ran successfully".to_string(),
+            is_error: false,
+        };
+        let out = reg.after_tool_call("Bash", &args, result).await;
+        assert!(out.is_error, "PostToolUse block should flip is_error");
+        assert!(
+            out.content.contains("ran successfully"),
+            "original content must be preserved: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("tests still failing"),
+            "reason must be appended: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn tool_hooks_post_tool_use_pass_through_keeps_result() {
+        let tmp = crate::util::unique_temp_dir("ignis-th-post-pass");
+        let s = write_script(&tmp, "noop.sh", "#!/bin/sh\ncat >/dev/null\n");
+        let cfg = HooksConfig {
+            post_tool_use: vec![HookSpec {
+                program: s,
+                args: vec![],
+                timeout_ms: 5_000,
+                matcher: None,
+            }],
+            ..HooksConfig::default()
+        };
+        let reg = HookRegistry::from_config(cfg);
+        let args = serde_json::json!({});
+        let result = ToolResult {
+            content: "result".to_string(),
+            is_error: false,
+        };
+        let out = reg.after_tool_call("Bash", &args, result.clone()).await;
+        assert_eq!(out.content, "result");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

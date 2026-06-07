@@ -209,7 +209,17 @@ async fn before_llm_call(
 /// Append a tool-result message to `history`, running the `after_tool_call` hook
 /// first if one is set (the hook may transform the result content/error). The
 /// stored content is re-serialized as the `{result, is_error}` JSON envelope.
-async fn push_with_hook(history: &mut Vec<Message>, hooks: Option<&dyn ToolHooks>, msg: Message) {
+///
+/// `args` is the JSON the tool actually ran with — `PostToolUse` subprocess
+/// hooks pull `tool_input` from it. Orphan / unmatched result paths pass
+/// `Value::Null` (no way to recover original args after the fact); hooks that
+/// inspect `tool_input` should treat null as "unavailable".
+async fn push_with_hook(
+    history: &mut Vec<Message>,
+    hooks: Option<&dyn ToolHooks>,
+    args: &serde_json::Value,
+    msg: Message,
+) {
     if let Some(h) = hooks {
         let content_str = msg.content.clone().unwrap_or_default();
         let parsed: serde_json::Value = serde_json::from_str(&content_str).unwrap_or_default();
@@ -221,7 +231,7 @@ async fn push_with_hook(history: &mut Vec<Message>, hooks: Option<&dyn ToolHooks
             is_error: parsed["is_error"].as_bool().unwrap_or(false),
         };
         let transformed = h
-            .after_tool_call(msg.name.as_deref().unwrap_or(""), original_result)
+            .after_tool_call(msg.name.as_deref().unwrap_or(""), args, original_result)
             .await;
         let result_json = serde_json::json!({
             "result": transformed.content,
@@ -322,34 +332,68 @@ fn tool_result_message(name: &str, call_id: &str, result: &ToolResult) -> Messag
     }
 }
 
-/// Run the `before_tool_call` hook for `tc`. When a hook blocks the call, emit
-/// the `ToolExecutionStart`/`End` event pair (so a blocked call renders like
-/// any other) and return the `role:"tool"` message carrying the block reason.
-/// `None` means the call is allowed to proceed.
+/// Outcome of the `before_tool_call` gate for a single tool call.
+enum HookGateOutcome {
+    /// Hook chain (or no hooks) returned `Ok(None)`. Run the tool with
+    /// the original arguments.
+    Proceed,
+    /// A hook returned `Ok(Some(rewritten))` — the tool runs with
+    /// `rewritten` substituted for the original `tool_input` (the
+    /// `PreToolUse` `updatedInput` path). The caller must update the
+    /// `ToolCall.function.arguments` string before dispatch so the
+    /// tool, the `ToolExecutionStart` event, and any `PostToolUse`
+    /// envelope all see the same args.
+    Rewrite(serde_json::Value),
+    /// A hook returned `Err(reason)`. The blocked `role:"tool"`
+    /// message is ready to push to history; the
+    /// `ToolExecutionStart`/`End` event pair has been emitted so the
+    /// blocked call renders like any other.
+    Block(Message),
+}
+
+/// Run the `before_tool_call` hook for `tc`. Emits the
+/// `ToolExecutionStart`/`End` event pair on block so a blocked call
+/// renders like any other.
 async fn before_tool_call_block(
     tc: &ToolCall,
     hooks: Option<&dyn ToolHooks>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-) -> Option<Message> {
-    let h = hooks?;
+) -> HookGateOutcome {
+    let Some(h) = hooks else {
+        return HookGateOutcome::Proceed;
+    };
     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-    let reason = h.before_tool_call(&tc.function.name, &args).await.err()?;
+    match h.before_tool_call(&tc.function.name, &args).await {
+        Ok(None) => HookGateOutcome::Proceed,
+        Ok(Some(rewritten)) => HookGateOutcome::Rewrite(rewritten),
+        Err(reason) => {
+            let blocked = ToolResult::error(format!("Blocked by hook: {}", reason));
+            let _ = tx
+                .send(AgentEvent::ToolExecutionStart {
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: tc.id.clone(),
+                    result: blocked.clone(),
+                })
+                .await;
+            HookGateOutcome::Block(tool_result_message(&tc.function.name, &tc.id, &blocked))
+        }
+    }
+}
 
-    let blocked = ToolResult::error(format!("Blocked by hook: {}", reason));
-    let _ = tx
-        .send(AgentEvent::ToolExecutionStart {
-            tool_call_id: tc.id.clone(),
-            tool_name: tc.function.name.clone(),
-            arguments: tc.function.arguments.clone(),
-        })
-        .await;
-    let _ = tx
-        .send(AgentEvent::ToolExecutionEnd {
-            tool_call_id: tc.id.clone(),
-            result: blocked.clone(),
-        })
-        .await;
-    Some(tool_result_message(&tc.function.name, &tc.id, &blocked))
+/// Apply a `PreToolUse` rewrite to `tc.function.arguments` in place. The
+/// rewritten JSON re-serialises canonically so the `ToolExecutionStart`
+/// event, the tool dispatch, and any downstream `PostToolUse` hook all
+/// agree on what ran.
+fn apply_rewrite(tc: &mut ToolCall, rewritten: serde_json::Value) {
+    if let Ok(s) = serde_json::to_string(&rewritten) {
+        tc.function.arguments = s;
+    }
 }
 
 /// The accumulated result of consuming one streamed LLM run.
@@ -1105,10 +1149,16 @@ impl Agent {
         let results = if force_sequential {
             // Sequential execution
             let mut results = Vec::new();
-            for tc in tool_calls_owned {
+            for mut tc in tool_calls_owned {
                 match before_tool_call_block(&tc, hooks.as_deref(), &tx_clone).await {
-                    Some(blocked) => results.push(blocked),
-                    None => {
+                    HookGateOutcome::Block(blocked) => results.push(blocked),
+                    HookGateOutcome::Rewrite(args) => {
+                        apply_rewrite(&mut tc, args);
+                        results.push(
+                            execute_single_tool(tc, tools_map.clone(), tx_clone.clone()).await,
+                        );
+                    }
+                    HookGateOutcome::Proceed => {
                         results.push(
                             execute_single_tool(tc, tools_map.clone(), tx_clone.clone()).await,
                         );
@@ -1118,14 +1168,19 @@ impl Agent {
             results
         } else {
             // Parallel execution — run before_tool_call hooks first
-            // sequentially, then fan out the allowed calls.
+            // sequentially, then fan out the allowed (post-rewrite) calls.
             let mut allowed_calls = Vec::new();
             let mut blocked_results: Vec<Message> = Vec::new();
 
             for tc in &tool_calls_owned {
-                match before_tool_call_block(tc, hooks.as_deref(), &tx_clone).await {
-                    Some(blocked) => blocked_results.push(blocked),
-                    None => allowed_calls.push(tc.clone()),
+                let mut tc = tc.clone();
+                match before_tool_call_block(&tc, hooks.as_deref(), &tx_clone).await {
+                    HookGateOutcome::Block(blocked) => blocked_results.push(blocked),
+                    HookGateOutcome::Rewrite(args) => {
+                        apply_rewrite(&mut tc, args);
+                        allowed_calls.push(tc);
+                    }
+                    HookGateOutcome::Proceed => allowed_calls.push(tc),
                 }
             }
 
@@ -1161,20 +1216,27 @@ impl Agent {
 
         for tc in tool_calls {
             if let Some(msg) = results_by_id.remove(&tc.id) {
-                push_with_hook(history, hooks.as_deref(), msg).await;
+                // Parse args from the original tool call. Fallback to Null on
+                // malformed JSON — the tool's already run, we don't fail the
+                // history push over a bad PostToolUse envelope.
+                let args =
+                    serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
+                push_with_hook(history, hooks.as_deref(), &args, msg).await;
             }
         }
 
         // Drain any remaining orphan results (unmatched IDs or missing IDs) so we
         // never silently lose a tool result. Sort by tool_call_id so the appended
         // order is deterministic across runs (HashMap drain order is not).
+        // Orphans have no recoverable args — PostToolUse hooks get Value::Null.
+        let null_args = serde_json::Value::Null;
         let mut leftover: Vec<(String, Message)> = results_by_id.drain().collect();
         leftover.sort_by(|a, b| a.0.cmp(&b.0));
         for (_, msg) in leftover {
-            push_with_hook(history, hooks.as_deref(), msg).await;
+            push_with_hook(history, hooks.as_deref(), &null_args, msg).await;
         }
         for msg in orphans.drain(..) {
-            push_with_hook(history, hooks.as_deref(), msg).await;
+            push_with_hook(history, hooks.as_deref(), &null_args, msg).await;
         }
     }
 }

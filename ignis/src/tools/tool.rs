@@ -152,19 +152,45 @@ where
 }
 
 /// Optional hooks for tool call lifecycle.
+///
+/// One hook impl covers two ignis use cases: the in-process
+/// `PermissionChecker` (the policy gate that enforces session rules and
+/// safety floors), and the subprocess `HookRegistry` (which fires the
+/// user-configured `PreToolUse` / `PostToolUse` events). They're
+/// composable — the agent loop runs both in series.
 #[async_trait]
 pub trait ToolHooks: Send + Sync + 'static {
-    /// Called before tool execution. Return Err(reason) to block the call.
+    /// Called before tool execution. The return value carries three
+    /// outcomes:
+    ///
+    /// * `Ok(None)` — no opinion; the tool runs with the original args.
+    /// * `Ok(Some(rewritten))` — use `rewritten` as the tool's input
+    ///   instead of `args`. This is the `PreToolUse` `updatedInput`
+    ///   path; the policy gate uses it for sanitisation (PATH
+    ///   normalisation, secret redaction) and the subprocess registry
+    ///   uses it for user `PreToolUse` hooks that return a JSON object
+    ///   replacement for `tool_input`.
+    /// * `Err(reason)` — block the call. `reason` is surfaced to the
+    ///   model as a system reminder so the next turn understands why
+    ///   the tool didn't run.
     async fn before_tool_call(
         &self,
         _tool_name: &str,
         _args: &serde_json::Value,
-    ) -> Result<(), String> {
-        Ok(())
+    ) -> Result<Option<serde_json::Value>, String> {
+        Ok(None)
     }
 
-    /// Called after tool execution. Can transform the result.
-    async fn after_tool_call(&self, _tool_name: &str, result: ToolResult) -> ToolResult {
+    /// Called after tool execution. `args` carries the (possibly
+    /// rewritten) input the tool actually ran with — `PostToolUse`
+    /// hooks need it to build their envelope. May transform the
+    /// `ToolResult` content / `is_error` flag.
+    async fn after_tool_call(
+        &self,
+        _tool_name: &str,
+        _args: &serde_json::Value,
+        result: ToolResult,
+    ) -> ToolResult {
         result
     }
 }
