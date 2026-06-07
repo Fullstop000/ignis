@@ -14,7 +14,7 @@ use crate::console::{
     format_duration, sanitize, truncate, BORDER, DIFF_ADD_BG, DIFF_DEL_BG, GREEN, RED, SPINNERS,
     TEXT, TEXT_DIM, YELLOW,
 };
-use crate::tools::{CreateFileTool, EditFileTool};
+use crate::tools::{CreateFileTool, EditFileTool, SkillTool};
 use unicode_width::UnicodeWidthStr;
 
 /// `inline_picker::trace_lines` so resumed sessions read identically.
@@ -171,6 +171,16 @@ pub(crate) fn render_tool_block(
             lines.push(Line::from(vec![
                 Span::styled("  │ ", Style::default().fg(color)),
                 Span::styled(status_line, Style::default().fg(TEXT_DIM)),
+            ]));
+        }
+        ToolStatus::Success(_) if entry.name == SkillTool::NAME => {
+            // The skill tool returns the entire skill body wrapped in
+            // <skill name="…">. Never spill that into scrollback — the body is
+            // the model's to read, not the user's. Show one dim confirmation
+            // line (CC/Codex render the compact invocation, not the loaded text).
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(color)),
+                Span::styled("loaded skill instructions", Style::default().fg(TEXT_DIM)),
             ]));
         }
         ToolStatus::Success(out) => {
