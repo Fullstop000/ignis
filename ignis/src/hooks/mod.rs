@@ -168,20 +168,22 @@ impl HookRegistry {
 
         let mut current = initial.to_string();
         for spec in &specs {
-            let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx).await;
+            let payload = dispatch::HookPayload::UserPromptSubmit { prompt: &current };
+            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
             match outcome {
                 HookOutcome::Mutated(next) => current = next,
                 HookOutcome::PassThrough => {}
-                HookOutcome::Blocked { stderr } => {
+                HookOutcome::Blocked { stderr, reason } => {
                     // Honour the block. Spec: "Hook exits 2 → Block the
                     // turn (only event where blocking makes sense —
                     // UserPromptSubmit). Show stderr to user." Emit the
                     // warning here so the caller doesn't have to.
-                    let trimmed = trim_one_line(&stderr);
+                    let display = reason.unwrap_or_else(|| trim_one_line(&stderr));
+                    let trimmed = trim_one_line(&display);
                     emit_warning(
                         tx,
                         event,
-                        &format!("blocked by {} (exit 2): {}", spec.display_name(), trimmed),
+                        &format!("blocked by {}: {}", spec.display_name(), trimmed),
                     )
                     .await;
                     return PromptHookResult::Blocked { stderr: trimmed };
@@ -190,6 +192,13 @@ impl HookRegistry {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
                     break;
                 }
+                // Variants that don't apply to UserPromptSubmit's text-rewrite
+                // semantics yet — InjectContext is wired in commit 4 via the
+                // additional-context system-reminder path; MutatedJson is
+                // PreToolUse-only; KeepLooping is Stop-only.
+                HookOutcome::InjectContext(_)
+                | HookOutcome::MutatedJson(_)
+                | HookOutcome::KeepLooping { .. } => {}
             }
         }
         PromptHookResult::Continue(current)
@@ -220,18 +229,20 @@ impl HookRegistry {
 
         let mut current = initial.to_string();
         for spec in &specs {
-            let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx).await;
+            let payload = dispatch::HookPayload::AssistantMessageRender { content: &current };
+            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
             match outcome {
                 HookOutcome::Mutated(next) => current = next,
                 HookOutcome::PassThrough => {}
-                HookOutcome::Blocked { stderr } => {
+                HookOutcome::Blocked { stderr, reason } => {
+                    let display = reason.unwrap_or_else(|| trim_one_line(&stderr));
                     emit_warning(
                         tx,
                         event,
                         &format!(
                             "{} requested block (ignored for render): {}",
                             spec.display_name(),
-                            trim_one_line(&stderr)
+                            trim_one_line(&display)
                         ),
                     )
                     .await;
@@ -240,6 +251,11 @@ impl HookRegistry {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
                     break;
                 }
+                // Same as UserPromptSubmit — these v2 variants don't apply
+                // to AssistantMessageRender's text-rewrite path.
+                HookOutcome::InjectContext(_)
+                | HookOutcome::MutatedJson(_)
+                | HookOutcome::KeepLooping { .. } => {}
             }
         }
         current
