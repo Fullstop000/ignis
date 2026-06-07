@@ -219,7 +219,7 @@ impl Session {
         // Best-effort: a compaction failure must not block the user's prompt.
         if self.compaction.auto && estimate_tokens(&self.history) > self.compaction.threshold_tokens
         {
-            let _ = self.compact().await;
+            let _ = self.compact_with_trigger("auto").await;
         }
 
         // Run UserPromptSubmit hooks. Soft failures fall back to the
@@ -322,9 +322,44 @@ impl Session {
     /// Summarize older history into a single message, keeping the most recent
     /// turns (by token budget) verbatim. Returns the number of messages
     /// replaced by the summary (0 if nothing was compacted).
+    /// Manual compaction — called by `/compact`. Equivalent to
+    /// `compact_with_trigger("manual")`. The hook chain sees
+    /// `trigger: "manual"` in its envelope so PreCompact / PostCompact
+    /// users can distinguish user-initiated from threshold-triggered
+    /// compactions.
     pub async fn compact(&mut self) -> Result<usize, anyhow::Error> {
+        self.compact_with_trigger("manual").await
+    }
+
+    /// Internal: compact with an explicit trigger label
+    /// (`"auto"` or `"manual"`). Fires `PreCompact` (which may abort)
+    /// and `PostCompact` (which sees the summary) hooks around the
+    /// existing summarisation logic.
+    pub async fn compact_with_trigger(&mut self, trigger: &str) -> Result<usize, anyhow::Error> {
         let n = self.history.len();
         if n == 0 {
+            return Ok(0);
+        }
+
+        // PreCompact: a hook may abort the compact entirely. The
+        // transcript path is the empty string for now — disk-persistence
+        // plumbing is a follow-up. The temporary tx channel mirrors the
+        // SessionStart wiring: warnings emitted by hooks die with this
+        // scope, which is "best-effort during a slash command".
+        let (hook_tx, _hook_rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+        let abort = self
+            .hooks
+            .run_pre_compact(
+                trigger,
+                "",
+                HookContext {
+                    session_id: &self.id,
+                    cwd: &self.start_dir,
+                },
+                &hook_tx,
+            )
+            .await;
+        if abort {
             return Ok(0);
         }
         // Keep the most recent messages up to the token budget (walking from the
@@ -378,6 +413,24 @@ impl Session {
         compacted.extend_from_slice(&self.history[cut..]);
         self.history = compacted;
         self.persist().await?;
+
+        // PostCompact: hooks see the summary text and can inject
+        // `additionalContext` for the next LLM call (queued in the
+        // pending-injection path the agent loop drains). Best-effort
+        // (warnings drop with this scope), same posture as
+        // PreCompact above.
+        self.hooks
+            .run_post_compact(
+                trigger,
+                &summary,
+                HookContext {
+                    session_id: &self.id,
+                    cwd: &self.start_dir,
+                },
+                &hook_tx,
+            )
+            .await;
+
         Ok(cut)
     }
 

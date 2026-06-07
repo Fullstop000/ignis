@@ -308,6 +308,96 @@ impl HookRegistry {
         .await;
     }
 
+    /// Run the `PreCompact` chain — fires before context compaction.
+    /// `trigger` is `"auto"` or `"manual"`. A hook returning
+    /// `decision: "block"` aborts the compact; the returned bool is
+    /// `true` when the caller MUST skip compaction. `additionalContext`
+    /// is queued for the next-LLM-call drain.
+    pub async fn run_pre_compact(
+        &self,
+        trigger: &str,
+        transcript_path: &str,
+        ctx: HookContext<'_>,
+        tx: &EventSender,
+    ) -> bool {
+        let event = HookEvent::PreCompact;
+        let specs: Vec<HookSpec> = {
+            let guard = self.inner.read().await;
+            guard.for_event(event).to_vec()
+        };
+        if specs.is_empty() {
+            return false;
+        }
+        let dispatch_ctx = DispatchContext {
+            session_id: ctx.session_id,
+            cwd: ctx.cwd,
+        };
+        let mut abort = false;
+        for spec in &specs {
+            let payload = dispatch::HookPayload::PreCompact {
+                trigger,
+                transcript_path,
+            };
+            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            match outcome {
+                HookOutcome::PassThrough => {}
+                HookOutcome::InjectContext(text) => {
+                    self.queue_injection(PendingInjection {
+                        text,
+                        source: spec.display_name(),
+                        event,
+                    })
+                    .await;
+                }
+                HookOutcome::Blocked { stderr, reason } => {
+                    let why = reason.unwrap_or_else(|| trim_one_line(&stderr));
+                    emit_warning(
+                        tx,
+                        event,
+                        &format!(
+                            "aborted by {}: {}",
+                            spec.display_name(),
+                            trim_one_line(&why)
+                        ),
+                    )
+                    .await;
+                    abort = true;
+                    break;
+                }
+                HookOutcome::SoftFailed { reason } => {
+                    emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
+                    break;
+                }
+                other => {
+                    tracing::debug!(
+                        hook = %spec.display_name(),
+                        outcome = ?other,
+                        "PreCompact hook returned outcome that does not apply; ignoring"
+                    );
+                }
+            }
+        }
+        abort
+    }
+
+    /// Run the `PostCompact` chain — fires after compaction succeeds.
+    /// Sees the summary text; can inject `additionalContext` for the
+    /// next LLM call. Block / rewrite outcomes don't apply (the
+    /// summary is already final).
+    pub async fn run_post_compact(
+        &self,
+        trigger: &str,
+        summary: &str,
+        ctx: HookContext<'_>,
+        tx: &EventSender,
+    ) {
+        self.run_inject_only_event(HookEvent::PostCompact, ctx, tx, |spec| {
+            dispatch::HookPayload::PostCompact { trigger, summary }
+                .with_spec_label(spec.display_name())
+        })
+        .await;
+    }
+
     /// Run the `Stop` chain — fires on the clean-exit branch of the
     /// agent loop (NOT on `emit_fatal`). The CC inversion applies:
     /// `decision: "block"` becomes [`HookOutcome::KeepLooping`] inside
