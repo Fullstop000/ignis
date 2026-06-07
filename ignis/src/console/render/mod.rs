@@ -30,7 +30,7 @@ pub(crate) use pickers::{
     render_mcp_picker, render_model_picker, render_session_picker, render_skill_picker,
 };
 pub(crate) use widgets::{
-    draw_footer, draw_input, draw_loading, draw_queued, draw_slash_suggestions, picker_window,
+    draw_footer, draw_input, draw_loading, draw_queued, draw_slash_suggestions,
     queued_region_height, MAX_SLASH_ROWS,
 };
 
@@ -104,23 +104,31 @@ pub(crate) fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 
 /// Natural height (rows) of the `/model` picker content. Used by
 /// `viewport_height` so the picker only takes the room it needs instead
 /// of consuming the whole terminal.
+///
+/// **Selection-stable** — the height is computed from the option set, not
+/// from `picker.selected`. Otherwise a single `↓` over the scroll-window
+/// boundary (or across a reasoning↔non-reasoning model) would change the
+/// viewport height and trigger a full terminal rebuild + flicker. The
+/// actual rendered height is at most the worst case; any leftover rows
+/// in `body_area` simply render blank.
 const MODEL_PICKER_MAX_OPTION_ROWS: usize = 15;
 
 fn model_picker_height(
-    picker: &crate::console::app::ModelPicker,
+    _picker: &crate::console::app::ModelPicker,
     options: &[crate::llm::ModelOption],
 ) -> u16 {
     if options.is_empty() {
         return 3; // blank + header + "No models configured."
     }
-    let sel = picker.selected.min(options.len() - 1);
-    let has_effort = !options[sel].effort_levels.is_empty();
-    let (start, end) = picker_window(sel, MODEL_PICKER_MAX_OPTION_ROWS, options.len());
-    let visible = (end - start) as u16;
-    let above = (start > 0) as u16;
-    let below = (options.len() - end > 0) as u16;
+    // Worst case across all selections:
+    // - effort row is shown iff any option declares levels
+    // - `↑ N more` / `↓ N more` appear iff the list overflows the cap
+    let any_has_effort = options.iter().any(|o| !o.effort_levels.is_empty());
+    let overflows = options.len() > MODEL_PICKER_MAX_OPTION_ROWS;
+    let visible = options.len().min(MODEL_PICKER_MAX_OPTION_ROWS) as u16;
+    let has_above_below = overflows as u16;
     // blank + header + effort? + above? + visible + below? + footer
-    2 + has_effort as u16 + above + visible + below + 1
+    2 + any_has_effort as u16 + has_above_below + visible + has_above_below + 1
 }
 
 /// Blit pre-wrapped `lines` (one `Line` per visual row — `block_lines` already
@@ -238,7 +246,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         let mut lines: Vec<Line> = Vec::new();
         render_model_picker(&mut lines, picker, options, max_rows);
         let desired = lines.len() as u16;
-        let h = desired.min(body_area.height).max(1);
+        let h = desired.min(body_area.height);
         let split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(h)])
@@ -633,6 +641,97 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("effort:"));
         assert!(content.contains("high") && content.contains("max"));
+    }
+
+    /// `model_picker_height` is selection-stable: walking `sel` across the
+    /// scroll-window boundary or across a reasoning↔non-reasoning boundary
+    /// must NOT change the returned height — otherwise the runner rebuilds
+    /// the viewport and the user sees a full-screen flicker on every `↓`.
+    #[test]
+    fn model_picker_height_is_stable_across_navigation() {
+        let opt = |p: &str, m: &str, l: &[&str]| crate::llm::ModelOption {
+            provider: p.to_string(),
+            model: m.to_string(),
+            effort_levels: l.iter().map(|s| s.to_string()).collect(),
+            context: None,
+        };
+        // 20 options, mixed effort. Walk sel across the full range — including
+        // both the scroll-window boundary at sel=15 and the
+        // reasoning↔non-reasoning boundary inside the mix.
+        let options: Vec<crate::llm::ModelOption> = (0..20)
+            .map(|i| {
+                if i % 2 == 0 {
+                    opt("p", &format!("m{i}"), &["high"])
+                } else {
+                    opt("p", &format!("m{i}"), &[])
+                }
+            })
+            .collect();
+        let mut picker = crate::console::app::ModelPicker {
+            selected: 0,
+            effort_idx: 0,
+        };
+        let baseline = model_picker_height(&picker, &options);
+        for sel in 0..options.len() {
+            picker.selected = sel;
+            let h = model_picker_height(&picker, &options);
+            assert_eq!(
+                h, baseline,
+                "model_picker_height must not change when sel moves (sel={sel}, h={h}, baseline={baseline})"
+            );
+        }
+        // Also unchanged when effort is cycled (effort doesn't enter the math).
+        picker.cycle_effort(crate::console::SelectionDirection::Next, &options);
+        assert_eq!(model_picker_height(&picker, &options), baseline);
+
+        // Sanity: the formula handles edge cases.
+        // Empty options → 3.
+        let empty: Vec<crate::llm::ModelOption> = vec![];
+        assert_eq!(model_picker_height(&picker, &empty), 3);
+        // 1 option, no effort: blank + header + 1 option + footer = 4.
+        let one = vec![opt("p", "m0", &[])];
+        assert_eq!(model_picker_height(&picker, &one), 4);
+        // 1 option, with effort: 5.
+        let one_effort = vec![opt("p", "m0", &["high"])];
+        assert_eq!(model_picker_height(&picker, &one_effort), 5);
+        // 16 options, no effort, list overflows: 2 + 0 + 1 + 15 + 1 + 1 = 20.
+        let sixteen: Vec<crate::llm::ModelOption> =
+            (0..16).map(|i| opt("p", &format!("m{i}"), &[])).collect();
+        assert_eq!(model_picker_height(&picker, &sixteen), 20);
+        // 20 options, with effort, list overflows: 2 + 1 + 1 + 15 + 1 + 1 = 21.
+        let twenty: Vec<crate::llm::ModelOption> = (0..20)
+            .map(|i| opt("p", &format!("m{i}"), &["high"]))
+            .collect();
+        assert_eq!(model_picker_height(&picker, &twenty), 21);
+    }
+
+    /// `viewport_height` for the model picker must always include the band
+    /// height (status + footer) plus the picker's natural height, clamped to
+    /// the terminal — never returning 0 in normal use.
+    #[test]
+    fn viewport_height_clamps_model_picker_to_terminal() {
+        let opt = |p: &str, m: &str, l: &[&str]| crate::llm::ModelOption {
+            provider: p.to_string(),
+            model: m.to_string(),
+            effort_levels: l.iter().map(|s| s.to_string()).collect(),
+            context: None,
+        };
+        let options: Vec<crate::llm::ModelOption> = (0..20)
+            .map(|i| opt("p", &format!("m{i}"), &["high"]))
+            .collect();
+        let mut app = App::new(
+            "p".to_string(),
+            "m0".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        app.set_model_options(options, None);
+        app.show_model_picker();
+
+        // 8-row terminal: ph=21 + bh=2 = 23, clamped to cap=7.
+        assert_eq!(viewport_height(&app, 80, 8), 7);
+        // 100-row terminal: ph=21 + bh=2 = 23.
+        assert_eq!(viewport_height(&app, 80, 100), 23);
     }
 
     #[test]

@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- TUI — `/model` picker anchors above the input (replacing it, CC-style) instead of taking over the whole body. The conversation in native scrollback above the TUI stays visible while the picker is open. ([#134](https://github.com/Fullstop000/ignis/pull/134))
+
 ## [0.36.0] - 2026-06-08
 
 ### Added
 - TUI — the input bar shows a `❯` prompt at its left edge. ([#133](https://github.com/Fullstop000/ignis/pull/133))
-- TUI — `/model` now anchors above the input (replacing it, CC-style) instead of taking over the whole body. The conversation in native scrollback above the TUI stays visible while the picker is open. ([#134](https://github.com/Fullstop000/ignis/pull/134))
 
 ### Changed
 - TUI — invoking a skill (`/skill-name` or the `skill` tool) shows a compact line in the transcript instead of the full skill body. ([#136](https://github.com/Fullstop000/ignis/pull/136))
