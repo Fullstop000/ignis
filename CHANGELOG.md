@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- hooks: v2 protocol extends the surface from 2 events to 9 — `SessionStart`, `SystemPromptCompose`, `PreToolUse`, `PostToolUse`, `PreCompact`, `PostCompact`, and `Stop` join `UserPromptSubmit` + `AssistantMessageRender`. Each event gets typed per-event envelope fields (`tool_name`, `tool_input`, `tool_response`, `system_prompt`, `model`, `trigger`, `summary`, `source`, `transcript_path`, `triggered_at`). Hooks can rewrite (`updatedInput` / `updatedOutput` / `updatedSystemPrompt`), block (`decision: "block"` + `reason`), or inject context for the next LLM call (`additionalContext`, surfaced as a labelled `<system-reminder>`). v1 hook configs parse unchanged.
+- hooks: `matcher` field on `PreToolUse` / `PostToolUse` entries — regex on `tool_name`, compiled at parse so a malformed pattern is a startup error. Non-matching tools skip the spawn entirely. Declaring `matcher` on a non-tool event logs a `[warn]` at load.
+- hooks: `Stop` event honours the Claude Code inversion — a `decision: "block"` on `Stop` keeps the loop alive and surfaces the reason as a `<system-reminder>` framed `"stopped continuation: <reason>"`. Lets users wire "don't stop until tests pass" guardrails without a new event.
+- hooks: `SystemPromptCompose` fires once per LLM call (not per session) — hooks can prune or rewrite the assembled system prompt (which includes git status/diff, AGENTS.md, the skills catalog, and MCP instructions) to A/B test prompt density for token-efficiency research.
+- hooks: three new example hooks — `examples/hooks/bash-deny-rm-rf/` (PreToolUse block), `examples/hooks/auto-test/` (PostToolUse `additionalContext`), `examples/hooks/system-prompt-trim/` (SystemPromptCompose rewrite).
+
 ## [0.35.0] - 2026-06-06
 
 ### Added

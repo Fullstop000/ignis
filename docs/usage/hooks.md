@@ -1,12 +1,11 @@
 # Hooks
 
-Hooks let an external program subscribe to ignis lifecycle events and,
-where the event permits it, rewrite the data flowing through. v1 ships
-two events — `UserPromptSubmit` (mutates the prompt before model send)
-and `AssistantMessageRender` (mutates the assistant's text before TUI
-render).
+Hooks let an external program subscribe to ignis lifecycle events.
+Where the event permits it they can **rewrite** the data flowing
+through, **block** the action, or **inject context** the model sees on
+the next turn.
 
-> ## ⚠ Hooks run unsandboxed in v1
+> ## ⚠ Hooks run unsandboxed
 >
 > Each hook command runs with the full privileges of your `ignis`
 > process. A malicious or buggy hook can:
@@ -22,41 +21,101 @@ render).
 > has root-equivalent power over your user account. Only install hooks
 > whose source you have personally audited.
 >
-> v2 will add env-var scrubbing and a Linux filesystem sandbox; until
-> then, the protocol relies on you reading the script.
+> A separate PR adds env-var scrubbing and a Linux Landlock / macOS
+> Seatbelt sandbox; until it merges, the protocol relies on you reading
+> the script.
 
 ## Events
 
-### `UserPromptSubmit`
+All nine events ignis fires, in the rough order they appear during a
+session:
 
-Fires in `Session::prompt` immediately before the user message is
-pushed to history. Hooks run in declared order; each receives the
-output of the previous (chaining). The final string is stored.
+| Event | When | Block | Rewrite | Inject context |
+|---|---|---|---|---|
+| `SessionStart` | Once at session open | — | — | ✓ `additionalContext` |
+| `UserPromptSubmit` | Before user message reaches model | ✓ | ✓ `updatedInput` (string) | — |
+| `SystemPromptCompose` | Before each LLM call, after prompt assembly | (degraded to warning) | ✓ `updatedSystemPrompt` | ✓ |
+| `PreToolUse` | Before a tool runs | ✓ | ✓ `updatedInput` (object) | ✓ |
+| `PostToolUse` | After tool succeeds / fails | ✓ (frames as tool error) | — | ✓ |
+| `AssistantMessageRender` | Before TUI renders model reply | (degraded to warning) | ✓ `updatedOutput` | — |
+| `PreCompact` | Before context compaction | ✓ (aborts compact) | — | ✓ |
+| `PostCompact` | After compaction; sees summary | — | — | ✓ |
+| `Stop` | On clean turn exit | **inverted** — keeps loop alive | — | ✓ |
 
-### `AssistantMessageRender`
+### Per-event detail
 
-Fires on `MessageEnd` for an assistant message, before the TUI commits
-the rewritten block. Hooks chain in declared order. **History stores
-the model's original output**, not the rewritten render — so prompt
-cache stays clean and replay is exact. The rewrite shows as a
-labelled `[hook rewrite]` block immediately below the model's original.
+- **`SessionStart`** — fires once. Envelope has `source: "new"` /
+  `"resume"`. Useful for prepending project-wide instructions ("user is
+  bilingual, default to Chinese in replies") to the model's first turn.
+- **`UserPromptSubmit`** — the v1 event. Fires before the user message
+  is pushed to history. Hooks chain; each receives the previous hook's
+  output. The final string is what the model sees and history stores.
+  `decision: "block"` rejects the turn (the only event where blocking
+  is meaningful for input).
+- **`SystemPromptCompose`** — fires before **every** LLM call (not
+  just session start), because the assembled prompt changes per turn
+  (git status, git diff). Envelope has `system_prompt` and `model`.
+  Hooks chain — the threaded `updatedSystemPrompt` is used for THIS
+  call only; the base prompt isn't touched for next call. Use for
+  token-efficiency experiments (strip the diff block, compress
+  AGENTS.md, etc.). `decision: "block"` is degraded to a warning — the
+  LLM call still needs some prompt.
+- **`PreToolUse`** — fires before each tool call. Envelope has
+  `tool_name` and `tool_input` (JSON object). `updatedInput` rewrites
+  `tool_input` (must also be a JSON object); `decision: "block"`
+  refuses the call and the reason flows to the model as a tool error.
+  Use `matcher` to scope to specific tools.
+- **`PostToolUse`** — fires after the tool finishes (success or
+  failure). Envelope has `tool_name`, `tool_input`, `tool_response`
+  (`{success, content}`). `additionalContext` is queued for the next
+  LLM call as a `<system-reminder>` block — the "I ran tests for you,
+  here's what happened" channel. `decision: "block"` reframes the tool
+  result as an error with the reason appended.
+- **`AssistantMessageRender`** — v1 event. Fires before the TUI
+  commits the model's text. **History stores the original output**,
+  not the rewrite — so prompt cache and replay stay exact. The
+  rewrite appears as a `[hook rewrite]` block below the original in
+  scrollback.
+- **`PreCompact`** — fires before context compaction. Envelope has
+  `trigger: "auto"` (threshold-driven) or `"manual"` (slash command).
+  `decision: "block"` aborts the compact entirely.
+- **`PostCompact`** — fires after compaction succeeds, with the
+  generated `summary` in the envelope. Only `additionalContext`
+  matters (the summary is already final).
+- **`Stop`** — fires on the clean-exit branch of the agent loop (NOT
+  on fatal errors). **The CC inversion applies:** `decision: "block"`
+  means "keep looping" — the loop reads the reason as a system
+  reminder and continues. The pattern: a stop-condition hook that
+  says "your test suite is still failing, don't stop yet."
 
 ## Envelope
 
 ### stdin — JSON object
 
+Base fields on every event:
+
 ```json
 {
-  "hook_event_name": "UserPromptSubmit",
+  "hook_event_name": "PreToolUse",
   "session_id": "session-…",
   "cwd": "/home/you/project",
-  "prompt": "<user's text>"
+  "triggered_at": "2026-06-07T13:00:00Z"
 }
 ```
 
-- `prompt` is present for `UserPromptSubmit`.
-- `content` is present for `AssistantMessageRender`.
-- The other field is omitted.
+Per-event additions (only the fields its event populates are present):
+
+| Event | Extra fields |
+|---|---|
+| `UserPromptSubmit` | `prompt` |
+| `AssistantMessageRender` | `content` |
+| `SystemPromptCompose` | `system_prompt`, `model` |
+| `PreToolUse` | `tool_name`, `tool_input` |
+| `PostToolUse` | `tool_name`, `tool_input`, `tool_response` |
+| `PreCompact` | `trigger`, `transcript_path` |
+| `PostCompact` | `trigger`, `summary` |
+| `SessionStart` | `source` |
+| `Stop` | `transcript_path` |
 
 ### stdout — JSON object (all fields optional)
 
@@ -64,28 +123,66 @@ labelled `[hook rewrite]` block immediately below the model's original.
 {
   "continue": true,
   "systemMessage": "Optional 1-line note shown in TUI",
+  "suppressOutput": false,
+  "decision": "block",
+  "reason": "structured block reason — surfaced to model as system reminder",
+  "stopReason": "shown in TUI when continue:false",
   "hookSpecificOutput": {
-    "hookEventName": "UserPromptSubmit",
-    "updatedInput": "<rewritten prompt>"
+    "hookEventName": "PreToolUse",
+    "updatedInput": { "command": "echo safe" },
+    "updatedOutput": "rewritten assistant text",
+    "updatedSystemPrompt": "rewritten system prompt",
+    "additionalContext": "appears as <system-reminder> on next turn"
   }
 }
 ```
 
-For `AssistantMessageRender`, the rewrite field is `updatedOutput`.
-Absent rewrite field, or `continue: false`, means "no rewrite from this
-hook" — but `continue: false` is also a block signal (see exit codes).
+Each `updated*` field is honored only for the event(s) listed in the
+table above; unrelated fields on the wrong event are ignored with a
+debug log.
+
+## Matcher (PreToolUse / PostToolUse)
+
+Tool events accept a `matcher` regex on `tool_name`:
+
+```json
+{ "command": "~/.ignis/hooks/bash-deny/run.sh", "matcher": "Bash" }
+```
+
+Hooks with a matcher only fire when the running tool's name matches —
+unrelated calls don't pay the spawn cost. `matcher` is compiled at
+parse, so a malformed regex is a startup error. Declaring `matcher`
+on a non-tool event logs a `[warn]` at load and is otherwise ignored.
+
+## `additionalContext` — injecting reminders
+
+Hooks can return `additionalContext` instead of (or alongside) a
+rewrite. The text is queued and, before the next LLM call, prepended
+to history as a synthetic `<system-reminder>` block labelled with the
+hook's display name and event class:
+
+```
+<system-reminder>
+hook PostToolUse (auto-test): cargo test --workspace -q: PASSED
+</system-reminder>
+```
+
+`PostToolUse`, `SessionStart`, `SystemPromptCompose`, `PreCompact`,
+`PostCompact`, and `Stop` all support `additionalContext`. It is the
+"talk to the model side-channel" — useful when you want to add
+information without modifying the actual tool result, prompt, or
+summary.
 
 ## Exit codes
 
 | Code | Behaviour |
 |---|---|
 | `0` | OK. stdout is parsed; absent/empty stdout = pass-through. |
-| `2` | Block the chain. Honoured for `UserPromptSubmit` (turn does not send). Degraded to a soft failure for `AssistantMessageRender`. |
-| anything else | Soft failure: original text kept; a `[warn]` line is committed to scrollback. |
+| `2` | Block the chain. Per-event semantics (see Block column above). |
+| anything else | Soft failure: original payload kept; `[warn]` in scrollback. |
 
-A hook that runs longer than its `timeout_ms` is killed (SIGKILL,
-via `kill_on_drop`) and treated as a soft failure. v2 will add a
-SIGTERM grace window before the SIGKILL.
+A hook that runs longer than its `timeout_ms` is killed (SIGKILL via
+`kill_on_drop`) and treated as a soft failure.
 
 ## Declaration — `~/.ignis/hooks.json`
 
@@ -98,11 +195,22 @@ SIGTERM grace window before the SIGKILL.
         "timeout_ms": 30000
       }
     ],
-    "AssistantMessageRender": [
+    "PreToolUse": [
       {
-        "command": "~/.ignis/hooks/translate-en/run.py",
-        "timeout_ms": 30000
+        "command": "~/.ignis/hooks/bash-deny-rm-rf/run.sh",
+        "matcher": "Bash",
+        "timeout_ms": 2000
       }
+    ],
+    "PostToolUse": [
+      {
+        "command": "~/.ignis/hooks/auto-test/run.sh",
+        "matcher": "Write|Edit",
+        "timeout_ms": 120000
+      }
+    ],
+    "SystemPromptCompose": [
+      { "command": "~/.ignis/hooks/system-prompt-trim/run.sh" }
     ]
   }
 }
@@ -111,73 +219,77 @@ SIGTERM grace window before the SIGKILL.
 - `command` is **split on whitespace** at parse time and passed argv-
   style to `Command::new`. No shell is involved. No `$VAR` expansion.
   Only a leading `~/` is expanded (against the home dir).
-- For program paths that **contain whitespace** (e.g.
-  `/Users/foo bar/run.py`), use the explicit `argv` form instead:
+- For program paths with whitespace, use `argv: [...]` instead:
 
   ```json
   { "argv": ["/Users/foo bar/run.py", "--display"], "timeout_ms": 30000 }
   ```
 
-  `argv[0]` is the program; subsequent entries are arguments. `~/` is
-  expanded on `argv[0]`. `command` and `argv` are mutually exclusive.
+  `argv[0]` is the program; `command` and `argv` are mutually
+  exclusive.
 - `timeout_ms` defaults to `10000` (10 s).
+- `matcher` is a regex on `tool_name`. Meaningful only for
+  `PreToolUse` / `PostToolUse`; on other events it's logged at load.
 - Each event takes a JSON array — multiple hooks chain left-to-right,
   each receiving the previous hook's output.
-- The file is loaded at session start. An absent file means no hooks
-  and no log noise. A malformed file is a startup error — ignis exits
-  before the first prompt (same posture as a broken `config.toml`).
+- The file is loaded at session start. Absent file = no hooks, no log
+  noise. Malformed file = startup error.
+
+### v1 → v2 back-compat
+
+v2 reads v1 configs unchanged. Existing
+`{"command": "...", "timeout_ms": N}` entries still parse with no
+edits required. The `matcher` field is optional; absent matcher means
+"every tool".
 
 ### Inspecting the active chains — `/hooks` (or `/hooks list`)
 
-Type `/hooks` (or its explicit alias `/hooks list`) to print the
-chains that the running session is actually using — one block per
-event, each entry showing the program path, its argv tail, and the
-per-hook timeout. The leftmost column is the hook's `display_name()`
-(its program file's stem, no directory or extension):
-
 ```
-[info] 3 hooks registered · /hooks reload to re-read · run unsandboxed; audit before installing:
-  UserPromptSubmit (2):
-    · translate-en  ~/.ignis/hooks/translate-en/run.py  (timeout 10000ms)
-    · redact        /opt/ignis/hooks/redact.sh --strict  (timeout 30000ms)
-  AssistantMessageRender (1):
-    · translate-en  ~/.ignis/hooks/translate-en/run.py  (timeout 10000ms)
+[info] 4 hooks registered · /hooks reload to re-read · run unsandboxed; audit before installing:
+  UserPromptSubmit (1):
+    · translate-en  ~/.ignis/hooks/translate-en/run.py  (timeout 30000ms)
+  SystemPromptCompose (1):
+    · run           ~/.ignis/hooks/system-prompt-trim/run.sh  (timeout 10000ms)
+  PreToolUse (1):
+    · run           ~/.ignis/hooks/bash-deny-rm-rf/run.sh  (timeout 2000ms)
+  PostToolUse (1):
+    · run           ~/.ignis/hooks/auto-test/run.sh  (timeout 120000ms)
 ```
 
-(The `translate-en` in the name column there assumes your program
-lives at `…/translate-en/run` — the name is the stem, not the
-directory. If your hook is `…/translate-en/translate.py`, the column
-will show `translate`.)
-
-When no hooks are registered, the command prints a single
-`[info] no hooks registered` line pointing at the file path and the
-`/hooks reload` action. The list reflects the in-memory state — the
-last successful load or `/hooks reload` — not a live disk probe, so
-`/hooks reload` first if you just edited the file.
+The list reflects the in-memory state (last successful load or
+`/hooks reload`), not a live disk probe.
 
 ### Hot-reload — `/hooks reload`
 
 Type `/hooks reload` in the TUI after editing `hooks.json`. The parsed
 config is swapped into the running registry; the next prompt picks it
-up. The confirmation line includes the unsandboxed reminder.
+up.
 
 ## Failure UI
 
 Every soft failure commits a `[warn] <event>: <reason> (<hook-name>)`
 line below the affected block. No rate-limiting — transparency over
-visual cleanliness. If you'd rather not see them, audit and disable
-the misbehaving hook.
+visual cleanliness.
 
 ## Observability
 
 Each hook invocation emits a `tracing` span named `ignis.hook` with
-attributes `event`, `command`, `duration_ms`, `outcome` (`mutated` /
-`pass_through` / `blocked` / `failed`). Enable
-`IGNIS_ENABLE_TELEMETRY=1` to export them via OpenTelemetry.
+attributes `event`, `command`, `duration_ms`, `outcome`
+(`mutated` / `mutated_json` / `inject_context` / `pass_through` /
+`blocked` / `keep_looping` / `failed`). Enable
+`IGNIS_ENABLE_TELEMETRY=1` to export via OpenTelemetry.
 
-## Reference translator
+## Worked examples
 
-A worked example lives at `examples/hooks/translate-en/`. It's a
-single Python script (~80 LOC) that routes on `hook_event_name`,
-masks code blocks with sentinels, and calls Anthropic Haiku. See its
-README for install/run instructions.
+- [`examples/hooks/translate-en/`](../../examples/hooks/translate-en/)
+  — bilingual translator (the original ignis use case). Demonstrates
+  `UserPromptSubmit` + `AssistantMessageRender`.
+- [`examples/hooks/bash-deny-rm-rf/`](../../examples/hooks/bash-deny-rm-rf/)
+  — `PreToolUse` with `matcher: "Bash"`, blocks `rm -rf`. Demonstrates
+  `decision: "block"`.
+- [`examples/hooks/auto-test/`](../../examples/hooks/auto-test/) —
+  `PostToolUse` with `matcher: "Write|Edit"`, runs the test suite and
+  injects PASS/FAIL via `additionalContext`.
+- [`examples/hooks/system-prompt-trim/`](../../examples/hooks/system-prompt-trim/)
+  — `SystemPromptCompose`, strips the `Git Diff:` block for
+  token-efficiency experiments.
