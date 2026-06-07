@@ -44,8 +44,10 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","updatedI
             program: hook,
             args: vec![],
             timeout_ms: 5_000,
+            matcher: None,
         }],
         assistant_message_render: vec![],
+        ..HooksConfig::default()
     };
     let reg = HookRegistry::from_config(cfg);
 
@@ -87,7 +89,9 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"AssistantMessageRender","up
             program: hook,
             args: vec![],
             timeout_ms: 5_000,
+            matcher: None,
         }],
+        ..HooksConfig::default()
     };
     let reg = HookRegistry::from_config(cfg);
     let (tx, mut rx) = mpsc::channel(8);
@@ -212,8 +216,10 @@ printf '{"hookSpecificOutput":{"updatedInput":"%s"}}' "$UPPER"
             program: upper,
             args: vec![],
             timeout_ms: 5_000,
+            matcher: None,
         }],
         assistant_message_render: vec![],
+        ..HooksConfig::default()
     };
     session.set_hook_registry(HookRegistry::from_config(cfg));
 

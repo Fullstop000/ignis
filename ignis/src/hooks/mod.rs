@@ -407,14 +407,17 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: s1,
                     args: vec![],
                     timeout_ms: 5_000,
+                    matcher: None,
                 },
                 HookSpec {
                     program: s2,
                     args: vec![],
                     timeout_ms: 5_000,
+                    matcher: None,
                 },
             ],
             assistant_message_render: vec![],
+            ..HooksConfig::default()
         };
         let reg = HookRegistry::from_config(cfg);
         let (tx, _rx) = mpsc::channel(8);
@@ -445,14 +448,17 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: good,
                     args: vec![],
                     timeout_ms: 5_000,
+                    matcher: None,
                 },
                 HookSpec {
                     program: bad,
                     args: vec![],
                     timeout_ms: 5_000,
+                    matcher: None,
                 },
             ],
             assistant_message_render: vec![],
+            ..HooksConfig::default()
         };
         let reg = HookRegistry::from_config(cfg);
         let (tx, mut rx) = mpsc::channel(8);
@@ -488,8 +494,10 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: blocker,
                 args: vec![],
                 timeout_ms: 5_000,
+                matcher: None,
             }],
             assistant_message_render: vec![],
+            ..HooksConfig::default()
         };
         let reg = HookRegistry::from_config(cfg);
         let (tx, mut rx) = mpsc::channel(8);
@@ -528,7 +536,9 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: blocker,
                 args: vec![],
                 timeout_ms: 5_000,
+                matcher: None,
             }],
+            ..HooksConfig::default()
         };
         let reg = HookRegistry::from_config(cfg);
         let (tx, mut rx) = mpsc::channel(8);
@@ -594,8 +604,10 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/a/hook.sh"),
                 args: vec!["--flag".to_string()],
                 timeout_ms: 7_000,
+                matcher: None,
             }],
             assistant_message_render: vec![],
+            ..HooksConfig::default()
         };
         let reg = HookRegistry::from_config(cfg.clone());
         let snap = reg.snapshot().await;
@@ -620,8 +632,10 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/opt/translate/run.py"),
                 args: vec![],
                 timeout_ms: 10_000,
+                matcher: None,
             }],
             assistant_message_render: vec![],
+            ..HooksConfig::default()
         };
         let out = format_list(&cfg);
         assert!(out.contains("1 hook registered "), "got: {out}");
@@ -642,18 +656,22 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: PathBuf::from("/opt/translate/run.py"),
                     args: vec!["--source".to_string(), "en".to_string()],
                     timeout_ms: 30_000,
+                    matcher: None,
                 },
                 HookSpec {
                     program: PathBuf::from("/opt/redact.sh"),
                     args: vec![],
                     timeout_ms: 5_000,
+                    matcher: None,
                 },
             ],
             assistant_message_render: vec![HookSpec {
                 program: PathBuf::from("/opt/translate/run.py"),
                 args: vec![],
                 timeout_ms: 10_000,
+                matcher: None,
             }],
+            ..HooksConfig::default()
         };
         let out = format_list(&cfg);
         // Plural wording, both event headers, both hooks in the prompt
@@ -677,7 +695,9 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/opt/render.sh"),
                 args: vec![],
                 timeout_ms: 1_000,
+                matcher: None,
             }],
+            ..HooksConfig::default()
         };
         let out = format_list(&cfg);
         assert!(!out.contains("UserPromptSubmit"));
@@ -705,14 +725,17 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: PathBuf::from("/opt/translate-to-french-v2.py"),
                     args: vec![],
                     timeout_ms: 10_000,
+                    matcher: None,
                 },
                 HookSpec {
                     program: PathBuf::from("/opt/redact.sh"),
                     args: vec![],
                     timeout_ms: 10_000,
+                    matcher: None,
                 },
             ],
             assistant_message_render: vec![],
+            ..HooksConfig::default()
         };
         let out = format_list(&cfg);
         // Expected max name width: "translate-to-french-v2" == 22 chars.
@@ -742,18 +765,21 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         // slice the registry is typed against, so adding a new event
         // variant to `HookEvent::ALL` automatically appears in the
         // listing without touching this function.
-        assert_eq!(HookEvent::ALL.len(), 2);
+        assert_eq!(HookEvent::ALL.len(), 9);
         let cfg = HooksConfig {
             user_prompt_submit: vec![HookSpec {
                 program: PathBuf::from("/a"),
                 args: vec![],
                 timeout_ms: 1_000,
+                matcher: None,
             }],
             assistant_message_render: vec![HookSpec {
                 program: PathBuf::from("/b"),
                 args: vec![],
                 timeout_ms: 1_000,
+                matcher: None,
             }],
+            ..HooksConfig::default()
         };
         let out = format_list(&cfg);
         assert!(out.contains("UserPromptSubmit (1):"));

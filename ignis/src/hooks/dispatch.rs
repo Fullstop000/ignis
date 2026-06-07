@@ -83,11 +83,11 @@ pub async fn run_hook(
         cwd: ctx.cwd,
         prompt: match event {
             HookEvent::UserPromptSubmit => Some(payload),
-            HookEvent::AssistantMessageRender => None,
+            _ => None,
         },
         content: match event {
             HookEvent::AssistantMessageRender => Some(payload),
-            HookEvent::UserPromptSubmit => None,
+            _ => None,
         },
     };
     let stdin_bytes = match serde_json::to_vec(&envelope) {
@@ -207,9 +207,20 @@ pub async fn run_hook(
         return record(&span, started, HookOutcome::Blocked { stderr });
     }
 
+    // For v1's text-rewrite events, `updated_input` is a JSON string and
+    // `updated_output` is the rewritten content. New event types' rewrites
+    // (e.g. PreToolUse's tool_input object, SystemPromptCompose's prompt
+    // text) are wired through richer dispatch paths added in commit 3 —
+    // this match deliberately returns `None` for those so they pass through
+    // until then.
     let rewrite = parsed.hook_specific_output.and_then(|s| match event {
-        HookEvent::UserPromptSubmit => s.updated_input,
+        HookEvent::UserPromptSubmit => s
+            .updated_input
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .map(String::from),
         HookEvent::AssistantMessageRender => s.updated_output,
+        _ => None,
     });
     match rewrite {
         Some(updated) => record(&span, started, HookOutcome::Mutated(updated)),
@@ -273,6 +284,7 @@ mod tests {
             program: script,
             args: vec![],
             timeout_ms: 5_000,
+            matcher: None,
         };
         let out = run_hook(&spec, HookEvent::UserPromptSubmit, "original", &ctx()).await;
         assert_eq!(out, HookOutcome::Mutated("rewritten".to_string()));
@@ -287,6 +299,7 @@ mod tests {
             program: script,
             args: vec![],
             timeout_ms: 5_000,
+            matcher: None,
         };
         let out = run_hook(&spec, HookEvent::UserPromptSubmit, "original", &ctx()).await;
         assert_eq!(out, HookOutcome::PassThrough);
@@ -305,6 +318,7 @@ mod tests {
             program: script,
             args: vec![],
             timeout_ms: 5_000,
+            matcher: None,
         };
         let out = run_hook(&spec, HookEvent::UserPromptSubmit, "x", &ctx()).await;
         match out {
@@ -326,6 +340,7 @@ mod tests {
             program: script,
             args: vec![],
             timeout_ms: 5_000,
+            matcher: None,
         };
         let out = run_hook(&spec, HookEvent::UserPromptSubmit, "x", &ctx()).await;
         match out {
@@ -341,6 +356,7 @@ mod tests {
             program: PathBuf::from("/nonexistent/binary/__ignis_no_such_path__"),
             args: vec![],
             timeout_ms: 1_000,
+            matcher: None,
         };
         let out = run_hook(&spec, HookEvent::UserPromptSubmit, "x", &ctx()).await;
         matches!(out, HookOutcome::SoftFailed { .. });
@@ -354,6 +370,7 @@ mod tests {
             program: script,
             args: vec![],
             timeout_ms: 200,
+            matcher: None,
         };
         let out = run_hook(&spec, HookEvent::UserPromptSubmit, "x", &ctx()).await;
         match out {
@@ -385,6 +402,7 @@ mod tests {
             program: script,
             args: vec![],
             timeout_ms: 150,
+            matcher: None,
         };
         let big_payload = "x".repeat(256 * 1024); // > 64 KiB pipe buf
         let t0 = std::time::Instant::now();

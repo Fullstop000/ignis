@@ -776,7 +776,9 @@ printf '{"hookSpecificOutput":{"updatedOutput":"R:%s"}}' "$CONTENT"
                 program: script,
                 args: vec![],
                 timeout_ms: 5_000,
+                matcher: None,
             }],
+            ..HooksConfig::default()
         };
         let registry = HookRegistry::from_config(cfg);
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
