@@ -1121,6 +1121,7 @@ impl App {
         self.current_chunk_idx = None;
         self.history_idx = None;
         self.last_usage = None;
+        self.pending_user_display = None;
         self.session_picker = None;
         self.add_assistant_notice(format!("Started new session `{}`.", self.session_id));
     }
@@ -1432,6 +1433,7 @@ impl App {
         self.current_chunk_idx = None;
         self.session_picker = None;
         self.last_usage = None;
+        self.pending_user_display = None;
 
         if messages.is_empty() {
             self.add_assistant_notice(format!("Resumed empty session `{}`.", session_id));
