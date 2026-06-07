@@ -196,6 +196,86 @@ impl HookRegistry {
         self.run_prompt_chain(prompt, ctx, tx).await
     }
 
+    /// Run the `SystemPromptCompose` chain — fires once per LLM call,
+    /// before serialization. Hooks may:
+    /// * rewrite the prompt (`updatedSystemPrompt`) — threaded through
+    ///   the remaining hooks and used for THIS call only;
+    /// * inject `additionalContext` — queued for the same flush path
+    ///   `PostToolUse` uses;
+    /// * soft-fail (the base prompt is preserved, a `[warn]` is
+    ///   emitted on `tx`).
+    ///
+    /// Returns the prompt to send to the provider. Empty hook chain →
+    /// the base prompt unchanged, no allocation.
+    pub async fn run_system_prompt_compose(
+        &self,
+        base: &str,
+        model: &str,
+        ctx: HookContext<'_>,
+        tx: &EventSender,
+    ) -> String {
+        let event = HookEvent::SystemPromptCompose;
+        let specs: Vec<HookSpec> = {
+            let guard = self.inner.read().await;
+            guard.for_event(event).to_vec()
+        };
+        if specs.is_empty() {
+            return base.to_string();
+        }
+        let dispatch_ctx = DispatchContext {
+            session_id: ctx.session_id,
+            cwd: ctx.cwd,
+        };
+        let mut current = base.to_string();
+        for spec in &specs {
+            let payload = dispatch::HookPayload::SystemPromptCompose {
+                system_prompt: &current,
+                model,
+            };
+            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            match outcome {
+                HookOutcome::PassThrough => {}
+                HookOutcome::Mutated(text) => current = text,
+                HookOutcome::InjectContext(text) => {
+                    self.queue_injection(PendingInjection {
+                        text,
+                        source: spec.display_name(),
+                        event,
+                    })
+                    .await;
+                }
+                HookOutcome::Blocked { stderr, reason } => {
+                    // SystemPromptCompose has no meaningful "block" —
+                    // the call still needs SOME prompt. Degrade to a
+                    // soft failure with the reason surfaced as a
+                    // warning so the user sees the misconfiguration.
+                    let why = reason.unwrap_or_else(|| trim_one_line(&stderr));
+                    emit_warning(
+                        tx,
+                        event,
+                        &format!(
+                            "{} returned `decision: \"block\"` (ignored for SystemPromptCompose): {}",
+                            spec.display_name(),
+                            trim_one_line(&why)
+                        ),
+                    )
+                    .await;
+                }
+                HookOutcome::SoftFailed { reason } => {
+                    emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
+                    break;
+                }
+                HookOutcome::MutatedJson(_) | HookOutcome::KeepLooping { .. } => {
+                    tracing::debug!(
+                        hook = %spec.display_name(),
+                        "SystemPromptCompose hook returned outcome that does not apply; ignoring"
+                    );
+                }
+            }
+        }
+        current
+    }
+
     /// Run the `AssistantMessageRender` chain. Same semantics as
     /// `run_user_prompt_submit` but for `updatedOutput`. Hooks blocking
     /// (`exit 2` or `continue: false`) are degraded to a soft failure —
@@ -1367,6 +1447,121 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         assert!(drained[1].source.contains("inject2"));
         // Second drain is empty — `drain_injections` consumes.
         assert_eq!(reg.pending_injection_count().await, 0);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ---- SystemPromptCompose ----
+
+    #[tokio::test]
+    async fn system_prompt_compose_no_hooks_returns_base() {
+        let reg = HookRegistry::empty();
+        let (tx, _rx) = mpsc::channel(8);
+        let out = reg
+            .run_system_prompt_compose("base prompt", "test-model", ctx(), &tx)
+            .await;
+        assert_eq!(out, "base prompt");
+    }
+
+    #[tokio::test]
+    async fn system_prompt_compose_rewrite_returns_updated() {
+        let tmp = crate::util::unique_temp_dir("ignis-spc-rewrite");
+        let s = write_script(
+            &tmp,
+            "trim.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"updatedSystemPrompt\":\"trimmed\"}}'\n",
+        );
+        let cfg = HooksConfig {
+            system_prompt_compose: vec![HookSpec {
+                program: s,
+                args: vec![],
+                timeout_ms: 5_000,
+                matcher: None,
+            }],
+            ..HooksConfig::default()
+        };
+        let reg = HookRegistry::from_config(cfg);
+        let (tx, _rx) = mpsc::channel(8);
+        let out = reg
+            .run_system_prompt_compose("verbose base", "test-model", ctx(), &tx)
+            .await;
+        assert_eq!(out, "trimmed");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn system_prompt_compose_inject_context_queued() {
+        let tmp = crate::util::unique_temp_dir("ignis-spc-inject");
+        let s = write_script(
+            &tmp,
+            "inject.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"additionalContext\":\"note about prompt\"}}'\n",
+        );
+        let cfg = HooksConfig {
+            system_prompt_compose: vec![HookSpec {
+                program: s,
+                args: vec![],
+                timeout_ms: 5_000,
+                matcher: None,
+            }],
+            ..HooksConfig::default()
+        };
+        let reg = HookRegistry::from_config(cfg);
+        let (tx, _rx) = mpsc::channel(8);
+        let out = reg
+            .run_system_prompt_compose("base", "test-model", ctx(), &tx)
+            .await;
+        // Base prompt is unchanged when only context is injected.
+        assert_eq!(out, "base");
+        // The context is queued for the next-LLM-call drain.
+        let drained = reg.drain_injections().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].text, "note about prompt");
+        assert_eq!(drained[0].event, HookEvent::SystemPromptCompose);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn system_prompt_compose_chain_threads_rewrite() {
+        // Hook 1: prepends `A:`. Hook 2: prepends `B:` to whatever it
+        // receives. The second hook MUST see the first hook's output;
+        // pins the chain-threading invariant for SystemPromptCompose.
+        let tmp = crate::util::unique_temp_dir("ignis-spc-chain");
+        let s1 = write_script(
+            &tmp,
+            "h1.sh",
+            "#!/bin/sh\nread payload\nprintf '%s' '{\"hookSpecificOutput\":{\"updatedSystemPrompt\":\"A:original\"}}'\n",
+        );
+        let s2 = write_script(
+            &tmp,
+            "h2.sh",
+            // Always prepend B: to whatever it gets — the value carries
+            // the previous hook's rewrite.
+            "#!/bin/sh\nread payload\nprintf '%s' '{\"hookSpecificOutput\":{\"updatedSystemPrompt\":\"B:received\"}}'\n",
+        );
+        let cfg = HooksConfig {
+            system_prompt_compose: vec![
+                HookSpec {
+                    program: s1,
+                    args: vec![],
+                    timeout_ms: 5_000,
+                    matcher: None,
+                },
+                HookSpec {
+                    program: s2,
+                    args: vec![],
+                    timeout_ms: 5_000,
+                    matcher: None,
+                },
+            ],
+            ..HooksConfig::default()
+        };
+        let reg = HookRegistry::from_config(cfg);
+        let (tx, _rx) = mpsc::channel(8);
+        let out = reg
+            .run_system_prompt_compose("original", "test-model", ctx(), &tx)
+            .await;
+        // Final rewrite is the last hook's output.
+        assert_eq!(out, "B:received");
         std::fs::remove_dir_all(&tmp).ok();
     }
 

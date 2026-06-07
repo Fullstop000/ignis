@@ -1073,8 +1073,26 @@ impl Agent {
             .await;
             let _ = tx.send(AgentEvent::RunStart).await;
 
+            // SystemPromptCompose: hooks may rewrite the system prompt
+            // per LLM call (e.g. trim git diff for token-efficiency
+            // research). Hooks may also inject `additionalContext`,
+            // queued for the same flush path PostToolUse uses. No
+            // hook chain → zero overhead.
+            let call_prompt: std::borrow::Cow<'_, str> = match (prompt_hooks, hook_ctx) {
+                (Some(reg), Some(ctx)) => std::borrow::Cow::Owned(
+                    reg.run_system_prompt_compose(
+                        &effective_prompt,
+                        self.provider.model_id(),
+                        ctx,
+                        &tx,
+                    )
+                    .await,
+                ),
+                _ => std::borrow::Cow::Borrowed(effective_prompt.as_str()),
+            };
+
             let run = match self
-                .call_llm(&effective_prompt, history, &tool_schemas, &tx)
+                .call_llm(&call_prompt, history, &tool_schemas, &tx)
                 .await
             {
                 Ok(run) => run,
