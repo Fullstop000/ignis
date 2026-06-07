@@ -362,6 +362,11 @@ pub use imp::{
 mod tests {
     use super::*;
 
+    // NOTE: keep this the ONLY test that mutates the process-global
+    // `IGNIS_ENABLE_TELEMETRY`. A second test that also touched it raced under
+    // parallel `cargo llvm-cov` (one test's `set_var("…","1")` landing inside
+    // another's env-unset window → spurious `!is_enabled` failure). It covered
+    // nothing this test doesn't, so it was removed rather than re-added with a lock.
     #[test]
     fn is_enabled_reads_env_var() {
         let config = Config::default();
@@ -376,15 +381,6 @@ mod tests {
 
         // Config disabled, env var not set — disabled.
         let mut config = Config::default();
-        config.telemetry.enabled = false;
-        assert!(!is_enabled(&config));
-    }
-
-    #[test]
-    fn is_enabled_reads_config_when_env_unset() {
-        std::env::remove_var("IGNIS_ENABLE_TELEMETRY");
-        let mut config = Config::default();
-        assert!(is_enabled(&config)); // on by default
         config.telemetry.enabled = false;
         assert!(!is_enabled(&config));
     }

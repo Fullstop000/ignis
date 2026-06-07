@@ -1222,6 +1222,33 @@ mod tests {
     }
 
     #[test]
+    fn input_bar_shows_prompt_glyph() {
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        // Empty input: the ❯ prompt sits left of the placeholder.
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_content(&term).contains('❯'),
+            "input bar should show the ❯ prompt glyph"
+        );
+
+        // With typed text the glyph still leads the line.
+        app.input = "hello".to_string();
+        app.cursor = app.input.len();
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_content(&term).contains("❯ hello"),
+            "prompt glyph should prefix the typed input"
+        );
+    }
+
+    #[test]
     fn wrapped_blocks_render_all_turns() {
         // Long wrapping turns all become scrollback lines; the latest turn is
         // present (the terminal's own scrollback handles viewing earlier ones).
