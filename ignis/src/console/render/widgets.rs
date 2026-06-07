@@ -279,9 +279,18 @@ fn input_line(line: &str, pastes: &[PendingPaste]) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Leftmost prompt glyph that prefixes the first input line (Claude-Code style);
+/// continuation lines are indented `PROMPT_W` columns so wrapped text aligns.
+const PROMPT: &str = "❯ ";
+const PROMPT_W: u16 = 2;
+
 pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     let idle = app.mode == Mode::Idle;
     let border_color = if idle { BORDER_ACTIVE } else { BORDER };
+    let prompt = Span::styled(
+        PROMPT,
+        Style::default().fg(if idle { ACCENT } else { TEXT_DIM }),
+    );
 
     let content = if app.input.is_empty() {
         let placeholder = if idle {
@@ -289,12 +298,26 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         } else {
             "Type your next message…"
         };
-        Text::from(Span::styled(placeholder, Style::default().fg(TEXT_DIM)))
+        Text::from(Line::from(vec![
+            prompt,
+            Span::styled(placeholder, Style::default().fg(TEXT_DIM)),
+        ]))
     } else {
         Text::from(
             app.input
                 .split('\n')
-                .map(|l| input_line(l, &app.pending_pastes))
+                .enumerate()
+                .map(|(i, l)| {
+                    let mut line = input_line(l, &app.pending_pastes);
+                    // Prompt glyph on the first line; align continuation lines.
+                    let lead = if i == 0 {
+                        prompt.clone()
+                    } else {
+                        Span::raw("  ")
+                    };
+                    line.spans.insert(0, lead);
+                    line
+                })
                 .collect::<Vec<_>>(),
         )
     };
@@ -302,11 +325,7 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
-        .style(Style::default().bg(SURFACE_2))
-        .title(Span::styled(
-            if idle { " > " } else { " … " },
-            Style::default().fg(if idle { ACCENT } else { TEXT_DIM }),
-        ));
+        .style(Style::default().bg(SURFACE_2));
     if !app.queue.is_empty() {
         block = block.title(
             ratatui::widgets::block::Title::from(Span::styled(
@@ -321,12 +340,12 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 
     // Cursor is shown whenever the input has focus — idle or busy (you can type
-    // while the agent works to queue / steer).
+    // while the agent works to queue / steer). It sits just past the prompt glyph.
     let before = &app.input[..app.cursor];
     let row = before.matches('\n').count() as u16;
     let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
     let col = UnicodeWidthStr::width(&app.input[line_start..app.cursor]) as u16;
-    f.set_cursor(area.x + 1 + col, area.y + 1 + row);
+    f.set_cursor(area.x + 1 + PROMPT_W + col, area.y + 1 + row);
 }
 
 /// Render the slash-command suggestions into `area` (the band reserved above the
