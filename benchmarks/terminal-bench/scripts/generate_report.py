@@ -593,7 +593,7 @@ def _suite_label(trials: list[Trial], job_dir: Path) -> str:
     return top
 
 
-def render(trials: list[Trial], job_dir: Path) -> str:
+def render(trials: list[Trial], job_dir: Path, model_label: str | None = None) -> str:
     bucket_counts = Counter(t.bucket for t in trials)
     real_attempts = [t for t in trials if t.bucket in {"passed", "failed", "errored"}]
     passed = [t for t in trials if t.bucket == "passed"]
@@ -607,7 +607,7 @@ def render(trials: list[Trial], job_dir: Path) -> str:
     total_tool_err = sum(t.n_tool_err for t in trials)
     tool_ok_pct = (total_tool_ok / total_tool_calls * 100) if total_tool_calls else 0.0
     suite = _suite_label(trials, job_dir)
-    model = _model_label(job_dir)
+    model = model_label or _model_label(job_dir)
     title = f"{suite} · {model}" if model else suite
 
     # Stacked bar segments (passed, failed, errored). Only three buckets now
@@ -649,6 +649,8 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Render a harbor TB2 job dir into a single-file HTML report aimed at ignis improvement.")
     parser.add_argument("job_dir", type=Path)
     parser.add_argument("-o", "--output", type=Path, default=Path("report.html"))
+    parser.add_argument("--model-label", default=None,
+                        help="display name to use in the report title instead of the raw model id from config.json.")
     args = parser.parse_args(argv)
 
     if not args.job_dir.is_dir():
@@ -659,7 +661,7 @@ def main(argv: list[str]) -> int:
     if not trials:
         print(f"warning: no trial dirs with result.json under {args.job_dir}", file=sys.stderr)
 
-    args.output.write_text(render(trials, args.job_dir))
+    args.output.write_text(render(trials, args.job_dir, model_label=args.model_label))
     print(f"{len(trials)} trials → {args.output} ({args.output.stat().st_size // 1024} KB)")
     return 0
 
