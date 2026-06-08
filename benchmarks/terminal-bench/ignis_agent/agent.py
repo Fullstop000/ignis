@@ -40,6 +40,9 @@ _PROVIDERS: dict[str, tuple[str, str | None]] = {
     # protocols; ignis hardcodes both endpoints (api.minimaxi.com/anthropic
     # first, recommended for prompt-cache hits). Only forward the key.
     "minimax-token-plan": ("MINIMAX_TOKEN_PLAN_API_KEY", None),
+    # Zhipu / BigModel — ignis hardcodes https://open.bigmodel.cn/api/paas/v4
+    # (OpenAI-compatible). Only forward the key.
+    "zhipu": ("ZHIPU_API_KEY", None),
 }
 
 
