@@ -7,7 +7,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal, TerminalOptions, Viewport};
+use ratatui::{backend::CrosstermBackend, text::Line, Terminal, TerminalOptions, Viewport};
 use std::io;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -504,6 +504,15 @@ pub async fn run_console(
         // scrollback history, then re-anchor a fresh viewport, so old output
         // doesn't linger when scrolling up. `committed`/`committed_rows` were
         // already reset in App, so the new session's blocks commit from the top.
+        //
+        // Compute the target viewport height *before* the rebuild — the
+        // pending viewport_rows is from the previous frame (e.g. 2 rows while
+        // a picker was open), but the picker just closed, so the new size is
+        // the band height. Building the post-clear terminal at the right size
+        // up front means the commit loop below runs in the correct viewport
+        // and the draw-time rebuild check is a no-op.
+        let term_size = crossterm::terminal::size()?;
+        let want_rows = render::viewport_height(&app, term_size.0, term_size.1);
         if app.pending_screen_clear {
             execute!(
                 io::stdout(),
@@ -513,8 +522,10 @@ pub async fn run_console(
             )?;
             // Leave `pending_screen_clear` set if the rebuild's DSR times out,
             // so the re-anchor is retried next frame instead of crashing.
-            if try_rebuild(&mut terminal, viewport_rows)? {
+            if try_rebuild(&mut terminal, want_rows)? {
                 app.pending_screen_clear = false;
+                viewport_rows = want_rows;
+                last_term_size = term_size;
             }
         }
 
@@ -525,7 +536,25 @@ pub async fn run_console(
         // they settle (stream_commit), so text flows smoothly into scrollback
         // rather than appearing all at once. A pending tool block waits.
         let width = terminal.size()?.width;
-        while app.committed < app.blocks.len() {
+        // Collect the new rows for every block we're about to commit in this
+        // frame, then hand them to insert_before as a single batch. Calling
+        // insert_before multiple times in succession overwrites prior inserts
+        // — each call's `clear()` only protects the live viewport, so earlier
+        // buffer content gets shifted up off the top of the terminal by
+        // subsequent `append_lines` calls and overwritten. One call per frame
+        // preserves the full ordered history (matters for /resume which
+        // commits N blocks back-to-back after a screen clear). For the
+        // streaming case, the loop breaks after the first in-progress block,
+        // so the batch is always exactly the new rows of that one block.
+        let mut batch: Vec<Line<'static>> = Vec::new();
+        // Defer commits while a screen-clear re-anchor is still pending. A
+        // timed-out `try_rebuild` (DSR cursor-read backpressure on WSL2/tmux)
+        // leaves `pending_screen_clear` set, and the next frame `Clear(All)`s
+        // again. Committing now would advance `committed` into blocks the
+        // re-clear then wipes — a resumed transcript paints once, gets erased,
+        // and never repaints (committed == blocks.len(), so nothing is left to
+        // push). Hold off; once the re-anchor lands we commit the batch at once.
+        while !app.pending_screen_clear && app.committed < app.blocks.len() {
             let block = &app.blocks[app.committed];
             let done = app.block_done(app.committed);
             let rows = if done {
@@ -537,10 +566,7 @@ pub async fn run_console(
             };
             let start = app.committed_rows.min(rows.len());
             let new = &rows[start..];
-            if !new.is_empty() {
-                let h = new.len() as u16;
-                terminal.insert_before(h, |buf| render::render_block_into(buf, new))?;
-            }
+            batch.extend_from_slice(new);
             if done {
                 app.committed += 1;
                 app.committed_rows = 0;
@@ -548,6 +574,10 @@ pub async fn run_console(
                 app.committed_rows += new.len();
                 break; // in-progress block is last; nothing after it yet
             }
+        }
+        if !batch.is_empty() {
+            let h = batch.len() as u16;
+            terminal.insert_before(h, |buf| render::render_block_into(buf, &batch))?;
         }
 
         // Coalesced redraw of the live band: at most once per frame interval.

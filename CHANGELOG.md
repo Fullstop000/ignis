@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.2] - 2026-06-08
+
+### Fixed
+- TUI — resizing the terminal (e.g. dragging between monitors) no longer leaves duplicate input bars stacked on screen. ([#138](https://github.com/Fullstop000/ignis/pull/138))
+- TUI — resuming a session via `/sessions` reliably repaints the conversation history instead of sometimes leaving a blank screen with only the input bar. ([#140](https://github.com/Fullstop000/ignis/pull/140))
+
+## [0.36.1] - 2026-06-08
+
 ### Fixed
 - TUI — `/model` picker anchors above the input (replacing it, CC-style) instead of taking over the whole body. The conversation in native scrollback above the TUI stays visible while the picker is open. ([#134](https://github.com/Fullstop000/ignis/pull/134))
-- TUI — resizing the terminal (e.g. dragging between monitors) no longer leaves duplicate input bars stacked on screen. ([#138](https://github.com/Fullstop000/ignis/pull/138))
 
 ## [0.36.0] - 2026-06-08
 
