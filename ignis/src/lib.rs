@@ -1,7 +1,7 @@
 pub mod agent;
 pub mod cli;
 pub mod config;
-pub mod hooks;
+pub mod extensions;
 pub mod llm;
 pub mod logger;
 pub mod mcp;
@@ -24,6 +24,6 @@ pub use mcp::{McpRegistry, McpServerEntry, McpStatus};
 pub use session::Session;
 pub use skills::{Skill, SkillRegistry, SkillScope};
 pub use tools::tool::{
-    AgentTool, ExecutionMode, IntoToolResult, StaticTool, ToolArgs, ToolHooks, ToolOutcome,
+    AgentTool, ExecutionMode, IntoToolResult, StaticTool, ToolArgs, ToolExtensions, ToolOutcome,
     ToolParam, ToolResult,
 };

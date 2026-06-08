@@ -8,12 +8,12 @@
 # codebase versus its cost in tokens.
 #
 # Install:
-#   cp -R examples/hooks/system-prompt-trim ~/.ignis/hooks/system-prompt-trim
-#   chmod +x ~/.ignis/hooks/system-prompt-trim/run.sh
+#   cp -R examples/extensions/system-prompt-trim ~/.ignis/extensions/system-prompt-trim
+#   chmod +x ~/.ignis/extensions/system-prompt-trim/run.sh
 #
-# Wire in ~/.ignis/hooks.json:
-#   { "hooks": { "SystemPromptCompose": [
-#       { "command": "~/.ignis/hooks/system-prompt-trim/run.sh" }
+# Wire in ~/.ignis/extensions.json:
+#   { "extensions": { "SystemPromptCompose": [
+#       { "command": "~/.ignis/extensions/system-prompt-trim/run.sh" }
 #   ]}}
 
 set -eu

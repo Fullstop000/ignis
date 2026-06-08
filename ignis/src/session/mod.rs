@@ -1,9 +1,11 @@
 use crate::agent::Agent;
 use crate::config::CompactionConfig;
-use crate::hooks::{ChainedToolHooks, HookContext, HookRegistry, PromptHookResult};
+use crate::extensions::{
+    ChainedToolExtensions, ExtensionContext, ExtensionRegistry, PromptExtensionResult,
+};
 use crate::llm::LlmProvider;
 use crate::storage::SessionStorage;
-use crate::tools::tool::{AgentTool, ToolHooks};
+use crate::tools::tool::{AgentTool, ToolExtensions};
 use crate::{AgentEvent, Message};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -38,7 +40,7 @@ pub struct Session {
     /// drive the `AssistantMessageRender` chain over the same registry, and
     /// so `/hooks reload` can swap the live config without rebuilding the
     /// session.
-    hooks: HookRegistry,
+    hooks: ExtensionRegistry,
 }
 
 impl Session {
@@ -70,15 +72,15 @@ impl Session {
         // `/hooks reload` swaps the parsed config in place via the
         // RwLock-backed registry. Absent file = no-op, fast path.
         let hooks = match dirs::home_dir() {
-            Some(home) => HookRegistry::from_config_dir(&home)?,
-            None => HookRegistry::empty(),
+            Some(home) => ExtensionRegistry::from_config_dir(&home)?,
+            None => ExtensionRegistry::empty(),
         };
         // Seed the registry's envelope context so PreToolUse / PostToolUse
         // (and the lifecycle events landing in commit 6) carry the real
         // session id + cwd in their JSON envelopes. Set before any hook
         // can fire — the registry is then used by both the prompt-hook
         // path (UserPromptSubmit / AssistantMessageRender) and, once
-        // `set_hooks` is called, the chained ToolHooks path.
+        // `set_hooks` is called, the chained ToolExtensions path.
         hooks
             .set_envelope_context(id.clone(), PathBuf::from(&start_dir))
             .await;
@@ -95,7 +97,7 @@ impl Session {
         hooks
             .run_session_start(
                 source,
-                HookContext {
+                ExtensionContext {
                     session_id: &id,
                     cwd: &start_dir,
                 },
@@ -139,13 +141,13 @@ impl Session {
     }
 
     /// Install the in-tree policy gate. The session always wraps it
-    /// with the subprocess `HookRegistry` so user-authored
+    /// with the subprocess `ExtensionRegistry` so user-authored
     /// `PreToolUse` / `PostToolUse` hooks fire on the same path — see
-    /// [`ChainedToolHooks`]. The policy gate runs first; only allowed
+    /// [`ChainedToolExtensions`]. The policy gate runs first; only allowed
     /// calls reach user hooks. A second call replaces the previous
     /// policy gate but keeps the registry wired.
-    pub fn set_hooks(&mut self, policy: Box<dyn ToolHooks>) {
-        let chained = ChainedToolHooks::wrap(policy, self.hooks.clone());
+    pub fn set_hooks(&mut self, policy: Box<dyn ToolExtensions>) {
+        let chained = ChainedToolExtensions::wrap(policy, self.hooks.clone());
         self.agent.set_hooks(chained);
     }
 
@@ -172,14 +174,14 @@ impl Session {
     /// The shared hook registry. The console's render path takes a clone of
     /// this handle so it can run the `AssistantMessageRender` chain over
     /// the same parsed config the session uses for `UserPromptSubmit`.
-    pub fn hooks(&self) -> &HookRegistry {
+    pub fn hooks(&self) -> &ExtensionRegistry {
         &self.hooks
     }
 
     /// Replace the hook registry — used by the console runner so
     /// `/hooks reload` reaches the live registry instance, and by tests
     /// so they don't have to touch the real `~/.ignis/hooks.json`.
-    pub fn set_hook_registry(&mut self, registry: HookRegistry) {
+    pub fn set_hook_registry(&mut self, registry: ExtensionRegistry) {
         self.hooks = registry;
     }
 
@@ -232,7 +234,7 @@ impl Session {
             .hooks
             .run_user_prompt_submit(
                 text,
-                HookContext {
+                ExtensionContext {
                     session_id: &self.id,
                     cwd: &self.start_dir,
                 },
@@ -240,8 +242,8 @@ impl Session {
             )
             .await
         {
-            PromptHookResult::Continue(t) => t,
-            PromptHookResult::Blocked { .. } => {
+            PromptExtensionResult::Continue(t) => t,
+            PromptExtensionResult::Blocked { .. } => {
                 // The hook chain already emitted a Warning event carrying
                 // the stderr reason. Do NOT push to history, do NOT call
                 // the agent. The console handler renders Warning lines
@@ -300,7 +302,7 @@ impl Session {
                 tx,
                 self.inject_rx.as_mut(),
                 Some(&self.hooks),
-                Some(HookContext {
+                Some(ExtensionContext {
                     session_id: &self.id,
                     cwd: &self.start_dir,
                 }),
@@ -352,7 +354,7 @@ impl Session {
             .run_pre_compact(
                 trigger,
                 "",
-                HookContext {
+                ExtensionContext {
                     session_id: &self.id,
                     cwd: &self.start_dir,
                 },
@@ -423,7 +425,7 @@ impl Session {
             .run_post_compact(
                 trigger,
                 &summary,
-                HookContext {
+                ExtensionContext {
                     session_id: &self.id,
                     cwd: &self.start_dir,
                 },

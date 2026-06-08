@@ -155,11 +155,11 @@ where
 ///
 /// One hook impl covers two ignis use cases: the in-process
 /// `PermissionChecker` (the policy gate that enforces session rules and
-/// safety floors), and the subprocess `HookRegistry` (which fires the
+/// safety floors), and the subprocess `ExtensionRegistry` (which fires the
 /// user-configured `PreToolUse` / `PostToolUse` events). They're
 /// composable — the agent loop runs both in series.
 #[async_trait]
-pub trait ToolHooks: Send + Sync + 'static {
+pub trait ToolExtensions: Send + Sync + 'static {
     /// Called before tool execution. The return value carries three
     /// outcomes:
     ///
@@ -202,9 +202,9 @@ pub trait ToolHooks: Send + Sync + 'static {
     /// `PostCompact` / `Stop`) injection path.
     ///
     /// Default returns empty. Only impls that produce
-    /// `additional_context` (today: `HookRegistry`, and the chained
+    /// `additional_context` (today: `ExtensionRegistry`, and the chained
     /// wrapper that fans across multiple impls) override this.
-    async fn drain_pending_context(&self) -> Vec<crate::hooks::PendingInjection> {
+    async fn drain_pending_context(&self) -> Vec<crate::extensions::PendingInjection> {
         Vec::new()
     }
 }

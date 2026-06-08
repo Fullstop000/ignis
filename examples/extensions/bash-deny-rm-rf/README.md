@@ -12,20 +12,20 @@ reminder — the model sees a tool error and adapts (or asks the user).
 
 ```sh
 mkdir -p ~/.ignis/hooks
-cp -R examples/hooks/bash-deny-rm-rf ~/.ignis/hooks/bash-deny-rm-rf
-chmod +x ~/.ignis/hooks/bash-deny-rm-rf/run.sh
+cp -R examples/extensions/bash-deny-rm-rf ~/.ignis/extensions/bash-deny-rm-rf
+chmod +x ~/.ignis/extensions/bash-deny-rm-rf/run.sh
 ```
 
 Requires `jq` on `PATH`.
 
-## Wire in `~/.ignis/hooks.json`
+## Wire in `~/.ignis/extensions.json`
 
 ```json
 {
-  "hooks": {
+  "extensions": {
     "PreToolUse": [
       {
-        "command": "~/.ignis/hooks/bash-deny-rm-rf/run.sh",
+        "command": "~/.ignis/extensions/bash-deny-rm-rf/run.sh",
         "matcher": "Bash",
         "timeout_ms": 2000
       }
@@ -38,7 +38,7 @@ The `matcher` field is a regex on the tool name — `"Bash"` means the
 hook only fires for bash calls; PreToolUse on `Edit` or `Read` skips
 this hook without paying a spawn cost.
 
-Reload without restarting: type `/hooks reload`.
+Reload without restarting: type `/extensions reload`.
 
 ## What it blocks
 

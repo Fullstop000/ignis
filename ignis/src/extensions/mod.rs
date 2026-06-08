@@ -25,17 +25,17 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::tools::tool::{ToolHooks, ToolResult};
+use crate::tools::tool::{ToolExtensions, ToolResult};
 use crate::AgentEvent;
 
-pub use config::{HookSpec, HooksConfig, DEFAULT_TIMEOUT_MS};
-pub use dispatch::{DispatchContext, HookOutcome};
-pub use protocol::{HookEvent, HookInput, HookOutput, HookSpecificOutput};
+pub use config::{ExtensionSpec, ExtensionsConfig, DEFAULT_TIMEOUT_MS};
+pub use dispatch::{DispatchContext, ExtensionOutcome};
+pub use protocol::{ExtensionEvent, ExtensionInput, ExtensionOutput, ExtensionSpecificOutput};
 
 /// Context the registry needs at every dispatch call. Borrowed strings so
 /// callers don't have to allocate per turn.
 #[derive(Debug, Clone, Copy)]
-pub struct HookContext<'a> {
+pub struct ExtensionContext<'a> {
     pub session_id: &'a str,
     pub cwd: &'a str,
 }
@@ -57,11 +57,11 @@ pub type EventSender = mpsc::Sender<AgentEvent>;
 /// so a `/hooks reload` (which writes `inner`) cannot stall a tool call
 /// that reads `session`.
 #[derive(Debug, Default, Clone)]
-pub struct HookRegistry {
-    inner: Arc<RwLock<HooksConfig>>,
+pub struct ExtensionRegistry {
+    inner: Arc<RwLock<ExtensionsConfig>>,
     session: Arc<RwLock<SessionEnvelopeContext>>,
     /// FIFO queue of `additionalContext` strings emitted by hooks that
-    /// returned [`HookOutcome::InjectContext`]. The agent loop drains
+    /// returned [`ExtensionOutcome::InjectContext`]. The agent loop drains
     /// this between tool batches and prepends each entry as a
     /// `<system-reminder>` block before the next LLM call. Queue is
     /// shared across the session (same posture as the config) so a
@@ -82,7 +82,7 @@ pub struct PendingInjection {
     pub source: String,
     /// The event class that produced it (e.g. `PostToolUse`). Lets the
     /// renderer label the reminder ("hook PostToolUse: ...").
-    pub event: HookEvent,
+    pub event: ExtensionEvent,
 }
 
 /// Per-session envelope context — what subprocess hooks see in their
@@ -101,11 +101,11 @@ struct SessionEnvelopeContext {
 /// `PendingInjection` provenance. Closures can't easily return two
 /// values with different lifetimes, so we bundle them here.
 struct PayloadWithLabel<'a> {
-    payload: dispatch::HookPayload<'a>,
+    payload: dispatch::ExtensionPayload<'a>,
     label: String,
 }
 
-impl<'a> dispatch::HookPayload<'a> {
+impl<'a> dispatch::ExtensionPayload<'a> {
     fn with_spec_label(self, label: String) -> PayloadWithLabel<'a> {
         PayloadWithLabel {
             payload: self,
@@ -114,10 +114,10 @@ impl<'a> dispatch::HookPayload<'a> {
     }
 }
 
-impl HookRegistry {
+impl ExtensionRegistry {
     /// Load `~/.ignis/hooks.json` into a fresh registry.
     pub fn from_config_dir(home: &Path) -> anyhow::Result<Self> {
-        let cfg = HooksConfig::from_home(home)?;
+        let cfg = ExtensionsConfig::from_home(home)?;
         Ok(Self {
             inner: Arc::new(RwLock::new(cfg)),
             session: Arc::new(RwLock::new(SessionEnvelopeContext::default())),
@@ -132,7 +132,7 @@ impl HookRegistry {
 
     /// Construct directly from a parsed config (test helper, used by the
     /// integration test in `tests/hook_roundtrip.rs`).
-    pub fn from_config(cfg: HooksConfig) -> Self {
+    pub fn from_config(cfg: ExtensionsConfig) -> Self {
         Self {
             inner: Arc::new(RwLock::new(cfg)),
             session: Arc::new(RwLock::new(SessionEnvelopeContext::default())),
@@ -157,7 +157,7 @@ impl HookRegistry {
         self.pending_injections.lock().await.len()
     }
 
-    /// Internal: queue an injection. Used by the `ToolHooks` impl when
+    /// Internal: queue an injection. Used by the `ToolExtensions` impl when
     /// a `PostToolUse` (or, in commit 5, any inject-context event)
     /// returns `additional_context`.
     async fn queue_injection(&self, inj: PendingInjection) {
@@ -187,7 +187,7 @@ impl HookRegistry {
     /// Rebuild the registry from disk in place. Returns the new hook count
     /// for the `/hooks reload` confirmation line.
     pub async fn reload(&self, home: &Path) -> anyhow::Result<usize> {
-        let cfg = HooksConfig::from_home(home)?;
+        let cfg = ExtensionsConfig::from_home(home)?;
         let total = cfg.total_len();
         let mut guard = self.inner.write().await;
         *guard = cfg;
@@ -196,11 +196,11 @@ impl HookRegistry {
 
     /// Run the `UserPromptSubmit` chain. Returns:
     ///
-    /// - [`PromptHookResult::Continue`] with the (possibly rewritten) prompt
+    /// - [`PromptExtensionResult::Continue`] with the (possibly rewritten) prompt
     ///   when every hook passed through or successfully rewrote, or when a
     ///   soft-failure short-circuited the chain at the last good value
     ///   (caller pushes the string to history and runs the agent).
-    /// - [`PromptHookResult::Blocked`] when a hook returned exit 2 or
+    /// - [`PromptExtensionResult::Blocked`] when a hook returned exit 2 or
     ///   `continue: false`. The spec's iron rule: hooks cannot kill a
     ///   turn EXCEPT here — `UserPromptSubmit` is the one event where
     ///   blocking is meaningful. The caller MUST NOT push the prompt to
@@ -209,9 +209,9 @@ impl HookRegistry {
     pub async fn run_user_prompt_submit(
         &self,
         prompt: &str,
-        ctx: HookContext<'_>,
+        ctx: ExtensionContext<'_>,
         tx: &EventSender,
-    ) -> PromptHookResult {
+    ) -> PromptExtensionResult {
         self.run_prompt_chain(prompt, ctx, tx).await
     }
 
@@ -230,11 +230,11 @@ impl HookRegistry {
         &self,
         base: &str,
         model: &str,
-        ctx: HookContext<'_>,
+        ctx: ExtensionContext<'_>,
         tx: &EventSender,
     ) -> String {
-        let event = HookEvent::SystemPromptCompose;
-        let specs: Vec<HookSpec> = {
+        let event = ExtensionEvent::SystemPromptCompose;
+        let specs: Vec<ExtensionSpec> = {
             let guard = self.inner.read().await;
             guard.for_event(event).to_vec()
         };
@@ -247,15 +247,15 @@ impl HookRegistry {
         };
         let mut current = base.to_string();
         for spec in &specs {
-            let payload = dispatch::HookPayload::SystemPromptCompose {
+            let payload = dispatch::ExtensionPayload::SystemPromptCompose {
                 system_prompt: &current,
                 model,
             };
             let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
             match outcome {
-                HookOutcome::PassThrough => {}
-                HookOutcome::Mutated(text) => current = text,
-                HookOutcome::InjectContext(text) => {
+                ExtensionOutcome::PassThrough => {}
+                ExtensionOutcome::Mutated(text) => current = text,
+                ExtensionOutcome::InjectContext(text) => {
                     self.queue_injection(PendingInjection {
                         text,
                         source: spec.display_name(),
@@ -263,7 +263,7 @@ impl HookRegistry {
                     })
                     .await;
                 }
-                HookOutcome::Blocked { stderr, reason } => {
+                ExtensionOutcome::Blocked { stderr, reason } => {
                     // SystemPromptCompose has no meaningful "block" —
                     // the call still needs SOME prompt. Degrade to a
                     // soft failure with the reason surfaced as a
@@ -280,11 +280,11 @@ impl HookRegistry {
                     )
                     .await;
                 }
-                HookOutcome::SoftFailed { reason } => {
+                ExtensionOutcome::SoftFailed { reason } => {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
                     break;
                 }
-                HookOutcome::MutatedJson(_) | HookOutcome::KeepLooping { .. } => {
+                ExtensionOutcome::MutatedJson(_) | ExtensionOutcome::KeepLooping { .. } => {
                     tracing::debug!(
                         hook = %spec.display_name(),
                         "SystemPromptCompose hook returned outcome that does not apply; ignoring"
@@ -301,9 +301,14 @@ impl HookRegistry {
     /// (queued for the next-LLM-call drain) or pass-through; rewrite
     /// variants and `decision: "block"` are logged at debug and
     /// otherwise ignored — a session has to start.
-    pub async fn run_session_start(&self, source: &str, ctx: HookContext<'_>, tx: &EventSender) {
-        self.run_inject_only_event(HookEvent::SessionStart, ctx, tx, |spec| {
-            dispatch::HookPayload::SessionStart { source }.with_spec_label(spec.display_name())
+    pub async fn run_session_start(
+        &self,
+        source: &str,
+        ctx: ExtensionContext<'_>,
+        tx: &EventSender,
+    ) {
+        self.run_inject_only_event(ExtensionEvent::SessionStart, ctx, tx, |spec| {
+            dispatch::ExtensionPayload::SessionStart { source }.with_spec_label(spec.display_name())
         })
         .await;
     }
@@ -317,11 +322,11 @@ impl HookRegistry {
         &self,
         trigger: &str,
         transcript_path: &str,
-        ctx: HookContext<'_>,
+        ctx: ExtensionContext<'_>,
         tx: &EventSender,
     ) -> bool {
-        let event = HookEvent::PreCompact;
-        let specs: Vec<HookSpec> = {
+        let event = ExtensionEvent::PreCompact;
+        let specs: Vec<ExtensionSpec> = {
             let guard = self.inner.read().await;
             guard.for_event(event).to_vec()
         };
@@ -334,14 +339,14 @@ impl HookRegistry {
         };
         let mut abort = false;
         for spec in &specs {
-            let payload = dispatch::HookPayload::PreCompact {
+            let payload = dispatch::ExtensionPayload::PreCompact {
                 trigger,
                 transcript_path,
             };
             let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
             match outcome {
-                HookOutcome::PassThrough => {}
-                HookOutcome::InjectContext(text) => {
+                ExtensionOutcome::PassThrough => {}
+                ExtensionOutcome::InjectContext(text) => {
                     self.queue_injection(PendingInjection {
                         text,
                         source: spec.display_name(),
@@ -349,7 +354,7 @@ impl HookRegistry {
                     })
                     .await;
                 }
-                HookOutcome::Blocked { stderr, reason } => {
+                ExtensionOutcome::Blocked { stderr, reason } => {
                     let why = reason.unwrap_or_else(|| trim_one_line(&stderr));
                     emit_warning(
                         tx,
@@ -364,7 +369,7 @@ impl HookRegistry {
                     abort = true;
                     break;
                 }
-                HookOutcome::SoftFailed { reason } => {
+                ExtensionOutcome::SoftFailed { reason } => {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
                     break;
                 }
@@ -388,11 +393,11 @@ impl HookRegistry {
         &self,
         trigger: &str,
         summary: &str,
-        ctx: HookContext<'_>,
+        ctx: ExtensionContext<'_>,
         tx: &EventSender,
     ) {
-        self.run_inject_only_event(HookEvent::PostCompact, ctx, tx, |spec| {
-            dispatch::HookPayload::PostCompact { trigger, summary }
+        self.run_inject_only_event(ExtensionEvent::PostCompact, ctx, tx, |spec| {
+            dispatch::ExtensionPayload::PostCompact { trigger, summary }
                 .with_spec_label(spec.display_name())
         })
         .await;
@@ -400,7 +405,7 @@ impl HookRegistry {
 
     /// Run the `Stop` chain — fires on the clean-exit branch of the
     /// agent loop (NOT on `emit_fatal`). The CC inversion applies:
-    /// `decision: "block"` becomes [`HookOutcome::KeepLooping`] inside
+    /// `decision: "block"` becomes [`ExtensionOutcome::KeepLooping`] inside
     /// dispatch, surfaced here as a queued `<system-reminder>` framing
     /// the loop-keep-alive reason. The caller decides whether to honour
     /// the keep-loop by reading the returned `bool` (`true` =
@@ -408,11 +413,11 @@ impl HookRegistry {
     pub async fn run_stop(
         &self,
         transcript_path: &str,
-        ctx: HookContext<'_>,
+        ctx: ExtensionContext<'_>,
         tx: &EventSender,
     ) -> bool {
-        let event = HookEvent::Stop;
-        let specs: Vec<HookSpec> = {
+        let event = ExtensionEvent::Stop;
+        let specs: Vec<ExtensionSpec> = {
             let guard = self.inner.read().await;
             guard.for_event(event).to_vec()
         };
@@ -425,11 +430,11 @@ impl HookRegistry {
         };
         let mut keep_looping = false;
         for spec in &specs {
-            let payload = dispatch::HookPayload::Stop { transcript_path };
+            let payload = dispatch::ExtensionPayload::Stop { transcript_path };
             let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
             match outcome {
-                HookOutcome::PassThrough => {}
-                HookOutcome::InjectContext(text) => {
+                ExtensionOutcome::PassThrough => {}
+                ExtensionOutcome::InjectContext(text) => {
                     self.queue_injection(PendingInjection {
                         text,
                         source: spec.display_name(),
@@ -437,7 +442,7 @@ impl HookRegistry {
                     })
                     .await;
                 }
-                HookOutcome::KeepLooping { reason } => {
+                ExtensionOutcome::KeepLooping { reason } => {
                     // CC inversion: surface the reason as a queued
                     // system reminder framing the keep-alive, and tell
                     // the caller to continue the loop.
@@ -449,11 +454,11 @@ impl HookRegistry {
                     .await;
                     keep_looping = true;
                 }
-                HookOutcome::SoftFailed { reason } => {
+                ExtensionOutcome::SoftFailed { reason } => {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
                     break;
                 }
-                HookOutcome::Blocked { stderr, reason } => {
+                ExtensionOutcome::Blocked { stderr, reason } => {
                     // Non-inverted block on Stop shouldn't happen
                     // (dispatch normalises `decision: "block"` to
                     // KeepLooping for Stop); the exit-2 path is the
@@ -474,7 +479,7 @@ impl HookRegistry {
                     keep_looping = true;
                 }
                 // Rewrite variants don't apply to Stop.
-                HookOutcome::Mutated(_) | HookOutcome::MutatedJson(_) => {
+                ExtensionOutcome::Mutated(_) | ExtensionOutcome::MutatedJson(_) => {
                     tracing::debug!(
                         hook = %spec.display_name(),
                         "Stop hook returned a rewrite outcome that does not apply; ignoring"
@@ -492,14 +497,14 @@ impl HookRegistry {
     /// posture so the per-event functions stay short.
     async fn run_inject_only_event<'a, F>(
         &self,
-        event: HookEvent,
-        ctx: HookContext<'a>,
+        event: ExtensionEvent,
+        ctx: ExtensionContext<'a>,
         tx: &EventSender,
         mut build_payload: F,
     ) where
-        F: for<'b> FnMut(&'b HookSpec) -> PayloadWithLabel<'a>,
+        F: for<'b> FnMut(&'b ExtensionSpec) -> PayloadWithLabel<'a>,
     {
-        let specs: Vec<HookSpec> = {
+        let specs: Vec<ExtensionSpec> = {
             let guard = self.inner.read().await;
             guard.for_event(event).to_vec()
         };
@@ -514,8 +519,8 @@ impl HookRegistry {
             let pwl = build_payload(spec);
             let outcome = dispatch::run_hook(spec, pwl.payload, &dispatch_ctx).await;
             match outcome {
-                HookOutcome::PassThrough => {}
-                HookOutcome::InjectContext(text) => {
+                ExtensionOutcome::PassThrough => {}
+                ExtensionOutcome::InjectContext(text) => {
                     self.queue_injection(PendingInjection {
                         text,
                         source: pwl.label.clone(),
@@ -523,11 +528,11 @@ impl HookRegistry {
                     })
                     .await;
                 }
-                HookOutcome::SoftFailed { reason } => {
+                ExtensionOutcome::SoftFailed { reason } => {
                     emit_warning(tx, event, &format!("{} ({})", reason, pwl.label)).await;
                     break;
                 }
-                HookOutcome::Blocked { .. } => {
+                ExtensionOutcome::Blocked { .. } => {
                     emit_warning(
                         tx,
                         event,
@@ -554,7 +559,7 @@ impl HookRegistry {
     pub async fn run_assistant_message_render(
         &self,
         content: &str,
-        ctx: HookContext<'_>,
+        ctx: ExtensionContext<'_>,
         tx: &EventSender,
     ) -> String {
         self.run_render_chain(content, ctx, tx).await
@@ -562,15 +567,15 @@ impl HookRegistry {
 
     /// Are any hooks declared for `event`? Fast path the render seam uses
     /// to skip task-spawn when there's nothing to do.
-    pub async fn has_hooks(&self, event: HookEvent) -> bool {
+    pub async fn has_hooks(&self, event: ExtensionEvent) -> bool {
         !self.inner.read().await.for_event(event).is_empty()
     }
 
-    /// Cheap clone of the in-memory `HooksConfig`. Used by `/hooks` to
+    /// Cheap clone of the in-memory `ExtensionsConfig`. Used by `/hooks` to
     /// render the currently-registered chains without re-reading disk.
     /// The list reflects the last `reload()` (or initial load) — it is
     /// not a live probe of the filesystem.
-    pub async fn snapshot(&self) -> HooksConfig {
+    pub async fn snapshot(&self) -> ExtensionsConfig {
         self.inner.read().await.clone()
     }
 
@@ -578,31 +583,31 @@ impl HookRegistry {
     /// the read lock only across the sync `format_list` call — no
     /// `.await` is nested, so the lock is dropped before this returns.
     /// Prefer this over `snapshot() + format_list(&cfg)` to avoid cloning
-    /// two `Vec<HookSpec>` per call.
+    /// two `Vec<ExtensionSpec>` per call.
     pub async fn format_list(&self) -> String {
         let cfg = self.inner.read().await;
         format_list(&cfg)
     }
 
     /// `UserPromptSubmit` chain — same body as the render chain except
-    /// that `Blocked` is honoured (returns `PromptHookResult::Blocked`)
+    /// that `Blocked` is honoured (returns `PromptExtensionResult::Blocked`)
     /// instead of being degraded to a Warning. Kept separate so the
     /// caller's return type carries the block decision at the type level.
     async fn run_prompt_chain(
         &self,
         initial: &str,
-        ctx: HookContext<'_>,
+        ctx: ExtensionContext<'_>,
         tx: &EventSender,
-    ) -> PromptHookResult {
-        let event = HookEvent::UserPromptSubmit;
-        // Clone the small Vec of HookSpec out of the RwLock so we don't
+    ) -> PromptExtensionResult {
+        let event = ExtensionEvent::UserPromptSubmit;
+        // Clone the small Vec of ExtensionSpec out of the RwLock so we don't
         // hold the read guard across `.await` points in dispatch.
-        let specs: Vec<HookSpec> = {
+        let specs: Vec<ExtensionSpec> = {
             let guard = self.inner.read().await;
             guard.for_event(event).to_vec()
         };
         if specs.is_empty() {
-            return PromptHookResult::Continue(initial.to_string());
+            return PromptExtensionResult::Continue(initial.to_string());
         }
 
         let dispatch_ctx = DispatchContext {
@@ -612,12 +617,12 @@ impl HookRegistry {
 
         let mut current = initial.to_string();
         for spec in &specs {
-            let payload = dispatch::HookPayload::UserPromptSubmit { prompt: &current };
+            let payload = dispatch::ExtensionPayload::UserPromptSubmit { prompt: &current };
             let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
             match outcome {
-                HookOutcome::Mutated(next) => current = next,
-                HookOutcome::PassThrough => {}
-                HookOutcome::Blocked { stderr, reason } => {
+                ExtensionOutcome::Mutated(next) => current = next,
+                ExtensionOutcome::PassThrough => {}
+                ExtensionOutcome::Blocked { stderr, reason } => {
                     // Honour the block. Spec: "Hook exits 2 → Block the
                     // turn (only event where blocking makes sense —
                     // UserPromptSubmit). Show stderr to user." Emit the
@@ -630,9 +635,9 @@ impl HookRegistry {
                         &format!("blocked by {}: {}", spec.display_name(), trimmed),
                     )
                     .await;
-                    return PromptHookResult::Blocked { stderr: trimmed };
+                    return PromptExtensionResult::Blocked { stderr: trimmed };
                 }
-                HookOutcome::SoftFailed { reason } => {
+                ExtensionOutcome::SoftFailed { reason } => {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
                     break;
                 }
@@ -640,12 +645,12 @@ impl HookRegistry {
                 // semantics yet — InjectContext is wired in commit 4 via the
                 // additional-context system-reminder path; MutatedJson is
                 // PreToolUse-only; KeepLooping is Stop-only.
-                HookOutcome::InjectContext(_)
-                | HookOutcome::MutatedJson(_)
-                | HookOutcome::KeepLooping { .. } => {}
+                ExtensionOutcome::InjectContext(_)
+                | ExtensionOutcome::MutatedJson(_)
+                | ExtensionOutcome::KeepLooping { .. } => {}
             }
         }
-        PromptHookResult::Continue(current)
+        PromptExtensionResult::Continue(current)
     }
 
     /// `AssistantMessageRender` chain — `Blocked` is degraded to a
@@ -654,11 +659,11 @@ impl HookRegistry {
     async fn run_render_chain(
         &self,
         initial: &str,
-        ctx: HookContext<'_>,
+        ctx: ExtensionContext<'_>,
         tx: &EventSender,
     ) -> String {
-        let event = HookEvent::AssistantMessageRender;
-        let specs: Vec<HookSpec> = {
+        let event = ExtensionEvent::AssistantMessageRender;
+        let specs: Vec<ExtensionSpec> = {
             let guard = self.inner.read().await;
             guard.for_event(event).to_vec()
         };
@@ -673,12 +678,12 @@ impl HookRegistry {
 
         let mut current = initial.to_string();
         for spec in &specs {
-            let payload = dispatch::HookPayload::AssistantMessageRender { content: &current };
+            let payload = dispatch::ExtensionPayload::AssistantMessageRender { content: &current };
             let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
             match outcome {
-                HookOutcome::Mutated(next) => current = next,
-                HookOutcome::PassThrough => {}
-                HookOutcome::Blocked { stderr, reason } => {
+                ExtensionOutcome::Mutated(next) => current = next,
+                ExtensionOutcome::PassThrough => {}
+                ExtensionOutcome::Blocked { stderr, reason } => {
                     let display = reason.unwrap_or_else(|| trim_one_line(&stderr));
                     emit_warning(
                         tx,
@@ -691,15 +696,15 @@ impl HookRegistry {
                     )
                     .await;
                 }
-                HookOutcome::SoftFailed { reason } => {
+                ExtensionOutcome::SoftFailed { reason } => {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
                     break;
                 }
                 // Same as UserPromptSubmit — these v2 variants don't apply
                 // to AssistantMessageRender's text-rewrite path.
-                HookOutcome::InjectContext(_)
-                | HookOutcome::MutatedJson(_)
-                | HookOutcome::KeepLooping { .. } => {}
+                ExtensionOutcome::InjectContext(_)
+                | ExtensionOutcome::MutatedJson(_)
+                | ExtensionOutcome::KeepLooping { .. } => {}
             }
         }
         current
@@ -710,7 +715,7 @@ impl HookRegistry {
 /// decision in `Session::prompt` — `Continue` proceeds to history.push
 /// and the model call; `Blocked` short-circuits the turn entirely.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PromptHookResult {
+pub enum PromptExtensionResult {
     /// All hooks passed/rewrote, or the chain soft-failed; carry on with
     /// the (possibly-rewritten) prompt.
     Continue(String),
@@ -719,7 +724,7 @@ pub enum PromptHookResult {
     /// MUST NOT push the prompt to history or call the agent.
     Blocked { stderr: String },
 }
-async fn emit_warning(tx: &EventSender, event: HookEvent, message: &str) {
+async fn emit_warning(tx: &EventSender, event: ExtensionEvent, message: &str) {
     let _ = tx
         .send(AgentEvent::Warning {
             source: event.as_str().to_string(),
@@ -733,15 +738,15 @@ fn trim_one_line(s: &str) -> String {
     truncate_chars(&one, 200)
 }
 
-/// Render the in-memory `HooksConfig` as a multi-line notice suitable for
+/// Render the in-memory `ExtensionsConfig` as a multi-line notice suitable for
 /// `add_assistant_notice`. Always returns at least one line; the empty
 /// case is rendered as a single `[info]` line so the user gets feedback
 /// rather than a silent no-op. The list reflects the last `reload()` —
 /// it is not a live probe of `~/.ignis/hooks.json`.
-pub(crate) fn format_list(cfg: &HooksConfig) -> String {
+pub(crate) fn format_list(cfg: &ExtensionsConfig) -> String {
     let total = cfg.total_len();
     if total == 0 {
-        return "[info] no hooks registered · edit ~/.ignis/hooks.json, then /hooks reload"
+        return "[info] no extensions registered · edit ~/.ignis/extensions.json, then /extensions reload"
             .to_string();
     }
     // Compute the widest display name across every chain so the program
@@ -750,7 +755,7 @@ pub(crate) fn format_list(cfg: &HooksConfig) -> String {
     // project-prefixed names like `translate-to-french-v2` would
     // otherwise push the program column right and break alignment for
     // shorter names in the same chain.
-    let name_width = HookEvent::ALL
+    let name_width = ExtensionEvent::ALL
         .iter()
         .flat_map(|ev| {
             cfg.for_event(*ev)
@@ -761,10 +766,10 @@ pub(crate) fn format_list(cfg: &HooksConfig) -> String {
         .unwrap_or(0);
     let mut out = String::new();
     out.push_str(&format!(
-        "[info] {total} hook{total_plural} registered · /hooks reload to re-read · run unsandboxed; audit before installing:",
+        "[info] {total} extension{total_plural} registered · /extensions reload to re-read · run unsandboxed; audit before installing:",
         total_plural = if total == 1 { "" } else { "s" },
     ));
-    for event in HookEvent::ALL {
+    for event in ExtensionEvent::ALL {
         let chain = cfg.for_event(*event);
         if chain.is_empty() {
             continue;
@@ -805,7 +810,7 @@ pub(crate) fn truncate_chars(s: &str, n: usize) -> String {
     out
 }
 
-/// `ToolHooks` implementation that fires `PreToolUse` / `PostToolUse`
+/// `ToolExtensions` implementation that fires `PreToolUse` / `PostToolUse`
 /// subprocess hooks. Composes with the in-process policy gate
 /// (`PermissionChecker`) via the agent loop's `before_tool_call_block` —
 /// the policy gate runs first; only allowed calls reach this impl.
@@ -839,13 +844,13 @@ pub(crate) fn truncate_chars(s: &str, n: usize) -> String {
 /// context is unset (logged at `debug` once). Production wiring sets
 /// it via `set_envelope_context` in `Session::open`.
 #[async_trait]
-impl ToolHooks for HookRegistry {
+impl ToolExtensions for ExtensionRegistry {
     async fn before_tool_call(
         &self,
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Result<Option<serde_json::Value>, String> {
-        let specs: Vec<HookSpec> = {
+        let specs: Vec<ExtensionSpec> = {
             let guard = self.inner.read().await;
             guard.pre_tool_use.clone()
         };
@@ -864,18 +869,18 @@ impl ToolHooks for HookRegistry {
             if !spec.applies_to_tool(tool_name) {
                 continue;
             }
-            let payload = dispatch::HookPayload::PreToolUse {
+            let payload = dispatch::ExtensionPayload::PreToolUse {
                 tool_name,
                 tool_input: &current,
             };
             let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
             match outcome {
-                HookOutcome::PassThrough => {}
-                HookOutcome::MutatedJson(v) => current = v,
-                HookOutcome::Blocked { reason, stderr } => {
+                ExtensionOutcome::PassThrough => {}
+                ExtensionOutcome::MutatedJson(v) => current = v,
+                ExtensionOutcome::Blocked { reason, stderr } => {
                     return Err(reason.unwrap_or_else(|| trim_one_line(&stderr)));
                 }
-                HookOutcome::SoftFailed { reason } => {
+                ExtensionOutcome::SoftFailed { reason } => {
                     tracing::debug!(
                         hook = %spec.display_name(),
                         reason,
@@ -913,7 +918,7 @@ impl ToolHooks for HookRegistry {
         args: &serde_json::Value,
         result: ToolResult,
     ) -> ToolResult {
-        let specs: Vec<HookSpec> = {
+        let specs: Vec<ExtensionSpec> = {
             let guard = self.inner.read().await;
             guard.post_tool_use.clone()
         };
@@ -937,15 +942,15 @@ impl ToolHooks for HookRegistry {
             if !spec.applies_to_tool(tool_name) {
                 continue;
             }
-            let payload = dispatch::HookPayload::PostToolUse {
+            let payload = dispatch::ExtensionPayload::PostToolUse {
                 tool_name,
                 tool_input: args,
                 tool_response: &tool_response,
             };
             let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
             match outcome {
-                HookOutcome::PassThrough => {}
-                HookOutcome::InjectContext(text) => {
+                ExtensionOutcome::PassThrough => {}
+                ExtensionOutcome::InjectContext(text) => {
                     // Queue the context for the next LLM call. The agent
                     // loop drains `pending_injections` after each tool
                     // batch and prepends each entry as a
@@ -953,11 +958,11 @@ impl ToolHooks for HookRegistry {
                     self.queue_injection(PendingInjection {
                         text,
                         source: spec.display_name(),
-                        event: HookEvent::PostToolUse,
+                        event: ExtensionEvent::PostToolUse,
                     })
                     .await;
                 }
-                HookOutcome::Blocked { reason, stderr } => {
+                ExtensionOutcome::Blocked { reason, stderr } => {
                     // CC posture: a PostToolUse "block" frames the tool
                     // result as an error the model should react to. The
                     // original content is preserved alongside the reason
@@ -969,7 +974,7 @@ impl ToolHooks for HookRegistry {
                         is_error: true,
                     };
                 }
-                HookOutcome::SoftFailed { reason } => {
+                ExtensionOutcome::SoftFailed { reason } => {
                     tracing::debug!(
                         hook = %spec.display_name(),
                         reason,
@@ -991,10 +996,10 @@ impl ToolHooks for HookRegistry {
     }
 }
 
-/// Compose multiple `ToolHooks` impls into a single dispatch point. The
-/// agent loop calls only ONE `ToolHooks` impl; this wrapper lets the
+/// Compose multiple `ToolExtensions` impls into a single dispatch point. The
+/// agent loop calls only ONE `ToolExtensions` impl; this wrapper lets the
 /// in-tree policy gate (`PermissionChecker`) and the subprocess
-/// `HookRegistry` both fire from the same path.
+/// `ExtensionRegistry` both fire from the same path.
 ///
 /// Order matters:
 /// * `before_tool_call` runs children left-to-right. Each child sees
@@ -1005,26 +1010,29 @@ impl ToolHooks for HookRegistry {
 ///   `ToolResult`. Each child sees what the previous child produced.
 /// * `drain_pending_context` concatenates all children's drains in
 ///   declaration order.
-pub struct ChainedToolHooks {
-    children: Vec<Box<dyn ToolHooks>>,
+pub struct ChainedToolExtensions {
+    children: Vec<Box<dyn ToolExtensions>>,
 }
 
-impl ChainedToolHooks {
-    pub fn new(children: Vec<Box<dyn ToolHooks>>) -> Self {
+impl ChainedToolExtensions {
+    pub fn new(children: Vec<Box<dyn ToolExtensions>>) -> Self {
         Self { children }
     }
 
-    /// Convenience: wrap a single existing impl plus a `HookRegistry`
-    /// behind a `ChainedToolHooks`. Used by `Session::set_hooks` to
+    /// Convenience: wrap a single existing impl plus a `ExtensionRegistry`
+    /// behind a `ChainedToolExtensions`. Used by `Session::set_hooks` to
     /// fold the subprocess registry into whatever policy gate the
     /// runner installs (typically `PermissionChecker`).
-    pub fn wrap(policy: Box<dyn ToolHooks>, registry: HookRegistry) -> Box<dyn ToolHooks> {
+    pub fn wrap(
+        policy: Box<dyn ToolExtensions>,
+        registry: ExtensionRegistry,
+    ) -> Box<dyn ToolExtensions> {
         Box::new(Self::new(vec![policy, Box::new(registry)]))
     }
 }
 
 #[async_trait]
-impl ToolHooks for ChainedToolHooks {
+impl ToolExtensions for ChainedToolExtensions {
     async fn before_tool_call(
         &self,
         tool_name: &str,
@@ -1085,8 +1093,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn ctx() -> HookContext<'static> {
-        HookContext {
+    fn ctx() -> ExtensionContext<'static> {
+        ExtensionContext {
             session_id: "s",
             cwd: "/tmp",
         }
@@ -1108,10 +1116,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_registry_passes_through() {
-        let reg = HookRegistry::empty();
+        let reg = ExtensionRegistry::empty();
         let (tx, mut rx) = mpsc::channel(8);
         let out = reg.run_user_prompt_submit("hello", ctx(), &tx).await;
-        assert_eq!(out, PromptHookResult::Continue("hello".to_string()));
+        assert_eq!(out, PromptExtensionResult::Continue("hello".to_string()));
         drop(tx);
         assert!(rx.recv().await.is_none());
     }
@@ -1136,15 +1144,15 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
 "#,
         );
 
-        let cfg = HooksConfig {
+        let cfg = ExtensionsConfig {
             user_prompt_submit: vec![
-                HookSpec {
+                ExtensionSpec {
                     program: s1,
                     args: vec![],
                     timeout_ms: 5_000,
                     matcher: None,
                 },
-                HookSpec {
+                ExtensionSpec {
                     program: s2,
                     args: vec![],
                     timeout_ms: 5_000,
@@ -1152,12 +1160,12 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 },
             ],
             assistant_message_render: vec![],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let (tx, _rx) = mpsc::channel(8);
         let out = reg.run_user_prompt_submit("A", ctx(), &tx).await;
-        assert_eq!(out, PromptHookResult::Continue("STEP1!".to_string()));
+        assert_eq!(out, PromptExtensionResult::Continue("STEP1!".to_string()));
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1177,15 +1185,15 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "#!/bin/sh\ncat >/dev/null\nprintf 'not json'\n",
         );
 
-        let cfg = HooksConfig {
+        let cfg = ExtensionsConfig {
             user_prompt_submit: vec![
-                HookSpec {
+                ExtensionSpec {
                     program: good,
                     args: vec![],
                     timeout_ms: 5_000,
                     matcher: None,
                 },
-                HookSpec {
+                ExtensionSpec {
                     program: bad,
                     args: vec![],
                     timeout_ms: 5_000,
@@ -1193,13 +1201,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 },
             ],
             assistant_message_render: vec![],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let (tx, mut rx) = mpsc::channel(8);
         let out = reg.run_user_prompt_submit("A", ctx(), &tx).await;
         // Last good value is preserved.
-        assert_eq!(out, PromptHookResult::Continue("GOOD".to_string()));
+        assert_eq!(out, PromptExtensionResult::Continue("GOOD".to_string()));
         drop(tx);
         // Exactly one warning emitted.
         let mut warnings = 0;
@@ -1224,21 +1232,21 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "blk.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf 'leaks secret' >&2\nexit 2\n",
         );
-        let cfg = HooksConfig {
-            user_prompt_submit: vec![HookSpec {
+        let cfg = ExtensionsConfig {
+            user_prompt_submit: vec![ExtensionSpec {
                 program: blocker,
                 args: vec![],
                 timeout_ms: 5_000,
                 matcher: None,
             }],
             assistant_message_render: vec![],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let (tx, mut rx) = mpsc::channel(8);
         let out = reg.run_user_prompt_submit("original", ctx(), &tx).await;
         match out {
-            PromptHookResult::Blocked { stderr } => {
+            PromptExtensionResult::Blocked { stderr } => {
                 assert!(stderr.contains("leaks secret"));
             }
             other => panic!("expected Blocked, got {other:?}"),
@@ -1265,17 +1273,17 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "blk.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf 'no' >&2\nexit 2\n",
         );
-        let cfg = HooksConfig {
+        let cfg = ExtensionsConfig {
             user_prompt_submit: vec![],
-            assistant_message_render: vec![HookSpec {
+            assistant_message_render: vec![ExtensionSpec {
                 program: blocker,
                 args: vec![],
                 timeout_ms: 5_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let (tx, mut rx) = mpsc::channel(8);
         let out = reg.run_assistant_message_render("kept", ctx(), &tx).await;
         assert_eq!(out, "kept");
@@ -1314,7 +1322,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         std::fs::create_dir_all(home.join(".ignis")).unwrap();
 
         // No file → empty registry.
-        let reg = HookRegistry::from_config_dir(&home).unwrap();
+        let reg = ExtensionRegistry::from_config_dir(&home).unwrap();
         assert_eq!(reg.inner.read().await.total_len(), 0);
 
         // Write a hooks.json with one entry, reload.
@@ -1334,47 +1342,47 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         // `/hooks` listing is driven by `snapshot()` — pins that it returns
         // the in-memory state (not a disk probe) and is decoupled from any
         // concurrent `run_*` chain.
-        let cfg = HooksConfig {
-            user_prompt_submit: vec![HookSpec {
+        let cfg = ExtensionsConfig {
+            user_prompt_submit: vec![ExtensionSpec {
                 program: PathBuf::from("/a/hook.sh"),
                 args: vec!["--flag".to_string()],
                 timeout_ms: 7_000,
                 matcher: None,
             }],
             assistant_message_render: vec![],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg.clone());
+        let reg = ExtensionRegistry::from_config(cfg.clone());
         let snap = reg.snapshot().await;
         assert_eq!(snap, cfg);
     }
 
     #[test]
     fn format_list_empty_registry_prompts_to_install() {
-        let out = format_list(&HooksConfig::default());
+        let out = format_list(&ExtensionsConfig::default());
         assert!(out.starts_with("[info]"));
-        assert!(out.contains("no hooks registered"));
+        assert!(out.contains("no extensions registered"));
         // The hint mentions both the file path and the reload action so a
         // user who just typed `/hooks` knows what to do next.
-        assert!(out.contains("~/.ignis/hooks.json"));
-        assert!(out.contains("/hooks reload"));
+        assert!(out.contains("~/.ignis/extensions.json"));
+        assert!(out.contains("/extensions reload"));
     }
 
     #[test]
     fn format_list_one_hook_per_event_uses_singular_wording() {
-        let cfg = HooksConfig {
-            user_prompt_submit: vec![HookSpec {
+        let cfg = ExtensionsConfig {
+            user_prompt_submit: vec![ExtensionSpec {
                 program: PathBuf::from("/opt/translate/run.py"),
                 args: vec![],
                 timeout_ms: 10_000,
                 matcher: None,
             }],
             assistant_message_render: vec![],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
         let out = format_list(&cfg);
-        assert!(out.contains("1 hook registered "), "got: {out}");
-        assert!(!out.contains("1 hooks"), "got: {out}");
+        assert!(out.contains("1 extension registered "), "got: {out}");
+        assert!(!out.contains("1 extensions"), "got: {out}");
         assert!(out.contains("UserPromptSubmit (1):"));
         assert!(out.contains("translate")); // file_stem of run.py
         assert!(out.contains("/opt/translate/run.py"));
@@ -1385,33 +1393,33 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
 
     #[test]
     fn format_list_multi_hook_renders_each_chain_and_argv() {
-        let cfg = HooksConfig {
+        let cfg = ExtensionsConfig {
             user_prompt_submit: vec![
-                HookSpec {
+                ExtensionSpec {
                     program: PathBuf::from("/opt/translate/run.py"),
                     args: vec!["--source".to_string(), "en".to_string()],
                     timeout_ms: 30_000,
                     matcher: None,
                 },
-                HookSpec {
+                ExtensionSpec {
                     program: PathBuf::from("/opt/redact.sh"),
                     args: vec![],
                     timeout_ms: 5_000,
                     matcher: None,
                 },
             ],
-            assistant_message_render: vec![HookSpec {
+            assistant_message_render: vec![ExtensionSpec {
                 program: PathBuf::from("/opt/translate/run.py"),
                 args: vec![],
                 timeout_ms: 10_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
         let out = format_list(&cfg);
         // Plural wording, both event headers, both hooks in the prompt
         // chain, the single render hook, and the argv tail all appear.
-        assert!(out.contains("3 hooks registered "), "got: {out}");
+        assert!(out.contains("3 extensions registered "), "got: {out}");
         assert!(out.contains("UserPromptSubmit (2):"));
         assert!(out.contains("AssistantMessageRender (1):"));
         assert!(out.contains("translate"));
@@ -1424,15 +1432,15 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
     fn format_list_omits_empty_event_chains() {
         // If only AssistantMessageRender is configured, the UserPromptSubmit
         // header must not be rendered as `(0):` — that's noise.
-        let cfg = HooksConfig {
+        let cfg = ExtensionsConfig {
             user_prompt_submit: vec![],
-            assistant_message_render: vec![HookSpec {
+            assistant_message_render: vec![ExtensionSpec {
                 program: PathBuf::from("/opt/render.sh"),
                 args: vec![],
                 timeout_ms: 1_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
         let out = format_list(&cfg);
         assert!(!out.contains("UserPromptSubmit"));
@@ -1454,15 +1462,15 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         // file name itself: `…/translate-to-french-v2.py` (stem is
         // `translate-to-french-v2`, 22 chars) vs. `…/redact.sh` (stem
         // is `redact`, 6 chars).
-        let cfg = HooksConfig {
+        let cfg = ExtensionsConfig {
             user_prompt_submit: vec![
-                HookSpec {
+                ExtensionSpec {
                     program: PathBuf::from("/opt/translate-to-french-v2.py"),
                     args: vec![],
                     timeout_ms: 10_000,
                     matcher: None,
                 },
-                HookSpec {
+                ExtensionSpec {
                     program: PathBuf::from("/opt/redact.sh"),
                     args: vec![],
                     timeout_ms: 10_000,
@@ -1470,7 +1478,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 },
             ],
             assistant_message_render: vec![],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
         let out = format_list(&cfg);
         // Expected max name width: "translate-to-french-v2" == 22 chars.
@@ -1498,34 +1506,34 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
     fn format_list_iterates_all_known_events() {
         // Pin the "list of events" surface: formatter iterates the same
         // slice the registry is typed against, so adding a new event
-        // variant to `HookEvent::ALL` automatically appears in the
+        // variant to `ExtensionEvent::ALL` automatically appears in the
         // listing without touching this function.
-        assert_eq!(HookEvent::ALL.len(), 9);
-        let cfg = HooksConfig {
-            user_prompt_submit: vec![HookSpec {
+        assert_eq!(ExtensionEvent::ALL.len(), 9);
+        let cfg = ExtensionsConfig {
+            user_prompt_submit: vec![ExtensionSpec {
                 program: PathBuf::from("/a"),
                 args: vec![],
                 timeout_ms: 1_000,
                 matcher: None,
             }],
-            assistant_message_render: vec![HookSpec {
+            assistant_message_render: vec![ExtensionSpec {
                 program: PathBuf::from("/b"),
                 args: vec![],
                 timeout_ms: 1_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
         let out = format_list(&cfg);
         assert!(out.contains("UserPromptSubmit (1):"));
         assert!(out.contains("AssistantMessageRender (1):"));
     }
 
-    // -------- ToolHooks impl for HookRegistry --------
+    // -------- ToolExtensions impl for ExtensionRegistry --------
 
     #[tokio::test]
     async fn tool_hooks_before_with_no_hooks_returns_ok_none() {
-        let reg = HookRegistry::empty();
+        let reg = ExtensionRegistry::empty();
         let args = serde_json::json!({"command": "ls"});
         assert_eq!(reg.before_tool_call("Bash", &args).await, Ok(None));
     }
@@ -1540,16 +1548,16 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "rewrite.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"updatedInput\":{\"command\":\"ls -la\"}}}'\n",
         );
-        let cfg = HooksConfig {
-            pre_tool_use: vec![HookSpec {
+        let cfg = ExtensionsConfig {
+            pre_tool_use: vec![ExtensionSpec {
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let args = serde_json::json!({"command": "ls"});
         let out = reg.before_tool_call("Bash", &args).await.unwrap();
         let rewritten = out.expect("expected rewrite");
@@ -1565,16 +1573,16 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "block.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"decision\":\"block\",\"reason\":\"rm -rf is destructive\"}'\n",
         );
-        let cfg = HooksConfig {
-            pre_tool_use: vec![HookSpec {
+        let cfg = ExtensionsConfig {
+            pre_tool_use: vec![ExtensionSpec {
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let args = serde_json::json!({"command": "rm -rf /"});
         match reg.before_tool_call("Bash", &args).await {
             Err(reason) => assert_eq!(reason, "rm -rf is destructive"),
@@ -1600,8 +1608,8 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             r#"{{"hooks":{{"PreToolUse":[{{"command":"{}","matcher":"Bash"}}]}}}}"#,
             s.to_string_lossy()
         );
-        let cfg = HooksConfig::from_str(&raw, std::path::Path::new("/h")).unwrap();
-        let reg = HookRegistry::from_config(cfg);
+        let cfg = ExtensionsConfig::from_str(&raw, std::path::Path::new("/h")).unwrap();
+        let reg = ExtensionRegistry::from_config(cfg);
         let args = serde_json::json!({"file_path": "/a"});
         // `Edit` doesn't match `Bash` — hook is skipped, result Ok(None).
         assert_eq!(reg.before_tool_call("Edit", &args).await, Ok(None));
@@ -1610,7 +1618,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
 
     #[tokio::test]
     async fn tool_hooks_after_with_no_hooks_returns_result_unchanged() {
-        let reg = HookRegistry::empty();
+        let reg = ExtensionRegistry::empty();
         let args = serde_json::json!({});
         let result = ToolResult {
             content: "ok".to_string(),
@@ -1632,16 +1640,16 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "post.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"decision\":\"block\",\"reason\":\"tests still failing\"}'\n",
         );
-        let cfg = HooksConfig {
-            post_tool_use: vec![HookSpec {
+        let cfg = ExtensionsConfig {
+            post_tool_use: vec![ExtensionSpec {
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let args = serde_json::json!({});
         let result = ToolResult {
             content: "ran successfully".to_string(),
@@ -1680,24 +1688,24 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "inject2.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"additionalContext\":\"beta\"}}'\n",
         );
-        let cfg = HooksConfig {
+        let cfg = ExtensionsConfig {
             post_tool_use: vec![
-                HookSpec {
+                ExtensionSpec {
                     program: s1,
                     args: vec![],
                     timeout_ms: 5_000,
                     matcher: None,
                 },
-                HookSpec {
+                ExtensionSpec {
                     program: s2,
                     args: vec![],
                     timeout_ms: 5_000,
                     matcher: None,
                 },
             ],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let args = serde_json::json!({});
         let result = ToolResult {
             content: "ran".to_string(),
@@ -1712,7 +1720,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         let drained = reg.drain_injections().await;
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].text, "alpha");
-        assert_eq!(drained[0].event, HookEvent::PostToolUse);
+        assert_eq!(drained[0].event, ExtensionEvent::PostToolUse);
         assert!(drained[0].source.contains("inject1"));
         assert_eq!(drained[1].text, "beta");
         assert!(drained[1].source.contains("inject2"));
@@ -1725,7 +1733,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
 
     #[tokio::test]
     async fn session_start_no_hooks_is_noop() {
-        let reg = HookRegistry::empty();
+        let reg = ExtensionRegistry::empty();
         let (tx, _rx) = mpsc::channel(8);
         reg.run_session_start("new", ctx(), &tx).await;
         // No queue, no warnings — just a no-op.
@@ -1740,22 +1748,22 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "ss.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"additionalContext\":\"welcome back\"}}'\n",
         );
-        let cfg = HooksConfig {
-            session_start: vec![HookSpec {
+        let cfg = ExtensionsConfig {
+            session_start: vec![ExtensionSpec {
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let (tx, _rx) = mpsc::channel(8);
         reg.run_session_start("resume", ctx(), &tx).await;
         let drained = reg.drain_injections().await;
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].text, "welcome back");
-        assert_eq!(drained[0].event, HookEvent::SessionStart);
+        assert_eq!(drained[0].event, ExtensionEvent::SessionStart);
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1763,7 +1771,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
 
     #[tokio::test]
     async fn stop_no_hooks_returns_false() {
-        let reg = HookRegistry::empty();
+        let reg = ExtensionRegistry::empty();
         let (tx, _rx) = mpsc::channel(8);
         assert!(!reg.run_stop("/tmp/transcript", ctx(), &tx).await);
     }
@@ -1780,16 +1788,16 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "stop.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"decision\":\"block\",\"reason\":\"tests still failing\"}'\n",
         );
-        let cfg = HooksConfig {
-            stop: vec![HookSpec {
+        let cfg = ExtensionsConfig {
+            stop: vec![ExtensionSpec {
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let (tx, _rx) = mpsc::channel(8);
         let keep = reg.run_stop("/tmp/t", ctx(), &tx).await;
         assert!(keep, "decision:block on Stop must return KeepLooping");
@@ -1797,7 +1805,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         assert_eq!(drained.len(), 1);
         assert!(drained[0].text.contains("tests still failing"));
         assert!(drained[0].text.contains("stopped continuation"));
-        assert_eq!(drained[0].event, HookEvent::Stop);
+        assert_eq!(drained[0].event, ExtensionEvent::Stop);
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1805,7 +1813,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
 
     #[tokio::test]
     async fn system_prompt_compose_no_hooks_returns_base() {
-        let reg = HookRegistry::empty();
+        let reg = ExtensionRegistry::empty();
         let (tx, _rx) = mpsc::channel(8);
         let out = reg
             .run_system_prompt_compose("base prompt", "test-model", ctx(), &tx)
@@ -1821,16 +1829,16 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "trim.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"updatedSystemPrompt\":\"trimmed\"}}'\n",
         );
-        let cfg = HooksConfig {
-            system_prompt_compose: vec![HookSpec {
+        let cfg = ExtensionsConfig {
+            system_prompt_compose: vec![ExtensionSpec {
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let (tx, _rx) = mpsc::channel(8);
         let out = reg
             .run_system_prompt_compose("verbose base", "test-model", ctx(), &tx)
@@ -1847,16 +1855,16 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             "inject.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"additionalContext\":\"note about prompt\"}}'\n",
         );
-        let cfg = HooksConfig {
-            system_prompt_compose: vec![HookSpec {
+        let cfg = ExtensionsConfig {
+            system_prompt_compose: vec![ExtensionSpec {
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let (tx, _rx) = mpsc::channel(8);
         let out = reg
             .run_system_prompt_compose("base", "test-model", ctx(), &tx)
@@ -1867,7 +1875,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         let drained = reg.drain_injections().await;
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].text, "note about prompt");
-        assert_eq!(drained[0].event, HookEvent::SystemPromptCompose);
+        assert_eq!(drained[0].event, ExtensionEvent::SystemPromptCompose);
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1889,24 +1897,24 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
             // the previous hook's rewrite.
             "#!/bin/sh\nread payload\nprintf '%s' '{\"hookSpecificOutput\":{\"updatedSystemPrompt\":\"B:received\"}}'\n",
         );
-        let cfg = HooksConfig {
+        let cfg = ExtensionsConfig {
             system_prompt_compose: vec![
-                HookSpec {
+                ExtensionSpec {
                     program: s1,
                     args: vec![],
                     timeout_ms: 5_000,
                     matcher: None,
                 },
-                HookSpec {
+                ExtensionSpec {
                     program: s2,
                     args: vec![],
                     timeout_ms: 5_000,
                     matcher: None,
                 },
             ],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let (tx, _rx) = mpsc::channel(8);
         let out = reg
             .run_system_prompt_compose("original", "test-model", ctx(), &tx)
@@ -1916,17 +1924,17 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    // ---- ChainedToolHooks ----
+    // ---- ChainedToolExtensions ----
 
     struct AllowAll;
     struct AlwaysBlock(&'static str);
     struct ConstantRewrite(serde_json::Value);
 
     #[async_trait]
-    impl ToolHooks for AllowAll {}
+    impl ToolExtensions for AllowAll {}
 
     #[async_trait]
-    impl ToolHooks for AlwaysBlock {
+    impl ToolExtensions for AlwaysBlock {
         async fn before_tool_call(
             &self,
             _: &str,
@@ -1937,7 +1945,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
     }
 
     #[async_trait]
-    impl ToolHooks for ConstantRewrite {
+    impl ToolExtensions for ConstantRewrite {
         async fn before_tool_call(
             &self,
             _: &str,
@@ -1951,7 +1959,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
     async fn chained_first_block_short_circuits_chain() {
         // Policy gate denies → registry must never be consulted. Pins
         // the layering invariant used by Session::set_hooks.
-        let chain = ChainedToolHooks::new(vec![
+        let chain = ChainedToolExtensions::new(vec![
             Box::new(AlwaysBlock("policy denied")),
             Box::new(ConstantRewrite(serde_json::json!({"never": "ran"}))),
         ]);
@@ -1963,8 +1971,8 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
     async fn chained_rewrites_thread_through_next_child() {
         // First child rewrites → second child sees rewrite. Final args
         // are the second child's output if any. Tests the
-        // ChainedToolHooks args-threading contract.
-        let chain = ChainedToolHooks::new(vec![
+        // ChainedToolExtensions args-threading contract.
+        let chain = ChainedToolExtensions::new(vec![
             Box::new(ConstantRewrite(serde_json::json!({"step": 1}))),
             Box::new(ConstantRewrite(serde_json::json!({"step": 2}))),
         ]);
@@ -1977,25 +1985,25 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
 
     #[tokio::test]
     async fn chained_drain_aggregates_in_order() {
-        // Two HookRegistry impls queued with different injections —
+        // Two ExtensionRegistry impls queued with different injections —
         // the chain returns both, registry-A entries before registry-B.
-        let reg_a = HookRegistry::empty();
+        let reg_a = ExtensionRegistry::empty();
         reg_a
             .queue_injection(PendingInjection {
                 text: "from a".to_string(),
                 source: "a".to_string(),
-                event: HookEvent::PostToolUse,
+                event: ExtensionEvent::PostToolUse,
             })
             .await;
-        let reg_b = HookRegistry::empty();
+        let reg_b = ExtensionRegistry::empty();
         reg_b
             .queue_injection(PendingInjection {
                 text: "from b".to_string(),
                 source: "b".to_string(),
-                event: HookEvent::PostToolUse,
+                event: ExtensionEvent::PostToolUse,
             })
             .await;
-        let chain = ChainedToolHooks::new(vec![Box::new(reg_a), Box::new(reg_b)]);
+        let chain = ChainedToolExtensions::new(vec![Box::new(reg_a), Box::new(reg_b)]);
         let drained = chain.drain_pending_context().await;
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].text, "from a");
@@ -2011,7 +2019,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         let inj = PendingInjection {
             text: "tests are still failing".to_string(),
             source: "auto-test".to_string(),
-            event: HookEvent::PostToolUse,
+            event: ExtensionEvent::PostToolUse,
         };
         let rendered = render_injection_as_system_reminder(&inj);
         assert!(rendered.starts_with("<system-reminder>"));
@@ -2024,8 +2032,8 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         // Smoke test for Session::set_hooks's wiring: wrap(policy,
         // registry) → policy fires first; if it allows, registry sees
         // the args.
-        let registry = HookRegistry::empty();
-        let chained = ChainedToolHooks::wrap(Box::new(AllowAll), registry);
+        let registry = ExtensionRegistry::empty();
+        let chained = ChainedToolExtensions::wrap(Box::new(AllowAll), registry);
         let args = serde_json::json!({"command": "ls"});
         // No registry hooks declared → Ok(None).
         let res = chained.before_tool_call("Bash", &args).await;
@@ -2036,16 +2044,16 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
     async fn tool_hooks_post_tool_use_pass_through_keeps_result() {
         let tmp = crate::util::unique_temp_dir("ignis-th-post-pass");
         let s = write_script(&tmp, "noop.sh", "#!/bin/sh\ncat >/dev/null\n");
-        let cfg = HooksConfig {
-            post_tool_use: vec![HookSpec {
+        let cfg = ExtensionsConfig {
+            post_tool_use: vec![ExtensionSpec {
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let reg = HookRegistry::from_config(cfg);
+        let reg = ExtensionRegistry::from_config(cfg);
         let args = serde_json::json!({});
         let result = ToolResult {
             content: "result".to_string(),

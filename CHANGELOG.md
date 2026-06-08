@@ -8,11 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- hooks: v2 protocol extends the surface from 2 events to 9 — `SessionStart`, `SystemPromptCompose`, `PreToolUse`, `PostToolUse`, `PreCompact`, `PostCompact`, and `Stop` join `UserPromptSubmit` + `AssistantMessageRender`. Each event gets typed per-event envelope fields (`tool_name`, `tool_input`, `tool_response`, `system_prompt`, `model`, `trigger`, `summary`, `source`, `transcript_path`, `triggered_at`). Hooks can rewrite (`updatedInput` / `updatedOutput` / `updatedSystemPrompt`), block (`decision: "block"` + `reason`), or inject context for the next LLM call (`additionalContext`, surfaced as a labelled `<system-reminder>`). v1 hook configs parse unchanged.
-- hooks: `matcher` field on `PreToolUse` / `PostToolUse` entries — regex on `tool_name`, compiled at parse so a malformed pattern is a startup error. Non-matching tools skip the spawn entirely. Declaring `matcher` on a non-tool event logs a `[warn]` at load.
-- hooks: `Stop` event honours the Claude Code inversion — a `decision: "block"` on `Stop` keeps the loop alive and surfaces the reason as a `<system-reminder>` framed `"stopped continuation: <reason>"`. Lets users wire "don't stop until tests pass" guardrails without a new event.
-- hooks: `SystemPromptCompose` fires once per LLM call (not per session) — hooks can prune or rewrite the assembled system prompt (which includes git status/diff, AGENTS.md, the skills catalog, and MCP instructions) to A/B test prompt density for token-efficiency research.
-- hooks: three new example hooks — `examples/hooks/bash-deny-rm-rf/` (PreToolUse block), `examples/hooks/auto-test/` (PostToolUse `additionalContext`), `examples/hooks/system-prompt-trim/` (SystemPromptCompose rewrite).
+- extensions: ignis's agent-loop extension protocol (formerly "hooks"). Surface grows from 2 events to 9 — `SessionStart`, `SystemPromptCompose`, `PreToolUse`, `PostToolUse`, `PreCompact`, `PostCompact`, and `Stop` join `UserPromptSubmit` + `AssistantMessageRender`. Each event gets typed per-event envelope fields (`tool_name`, `tool_input`, `tool_response`, `system_prompt`, `model`, `trigger`, `summary`, `source`, `transcript_path`, `triggered_at`). Extensions can rewrite (`updatedInput` / `updatedOutput` / `updatedSystemPrompt`), block (`decision: "block"` + `reason`), or inject context for the next LLM call (`additionalContext`, surfaced as a labelled `<system-reminder>`).
+- extensions: `matcher` field on `PreToolUse` / `PostToolUse` entries — regex on `tool_name`, compiled at parse so a malformed pattern is a startup error. Non-matching tools skip the spawn entirely. Declaring `matcher` on a non-tool event logs a `[warn]` at load.
+- extensions: `Stop` event honours the Claude Code inversion — a `decision: "block"` on `Stop` keeps the loop alive and surfaces the reason as a `<system-reminder>` framed `"stopped continuation: <reason>"`. Lets users wire "don't stop until tests pass" guardrails without a new event.
+- extensions: `SystemPromptCompose` fires once per LLM call (not per session) — extensions can prune or rewrite the assembled system prompt (which includes git status/diff, AGENTS.md, the skills catalog, and MCP instructions) to A/B test prompt density for token-efficiency research.
+- extensions: three new example extensions — `examples/extensions/bash-deny-rm-rf/` (PreToolUse block), `examples/extensions/auto-test/` (PostToolUse `additionalContext`), `examples/extensions/system-prompt-trim/` (SystemPromptCompose rewrite).
+
+### Changed
+- extensions: rename of the user-facing surface. Config lives at `~/.ignis/extensions.json` and the slash command is `/extensions` (with `/extensions list` and `/extensions reload`). v1 hook configs at `~/.ignis/hooks.json` continue to be read as a back-compat fallback, and `/hooks` remains as a deprecated alias for `/extensions`. JSON top-level key accepts either `"extensions"` (preferred) or `"hooks"` (legacy).
 
 ## [0.35.0] - 2026-06-06
 
@@ -65,7 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.32.0] - 2026-06-01
 
 ### Added
-- hooks: external subprocess hooks for `UserPromptSubmit` and `AssistantMessageRender` with first-class prompt mutation; declare in `~/.ignis/hooks.json`. ([#102](https://github.com/Fullstop000/ignis/pull/102))
+- hooks: external subprocess hooks for `UserPromptSubmit` and `AssistantMessageRender` with first-class prompt mutation; declare in `~/.ignis/extensions.json`. ([#102](https://github.com/Fullstop000/ignis/pull/102))
 - MiniMax Token Plan: `MiniMax-M3` model now in the catalog (Anthropic-first, same dual-endpoint shape as M2.7). ([#94](https://github.com/Fullstop000/ignis/pull/94))
 - MCP HTTP transport (Streamable HTTP). `[mcp.servers.X] url = "https://…"` or `ignis mcp add X --url … [--bearer-token-env-var ENV] [--header "K: V"]`; `/mcp` picker shows transport tag and per-server tool list. ([#86](https://github.com/Fullstop000/ignis/pull/86))
 

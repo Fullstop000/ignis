@@ -13,19 +13,19 @@ motivated v2.
 
 ```sh
 mkdir -p ~/.ignis/hooks
-cp -R examples/hooks/system-prompt-trim ~/.ignis/hooks/system-prompt-trim
-chmod +x ~/.ignis/hooks/system-prompt-trim/run.sh
+cp -R examples/extensions/system-prompt-trim ~/.ignis/extensions/system-prompt-trim
+chmod +x ~/.ignis/extensions/system-prompt-trim/run.sh
 ```
 
 Requires `jq` + `awk` on `PATH`.
 
-## Wire in `~/.ignis/hooks.json`
+## Wire in `~/.ignis/extensions.json`
 
 ```json
 {
-  "hooks": {
+  "extensions": {
     "SystemPromptCompose": [
-      { "command": "~/.ignis/hooks/system-prompt-trim/run.sh" }
+      { "command": "~/.ignis/extensions/system-prompt-trim/run.sh" }
     ]
   }
 }
@@ -35,7 +35,7 @@ Requires `jq` + `awk` on `PATH`.
 goes in, the rewritten prompt goes out. No matcher (it's not a tool
 event).
 
-Reload without restarting: type `/hooks reload`.
+Reload without restarting: type `/extensions reload`.
 
 ## What it strips
 

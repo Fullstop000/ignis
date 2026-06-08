@@ -1,6 +1,6 @@
 //! Integration test for the hook protocol: a real subprocess shell script
 //! reads the JSON envelope from stdin, emits a rewrite on stdout, and the
-//! `HookRegistry` API surfaces the rewrite back to the caller.
+//! `ExtensionRegistry` API surfaces the rewrite back to the caller.
 //!
 //! Skipped automatically on non-Unix (no `chmod +x`, no `/bin/sh`); the
 //! protocol is portable but this fixture isn't.
@@ -10,7 +10,9 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use ignis::hooks::{HookContext, HookRegistry, HookSpec, HooksConfig, PromptHookResult};
+use ignis::extensions::{
+    ExtensionContext, ExtensionRegistry, ExtensionSpec, ExtensionsConfig, PromptExtensionResult,
+};
 use tokio::sync::mpsc;
 
 fn write_executable(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
@@ -39,23 +41,23 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","updatedI
 "#,
     );
 
-    let cfg = HooksConfig {
-        user_prompt_submit: vec![HookSpec {
+    let cfg = ExtensionsConfig {
+        user_prompt_submit: vec![ExtensionSpec {
             program: hook,
             args: vec![],
             timeout_ms: 5_000,
             matcher: None,
         }],
         assistant_message_render: vec![],
-        ..HooksConfig::default()
+        ..ExtensionsConfig::default()
     };
-    let reg = HookRegistry::from_config(cfg);
+    let reg = ExtensionRegistry::from_config(cfg);
 
     let (tx, mut rx) = mpsc::channel(8);
     let out = reg
         .run_user_prompt_submit(
             "原文",
-            HookContext {
+            ExtensionContext {
                 session_id: "test-session",
                 cwd: "/tmp",
             },
@@ -66,7 +68,7 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","updatedI
 
     assert_eq!(
         out,
-        PromptHookResult::Continue("HELLO_FROM_HOOK".to_string())
+        PromptExtensionResult::Continue("HELLO_FROM_HOOK".to_string())
     );
     // No warnings on the happy path.
     assert!(rx.recv().await.is_none());
@@ -83,22 +85,22 @@ cat >/dev/null
 printf '%s' '{"hookSpecificOutput":{"hookEventName":"AssistantMessageRender","updatedOutput":"渲染后"}}'
 "#,
     );
-    let cfg = HooksConfig {
+    let cfg = ExtensionsConfig {
         user_prompt_submit: vec![],
-        assistant_message_render: vec![HookSpec {
+        assistant_message_render: vec![ExtensionSpec {
             program: hook,
             args: vec![],
             timeout_ms: 5_000,
             matcher: None,
         }],
-        ..HooksConfig::default()
+        ..ExtensionsConfig::default()
     };
-    let reg = HookRegistry::from_config(cfg);
+    let reg = ExtensionRegistry::from_config(cfg);
     let (tx, mut rx) = mpsc::channel(8);
     let out = reg
         .run_assistant_message_render(
             "raw english",
-            HookContext {
+            ExtensionContext {
                 session_id: "s",
                 cwd: "/tmp",
             },
@@ -113,7 +115,7 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"AssistantMessageRender","up
 #[tokio::test]
 async fn config_file_round_trip_drives_chain() {
     // Asserts the user-facing path end-to-end:
-    //   write hooks.json on disk → HookRegistry::from_config_dir(home)
+    //   write hooks.json on disk → ExtensionRegistry::from_config_dir(home)
     //   → run_user_prompt_submit returns rewrite.
     let home = tempfile::tempdir().unwrap();
     let ignis_dir = home.path().join(".ignis");
@@ -130,19 +132,22 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"FROM_DISK"}}'
     let raw = format!(r#"{{"hooks": {{"UserPromptSubmit": [{{"command": "{hook_str}"}}]}}}}"#);
     std::fs::write(ignis_dir.join("hooks.json"), raw).unwrap();
 
-    let reg = HookRegistry::from_config_dir(home.path()).unwrap();
+    let reg = ExtensionRegistry::from_config_dir(home.path()).unwrap();
     let (tx, _rx) = mpsc::channel(8);
     let out = reg
         .run_user_prompt_submit(
             "ignored",
-            HookContext {
+            ExtensionContext {
                 session_id: "s",
                 cwd: "/tmp",
             },
             &tx,
         )
         .await;
-    assert_eq!(out, PromptHookResult::Continue("FROM_DISK".to_string()));
+    assert_eq!(
+        out,
+        PromptExtensionResult::Continue("FROM_DISK".to_string())
+    );
 }
 
 /// Inject (Ctrl+S steer) text must run through the UserPromptSubmit
@@ -211,17 +216,17 @@ printf '{"hookSpecificOutput":{"updatedInput":"%s"}}' "$UPPER"
     .await
     .unwrap();
 
-    let cfg = HooksConfig {
-        user_prompt_submit: vec![HookSpec {
+    let cfg = ExtensionsConfig {
+        user_prompt_submit: vec![ExtensionSpec {
             program: upper,
             args: vec![],
             timeout_ms: 5_000,
             matcher: None,
         }],
         assistant_message_render: vec![],
-        ..HooksConfig::default()
+        ..ExtensionsConfig::default()
     };
-    session.set_hook_registry(HookRegistry::from_config(cfg));
+    session.set_hook_registry(ExtensionRegistry::from_config(cfg));
 
     // Preload one steer message before calling prompt — it lands on the
     // inject channel and drain_injected picks it up between rounds.

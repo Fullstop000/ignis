@@ -1,13 +1,15 @@
-# Hooks
+# Extensions
 
-Hooks let an external program subscribe to ignis lifecycle events.
+Extensions let an external program subscribe to ignis lifecycle events.
 Where the event permits it they can **rewrite** the data flowing
 through, **block** the action, or **inject context** the model sees on
-the next turn.
+the next turn. (Formerly "hooks" — v1 configs at `~/.ignis/hooks.json`
+still load as a back-compat fallback, and the slash command `/hooks` is
+kept as a deprecated alias.)
 
-> ## ⚠ Hooks run unsandboxed
+> ## ⚠ Extensions run unsandboxed
 >
-> Each hook command runs with the full privileges of your `ignis`
+> Each extension command runs with the full privileges of your `ignis`
 > process. A malicious or buggy hook can:
 >
 > - Read `~/.ssh`, `~/.aws/credentials`, `~/.config/gh/`, `.netrc`,
@@ -17,7 +19,7 @@ the next turn.
 > - Spawn child processes; write/delete arbitrary files; make
 >   arbitrary network calls.
 >
-> **Treat `~/.ignis/hooks.json` like `crontab`** — anything in there
+> **Treat `~/.ignis/extensions.json` like `crontab`** — anything in there
 > has root-equivalent power over your user account. Only install hooks
 > whose source you have personally audited.
 >
@@ -146,7 +148,7 @@ debug log.
 Tool events accept a `matcher` regex on `tool_name`:
 
 ```json
-{ "command": "~/.ignis/hooks/bash-deny/run.sh", "matcher": "Bash" }
+{ "command": "~/.ignis/extensions/bash-deny/run.sh", "matcher": "Bash" }
 ```
 
 Hooks with a matcher only fire when the running tool's name matches —
@@ -184,33 +186,33 @@ summary.
 A hook that runs longer than its `timeout_ms` is killed (SIGKILL via
 `kill_on_drop`) and treated as a soft failure.
 
-## Declaration — `~/.ignis/hooks.json`
+## Declaration — `~/.ignis/extensions.json`
 
 ```json
 {
-  "hooks": {
+  "extensions": {
     "UserPromptSubmit": [
       {
-        "command": "~/.ignis/hooks/translate-en/run.py",
+        "command": "~/.ignis/extensions/translate-en/run.py",
         "timeout_ms": 30000
       }
     ],
     "PreToolUse": [
       {
-        "command": "~/.ignis/hooks/bash-deny-rm-rf/run.sh",
+        "command": "~/.ignis/extensions/bash-deny-rm-rf/run.sh",
         "matcher": "Bash",
         "timeout_ms": 2000
       }
     ],
     "PostToolUse": [
       {
-        "command": "~/.ignis/hooks/auto-test/run.sh",
+        "command": "~/.ignis/extensions/auto-test/run.sh",
         "matcher": "Write|Edit",
         "timeout_ms": 120000
       }
     ],
     "SystemPromptCompose": [
-      { "command": "~/.ignis/hooks/system-prompt-trim/run.sh" }
+      { "command": "~/.ignis/extensions/system-prompt-trim/run.sh" }
     ]
   }
 }
@@ -242,26 +244,26 @@ v2 reads v1 configs unchanged. Existing
 edits required. The `matcher` field is optional; absent matcher means
 "every tool".
 
-### Inspecting the active chains — `/hooks` (or `/hooks list`)
+### Inspecting the active chains — `/extensions` (or `/extensions list`)
 
 ```
-[info] 4 hooks registered · /hooks reload to re-read · run unsandboxed; audit before installing:
+[info] 4 hooks registered · /extensions reload to re-read · run unsandboxed; audit before installing:
   UserPromptSubmit (1):
-    · translate-en  ~/.ignis/hooks/translate-en/run.py  (timeout 30000ms)
+    · translate-en  ~/.ignis/extensions/translate-en/run.py  (timeout 30000ms)
   SystemPromptCompose (1):
-    · run           ~/.ignis/hooks/system-prompt-trim/run.sh  (timeout 10000ms)
+    · run           ~/.ignis/extensions/system-prompt-trim/run.sh  (timeout 10000ms)
   PreToolUse (1):
-    · run           ~/.ignis/hooks/bash-deny-rm-rf/run.sh  (timeout 2000ms)
+    · run           ~/.ignis/extensions/bash-deny-rm-rf/run.sh  (timeout 2000ms)
   PostToolUse (1):
-    · run           ~/.ignis/hooks/auto-test/run.sh  (timeout 120000ms)
+    · run           ~/.ignis/extensions/auto-test/run.sh  (timeout 120000ms)
 ```
 
 The list reflects the in-memory state (last successful load or
-`/hooks reload`), not a live disk probe.
+`/extensions reload`), not a live disk probe.
 
-### Hot-reload — `/hooks reload`
+### Hot-reload — `/extensions reload`
 
-Type `/hooks reload` in the TUI after editing `hooks.json`. The parsed
+Type `/extensions reload` in the TUI after editing `extensions.json`. The parsed
 config is swapped into the running registry; the next prompt picks it
 up.
 
@@ -281,15 +283,15 @@ attributes `event`, `command`, `duration_ms`, `outcome`
 
 ## Worked examples
 
-- [`examples/hooks/translate-en/`](../../examples/hooks/translate-en/)
+- [`examples/extensions/translate-en/`](../../examples/extensions/translate-en/)
   — bilingual translator (the original ignis use case). Demonstrates
   `UserPromptSubmit` + `AssistantMessageRender`.
-- [`examples/hooks/bash-deny-rm-rf/`](../../examples/hooks/bash-deny-rm-rf/)
+- [`examples/extensions/bash-deny-rm-rf/`](../../examples/extensions/bash-deny-rm-rf/)
   — `PreToolUse` with `matcher: "Bash"`, blocks `rm -rf`. Demonstrates
   `decision: "block"`.
-- [`examples/hooks/auto-test/`](../../examples/hooks/auto-test/) —
+- [`examples/extensions/auto-test/`](../../examples/extensions/auto-test/) —
   `PostToolUse` with `matcher: "Write|Edit"`, runs the test suite and
   injects PASS/FAIL via `additionalContext`.
-- [`examples/hooks/system-prompt-trim/`](../../examples/hooks/system-prompt-trim/)
+- [`examples/extensions/system-prompt-trim/`](../../examples/extensions/system-prompt-trim/)
   — `SystemPromptCompose`, strips the `Git Diff:` block for
   token-efficiency experiments.

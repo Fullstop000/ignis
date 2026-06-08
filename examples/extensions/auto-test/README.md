@@ -9,20 +9,20 @@ injection.
 
 ```sh
 mkdir -p ~/.ignis/hooks
-cp -R examples/hooks/auto-test ~/.ignis/hooks/auto-test
-chmod +x ~/.ignis/hooks/auto-test/run.sh
+cp -R examples/extensions/auto-test ~/.ignis/extensions/auto-test
+chmod +x ~/.ignis/extensions/auto-test/run.sh
 ```
 
 Requires `jq` on `PATH`.
 
-## Wire in `~/.ignis/hooks.json`
+## Wire in `~/.ignis/extensions.json`
 
 ```json
 {
-  "hooks": {
+  "extensions": {
     "PostToolUse": [
       {
-        "command": "~/.ignis/hooks/auto-test/run.sh",
+        "command": "~/.ignis/extensions/auto-test/run.sh",
         "matcher": "Write|Edit",
         "timeout_ms": 120000
       }
@@ -36,7 +36,7 @@ it doesn't run after `Read`, `Grep`, or `Bash`. `timeout_ms` is 2
 minutes because `cargo test --workspace` can take a while on cold
 incremental builds.
 
-Reload without restarting: type `/hooks reload`.
+Reload without restarting: type `/extensions reload`.
 
 ## How it shows up to the model
 

@@ -74,7 +74,7 @@ pub async fn run_console(
     skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
     mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
     permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
-    hook_registry: crate::hooks::HookRegistry,
+    hook_registry: crate::extensions::ExtensionRegistry,
 ) -> Result<(), anyhow::Error> {
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
     // Context windows: config override → cached models.dev → compaction threshold.
@@ -215,7 +215,7 @@ pub async fn run_console(
                 }
             };
             session.set_compaction(agent_config.compaction.clone());
-            // Share the runner's HookRegistry handle so `/hooks reload`
+            // Share the runner's ExtensionRegistry handle so `/hooks reload`
             // immediately affects the next prompt — Session::open loaded
             // its own copy from disk, but the runner owns the live one.
             session.set_hook_registry(runner_hook_registry.clone());
@@ -615,7 +615,7 @@ fn enqueue_render_hook(
 /// happened because every `MessageEnd` fired a fresh `tokio::spawn`).
 /// The worker exits when the queue's sender side drops at console exit.
 pub(crate) fn spawn_render_hook_worker(
-    registry: crate::hooks::HookRegistry,
+    registry: crate::extensions::ExtensionRegistry,
     event_tx: mpsc::Sender<crate::AgentEvent>,
 ) -> mpsc::Sender<RenderJob> {
     // Bounded; if hooks back up the producer drops via try_send rather
@@ -628,12 +628,12 @@ pub(crate) fn spawn_render_hook_worker(
             // saves the envelope encode + subprocess spawn on the
             // overwhelmingly common no-hook path.
             if !registry
-                .has_hooks(crate::hooks::HookEvent::AssistantMessageRender)
+                .has_hooks(crate::extensions::ExtensionEvent::AssistantMessageRender)
                 .await
             {
                 continue;
             }
-            let ctx = crate::hooks::HookContext {
+            let ctx = crate::extensions::ExtensionContext {
                 session_id: &job.session_id,
                 cwd: &job.cwd,
             };
@@ -672,7 +672,7 @@ pub(crate) fn spawn_render_hook_worker(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::hooks::{HookRegistry, HookSpec, HooksConfig};
+    use crate::extensions::{ExtensionRegistry, ExtensionSpec, ExtensionsConfig};
     use crate::{AgentEvent, Message};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -770,17 +770,17 @@ esac
 printf '{"hookSpecificOutput":{"updatedOutput":"R:%s"}}' "$CONTENT"
 "#,
         );
-        let cfg = HooksConfig {
+        let cfg = ExtensionsConfig {
             user_prompt_submit: vec![],
-            assistant_message_render: vec![HookSpec {
+            assistant_message_render: vec![ExtensionSpec {
                 program: script,
                 args: vec![],
                 timeout_ms: 5_000,
                 matcher: None,
             }],
-            ..HooksConfig::default()
+            ..ExtensionsConfig::default()
         };
-        let registry = HookRegistry::from_config(cfg);
+        let registry = ExtensionRegistry::from_config(cfg);
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
         let queue_tx = spawn_render_hook_worker(registry, event_tx);
 

@@ -17,7 +17,7 @@ It's the worked example for the ignis hook protocol — the protocol is
 the feature; translation is the proof. Distill, copy, adapt for your
 own use case (PII scrub, prompt enhancement, telemetry sidecar, …).
 
-> **Warning — hooks run unsandboxed in v1.** Each hook command runs
+> **Warning — hooks run unsandboxed in v1.** Each extension command runs
 > with the full privileges of your `ignis` process. Audit the source
 > before installing.
 
@@ -25,29 +25,29 @@ own use case (PII scrub, prompt enhancement, telemetry sidecar, …).
 
 ```sh
 mkdir -p ~/.ignis/hooks
-cp -R examples/hooks/translate-en ~/.ignis/hooks/translate-en
-chmod +x ~/.ignis/hooks/translate-en/run.py
+cp -R examples/extensions/translate-en ~/.ignis/extensions/translate-en
+chmod +x ~/.ignis/extensions/translate-en/run.py
 ```
 
 Python 3.10+. No third-party deps — the script uses the stdlib
 `urllib.request`. Set `ANTHROPIC_API_KEY` in your shell.
 
-Wire it in `~/.ignis/hooks.json`:
+Wire it in `~/.ignis/extensions.json`:
 
 ```json
 {
-  "hooks": {
+  "extensions": {
     "UserPromptSubmit": [
-      {"command": "~/.ignis/hooks/translate-en/run.py", "timeout_ms": 30000}
+      {"command": "~/.ignis/extensions/translate-en/run.py", "timeout_ms": 30000}
     ],
     "AssistantMessageRender": [
-      {"command": "~/.ignis/hooks/translate-en/run.py", "timeout_ms": 30000}
+      {"command": "~/.ignis/extensions/translate-en/run.py", "timeout_ms": 30000}
     ]
   }
 }
 ```
 
-Reload without restarting ignis: type `/hooks reload`.
+Reload without restarting ignis: type `/extensions reload`.
 
 ## Configure
 
@@ -73,7 +73,7 @@ sentinels.
 
 ```sh
 pip install pytest
-pytest examples/hooks/translate-en/
+pytest examples/extensions/translate-en/
 ```
 
 The tests are **not** part of `cargo test --workspace`. They mock

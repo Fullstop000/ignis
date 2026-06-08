@@ -1,10 +1,10 @@
-# ignis hooks — examples
+# ignis extensions — examples
 
-Hooks let an external program subscribe to ignis lifecycle events and,
+Extensions let an external program subscribe to ignis lifecycle events and,
 where the event permits it, **rewrite** the data flowing through or
 **inject context** the model sees on the next turn. This folder
-collects working hook scripts you can copy, install in
-`~/.ignis/hooks/`, and reference from `~/.ignis/hooks.json`.
+collects working extension scripts you can copy, install in
+`~/.ignis/extensions/`, and reference from `~/.ignis/extensions.json`.
 
 ## Catalog
 
@@ -100,7 +100,7 @@ calls don't pay the spawn cost:
 
 ```json
 {
-  "command": "~/.ignis/hooks/bash-deny/run.sh",
+  "command": "~/.ignis/extensions/bash-deny/run.sh",
   "matcher": "Bash"
 }
 ```
@@ -111,16 +111,16 @@ the field is ignored.
 
 ### Declare it
 
-`~/.ignis/hooks.json`:
+`~/.ignis/extensions.json`:
 
 ```json
 {
-  "hooks": {
+  "extensions": {
     "UserPromptSubmit": [
-      {"command": "~/.ignis/hooks/your-hook/run.py"}
+      {"command": "~/.ignis/extensions/your-hook/run.py"}
     ],
     "PreToolUse": [
-      {"command": "~/.ignis/hooks/bash-judge/run.sh", "matcher": "Bash"}
+      {"command": "~/.ignis/extensions/bash-judge/run.sh", "matcher": "Bash"}
     ]
   }
 }
@@ -131,7 +131,7 @@ involved, no `$VAR` expansion, no globbing. Only the leading `~/` is
 expanded. For program paths with spaces, use the explicit `argv`
 form. Each entry may set `timeout_ms` (default 10000).
 
-Type `/hooks reload` after editing the file to pick up changes without
+Type `/extensions reload` after editing the file to pick up changes without
 restarting ignis.
 
 ### `additionalContext` — injecting reminders

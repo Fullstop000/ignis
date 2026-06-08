@@ -120,7 +120,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Load the external-subprocess hook registry once at startup; the
     // runner shares this handle so `/hooks reload` swaps the live config
     // for every session that follows.
-    let hook_registry = ignis::hooks::HookRegistry::from_config_dir(&home)?;
+    let hook_registry = ignis::extensions::ExtensionRegistry::from_config_dir(&home)?;
 
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {

@@ -637,7 +637,7 @@ pub(crate) async fn submit_text(
         "/mcp" if arg_count == 1 => app.show_mcp_picker(),
         "/afk" if arg_count == 1 => handle_afk_toggle(app, picker_tx, notice_tx).await,
         "/telemetry" if arg_count == 1 => handle_telemetry_picker(app, picker_tx, notice_tx).await,
-        "/hooks" => handle_hooks_command(app, &text).await,
+        "/extensions" | "/hooks" => handle_extensions_command(app, &text).await,
         cmd if is_skill_command(app, cmd) => {
             let name = cmd.trim_start_matches('/').to_string();
             let reg = app.skills.clone().unwrap();
@@ -685,38 +685,43 @@ pub(crate) async fn submit_text(
 /// Listing reflects the registry as it stands in memory (i.e. what the
 /// session is actually running) — it is not a live probe of the JSON
 /// file. Reload first if you just edited it.
-async fn handle_hooks_command(app: &mut App, text: &str) {
+async fn handle_extensions_command(app: &mut App, text: &str) {
     let mut parts = text.split_whitespace();
-    let _ = parts.next(); // "/hooks"
+    let _ = parts.next(); // "/extensions" or "/hooks" (deprecated)
     let sub = parts.next().unwrap_or("");
 
     match sub {
-        "" | "list" => list_hooks(app).await,
-        "reload" => reload_hooks(app).await,
+        "" | "list" => list_extensions(app).await,
+        "reload" => reload_extensions(app).await,
         _ => app.add_assistant_notice(
-            "Usage: /hooks [list] | /hooks reload — list the in-memory hook \
-             chains or re-read ~/.ignis/hooks.json from disk."
+            "Usage: /extensions [list] | /extensions reload — list the in-memory \
+             extension chains or re-read ~/.ignis/extensions.json from disk. \
+             `/hooks` is a deprecated alias."
                 .to_string(),
         ),
     }
 }
 
-/// Render the current hook chains into a single multi-line notice.
-async fn list_hooks(app: &mut App) {
+/// Render the current extension chains into a single multi-line notice.
+async fn list_extensions(app: &mut App) {
     let Some(reg) = app.hooks.clone() else {
-        app.add_assistant_notice("[err] hooks registry unavailable in this session.".to_string());
+        app.add_assistant_notice(
+            "[err] extension registry unavailable in this session.".to_string(),
+        );
         return;
     };
     app.add_assistant_notice(reg.format_list().await);
 }
 
-/// Reload `~/.ignis/hooks.json` into the shared registry. Posts an
-/// `[info]` or `[err]` line to scrollback. The security reminder rides
-/// along on success so the user keeps noticing it every time they
-/// touch the file.
-async fn reload_hooks(app: &mut App) {
+/// Reload `~/.ignis/extensions.json` (or the legacy `~/.ignis/hooks.json`)
+/// into the shared registry. Posts an `[info]` or `[err]` line to
+/// scrollback. The security reminder rides along on success so the user
+/// keeps noticing it every time they touch the file.
+async fn reload_extensions(app: &mut App) {
     let Some(reg) = app.hooks.clone() else {
-        app.add_assistant_notice("[err] hooks registry unavailable in this session.".to_string());
+        app.add_assistant_notice(
+            "[err] extension registry unavailable in this session.".to_string(),
+        );
         return;
     };
     let Some(home) = dirs::home_dir() else {
@@ -725,7 +730,7 @@ async fn reload_hooks(app: &mut App) {
     };
     match reg.reload(&home).await {
         Ok(count) => app.add_assistant_notice(format!(
-            "[info] reloaded {count} hook{plural} \u{00b7} run unsandboxed; audit before installing",
+            "[info] reloaded {count} extension{plural} \u{00b7} run unsandboxed; audit before installing",
             plural = if count == 1 { "" } else { "s" }
         )),
         Err(e) => app.add_assistant_notice(format!("[err] /hooks reload: {e}")),

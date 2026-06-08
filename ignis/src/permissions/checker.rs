@@ -1,5 +1,5 @@
 //! `PermissionChecker` — wires the pure `check()` decision into the existing
-//! `ToolHooks::before_tool_call` integration point. When the decision is
+//! `ToolExtensions::before_tool_call` integration point. When the decision is
 //! `Ask`, opens a permission picker over the shared `PickerRequest` channel
 //! (same channel `ask_user` uses) with three fixed options:
 //! `Approve once`, `Approve session`, `Deny`. No "Other" free-text row —
@@ -21,7 +21,7 @@ use super::{check, default_policy_for_tool, rule, Decision};
 use crate::console::picker::{
     PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse,
 };
-use crate::tools::tool::ToolHooks;
+use crate::tools::tool::ToolExtensions;
 
 const APPROVE_ONCE: &str = "Approve once";
 const APPROVE_SESSION: &str = "Approve session";
@@ -144,7 +144,7 @@ impl PermissionChecker {
 }
 
 #[async_trait]
-impl ToolHooks for PermissionChecker {
+impl ToolExtensions for PermissionChecker {
     async fn before_tool_call(
         &self,
         tool_name: &str,

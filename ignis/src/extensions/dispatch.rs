@@ -1,6 +1,6 @@
 //! Spawn one hook subprocess, send the JSON envelope on stdin, read stdout,
 //! triage the exit code. Designed so a runaway, hung, or crashing hook can
-//! never kill the agent loop — every failure path returns a `HookOutcome`
+//! never kill the agent loop — every failure path returns a `ExtensionOutcome`
 //! the caller can turn into "use the original value + emit Warning".
 //!
 //! Process model:
@@ -16,18 +16,18 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use super::config::HookSpec;
-use super::protocol::{HookEvent, HookInput, HookOutput};
+use super::config::ExtensionSpec;
+use super::protocol::{ExtensionEvent, ExtensionInput, ExtensionOutput};
 
 /// Outcome of a single hook invocation. None of these are errors at the
-/// caller's level — `HookRegistry` decides whether each maps to "keep
+/// caller's level — `ExtensionRegistry` decides whether each maps to "keep
 /// running the chain", "stop with original value", etc.
 ///
-/// `Eq` is not derived: [`HookOutcome::MutatedJson`] holds a
+/// `Eq` is not derived: [`ExtensionOutcome::MutatedJson`] holds a
 /// `serde_json::Value`, which is `PartialEq` but not `Eq` because
 /// `Value::Number` can wrap an `f64`.
 #[derive(Debug, Clone, PartialEq)]
-pub enum HookOutcome {
+pub enum ExtensionOutcome {
     /// Exit 0, no rewrite or context injection — caller passes the
     /// original payload through.
     PassThrough,
@@ -47,7 +47,7 @@ pub enum HookOutcome {
     /// `decision: "block"`). For `Stop` this is inverted to
     /// [`Self::KeepLooping`] — see the dispatch path below.
     /// `reason` is the structured block reason from
-    /// `HookOutput.reason`; `stderr` is the raw subprocess stderr (used
+    /// `ExtensionOutput.reason`; `stderr` is the raw subprocess stderr (used
     /// for v1's exit-2 path where `reason` is empty).
     Blocked {
         stderr: String,
@@ -78,9 +78,9 @@ pub struct DispatchContext<'a> {
 /// `tool_input` and `PostCompact` receives a `summary`.
 ///
 /// `event()` recovers the discriminator; `into_envelope()` builds the
-/// outgoing [`HookInput`].
+/// outgoing [`ExtensionInput`].
 #[derive(Debug, Clone)]
-pub enum HookPayload<'a> {
+pub enum ExtensionPayload<'a> {
     UserPromptSubmit {
         prompt: &'a str,
     },
@@ -116,21 +116,23 @@ pub enum HookPayload<'a> {
     },
 }
 
-impl<'a> HookPayload<'a> {
-    /// The [`HookEvent`] this payload variant corresponds to. The
+impl<'a> ExtensionPayload<'a> {
+    /// The [`ExtensionEvent`] this payload variant corresponds to. The
     /// discriminator decides the wire-shape and outcome mapping in
     /// [`run_hook`].
-    pub fn event(&self) -> HookEvent {
+    pub fn event(&self) -> ExtensionEvent {
         match self {
-            HookPayload::UserPromptSubmit { .. } => HookEvent::UserPromptSubmit,
-            HookPayload::AssistantMessageRender { .. } => HookEvent::AssistantMessageRender,
-            HookPayload::SystemPromptCompose { .. } => HookEvent::SystemPromptCompose,
-            HookPayload::PreToolUse { .. } => HookEvent::PreToolUse,
-            HookPayload::PostToolUse { .. } => HookEvent::PostToolUse,
-            HookPayload::PreCompact { .. } => HookEvent::PreCompact,
-            HookPayload::PostCompact { .. } => HookEvent::PostCompact,
-            HookPayload::SessionStart { .. } => HookEvent::SessionStart,
-            HookPayload::Stop { .. } => HookEvent::Stop,
+            ExtensionPayload::UserPromptSubmit { .. } => ExtensionEvent::UserPromptSubmit,
+            ExtensionPayload::AssistantMessageRender { .. } => {
+                ExtensionEvent::AssistantMessageRender
+            }
+            ExtensionPayload::SystemPromptCompose { .. } => ExtensionEvent::SystemPromptCompose,
+            ExtensionPayload::PreToolUse { .. } => ExtensionEvent::PreToolUse,
+            ExtensionPayload::PostToolUse { .. } => ExtensionEvent::PostToolUse,
+            ExtensionPayload::PreCompact { .. } => ExtensionEvent::PreCompact,
+            ExtensionPayload::PostCompact { .. } => ExtensionEvent::PostCompact,
+            ExtensionPayload::SessionStart { .. } => ExtensionEvent::SessionStart,
+            ExtensionPayload::Stop { .. } => ExtensionEvent::Stop,
         }
     }
 
@@ -140,41 +142,41 @@ impl<'a> HookPayload<'a> {
     /// the spawn cost.
     pub fn tool_name(&self) -> Option<&'a str> {
         match self {
-            HookPayload::PreToolUse { tool_name, .. }
-            | HookPayload::PostToolUse { tool_name, .. } => Some(tool_name),
+            ExtensionPayload::PreToolUse { tool_name, .. }
+            | ExtensionPayload::PostToolUse { tool_name, .. } => Some(tool_name),
             _ => None,
         }
     }
 
-    fn build_envelope(&self, ctx: &DispatchContext<'_>) -> HookInput {
-        let mut env = HookInput {
+    fn build_envelope(&self, ctx: &DispatchContext<'_>) -> ExtensionInput {
+        let mut env = ExtensionInput {
             hook_event_name: self.event().as_str().to_string(),
             session_id: ctx.session_id.to_string(),
             cwd: ctx.cwd.to_string(),
             ..Default::default()
         };
         match self {
-            HookPayload::UserPromptSubmit { prompt } => {
+            ExtensionPayload::UserPromptSubmit { prompt } => {
                 env.prompt = Some((*prompt).to_string());
             }
-            HookPayload::AssistantMessageRender { content } => {
+            ExtensionPayload::AssistantMessageRender { content } => {
                 env.content = Some((*content).to_string());
             }
-            HookPayload::SystemPromptCompose {
+            ExtensionPayload::SystemPromptCompose {
                 system_prompt,
                 model,
             } => {
                 env.system_prompt = Some((*system_prompt).to_string());
                 env.model = Some((*model).to_string());
             }
-            HookPayload::PreToolUse {
+            ExtensionPayload::PreToolUse {
                 tool_name,
                 tool_input,
             } => {
                 env.tool_name = Some((*tool_name).to_string());
                 env.tool_input = Some((*tool_input).clone());
             }
-            HookPayload::PostToolUse {
+            ExtensionPayload::PostToolUse {
                 tool_name,
                 tool_input,
                 tool_response,
@@ -183,21 +185,21 @@ impl<'a> HookPayload<'a> {
                 env.tool_input = Some((*tool_input).clone());
                 env.tool_response = Some((*tool_response).clone());
             }
-            HookPayload::PreCompact {
+            ExtensionPayload::PreCompact {
                 trigger,
                 transcript_path,
             } => {
                 env.trigger = Some((*trigger).to_string());
                 env.transcript_path = Some((*transcript_path).to_string());
             }
-            HookPayload::PostCompact { trigger, summary } => {
+            ExtensionPayload::PostCompact { trigger, summary } => {
                 env.trigger = Some((*trigger).to_string());
                 env.summary = Some((*summary).to_string());
             }
-            HookPayload::SessionStart { source } => {
+            ExtensionPayload::SessionStart { source } => {
                 env.source = Some((*source).to_string());
             }
-            HookPayload::Stop { transcript_path } => {
+            ExtensionPayload::Stop { transcript_path } => {
                 env.transcript_path = Some((*transcript_path).to_string());
             }
         }
@@ -206,23 +208,23 @@ impl<'a> HookPayload<'a> {
 }
 
 /// Run one hook and return the outcome. Never returns an `Err` — every
-/// failure mode maps to [`HookOutcome::SoftFailed`] (or [`HookOutcome::Blocked`]).
+/// failure mode maps to [`ExtensionOutcome::SoftFailed`] (or [`ExtensionOutcome::Blocked`]).
 ///
 /// The payload's variant (and not a separate `event` arg) decides the
 /// envelope shape, the response-field this dispatch reads (`updated_input`
 /// vs `updated_output` vs `updated_system_prompt` vs `additional_context`),
 /// and whether `decision: "block"` short-circuits or is inverted to
-/// [`HookOutcome::KeepLooping`] (the `Stop` case).
+/// [`ExtensionOutcome::KeepLooping`] (the `Stop` case).
 pub async fn run_hook(
-    spec: &HookSpec,
-    payload: HookPayload<'_>,
+    spec: &ExtensionSpec,
+    payload: ExtensionPayload<'_>,
     ctx: &DispatchContext<'_>,
-) -> HookOutcome {
+) -> ExtensionOutcome {
     let started = std::time::Instant::now();
     let event = payload.event();
     let cmd_name = spec.display_name();
     let span = tracing::info_span!(
-        "ignis.hook",
+        "ignis.extension",
         event = event.as_str(),
         command = %cmd_name,
         duration_ms = tracing::field::Empty,
@@ -237,7 +239,7 @@ pub async fn run_hook(
             return record(
                 &span,
                 started,
-                HookOutcome::SoftFailed {
+                ExtensionOutcome::SoftFailed {
                     reason: format!("envelope encode failed: {e}"),
                 },
             );
@@ -257,7 +259,7 @@ pub async fn run_hook(
             return record(
                 &span,
                 started,
-                HookOutcome::SoftFailed {
+                ExtensionOutcome::SoftFailed {
                     reason: format!("spawn failed: {e}"),
                 },
             );
@@ -293,7 +295,7 @@ pub async fn run_hook(
             return record(
                 &span,
                 started,
-                HookOutcome::SoftFailed {
+                ExtensionOutcome::SoftFailed {
                     reason: format!("wait failed: {e}"),
                 },
             );
@@ -305,7 +307,7 @@ pub async fn run_hook(
             return record(
                 &span,
                 started,
-                HookOutcome::SoftFailed {
+                ExtensionOutcome::SoftFailed {
                     reason: format!("timed out after {}ms", spec.timeout_ms),
                 },
             );
@@ -320,12 +322,12 @@ pub async fn run_hook(
         // Exit-2 blocking. For `Stop` the inversion ("block = keep
         // looping") flips this into `KeepLooping`; stderr stands in for
         // the reason text when no JSON came back.
-        let outcome = if matches!(event, HookEvent::Stop) {
-            HookOutcome::KeepLooping {
+        let outcome = if matches!(event, ExtensionEvent::Stop) {
+            ExtensionOutcome::KeepLooping {
                 reason: trim_stderr(&stderr),
             }
         } else {
-            HookOutcome::Blocked {
+            ExtensionOutcome::Blocked {
                 stderr,
                 reason: None,
             }
@@ -337,20 +339,20 @@ pub async fn run_hook(
             Some(code) => format!("exit {code}: {}", trim_stderr(&stderr)),
             None => format!("terminated by signal: {}", trim_stderr(&stderr)),
         };
-        return record(&span, started, HookOutcome::SoftFailed { reason });
+        return record(&span, started, ExtensionOutcome::SoftFailed { reason });
     }
 
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
-        return record(&span, started, HookOutcome::PassThrough);
+        return record(&span, started, ExtensionOutcome::PassThrough);
     }
-    let parsed: HookOutput = match serde_json::from_str(trimmed) {
+    let parsed: ExtensionOutput = match serde_json::from_str(trimmed) {
         Ok(p) => p,
         Err(e) => {
             return record(
                 &span,
                 started,
-                HookOutcome::SoftFailed {
+                ExtensionOutcome::SoftFailed {
                     reason: format!("invalid JSON on stdout: {e}"),
                 },
             );
@@ -360,48 +362,52 @@ pub async fn run_hook(
     record(&span, started, classify_response(event, parsed, stderr))
 }
 
-/// Translate a parsed [`HookOutput`] into a per-event [`HookOutcome`].
+/// Translate a parsed [`ExtensionOutput`] into a per-event [`ExtensionOutcome`].
 ///
 /// Precedence per event:
-/// * `continue: false` → [`HookOutcome::Blocked`] (or `KeepLooping` for
+/// * `continue: false` → [`ExtensionOutcome::Blocked`] (or `KeepLooping` for
 ///   `Stop`) — the hardest stop.
 /// * `decision: "block"` → same as above.
-/// * `updated_*` field for the event → [`HookOutcome::Mutated`] or
-///   [`HookOutcome::MutatedJson`].
-/// * `additional_context` → [`HookOutcome::InjectContext`].
-/// * otherwise → [`HookOutcome::PassThrough`].
+/// * `updated_*` field for the event → [`ExtensionOutcome::Mutated`] or
+///   [`ExtensionOutcome::MutatedJson`].
+/// * `additional_context` → [`ExtensionOutcome::InjectContext`].
+/// * otherwise → [`ExtensionOutcome::PassThrough`].
 ///
 /// The text-rewrite vs context-injection axes are exclusive in the
 /// outcome — a hook that returns both gets the rewrite, and the
 /// `additional_context` is logged as ignored. Splitting them into
 /// two simultaneous outcomes is left for v3 once a real use case
 /// shows up.
-fn classify_response(event: HookEvent, parsed: HookOutput, stderr: String) -> HookOutcome {
+fn classify_response(
+    event: ExtensionEvent,
+    parsed: ExtensionOutput,
+    stderr: String,
+) -> ExtensionOutcome {
     let reason = parsed.reason.clone();
     let blocked = parsed.r#continue == Some(false) || parsed.decision.as_deref() == Some("block");
     if blocked {
-        return if matches!(event, HookEvent::Stop) {
-            HookOutcome::KeepLooping {
+        return if matches!(event, ExtensionEvent::Stop) {
+            ExtensionOutcome::KeepLooping {
                 reason: reason.unwrap_or_else(|| trim_stderr(&stderr)),
             }
         } else {
-            HookOutcome::Blocked { stderr, reason }
+            ExtensionOutcome::Blocked { stderr, reason }
         };
     }
 
     let Some(spec) = parsed.hook_specific_output else {
-        return HookOutcome::PassThrough;
+        return ExtensionOutcome::PassThrough;
     };
 
     // Per-event rewrite extraction.
     let rewrite_text: Option<String> = match event {
-        HookEvent::UserPromptSubmit => spec
+        ExtensionEvent::UserPromptSubmit => spec
             .updated_input
             .as_ref()
             .and_then(|v| v.as_str())
             .map(String::from),
-        HookEvent::AssistantMessageRender => spec.updated_output.clone(),
-        HookEvent::SystemPromptCompose => spec.updated_system_prompt.clone(),
+        ExtensionEvent::AssistantMessageRender => spec.updated_output.clone(),
+        ExtensionEvent::SystemPromptCompose => spec.updated_system_prompt.clone(),
         _ => None,
     };
     if let Some(t) = rewrite_text {
@@ -411,14 +417,14 @@ fn classify_response(event: HookEvent, parsed: HookOutput, stderr: String) -> Ho
                 "hook returned both rewrite and additional_context; using rewrite"
             );
         }
-        return HookOutcome::Mutated(t);
+        return ExtensionOutcome::Mutated(t);
     }
 
     // PreToolUse: object rewrite of `tool_input`.
-    if matches!(event, HookEvent::PreToolUse) {
+    if matches!(event, ExtensionEvent::PreToolUse) {
         if let Some(v) = spec.updated_input {
             if v.is_object() {
-                return HookOutcome::MutatedJson(v);
+                return ExtensionOutcome::MutatedJson(v);
             }
             tracing::debug!(
                 event = "PreToolUse",
@@ -428,21 +434,25 @@ fn classify_response(event: HookEvent, parsed: HookOutput, stderr: String) -> Ho
     }
 
     if let Some(ctx) = spec.additional_context {
-        return HookOutcome::InjectContext(ctx);
+        return ExtensionOutcome::InjectContext(ctx);
     }
-    HookOutcome::PassThrough
+    ExtensionOutcome::PassThrough
 }
 
-fn record(span: &tracing::Span, started: std::time::Instant, outcome: HookOutcome) -> HookOutcome {
+fn record(
+    span: &tracing::Span,
+    started: std::time::Instant,
+    outcome: ExtensionOutcome,
+) -> ExtensionOutcome {
     span.record("duration_ms", started.elapsed().as_millis() as u64);
     let label = match &outcome {
-        HookOutcome::Mutated(_) => "mutated",
-        HookOutcome::MutatedJson(_) => "mutated_json",
-        HookOutcome::InjectContext(_) => "inject_context",
-        HookOutcome::PassThrough => "pass_through",
-        HookOutcome::Blocked { .. } => "blocked",
-        HookOutcome::KeepLooping { .. } => "keep_looping",
-        HookOutcome::SoftFailed { .. } => "failed",
+        ExtensionOutcome::Mutated(_) => "mutated",
+        ExtensionOutcome::MutatedJson(_) => "mutated_json",
+        ExtensionOutcome::InjectContext(_) => "inject_context",
+        ExtensionOutcome::PassThrough => "pass_through",
+        ExtensionOutcome::Blocked { .. } => "blocked",
+        ExtensionOutcome::KeepLooping { .. } => "keep_looping",
+        ExtensionOutcome::SoftFailed { .. } => "failed",
     };
     span.record("outcome", label);
     outcome
@@ -488,7 +498,7 @@ mod tests {
             "ok.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"hookSpecificOutput\":{\"updatedInput\":\"rewritten\"}}'\n",
         );
-        let spec = HookSpec {
+        let spec = ExtensionSpec {
             program: script,
             args: vec![],
             timeout_ms: 5_000,
@@ -496,11 +506,11 @@ mod tests {
         };
         let out = run_hook(
             &spec,
-            HookPayload::UserPromptSubmit { prompt: "original" },
+            ExtensionPayload::UserPromptSubmit { prompt: "original" },
             &ctx(),
         )
         .await;
-        assert_eq!(out, HookOutcome::Mutated("rewritten".to_string()));
+        assert_eq!(out, ExtensionOutcome::Mutated("rewritten".to_string()));
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -508,7 +518,7 @@ mod tests {
     async fn exit_zero_empty_stdout_is_passthrough() {
         let tmp = crate::util::unique_temp_dir("ignis-hook-disp-passthrough");
         let script = write_script(&tmp, "noop.sh", "#!/bin/sh\ncat >/dev/null\n");
-        let spec = HookSpec {
+        let spec = ExtensionSpec {
             program: script,
             args: vec![],
             timeout_ms: 5_000,
@@ -516,11 +526,11 @@ mod tests {
         };
         let out = run_hook(
             &spec,
-            HookPayload::UserPromptSubmit { prompt: "original" },
+            ExtensionPayload::UserPromptSubmit { prompt: "original" },
             &ctx(),
         )
         .await;
-        assert_eq!(out, HookOutcome::PassThrough);
+        assert_eq!(out, ExtensionOutcome::PassThrough);
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -532,15 +542,20 @@ mod tests {
             "block.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf 'nope' >&2\nexit 2\n",
         );
-        let spec = HookSpec {
+        let spec = ExtensionSpec {
             program: script,
             args: vec![],
             timeout_ms: 5_000,
             matcher: None,
         };
-        let out = run_hook(&spec, HookPayload::UserPromptSubmit { prompt: "x" }, &ctx()).await;
+        let out = run_hook(
+            &spec,
+            ExtensionPayload::UserPromptSubmit { prompt: "x" },
+            &ctx(),
+        )
+        .await;
         match out {
-            HookOutcome::Blocked { stderr, .. } => assert!(stderr.contains("nope")),
+            ExtensionOutcome::Blocked { stderr, .. } => assert!(stderr.contains("nope")),
             other => panic!("expected Blocked, got {other:?}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
@@ -554,15 +569,20 @@ mod tests {
             "bad.sh",
             "#!/bin/sh\ncat >/dev/null\nprintf 'not json at all'\n",
         );
-        let spec = HookSpec {
+        let spec = ExtensionSpec {
             program: script,
             args: vec![],
             timeout_ms: 5_000,
             matcher: None,
         };
-        let out = run_hook(&spec, HookPayload::UserPromptSubmit { prompt: "x" }, &ctx()).await;
+        let out = run_hook(
+            &spec,
+            ExtensionPayload::UserPromptSubmit { prompt: "x" },
+            &ctx(),
+        )
+        .await;
         match out {
-            HookOutcome::SoftFailed { reason } => assert!(reason.contains("invalid JSON")),
+            ExtensionOutcome::SoftFailed { reason } => assert!(reason.contains("invalid JSON")),
             other => panic!("expected SoftFailed, got {other:?}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
@@ -570,29 +590,39 @@ mod tests {
 
     #[tokio::test]
     async fn missing_binary_is_soft_failed() {
-        let spec = HookSpec {
+        let spec = ExtensionSpec {
             program: PathBuf::from("/nonexistent/binary/__ignis_no_such_path__"),
             args: vec![],
             timeout_ms: 1_000,
             matcher: None,
         };
-        let out = run_hook(&spec, HookPayload::UserPromptSubmit { prompt: "x" }, &ctx()).await;
-        matches!(out, HookOutcome::SoftFailed { .. });
+        let out = run_hook(
+            &spec,
+            ExtensionPayload::UserPromptSubmit { prompt: "x" },
+            &ctx(),
+        )
+        .await;
+        matches!(out, ExtensionOutcome::SoftFailed { .. });
     }
 
     #[tokio::test]
     async fn timeout_is_soft_failed() {
         let tmp = crate::util::unique_temp_dir("ignis-hook-disp-timeout");
         let script = write_script(&tmp, "slow.sh", "#!/bin/sh\ncat >/dev/null\nsleep 5\n");
-        let spec = HookSpec {
+        let spec = ExtensionSpec {
             program: script,
             args: vec![],
             timeout_ms: 200,
             matcher: None,
         };
-        let out = run_hook(&spec, HookPayload::UserPromptSubmit { prompt: "x" }, &ctx()).await;
+        let out = run_hook(
+            &spec,
+            ExtensionPayload::UserPromptSubmit { prompt: "x" },
+            &ctx(),
+        )
+        .await;
         match out {
-            HookOutcome::SoftFailed { reason } => assert!(reason.contains("timed out")),
+            ExtensionOutcome::SoftFailed { reason } => assert!(reason.contains("timed out")),
             other => panic!("expected SoftFailed, got {other:?}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
@@ -616,7 +646,7 @@ mod tests {
             // block until the child exited.
             "#!/bin/sh\nsleep 30\n",
         );
-        let spec = HookSpec {
+        let spec = ExtensionSpec {
             program: script,
             args: vec![],
             timeout_ms: 150,
@@ -626,7 +656,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let out = run_hook(
             &spec,
-            HookPayload::UserPromptSubmit {
+            ExtensionPayload::UserPromptSubmit {
                 prompt: &big_payload,
             },
             &ctx(),
@@ -634,7 +664,7 @@ mod tests {
         .await;
         let elapsed = t0.elapsed();
         match out {
-            HookOutcome::SoftFailed { reason } => assert!(reason.contains("timed out")),
+            ExtensionOutcome::SoftFailed { reason } => assert!(reason.contains("timed out")),
             other => panic!("expected SoftFailed, got {other:?}"),
         }
         // Must return well within the long sleep (with slack for spawn).
@@ -650,7 +680,7 @@ mod tests {
     // isolation, so behavioural drift on a single field type is caught
     // without spawning Python.
 
-    fn parse(raw: &str) -> HookOutput {
+    fn parse(raw: &str) -> ExtensionOutput {
         serde_json::from_str(raw).expect("test JSON")
     }
 
@@ -662,9 +692,9 @@ mod tests {
                 "updatedInput": { "command": "echo safe" }
             }
         }"#;
-        let outcome = classify_response(HookEvent::PreToolUse, parse(raw), String::new());
+        let outcome = classify_response(ExtensionEvent::PreToolUse, parse(raw), String::new());
         match outcome {
-            HookOutcome::MutatedJson(v) => {
+            ExtensionOutcome::MutatedJson(v) => {
                 assert_eq!(v["command"], "echo safe");
             }
             other => panic!("expected MutatedJson, got {other:?}"),
@@ -682,8 +712,8 @@ mod tests {
                 "updatedInput": "not an object"
             }
         }"#;
-        let outcome = classify_response(HookEvent::PreToolUse, parse(raw), String::new());
-        assert_eq!(outcome, HookOutcome::PassThrough);
+        let outcome = classify_response(ExtensionEvent::PreToolUse, parse(raw), String::new());
+        assert_eq!(outcome, ExtensionOutcome::PassThrough);
     }
 
     #[test]
@@ -694,10 +724,10 @@ mod tests {
                 "additionalContext": "test suite failed"
             }
         }"#;
-        let outcome = classify_response(HookEvent::PostToolUse, parse(raw), String::new());
+        let outcome = classify_response(ExtensionEvent::PostToolUse, parse(raw), String::new());
         assert_eq!(
             outcome,
-            HookOutcome::InjectContext("test suite failed".to_string())
+            ExtensionOutcome::InjectContext("test suite failed".to_string())
         );
     }
 
@@ -710,10 +740,10 @@ mod tests {
             "decision": "block",
             "reason": "tests are still failing"
         }"#;
-        let outcome = classify_response(HookEvent::Stop, parse(raw), String::new());
+        let outcome = classify_response(ExtensionEvent::Stop, parse(raw), String::new());
         assert_eq!(
             outcome,
-            HookOutcome::KeepLooping {
+            ExtensionOutcome::KeepLooping {
                 reason: "tests are still failing".to_string(),
             }
         );
@@ -722,13 +752,13 @@ mod tests {
     #[test]
     fn stop_decision_block_without_reason_falls_back_to_stderr() {
         let outcome = classify_response(
-            HookEvent::Stop,
+            ExtensionEvent::Stop,
             parse(r#"{ "decision": "block" }"#),
             "stderr-only reason".to_string(),
         );
         assert_eq!(
             outcome,
-            HookOutcome::KeepLooping {
+            ExtensionOutcome::KeepLooping {
                 reason: "stderr-only reason".to_string(),
             }
         );
@@ -743,12 +773,12 @@ mod tests {
             "reason": "rm -rf is destructive"
         }"#;
         let outcome = classify_response(
-            HookEvent::PreToolUse,
+            ExtensionEvent::PreToolUse,
             parse(raw),
             "fallback stderr".to_string(),
         );
         match outcome {
-            HookOutcome::Blocked { reason, stderr } => {
+            ExtensionOutcome::Blocked { reason, stderr } => {
                 assert_eq!(reason.as_deref(), Some("rm -rf is destructive"));
                 assert_eq!(stderr, "fallback stderr");
             }
@@ -764,10 +794,14 @@ mod tests {
                 "updatedSystemPrompt": "rewritten system prompt"
             }
         }"#;
-        let outcome = classify_response(HookEvent::SystemPromptCompose, parse(raw), String::new());
+        let outcome = classify_response(
+            ExtensionEvent::SystemPromptCompose,
+            parse(raw),
+            String::new(),
+        );
         assert_eq!(
             outcome,
-            HookOutcome::Mutated("rewritten system prompt".to_string())
+            ExtensionOutcome::Mutated("rewritten system prompt".to_string())
         );
     }
 
@@ -783,7 +817,8 @@ mod tests {
                 "additionalContext": "ignored for now"
             }
         }"#;
-        let outcome = classify_response(HookEvent::UserPromptSubmit, parse(raw), String::new());
-        assert_eq!(outcome, HookOutcome::Mutated("rewritten".to_string()));
+        let outcome =
+            classify_response(ExtensionEvent::UserPromptSubmit, parse(raw), String::new());
+        assert_eq!(outcome, ExtensionOutcome::Mutated("rewritten".to_string()));
     }
 }

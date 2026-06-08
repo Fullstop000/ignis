@@ -9,12 +9,12 @@
 # user pasting test output in by hand.
 #
 # Install:
-#   cp -R examples/hooks/auto-test ~/.ignis/hooks/auto-test
-#   chmod +x ~/.ignis/hooks/auto-test/run.sh
+#   cp -R examples/extensions/auto-test ~/.ignis/extensions/auto-test
+#   chmod +x ~/.ignis/extensions/auto-test/run.sh
 #
-# Wire in ~/.ignis/hooks.json:
-#   { "hooks": { "PostToolUse": [
-#       { "command": "~/.ignis/hooks/auto-test/run.sh",
+# Wire in ~/.ignis/extensions.json:
+#   { "extensions": { "PostToolUse": [
+#       { "command": "~/.ignis/extensions/auto-test/run.sh",
 #         "matcher": "Write|Edit", "timeout_ms": 120000 }
 #   ]}}
 

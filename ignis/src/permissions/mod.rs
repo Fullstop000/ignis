@@ -7,7 +7,7 @@
 //! `FullyUnattended`. Permission-mode CLI flag and the `bypassPermissions` name
 //! are gone.
 //!
-//! Integration: a `PermissionChecker` impls `tools::tool::ToolHooks`; the
+//! Integration: a `PermissionChecker` impls `tools::tool::ToolExtensions`; the
 //! agent loop already invokes `before_tool_call` on every dispatch (see
 //! `agent/mod.rs:608`). On `Decision::Ask`, the checker opens the existing
 //! `PickerRequest` channel to the console (same plumbing as `ask_user`).

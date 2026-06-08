@@ -6,7 +6,7 @@
 //!
 //! v2 adds:
 //! - 6 new events (`PreToolUse`, `PostToolUse`, `PreCompact`, `PostCompact`,
-//!   `SessionStart`, `Stop`, `SystemPromptCompose`) — see [`HookEvent`].
+//!   `SessionStart`, `Stop`, `SystemPromptCompose`) — see [`ExtensionEvent`].
 //! - A `matcher` field (regex on `tool_name`) compiled at load. Malformed
 //!   regex is a startup error. Declaring `matcher` on a non-tool event is
 //!   not a startup error but is reported once via `[warn]` when the
@@ -20,7 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 
-use super::protocol::HookEvent;
+use super::protocol::ExtensionEvent;
 
 /// Default per-hook timeout when `timeout_ms` is omitted. 10s — comfortably
 /// covers p99 of a healthy Haiku call; hooks doing heavier work declare a
@@ -30,7 +30,7 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 /// One declared hook: how to spawn it, how long to wait, and (optionally)
 /// which tool names it applies to.
 #[derive(Debug, Clone)]
-pub struct HookSpec {
+pub struct ExtensionSpec {
     /// Executable path (post-`~` expansion).
     pub program: PathBuf,
     /// argv tail (everything after the program, whitespace-split, no shell
@@ -39,14 +39,14 @@ pub struct HookSpec {
     pub timeout_ms: u64,
     /// Tool-name filter. Compiled at parse so a malformed pattern is a
     /// startup error rather than a per-call surprise. Meaningful only for
-    /// `PreToolUse` / `PostToolUse` (see [`HookEvent::uses_tool_matcher`]).
-    pub matcher: Option<HookMatcher>,
+    /// `PreToolUse` / `PostToolUse` (see [`ExtensionEvent::uses_tool_matcher`]).
+    pub matcher: Option<ExtensionMatcher>,
 }
 
 /// Tool-name regex paired with the source pattern. The pattern is kept
 /// for equality + display; the compiled regex is what `matches()` uses.
 #[derive(Debug, Clone)]
-pub struct HookMatcher {
+pub struct ExtensionMatcher {
     /// Raw pattern as it appeared in `hooks.json`. Used for equality,
     /// the `/hooks` listing, and `[warn]` lines.
     pub raw: String,
@@ -54,13 +54,13 @@ pub struct HookMatcher {
     pub re: Regex,
 }
 
-impl HookMatcher {
+impl ExtensionMatcher {
     pub fn matches(&self, tool_name: &str) -> bool {
         self.re.is_match(tool_name)
     }
 }
 
-impl PartialEq for HookSpec {
+impl PartialEq for ExtensionSpec {
     /// Equality compares the raw matcher pattern, not the compiled regex
     /// (`Regex` doesn't implement `Eq`). The compiled form derives from
     /// the raw — comparing one implies comparing the other.
@@ -71,9 +71,9 @@ impl PartialEq for HookSpec {
             && self.matcher.as_ref().map(|m| &m.raw) == other.matcher.as_ref().map(|m| &m.raw)
     }
 }
-impl Eq for HookSpec {}
+impl Eq for ExtensionSpec {}
 
-impl HookSpec {
+impl ExtensionSpec {
     /// Short, log-friendly identifier used in `[warn]` / `[info]` lines and
     /// the `· hook: <name>…` footer. The file stem of the program (no
     /// directory, no extension).
@@ -95,96 +95,111 @@ impl HookSpec {
     }
 }
 
-/// Parsed `hooks.json` keyed by event. v2 carries one `Vec<HookSpec>` per
-/// declared `HookEvent`. Adding a new event extends this struct + the
+/// Parsed `hooks.json` keyed by event. v2 carries one `Vec<ExtensionSpec>` per
+/// declared `ExtensionEvent`. Adding a new event extends this struct + the
 /// `for_event` match below + the parser's name table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HooksConfig {
-    pub user_prompt_submit: Vec<HookSpec>,
-    pub assistant_message_render: Vec<HookSpec>,
-    pub system_prompt_compose: Vec<HookSpec>,
-    pub pre_tool_use: Vec<HookSpec>,
-    pub post_tool_use: Vec<HookSpec>,
-    pub pre_compact: Vec<HookSpec>,
-    pub post_compact: Vec<HookSpec>,
-    pub session_start: Vec<HookSpec>,
-    pub stop: Vec<HookSpec>,
+pub struct ExtensionsConfig {
+    pub user_prompt_submit: Vec<ExtensionSpec>,
+    pub assistant_message_render: Vec<ExtensionSpec>,
+    pub system_prompt_compose: Vec<ExtensionSpec>,
+    pub pre_tool_use: Vec<ExtensionSpec>,
+    pub post_tool_use: Vec<ExtensionSpec>,
+    pub pre_compact: Vec<ExtensionSpec>,
+    pub post_compact: Vec<ExtensionSpec>,
+    pub session_start: Vec<ExtensionSpec>,
+    pub stop: Vec<ExtensionSpec>,
 }
 
-impl HooksConfig {
+impl ExtensionsConfig {
     pub fn is_empty(&self) -> bool {
-        HookEvent::ALL
+        ExtensionEvent::ALL
             .iter()
             .all(|ev| self.for_event(*ev).is_empty())
     }
 
     pub fn total_len(&self) -> usize {
-        HookEvent::ALL
+        ExtensionEvent::ALL
             .iter()
             .map(|ev| self.for_event(*ev).len())
             .sum()
     }
 
-    pub fn for_event(&self, event: HookEvent) -> &[HookSpec] {
+    pub fn for_event(&self, event: ExtensionEvent) -> &[ExtensionSpec] {
         match event {
-            HookEvent::UserPromptSubmit => &self.user_prompt_submit,
-            HookEvent::AssistantMessageRender => &self.assistant_message_render,
-            HookEvent::SystemPromptCompose => &self.system_prompt_compose,
-            HookEvent::PreToolUse => &self.pre_tool_use,
-            HookEvent::PostToolUse => &self.post_tool_use,
-            HookEvent::PreCompact => &self.pre_compact,
-            HookEvent::PostCompact => &self.post_compact,
-            HookEvent::SessionStart => &self.session_start,
-            HookEvent::Stop => &self.stop,
+            ExtensionEvent::UserPromptSubmit => &self.user_prompt_submit,
+            ExtensionEvent::AssistantMessageRender => &self.assistant_message_render,
+            ExtensionEvent::SystemPromptCompose => &self.system_prompt_compose,
+            ExtensionEvent::PreToolUse => &self.pre_tool_use,
+            ExtensionEvent::PostToolUse => &self.post_tool_use,
+            ExtensionEvent::PreCompact => &self.pre_compact,
+            ExtensionEvent::PostCompact => &self.post_compact,
+            ExtensionEvent::SessionStart => &self.session_start,
+            ExtensionEvent::Stop => &self.stop,
         }
     }
 
-    fn bucket_mut(&mut self, event: HookEvent) -> &mut Vec<HookSpec> {
+    fn bucket_mut(&mut self, event: ExtensionEvent) -> &mut Vec<ExtensionSpec> {
         match event {
-            HookEvent::UserPromptSubmit => &mut self.user_prompt_submit,
-            HookEvent::AssistantMessageRender => &mut self.assistant_message_render,
-            HookEvent::SystemPromptCompose => &mut self.system_prompt_compose,
-            HookEvent::PreToolUse => &mut self.pre_tool_use,
-            HookEvent::PostToolUse => &mut self.post_tool_use,
-            HookEvent::PreCompact => &mut self.pre_compact,
-            HookEvent::PostCompact => &mut self.post_compact,
-            HookEvent::SessionStart => &mut self.session_start,
-            HookEvent::Stop => &mut self.stop,
+            ExtensionEvent::UserPromptSubmit => &mut self.user_prompt_submit,
+            ExtensionEvent::AssistantMessageRender => &mut self.assistant_message_render,
+            ExtensionEvent::SystemPromptCompose => &mut self.system_prompt_compose,
+            ExtensionEvent::PreToolUse => &mut self.pre_tool_use,
+            ExtensionEvent::PostToolUse => &mut self.post_tool_use,
+            ExtensionEvent::PreCompact => &mut self.pre_compact,
+            ExtensionEvent::PostCompact => &mut self.post_compact,
+            ExtensionEvent::SessionStart => &mut self.session_start,
+            ExtensionEvent::Stop => &mut self.stop,
         }
     }
 
-    /// Load from `<home>/.ignis/hooks.json`. Returns `Ok(default)` when the
-    /// file is absent. Returns `Err` on parse failure or invalid entry — the
-    /// caller (`Session::open`) bubbles that up to startup.
+    /// Load from `<home>/.ignis/extensions.json` (preferred). Falls back
+    /// to the legacy `<home>/.ignis/hooks.json` if the new name doesn't
+    /// exist — v1 configs keep working byte-for-byte. Returns
+    /// `Ok(default)` when neither file is present. Returns `Err` on
+    /// parse failure or invalid entry — the caller (`Session::open`)
+    /// bubbles that up to startup.
     pub fn from_home(home: &Path) -> Result<Self> {
-        let path = home.join(".ignis").join("hooks.json");
-        if !path.exists() {
-            return Ok(HooksConfig::default());
-        }
+        let preferred = home.join(".ignis").join("extensions.json");
+        let legacy = home.join(".ignis").join("hooks.json");
+        let path = if preferred.exists() {
+            preferred
+        } else if legacy.exists() {
+            legacy
+        } else {
+            return Ok(ExtensionsConfig::default());
+        };
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         Self::from_str(&raw, home).with_context(|| format!("parsing {}", path.display()))
     }
 
     /// Parse the raw JSON. `home` is used to expand a leading `~/` in
-    /// command strings.
+    /// command strings. Accepts either `{"extensions": {...}}` (v2
+    /// preferred) or `{"hooks": {...}}` (v1 back-compat) as the top-
+    /// level key.
     pub fn from_str(raw: &str, home: &Path) -> Result<Self> {
-        let parsed: HooksJson =
-            serde_json::from_str(raw).context("hooks.json is not valid JSON")?;
-        let mut out = HooksConfig::default();
-        for (event_name, entries) in parsed.hooks {
+        let parsed: ExtensionsJson =
+            serde_json::from_str(raw).context("extensions.json is not valid JSON")?;
+        let entries = match (parsed.extensions, parsed.hooks) {
+            (Some(e), _) => e,
+            (None, Some(h)) => h,
+            (None, None) => std::collections::BTreeMap::new(),
+        };
+        let mut out = ExtensionsConfig::default();
+        for (event_name, entries) in entries {
             let event = match parse_event_name(&event_name) {
                 Some(ev) => ev,
                 None => {
                     // Forward-compat: unknown events ignored with a warning.
-                    // Lets a single hooks.json work across ignis versions.
-                    tracing::warn!(event = %event_name, "hooks.json: ignoring unknown event");
+                    // Lets a single extensions.json work across ignis versions.
+                    tracing::warn!(event = %event_name, "extensions.json: ignoring unknown event");
                     continue;
                 }
             };
             for entry in entries {
                 let spec = parse_entry(entry, home)
-                    .with_context(|| format!("invalid hook entry under `{event_name}`"))?;
+                    .with_context(|| format!("invalid extension entry under `{event_name}`"))?;
                 out.bucket_mut(event).push(spec);
             }
         }
@@ -195,9 +210,9 @@ impl HooksConfig {
     /// "matcher declared on a non-tool event" warning. Returns `(event,
     /// display_name, raw_pattern)` for every offending spec. Empty when
     /// the config is well-formed for tool-event semantics.
-    pub fn non_tool_matchers(&self) -> Vec<(HookEvent, String, String)> {
+    pub fn non_tool_matchers(&self) -> Vec<(ExtensionEvent, String, String)> {
         let mut out = Vec::new();
-        for ev in HookEvent::ALL {
+        for ev in ExtensionEvent::ALL {
             if ev.uses_tool_matcher() {
                 continue;
             }
@@ -211,31 +226,31 @@ impl HooksConfig {
     }
 }
 
-fn parse_event_name(s: &str) -> Option<HookEvent> {
+fn parse_event_name(s: &str) -> Option<ExtensionEvent> {
     match s {
-        "UserPromptSubmit" => Some(HookEvent::UserPromptSubmit),
-        "AssistantMessageRender" => Some(HookEvent::AssistantMessageRender),
-        "SystemPromptCompose" => Some(HookEvent::SystemPromptCompose),
-        "PreToolUse" => Some(HookEvent::PreToolUse),
-        "PostToolUse" => Some(HookEvent::PostToolUse),
-        "PreCompact" => Some(HookEvent::PreCompact),
-        "PostCompact" => Some(HookEvent::PostCompact),
-        "SessionStart" => Some(HookEvent::SessionStart),
-        "Stop" => Some(HookEvent::Stop),
+        "UserPromptSubmit" => Some(ExtensionEvent::UserPromptSubmit),
+        "AssistantMessageRender" => Some(ExtensionEvent::AssistantMessageRender),
+        "SystemPromptCompose" => Some(ExtensionEvent::SystemPromptCompose),
+        "PreToolUse" => Some(ExtensionEvent::PreToolUse),
+        "PostToolUse" => Some(ExtensionEvent::PostToolUse),
+        "PreCompact" => Some(ExtensionEvent::PreCompact),
+        "PostCompact" => Some(ExtensionEvent::PostCompact),
+        "SessionStart" => Some(ExtensionEvent::SessionStart),
+        "Stop" => Some(ExtensionEvent::Stop),
         _ => None,
     }
 }
 
-fn parse_entry(entry: HookJsonEntry, home: &Path) -> Result<HookSpec> {
+fn parse_entry(entry: ExtensionJsonEntry, home: &Path) -> Result<ExtensionSpec> {
     let timeout_ms = entry.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     // Compile matcher at parse so a malformed regex is a startup error,
     // not a per-call surprise.
     let matcher = entry
         .matcher
         .as_deref()
-        .map(|raw| -> Result<HookMatcher> {
+        .map(|raw| -> Result<ExtensionMatcher> {
             let re = Regex::new(raw).with_context(|| format!("invalid `matcher` regex `{raw}`"))?;
-            Ok(HookMatcher {
+            Ok(ExtensionMatcher {
                 raw: raw.to_string(),
                 re,
             })
@@ -277,7 +292,7 @@ fn parse_entry(entry: HookJsonEntry, home: &Path) -> Result<HookSpec> {
             (program, args)
         }
     };
-    Ok(HookSpec {
+    Ok(ExtensionSpec {
         program,
         args,
         timeout_ms,
@@ -296,13 +311,18 @@ fn expand_home(s: &str, home: &Path) -> PathBuf {
 }
 
 #[derive(Debug, Deserialize)]
-struct HooksJson {
+struct ExtensionsJson {
+    /// v2 preferred key.
     #[serde(default)]
-    hooks: std::collections::BTreeMap<String, Vec<HookJsonEntry>>,
+    extensions: Option<std::collections::BTreeMap<String, Vec<ExtensionJsonEntry>>>,
+    /// v1 legacy key. Read for back-compat; ignored if `extensions` is
+    /// also present.
+    #[serde(default)]
+    hooks: Option<std::collections::BTreeMap<String, Vec<ExtensionJsonEntry>>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct HookJsonEntry {
+struct ExtensionJsonEntry {
     /// Simple form: a single string split on whitespace, no shell. The
     /// program is the first token; subsequent tokens are argv. No
     /// `$VAR` expansion; only a leading `~/` is expanded against home.
@@ -342,7 +362,7 @@ mod tests {
                 ]
             }
         }"#;
-        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let cfg = ExtensionsConfig::from_str(raw, &home).unwrap();
         assert_eq!(cfg.user_prompt_submit.len(), 1);
         assert!(cfg.user_prompt_submit[0].matcher.is_none());
         assert_eq!(cfg.assistant_message_render[0].timeout_ms, 30_000);
@@ -366,7 +386,7 @@ mod tests {
                 ]
             }
         }"#;
-        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let cfg = ExtensionsConfig::from_str(raw, &home).unwrap();
         let spec = &cfg.pre_tool_use[0];
         let m = spec.matcher.as_ref().expect("matcher compiled");
         assert_eq!(m.raw, "Bash|Edit");
@@ -382,7 +402,7 @@ mod tests {
         let raw = r#"{
             "hooks": {"PreToolUse": [{"command": "/bin/true", "matcher": "[unbalanced"}]}
         }"#;
-        let err = HooksConfig::from_str(raw, &home).unwrap_err();
+        let err = ExtensionsConfig::from_str(raw, &home).unwrap_err();
         let chain = format!("{err:#}");
         assert!(chain.contains("matcher"), "got: {chain}");
         assert!(chain.contains("[unbalanced"), "got: {chain}");
@@ -390,7 +410,7 @@ mod tests {
 
     #[test]
     fn applies_to_tool_default_when_no_matcher() {
-        let spec = HookSpec {
+        let spec = ExtensionSpec {
             program: PathBuf::from("/bin/true"),
             args: vec![],
             timeout_ms: 1000,
@@ -413,22 +433,22 @@ mod tests {
                 "PreToolUse": [{"command": "/bin/true", "matcher": "Bash"}]
             }
         }"#;
-        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let cfg = ExtensionsConfig::from_str(raw, &home).unwrap();
         let warnings = cfg.non_tool_matchers();
         assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].0, HookEvent::UserPromptSubmit);
+        assert_eq!(warnings[0].0, ExtensionEvent::UserPromptSubmit);
         assert_eq!(warnings[0].2, "Bash");
     }
 
     #[test]
     fn parses_all_v2_event_names() {
-        // Pin that every name in HookEvent::ALL is parsable. A typo'd
+        // Pin that every name in ExtensionEvent::ALL is parsable. A typo'd
         // arm in parse_event_name would silently drop one event class
         // and reach the "unknown event" warn branch.
         let home = PathBuf::from("/h");
         let mut raw = String::from("{\"hooks\":{");
         let mut first = true;
-        for ev in HookEvent::ALL {
+        for ev in ExtensionEvent::ALL {
             if !first {
                 raw.push(',');
             }
@@ -439,9 +459,9 @@ mod tests {
             ));
         }
         raw.push_str("}}");
-        let cfg = HooksConfig::from_str(&raw, &home).unwrap();
-        assert_eq!(cfg.total_len(), HookEvent::ALL.len());
-        for ev in HookEvent::ALL {
+        let cfg = ExtensionsConfig::from_str(&raw, &home).unwrap();
+        assert_eq!(cfg.total_len(), ExtensionEvent::ALL.len());
+        for ev in ExtensionEvent::ALL {
             assert_eq!(cfg.for_event(*ev).len(), 1, "missing: {}", ev.as_str());
         }
     }
@@ -456,7 +476,7 @@ mod tests {
                 ]
             }
         }"#;
-        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let cfg = ExtensionsConfig::from_str(raw, &home).unwrap();
         let spec = &cfg.user_prompt_submit[0];
         assert_eq!(spec.program, PathBuf::from("/usr/bin/env"));
         assert_eq!(spec.args, vec!["python3", "/opt/run.py", "--display"]);
@@ -465,7 +485,7 @@ mod tests {
     #[test]
     fn absent_file_is_ok_empty() {
         let tmp = crate::util::unique_temp_dir("ignis-hooks-absent");
-        let cfg = HooksConfig::from_home(&tmp).unwrap();
+        let cfg = ExtensionsConfig::from_home(&tmp).unwrap();
         assert!(cfg.is_empty());
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -473,15 +493,15 @@ mod tests {
     #[test]
     fn malformed_json_is_an_error() {
         let home = PathBuf::from("/h");
-        let err = HooksConfig::from_str("{not json}", &home).unwrap_err();
-        assert!(err.to_string().contains("hooks.json"));
+        let err = ExtensionsConfig::from_str("{not json}", &home).unwrap_err();
+        assert!(err.to_string().contains("extensions.json"));
     }
 
     #[test]
     fn unknown_events_are_ignored() {
         let home = PathBuf::from("/h");
         let raw = r#"{"hooks": {"FutureSomething": [{"command": "/bin/true"}]}}"#;
-        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let cfg = ExtensionsConfig::from_str(raw, &home).unwrap();
         assert!(cfg.is_empty());
     }
 
@@ -489,7 +509,7 @@ mod tests {
     fn empty_command_rejected() {
         let home = PathBuf::from("/h");
         let raw = r#"{"hooks": {"UserPromptSubmit": [{"command": "   "}]}}"#;
-        let err = HooksConfig::from_str(raw, &home).unwrap_err();
+        let err = ExtensionsConfig::from_str(raw, &home).unwrap_err();
         assert!(format!("{err:#}").contains("empty"));
     }
 
@@ -497,7 +517,7 @@ mod tests {
     fn command_with_space_in_program_path_silently_truncates_in_simple_form() {
         let home = PathBuf::from("/h");
         let raw = r#"{"hooks": {"UserPromptSubmit": [{"command": "/path with space/run.py"}]}}"#;
-        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let cfg = ExtensionsConfig::from_str(raw, &home).unwrap();
         let spec = &cfg.user_prompt_submit[0];
         assert_eq!(spec.program, PathBuf::from("/path"));
         assert_eq!(spec.args, vec!["with", "space/run.py"]);
@@ -509,7 +529,7 @@ mod tests {
         let raw = r#"{"hooks": {"UserPromptSubmit": [
             {"argv": ["/path with space/run.py", "--display"]}
         ]}}"#;
-        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let cfg = ExtensionsConfig::from_str(raw, &home).unwrap();
         let spec = &cfg.user_prompt_submit[0];
         assert_eq!(spec.program, PathBuf::from("/path with space/run.py"));
         assert_eq!(spec.args, vec!["--display"]);
@@ -521,7 +541,7 @@ mod tests {
         let raw = r#"{"hooks": {"UserPromptSubmit": [
             {"argv": ["~/.ignis/hooks/run.py"]}
         ]}}"#;
-        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let cfg = ExtensionsConfig::from_str(raw, &home).unwrap();
         assert_eq!(
             cfg.user_prompt_submit[0].program,
             home.join(".ignis/hooks/run.py")
@@ -534,7 +554,7 @@ mod tests {
         let raw = r#"{"hooks": {"UserPromptSubmit": [
             {"command": "/bin/true", "argv": ["/bin/true"]}
         ]}}"#;
-        let err = HooksConfig::from_str(raw, &home).unwrap_err();
+        let err = ExtensionsConfig::from_str(raw, &home).unwrap_err();
         assert!(format!("{err:#}").contains("both"));
     }
 
@@ -542,7 +562,7 @@ mod tests {
     fn neither_command_nor_argv_rejected() {
         let home = PathBuf::from("/h");
         let raw = r#"{"hooks": {"UserPromptSubmit": [{}]}}"#;
-        let err = HooksConfig::from_str(raw, &home).unwrap_err();
+        let err = ExtensionsConfig::from_str(raw, &home).unwrap_err();
         assert!(format!("{err:#}").contains("neither"));
     }
 
@@ -550,13 +570,13 @@ mod tests {
     fn empty_argv_rejected() {
         let home = PathBuf::from("/h");
         let raw = r#"{"hooks": {"UserPromptSubmit": [{"argv": []}]}}"#;
-        let err = HooksConfig::from_str(raw, &home).unwrap_err();
+        let err = ExtensionsConfig::from_str(raw, &home).unwrap_err();
         assert!(format!("{err:#}").contains("empty"));
     }
 
     #[test]
     fn display_name_strips_directory_and_extension() {
-        let spec = HookSpec {
+        let spec = ExtensionSpec {
             program: PathBuf::from("/home/me/.ignis/hooks/translate-en/run.py"),
             args: vec![],
             timeout_ms: 1,

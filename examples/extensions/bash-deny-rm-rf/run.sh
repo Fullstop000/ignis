@@ -7,12 +7,12 @@
 # on the next turn.
 #
 # Install:
-#   cp -R examples/hooks/bash-deny-rm-rf ~/.ignis/hooks/bash-deny-rm-rf
-#   chmod +x ~/.ignis/hooks/bash-deny-rm-rf/run.sh
+#   cp -R examples/extensions/bash-deny-rm-rf ~/.ignis/extensions/bash-deny-rm-rf
+#   chmod +x ~/.ignis/extensions/bash-deny-rm-rf/run.sh
 #
-# Wire in ~/.ignis/hooks.json:
-#   { "hooks": { "PreToolUse": [
-#       { "command": "~/.ignis/hooks/bash-deny-rm-rf/run.sh", "matcher": "Bash" }
+# Wire in ~/.ignis/extensions.json:
+#   { "extensions": { "PreToolUse": [
+#       { "command": "~/.ignis/extensions/bash-deny-rm-rf/run.sh", "matcher": "Bash" }
 #   ]}}
 
 set -eu

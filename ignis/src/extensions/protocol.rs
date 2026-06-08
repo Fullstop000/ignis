@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// envelope to match Claude Code's wire format. New events extend this
 /// enum; existing values must not change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HookEvent {
+pub enum ExtensionEvent {
     UserPromptSubmit,
     AssistantMessageRender,
     SystemPromptCompose,
@@ -23,18 +23,18 @@ pub enum HookEvent {
     Stop,
 }
 
-impl HookEvent {
+impl ExtensionEvent {
     pub fn as_str(self) -> &'static str {
         match self {
-            HookEvent::UserPromptSubmit => "UserPromptSubmit",
-            HookEvent::AssistantMessageRender => "AssistantMessageRender",
-            HookEvent::SystemPromptCompose => "SystemPromptCompose",
-            HookEvent::PreToolUse => "PreToolUse",
-            HookEvent::PostToolUse => "PostToolUse",
-            HookEvent::PreCompact => "PreCompact",
-            HookEvent::PostCompact => "PostCompact",
-            HookEvent::SessionStart => "SessionStart",
-            HookEvent::Stop => "Stop",
+            ExtensionEvent::UserPromptSubmit => "UserPromptSubmit",
+            ExtensionEvent::AssistantMessageRender => "AssistantMessageRender",
+            ExtensionEvent::SystemPromptCompose => "SystemPromptCompose",
+            ExtensionEvent::PreToolUse => "PreToolUse",
+            ExtensionEvent::PostToolUse => "PostToolUse",
+            ExtensionEvent::PreCompact => "PreCompact",
+            ExtensionEvent::PostCompact => "PostCompact",
+            ExtensionEvent::SessionStart => "SessionStart",
+            ExtensionEvent::Stop => "Stop",
         }
     }
 
@@ -42,23 +42,26 @@ impl HookEvent {
     /// consumer that needs to iterate every event. Adding a new variant
     /// is a three-line change (this slice + the `as_str` arm + the
     /// `from_event_name` match in config.rs).
-    pub const ALL: &'static [HookEvent] = &[
-        HookEvent::UserPromptSubmit,
-        HookEvent::AssistantMessageRender,
-        HookEvent::SystemPromptCompose,
-        HookEvent::PreToolUse,
-        HookEvent::PostToolUse,
-        HookEvent::PreCompact,
-        HookEvent::PostCompact,
-        HookEvent::SessionStart,
-        HookEvent::Stop,
+    pub const ALL: &'static [ExtensionEvent] = &[
+        ExtensionEvent::UserPromptSubmit,
+        ExtensionEvent::AssistantMessageRender,
+        ExtensionEvent::SystemPromptCompose,
+        ExtensionEvent::PreToolUse,
+        ExtensionEvent::PostToolUse,
+        ExtensionEvent::PreCompact,
+        ExtensionEvent::PostCompact,
+        ExtensionEvent::SessionStart,
+        ExtensionEvent::Stop,
     ];
 
     /// Events whose envelope carries a `tool_name`. The `matcher` field
     /// on a hook spec is meaningful only for these — declaring `matcher`
     /// on (say) `SessionStart` triggers a one-time `[warn]` at load.
     pub fn uses_tool_matcher(self) -> bool {
-        matches!(self, HookEvent::PreToolUse | HookEvent::PostToolUse)
+        matches!(
+            self,
+            ExtensionEvent::PreToolUse | ExtensionEvent::PostToolUse
+        )
     }
 }
 
@@ -68,7 +71,7 @@ impl HookEvent {
 /// Per-event fields are all `Option<…>`; the hook reads only the fields
 /// its event populates and ignores the rest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct HookInput {
+pub struct ExtensionInput {
     pub hook_event_name: String,
     pub session_id: String,
     pub cwd: String,
@@ -120,12 +123,12 @@ pub struct HookInput {
 /// JSON the hook subprocess writes back on stdout. All fields are optional;
 /// an exit 0 with empty stdout means "pass through unchanged".
 ///
-/// `Eq` is deliberately not derived: `HookSpecificOutput::updated_input`
+/// `Eq` is deliberately not derived: `ExtensionSpecificOutput::updated_input`
 /// holds a `serde_json::Value`, which is `PartialEq` but not `Eq` because
 /// `Value::Number` can wrap an `f64`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
-pub struct HookOutput {
+pub struct ExtensionOutput {
     /// `false` blocks the chain. For `UserPromptSubmit` this rejects the
     /// turn; for `AssistantMessageRender` it degrades to a soft failure
     /// (the message already exists). See `dispatch.rs` for per-event
@@ -151,7 +154,7 @@ pub struct HookOutput {
     #[serde(rename = "stopReason", skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     #[serde(rename = "hookSpecificOutput", skip_serializing_if = "Option::is_none")]
-    pub hook_specific_output: Option<HookSpecificOutput>,
+    pub hook_specific_output: Option<ExtensionSpecificOutput>,
 }
 
 /// The per-event payload that carries the rewrite. Unknown fields are
@@ -159,7 +162,7 @@ pub struct HookOutput {
 /// hooks reading the same envelope.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
-pub struct HookSpecificOutput {
+pub struct ExtensionSpecificOutput {
     #[serde(rename = "hookEventName", skip_serializing_if = "Option::is_none")]
     pub hook_event_name: Option<String>,
     /// `UserPromptSubmit` (string) or `PreToolUse` (object): the rewrite.
@@ -190,7 +193,7 @@ mod tests {
 
     #[test]
     fn input_round_trips_user_prompt_submit() {
-        let input = HookInput {
+        let input = ExtensionInput {
             hook_event_name: "UserPromptSubmit".to_string(),
             session_id: "s1".to_string(),
             cwd: "/tmp".to_string(),
@@ -202,7 +205,7 @@ mod tests {
         assert!(!json.contains("\"content\""));
         assert!(!json.contains("\"tool_name\""));
         assert!(json.contains("\"prompt\":\"hello\""));
-        let back: HookInput = serde_json::from_str(&json).unwrap();
+        let back: ExtensionInput = serde_json::from_str(&json).unwrap();
         assert_eq!(back, input);
     }
 
@@ -210,7 +213,7 @@ mod tests {
     fn input_round_trips_pre_tool_use_envelope() {
         // PreToolUse-shaped envelope: tool_name + tool_input object, no
         // prompt or content. Pins the v2 wire format.
-        let input = HookInput {
+        let input = ExtensionInput {
             hook_event_name: "PreToolUse".to_string(),
             session_id: "s2".to_string(),
             cwd: "/repo".to_string(),
@@ -222,7 +225,7 @@ mod tests {
         assert!(json.contains("\"tool_name\":\"Bash\""));
         assert!(json.contains("\"tool_input\""));
         assert!(!json.contains("\"prompt\""));
-        let back: HookInput = serde_json::from_str(&json).unwrap();
+        let back: ExtensionInput = serde_json::from_str(&json).unwrap();
         assert_eq!(back, input);
     }
 
@@ -238,7 +241,7 @@ mod tests {
                 "updatedInput": "rewritten prompt"
             }
         }"#;
-        let out: HookOutput = serde_json::from_str(raw).unwrap();
+        let out: ExtensionOutput = serde_json::from_str(raw).unwrap();
         assert_eq!(out.r#continue, Some(true));
         let spec = out.hook_specific_output.expect("hookSpecificOutput");
         assert_eq!(
@@ -258,7 +261,7 @@ mod tests {
                 "updatedInput": { "command": "echo safe" }
             }
         }"#;
-        let out: HookOutput = serde_json::from_str(raw).unwrap();
+        let out: ExtensionOutput = serde_json::from_str(raw).unwrap();
         let spec = out.hook_specific_output.expect("hookSpecificOutput");
         let obj = spec
             .updated_input
@@ -281,7 +284,7 @@ mod tests {
                 "additionalContext": "test suite failed"
             }
         }"#;
-        let out: HookOutput = serde_json::from_str(raw).unwrap();
+        let out: ExtensionOutput = serde_json::from_str(raw).unwrap();
         assert_eq!(out.decision.as_deref(), Some("block"));
         assert_eq!(out.reason.as_deref(), Some("destructive command"));
         let spec = out.hook_specific_output.expect("hookSpecificOutput");
@@ -298,7 +301,7 @@ mod tests {
             "futureField": 42,
             "hookSpecificOutput": {"updatedOutput": "x", "extra": "ignored"}
         }"#;
-        let out: HookOutput = serde_json::from_str(raw).unwrap();
+        let out: ExtensionOutput = serde_json::from_str(raw).unwrap();
         assert_eq!(out.r#continue, Some(false));
         assert_eq!(
             out.hook_specific_output
@@ -310,8 +313,8 @@ mod tests {
 
     #[test]
     fn empty_object_is_a_valid_passthrough() {
-        let out: HookOutput = serde_json::from_str("{}").unwrap();
-        assert_eq!(out, HookOutput::default());
+        let out: ExtensionOutput = serde_json::from_str("{}").unwrap();
+        assert_eq!(out, ExtensionOutput::default());
     }
 
     #[test]
@@ -319,10 +322,10 @@ mod tests {
         // Pins the allow-list `matcher` is meaningful on. Adding a new
         // tool event must extend this set (otherwise users declaring
         // matcher silently lose it).
-        assert!(HookEvent::PreToolUse.uses_tool_matcher());
-        assert!(HookEvent::PostToolUse.uses_tool_matcher());
-        for ev in HookEvent::ALL {
-            if !matches!(ev, HookEvent::PreToolUse | HookEvent::PostToolUse) {
+        assert!(ExtensionEvent::PreToolUse.uses_tool_matcher());
+        assert!(ExtensionEvent::PostToolUse.uses_tool_matcher());
+        for ev in ExtensionEvent::ALL {
+            if !matches!(ev, ExtensionEvent::PreToolUse | ExtensionEvent::PostToolUse) {
                 assert!(
                     !ev.uses_tool_matcher(),
                     "{} unexpectedly uses tool matcher",
@@ -336,7 +339,7 @@ mod tests {
     fn all_event_names_round_trip_through_as_str() {
         // Every variant in ALL has a stable string label. The wire format
         // is keyed on these — a typo or rename here is a breaking change.
-        for ev in HookEvent::ALL {
+        for ev in ExtensionEvent::ALL {
             let s = ev.as_str();
             assert!(!s.is_empty());
             // PascalCase, matches CC's convention.

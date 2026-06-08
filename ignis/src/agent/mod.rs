@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::llm::{
     now_ms, LlmProvider, LlmResponseDelta, Message, ToolCall, ToolCallFunction, Usage,
 };
-use crate::tools::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
+use crate::tools::tool::{AgentTool, ExecutionMode, ToolExtensions, ToolResult};
 
 pub mod agents_md;
 
@@ -170,8 +170,8 @@ async fn before_llm_call(
     inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     history: &mut Vec<Message>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-    prompt_hooks: Option<&crate::hooks::HookRegistry>,
-    hook_ctx: Option<crate::hooks::HookContext<'_>>,
+    prompt_hooks: Option<&crate::extensions::ExtensionRegistry>,
+    hook_ctx: Option<crate::extensions::ExtensionContext<'_>>,
 ) -> usize {
     let mut n = 0;
     if let Some(rx) = inject_rx {
@@ -179,11 +179,11 @@ async fn before_llm_call(
             let effective = match (prompt_hooks, hook_ctx) {
                 (Some(reg), Some(ctx)) => {
                     match reg.run_user_prompt_submit(&text, ctx, tx).await {
-                        crate::hooks::PromptHookResult::Continue(t) => Some(t),
+                        crate::extensions::PromptExtensionResult::Continue(t) => Some(t),
                         // Block: warning already emitted on `tx`; drop
                         // the inject entirely — same posture as
                         // Session::prompt's short-circuit.
-                        crate::hooks::PromptHookResult::Blocked { .. } => None,
+                        crate::extensions::PromptExtensionResult::Blocked { .. } => None,
                     }
                 }
                 _ => Some(text),
@@ -216,7 +216,7 @@ async fn before_llm_call(
 /// inspect `tool_input` should treat null as "unavailable".
 async fn push_with_hook(
     history: &mut Vec<Message>,
-    hooks: Option<&dyn ToolHooks>,
+    hooks: Option<&dyn ToolExtensions>,
     args: &serde_json::Value,
     msg: Message,
 ) {
@@ -333,7 +333,7 @@ fn tool_result_message(name: &str, call_id: &str, result: &ToolResult) -> Messag
 }
 
 /// Outcome of the `before_tool_call` gate for a single tool call.
-enum HookGateOutcome {
+enum ExtensionGateOutcome {
     /// Hook chain (or no hooks) returned `Ok(None)`. Run the tool with
     /// the original arguments.
     Proceed,
@@ -356,16 +356,16 @@ enum HookGateOutcome {
 /// renders like any other.
 async fn before_tool_call_block(
     tc: &ToolCall,
-    hooks: Option<&dyn ToolHooks>,
+    hooks: Option<&dyn ToolExtensions>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-) -> HookGateOutcome {
+) -> ExtensionGateOutcome {
     let Some(h) = hooks else {
-        return HookGateOutcome::Proceed;
+        return ExtensionGateOutcome::Proceed;
     };
     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
     match h.before_tool_call(&tc.function.name, &args).await {
-        Ok(None) => HookGateOutcome::Proceed,
-        Ok(Some(rewritten)) => HookGateOutcome::Rewrite(rewritten),
+        Ok(None) => ExtensionGateOutcome::Proceed,
+        Ok(Some(rewritten)) => ExtensionGateOutcome::Rewrite(rewritten),
         Err(reason) => {
             let blocked = ToolResult::error(format!("Blocked by hook: {}", reason));
             let _ = tx
@@ -381,7 +381,7 @@ async fn before_tool_call_block(
                     result: blocked.clone(),
                 })
                 .await;
-            HookGateOutcome::Block(tool_result_message(&tc.function.name, &tc.id, &blocked))
+            ExtensionGateOutcome::Block(tool_result_message(&tc.function.name, &tc.id, &blocked))
         }
     }
 }
@@ -681,7 +681,7 @@ pub struct Agent {
     system_prompt: String,
     provider: Box<dyn LlmProvider>,
     tools: Vec<Arc<dyn AgentTool>>,
-    hooks: Option<Box<dyn ToolHooks>>,
+    hooks: Option<Box<dyn ToolExtensions>>,
     skills: Option<Arc<SkillRegistry>>,
     mcp: Option<Arc<McpRegistry>>,
     /// Project instructions (from `AGENTS.md`) prepended to each request as a
@@ -717,7 +717,7 @@ impl Agent {
         self.tools.push(tool);
     }
 
-    pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
+    pub fn set_hooks(&mut self, hooks: Box<dyn ToolExtensions>) {
         self.hooks = Some(hooks);
     }
 
@@ -1050,8 +1050,8 @@ impl Agent {
         history: &mut Vec<Message>,
         tx: tokio::sync::mpsc::Sender<AgentEvent>,
         mut inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
-        prompt_hooks: Option<&crate::hooks::HookRegistry>,
-        hook_ctx: Option<crate::hooks::HookContext<'_>>,
+        prompt_hooks: Option<&crate::extensions::ExtensionRegistry>,
+        hook_ctx: Option<crate::extensions::ExtensionContext<'_>>,
     ) -> Result<Usage, anyhow::Error> {
         let _ = tx.send(AgentEvent::TurnStart).await;
         let effective_prompt = with_catalog(
@@ -1152,7 +1152,9 @@ impl Agent {
                                 history.push(Message {
                                     role: "user".to_string(),
                                     content: Some(
-                                        crate::hooks::render_injection_as_system_reminder(&inj),
+                                        crate::extensions::render_injection_as_system_reminder(
+                                            &inj,
+                                        ),
                                     ),
                                     reasoning_content: None,
                                     name: None,
@@ -1208,14 +1210,14 @@ impl Agent {
             let mut results = Vec::new();
             for mut tc in tool_calls_owned {
                 match before_tool_call_block(&tc, hooks.as_deref(), &tx_clone).await {
-                    HookGateOutcome::Block(blocked) => results.push(blocked),
-                    HookGateOutcome::Rewrite(args) => {
+                    ExtensionGateOutcome::Block(blocked) => results.push(blocked),
+                    ExtensionGateOutcome::Rewrite(args) => {
                         apply_rewrite(&mut tc, args);
                         results.push(
                             execute_single_tool(tc, tools_map.clone(), tx_clone.clone()).await,
                         );
                     }
-                    HookGateOutcome::Proceed => {
+                    ExtensionGateOutcome::Proceed => {
                         results.push(
                             execute_single_tool(tc, tools_map.clone(), tx_clone.clone()).await,
                         );
@@ -1232,12 +1234,12 @@ impl Agent {
             for tc in &tool_calls_owned {
                 let mut tc = tc.clone();
                 match before_tool_call_block(&tc, hooks.as_deref(), &tx_clone).await {
-                    HookGateOutcome::Block(blocked) => blocked_results.push(blocked),
-                    HookGateOutcome::Rewrite(args) => {
+                    ExtensionGateOutcome::Block(blocked) => blocked_results.push(blocked),
+                    ExtensionGateOutcome::Rewrite(args) => {
                         apply_rewrite(&mut tc, args);
                         allowed_calls.push(tc);
                     }
-                    HookGateOutcome::Proceed => allowed_calls.push(tc),
+                    ExtensionGateOutcome::Proceed => allowed_calls.push(tc),
                 }
             }
 
@@ -1307,7 +1309,7 @@ impl Agent {
             for inj in h.drain_pending_context().await {
                 history.push(Message {
                     role: "user".to_string(),
-                    content: Some(crate::hooks::render_injection_as_system_reminder(&inj)),
+                    content: Some(crate::extensions::render_injection_as_system_reminder(&inj)),
                     reasoning_content: None,
                     name: None,
                     tool_call_id: None,

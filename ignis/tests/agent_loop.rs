@@ -751,7 +751,7 @@ async fn session_captures_real_token_usage() {
 #[cfg(unix)]
 #[tokio::test]
 async fn user_prompt_submit_block_short_circuits_turn() {
-    use ignis::hooks::{HookRegistry, HookSpec, HooksConfig};
+    use ignis::extensions::{ExtensionRegistry, ExtensionSpec, ExtensionsConfig};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -810,15 +810,15 @@ async fn user_prompt_submit_block_short_circuits_turn() {
     )
     .await
     .unwrap();
-    session.set_hook_registry(HookRegistry::from_config(HooksConfig {
-        user_prompt_submit: vec![HookSpec {
+    session.set_hook_registry(ExtensionRegistry::from_config(ExtensionsConfig {
+        user_prompt_submit: vec![ExtensionSpec {
             program: hook_path,
             args: vec![],
             timeout_ms: 5_000,
             matcher: None,
         }],
         assistant_message_render: vec![],
-        ..HooksConfig::default()
+        ..ExtensionsConfig::default()
     }));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
