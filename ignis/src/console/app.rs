@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use super::composer::Composer;
-use super::connect::{ConnectAdvance, ConnectFlow, ConnectOutcome};
+use super::connect::{ConnectAdvance, ConnectFlow, ConnectOutcome, ConnectResult};
 use super::{
     format_elapsed, next_selection, slash_suggestions, SelectionDirection, SlashCommand, SPINNERS,
     THINKING_VERBS,
@@ -833,29 +833,50 @@ impl App {
 
     /// Drive the `/connect` flow one step forward given the picker's answer.
     /// Coordinator over [`ConnectFlow::advance`]: it emits the flow's notices
-    /// and, on success, adopts the new `provider`/`model` (clearing `effort`) so
-    /// the banner reflects the pick. The agent loop gets a separate
+    /// and, on either success, rebuilds the `/model` list so the connected
+    /// provider's models appear in-session; a `Switched` result also adopts the
+    /// new `provider`/`model` (clearing `effort`). The agent loop gets a separate
     /// `ReloadConfig` request from `keys.rs` on `Saved`.
     pub(crate) fn advance_connect(
         &mut self,
         answers: Vec<crate::console::picker::PickerAnswer>,
     ) -> ConnectAdvance {
-        match self.connect.advance(answers) {
+        let current = (!self.provider.is_empty() && !self.model.is_empty())
+            .then(|| (self.provider.clone(), self.model.clone()));
+        let current_ref = current.as_ref().map(|(p, m)| (p.as_str(), m.as_str()));
+        match self.connect.advance(answers, current_ref) {
             ConnectOutcome::NextPicker(req) => ConnectAdvance::NextPicker(req),
-            ConnectOutcome::Done { notices, applied } => {
+            ConnectOutcome::Done { notices, result } => {
                 for notice in notices {
                     self.add_assistant_notice(notice);
                 }
-                match applied {
-                    Some((provider, model)) => {
+                match result {
+                    ConnectResult::Switched(provider, model) => {
                         self.provider = provider;
                         self.model = model;
                         self.effort = None;
+                        self.rebuild_model_options();
                         ConnectAdvance::Saved
                     }
-                    None => ConnectAdvance::Failed,
+                    ConnectResult::KeptCurrent => {
+                        self.rebuild_model_options();
+                        ConnectAdvance::Saved
+                    }
+                    ConnectResult::Failed => ConnectAdvance::Failed,
                 }
             }
+        }
+    }
+
+    /// Rebuild the `/model` list from the freshly-written config so a
+    /// newly-connected provider's whole model catalog is selectable in-session,
+    /// without a restart. Mirrors the startup path and the agent loop's
+    /// `ReloadConfig`.
+    fn rebuild_model_options(&mut self) {
+        let catalog = crate::llm::catalog::load();
+        match crate::config::load_config() {
+            Ok(cfg) => self.model_options = cfg.model_options(&catalog),
+            Err(e) => log::error!("/connect: model list not refreshed: {e}"),
         }
     }
 
@@ -1387,6 +1408,48 @@ mod connect_tests {
         let draft = app.connect.draft().unwrap();
         assert_eq!(draft.step, ConnectStep::PickModel);
         assert_eq!(draft.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn model_picker_offers_keep_current_when_a_model_is_active() {
+        // Re-connecting (a model is already active) — the model step leads with
+        // a "keep current" row so the user can connect without switching away.
+        let mut app = App::new(
+            "deepseek".to_string(),
+            "deepseek-v4-flash".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        let _ = app.start_connect().unwrap();
+        let _ = app.advance_connect(vec![PickerAnswer::Single("OpenAI".into())]);
+        let outcome = app.advance_connect(vec![PickerAnswer::Single("sk-test".into())]);
+        match outcome {
+            ConnectAdvance::NextPicker(req) => {
+                let opts = &req.questions[0].options;
+                assert_eq!(opts[0].label, "Keep current model");
+                assert!(opts[0].description.contains("deepseek/deepseek-v4-flash"));
+                // The provider's real models follow the keep row.
+                assert!(opts.iter().skip(1).any(|o| o.label == "gpt-5.5"));
+            }
+            other => panic!("expected model picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_picker_has_no_keep_row_on_first_connect() {
+        // No active model yet — nothing to keep, so only the provider's models.
+        let mut app = fresh_app();
+        let _ = app.start_connect().unwrap();
+        let _ = app.advance_connect(vec![PickerAnswer::Single("OpenAI".into())]);
+        let outcome = app.advance_connect(vec![PickerAnswer::Single("sk-test".into())]);
+        match outcome {
+            ConnectAdvance::NextPicker(req) => {
+                let opts = &req.questions[0].options;
+                assert!(opts.iter().all(|o| o.label != "Keep current model"));
+                assert_eq!(opts[0].label, "gpt-5.5");
+            }
+            other => panic!("expected model picker, got {other:?}"),
+        }
     }
 
     #[test]
