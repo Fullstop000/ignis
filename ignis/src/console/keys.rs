@@ -56,65 +56,67 @@ fn is_skill_command(app: &App, command: &str) -> bool {
         .is_some_and(|r| r.all().iter().any(|s| format!("/{}", s.name) == command))
 }
 
+/// Editor-style cursor / paste ops the input box always honors (both at idle
+/// and, via the busy-mode fallthrough, while a turn runs). Mutations go through
+/// the typed `app.composer` surface so the cursor/input UTF-8 invariant can't be
+/// violated from here; `app` only owns the cross-cutting exit-hint + slash reset.
 /// Returns true if the key was consumed.
 fn apply_edit_key(app: &mut App, key: KeyEvent) -> bool {
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
             app.clear_exit_hint();
-            app.input.clear();
-            app.cursor = 0;
-            app.pending_pastes.clear();
+            app.composer.clear();
             app.reset_slash_selection();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
             app.clear_exit_hint();
-            app.cursor = 0;
+            app.composer.cursor_home();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
             app.clear_exit_hint();
-            app.cursor = app.input.len();
+            app.composer.cursor_end();
         }
-        (KeyModifiers::CONTROL, KeyCode::Char('w')) if app.cursor > 0 => {
+        (KeyModifiers::CONTROL, KeyCode::Char('w')) if app.composer.cursor > 0 => {
             app.clear_exit_hint();
-            app.delete_word_back();
+            app.composer.delete_word_back();
         }
         (m, KeyCode::Char('j'))
             if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
         {
             app.clear_exit_hint();
-            app.insert_char('\n');
+            app.composer.insert_char('\n');
             app.reset_slash_selection();
         }
         (_, KeyCode::Char(c)) => {
             app.clear_exit_hint();
-            app.insert_char(c);
+            app.composer.insert_char(c);
             app.reset_slash_selection();
         }
-        (_, KeyCode::Backspace) if app.cursor > 0 => {
+        (_, KeyCode::Backspace) if app.composer.cursor > 0 => {
             app.clear_exit_hint();
-            app.backspace();
+            app.composer.backspace();
             app.reset_slash_selection();
         }
-        (_, KeyCode::Delete) if app.cursor < app.input.len() => {
+        (_, KeyCode::Delete) if app.composer.cursor < app.composer.input.len() => {
             app.clear_exit_hint();
-            app.delete_forward();
+            app.composer.delete_forward();
             app.reset_slash_selection();
         }
-        (_, KeyCode::Left) if app.cursor > 0 => {
+        (_, KeyCode::Left) if app.composer.cursor > 0 => {
             app.clear_exit_hint();
-            app.move_left();
+            app.composer.move_left();
         }
-        (_, KeyCode::Right) if app.cursor < app.input.len() => {
+        (_, KeyCode::Right) if app.composer.cursor < app.composer.input.len() => {
             app.clear_exit_hint();
-            app.move_right();
+            app.composer.move_right();
         }
         (_, KeyCode::Home) => {
             app.clear_exit_hint();
-            app.cursor = 0;
+            app.composer.cursor_home();
         }
         (_, KeyCode::End) => {
             app.clear_exit_hint();
-            app.cursor = app.input.len();
+            app.composer.cursor_end();
         }
         _ => return false,
     }
@@ -132,6 +134,42 @@ pub(crate) fn handle_paste(app: &mut App, data: String) {
     }
 }
 
+/// Dispatch a multi-select **toggle** picker (`/skills`, `/mcp`): ↑/↓ move the
+/// highlight, Enter/Space toggle the highlighted row's `[x]/[ ]` checkbox (the
+/// checkbox is the feedback — no transcript notice per toggle), Esc closes it,
+/// and any other char closes it *and* falls through so the char still types.
+/// `$select`/`$toggle` are this picker's `App` methods; `$field` is its
+/// `Option<…Picker>`. The model and session pickers don't use this — they carry
+/// bespoke behavior (effort cycling, List/Detail drill-in).
+macro_rules! toggle_picker {
+    ($app:ident, $key:ident, $field:ident, $select:ident, $toggle:ident) => {
+        if $app.$field.is_some() {
+            match $key.code {
+                KeyCode::Up => {
+                    $app.$select(SelectionDirection::Previous);
+                    return;
+                }
+                KeyCode::Down => {
+                    $app.$select(SelectionDirection::Next);
+                    return;
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    $app.$toggle();
+                    return;
+                }
+                KeyCode::Esc => {
+                    $app.$field = None;
+                    return;
+                }
+                KeyCode::Char(_) => {
+                    $app.$field = None;
+                }
+                _ => {}
+            }
+        }
+    };
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_key(
     app: &mut App,
@@ -147,7 +185,7 @@ pub(crate) async fn handle_key(
     // ESC and Ctrl+C — must come before global handlers and the busy-mode
     // gate, because the picker is the only thing the user is interacting with.
     if let Some(state) = app.inline_picker.as_mut() {
-        use crate::console::app::ConnectAdvance;
+        use crate::console::connect::ConnectAdvance;
         use crate::console::picker::PickerResponse;
         use inline_picker::KeyOutcome;
         let outcome = state.on_key(key);
@@ -173,7 +211,7 @@ pub(crate) async fn handle_key(
                 // Multi-step `/connect`: route the answer back into the draft
                 // state machine. The advance returns the next picker to open
                 // (steps 1 and 2) or signals success (step 3 persisted).
-                if app.connect_draft.is_some() {
+                if app.connect.is_active() {
                     match app.advance_connect(answers) {
                         ConnectAdvance::NextPicker(req) => {
                             let _ = picker_tx.send(req).await;
@@ -233,16 +271,16 @@ pub(crate) async fn handle_key(
     // never falls through to the idle handler and types a literal 's'.
     if matches!(key.code, KeyCode::Char('s')) && key.modifiers.contains(KeyModifiers::CONTROL) {
         if app.mode != Mode::Idle {
-            let text = app.expand_pastes(app.input.trim().to_string());
+            let text = app
+                .composer
+                .expand_pastes(app.composer.input.trim().to_string());
             if !text.is_empty() {
                 let sender = active_inject.lock().unwrap().clone();
                 match sender {
                     Some(tx) => match tx.try_send(text.clone()) {
                         Ok(()) => {
                             app.pending_injects.push(text);
-                            app.input.clear();
-                            app.cursor = 0;
-                            app.pending_pastes.clear();
+                            app.composer.clear();
                             app.reset_slash_selection();
                         }
                         Err(_) => {
@@ -256,9 +294,7 @@ pub(crate) async fn handle_key(
                     // queue is visible while busy and drains at the next TurnEnd.
                     None => {
                         app.enqueue(text);
-                        app.input.clear();
-                        app.cursor = 0;
-                        app.pending_pastes.clear();
+                        app.composer.clear();
                         app.reset_slash_selection();
                     }
                 }
@@ -276,14 +312,14 @@ pub(crate) async fn handle_key(
                 // into the input first, so the queued line is the full command
                 // (e.g. "/com" + Enter → "/compact" queued).
                 if let Some(cmd) = app.selected_slash_command() {
-                    app.input = cmd;
+                    app.composer.set_text(cmd);
                 }
-                let text = app.expand_pastes(app.input.trim().to_string());
+                let text = app
+                    .composer
+                    .expand_pastes(app.composer.input.trim().to_string());
                 if !text.is_empty() {
                     app.enqueue(text);
-                    app.input.clear();
-                    app.cursor = 0;
-                    app.pending_pastes.clear();
+                    app.composer.clear();
                     app.reset_slash_selection();
                 }
             }
@@ -293,7 +329,7 @@ pub(crate) async fn handle_key(
             (_, KeyCode::Down) if !app.slash_suggestions().is_empty() => {
                 app.select_slash_suggestion(SelectionDirection::Next);
             }
-            (_, KeyCode::Up) if app.input.is_empty() && !app.queue.is_empty() => {
+            (_, KeyCode::Up) if app.composer.input.is_empty() && !app.queue.is_empty() => {
                 app.recall_last_queued();
             }
             (_, KeyCode::Up) => app.history_prev(),
@@ -409,88 +445,34 @@ pub(crate) async fn handle_key(
         }
     }
 
-    if app.skill_picker.is_some() {
-        match key.code {
-            KeyCode::Up => {
-                app.select_skill_picker(SelectionDirection::Previous);
-                return;
-            }
-            KeyCode::Down => {
-                app.select_skill_picker(SelectionDirection::Next);
-                return;
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                // The picker's [x]/[ ] checkbox is the feedback; don't emit a
-                // notice into the transcript on every toggle.
-                app.toggle_selected_skill();
-                return;
-            }
-            KeyCode::Esc => {
-                app.skill_picker = None;
-                return;
-            }
-            KeyCode::Char(_) => {
-                app.skill_picker = None;
-            }
-            _ => {}
-        }
-    }
+    toggle_picker!(
+        app,
+        key,
+        skill_picker,
+        select_skill_picker,
+        toggle_selected_skill
+    );
+    toggle_picker!(
+        app,
+        key,
+        mcp_picker,
+        select_mcp_picker,
+        toggle_selected_mcp_server
+    );
 
-    if app.mcp_picker.is_some() {
-        match key.code {
-            KeyCode::Up => {
-                app.select_mcp_picker(SelectionDirection::Previous);
-                return;
-            }
-            KeyCode::Down => {
-                app.select_mcp_picker(SelectionDirection::Next);
-                return;
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                app.toggle_selected_mcp_server();
-                return;
-            }
-            KeyCode::Esc => {
-                app.mcp_picker = None;
-                return;
-            }
-            KeyCode::Char(_) => {
-                app.mcp_picker = None;
-            }
-            _ => {}
-        }
-    }
-
+    // Idle-specific arms first (submit + history/slash navigation); every other
+    // key falls through to `apply_edit_key`, the single home of the editor arms
+    // (Ctrl+U/A/E/W, Char, Backspace, Delete, arrows, Home/End) — so the editor
+    // behavior is defined once and shared with the busy-mode fallthrough.
     match (key.modifiers, key.code) {
         (_, KeyCode::Enter) => {
-            let text = if let Some(cmd) = app.selected_slash_command() {
-                app.input = cmd;
-                app.submit().unwrap_or_default()
-            } else {
-                app.submit().unwrap_or_default()
-            };
+            if let Some(cmd) = app.selected_slash_command() {
+                app.composer.set_text(cmd);
+            }
+            let text = app.submit().unwrap_or_default();
             if !text.is_empty() {
                 submit_text(app, text, prompt_tx, picker_tx, notice_tx, storage_dir).await;
             }
-        }
-        (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
-            app.clear_exit_hint();
-            app.input.clear();
-            app.cursor = 0;
-            app.pending_pastes.clear();
-            app.reset_slash_selection();
-        }
-        (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
-            app.clear_exit_hint();
-            app.cursor = 0;
-        }
-        (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
-            app.clear_exit_hint();
-            app.cursor = app.input.len();
-        }
-        (KeyModifiers::CONTROL, KeyCode::Char('w')) if app.cursor > 0 => {
-            app.clear_exit_hint();
-            app.delete_word_back();
         }
         (_, KeyCode::Up) if !app.slash_suggestions().is_empty() => {
             app.select_slash_suggestion(SelectionDirection::Previous);
@@ -504,49 +486,11 @@ pub(crate) async fn handle_key(
         (_, KeyCode::Down) => {
             app.history_next();
         }
-        (m, KeyCode::Char('j'))
-            if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
-        {
-            // Ctrl/Cmd+J inserts a newline (Enter still submits).
-            app.clear_exit_hint();
-            app.insert_char('\n');
-            app.reset_slash_selection();
+        // Editor keys (and PgUp/PgDn etc., which `apply_edit_key` ignores so the
+        // terminal's own native scrollback handles them).
+        _ => {
+            apply_edit_key(app, key);
         }
-        (_, KeyCode::Char(c)) => {
-            app.clear_exit_hint();
-            app.insert_char(c);
-            app.reset_slash_selection();
-        }
-        (_, KeyCode::Backspace) if app.cursor > 0 => {
-            app.clear_exit_hint();
-            app.backspace();
-            app.reset_slash_selection();
-        }
-        (_, KeyCode::Delete) if app.cursor < app.input.len() => {
-            app.clear_exit_hint();
-            app.delete_forward();
-            app.reset_slash_selection();
-        }
-        (_, KeyCode::Left) if app.cursor > 0 => {
-            app.clear_exit_hint();
-            app.move_left();
-        }
-        (_, KeyCode::Right) if app.cursor < app.input.len() => {
-            app.clear_exit_hint();
-            app.move_right();
-        }
-        (_, KeyCode::Home) => {
-            app.clear_exit_hint();
-            app.cursor = 0;
-        }
-        (_, KeyCode::End) => {
-            app.clear_exit_hint();
-            app.cursor = app.input.len();
-        }
-        // PgUp/PgDn/Ctrl+Home/End are left to the terminal — inline rendering
-        // puts the conversation in native scrollback, so the terminal's own
-        // scroll (mouse wheel, Shift+PgUp) handles history.
-        _ => {}
     }
 }
 
