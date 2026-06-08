@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use super::composer::Composer;
 use super::{
     format_elapsed, next_selection, slash_suggestions, SelectionDirection, SlashCommand, SPINNERS,
     THINKING_VERBS,
@@ -466,14 +467,6 @@ pub(crate) enum Mode {
     ToolRunning, // tool execution in progress
 }
 
-/// A pasted block collapsed into a chip. The `placeholder` text lives inline in
-/// the composer buffer; `expand_pastes` swaps it back for `content` at commit so
-/// the agent never sees the chip. Placeholders are unique (monotonic counter).
-pub(crate) struct PendingPaste {
-    pub(crate) placeholder: String,
-    pub(crate) content: String,
-}
-
 pub(crate) struct App {
     pub(crate) provider: String,
     pub(crate) model: String,
@@ -483,16 +476,8 @@ pub(crate) struct App {
     pub(crate) cwd: PathBuf,
 
     pub(crate) blocks: Vec<UIBlock>,
-    pub(crate) input: String,
-    pub(crate) cursor: usize,
-    /// Collapsed paste blocks (chip ↔ full content) currently in the composer.
-    pub(crate) pending_pastes: Vec<PendingPaste>,
-    /// Monotonic `#N` counter for paste chips. Never reset, so numbering keeps
-    /// climbing across messages and every placeholder string stays unique.
-    pub(crate) paste_counter: usize,
-    pub(crate) history: Vec<String>,
-    pub(crate) history_idx: Option<usize>,
-    pub(crate) saved_input: String, // saved input when browsing history
+    /// The text composer: input buffer, cursor, paste chips, input history.
+    pub(crate) composer: Composer,
     pub(crate) slash_selection: usize,
     pub(crate) session_picker: Option<SessionPicker>,
     /// Choices for the `/model` picker, flattened from config.
@@ -602,13 +587,7 @@ impl App {
             session_id,
             cwd,
             blocks: Vec::new(),
-            input: String::new(),
-            cursor: 0,
-            pending_pastes: Vec::new(),
-            paste_counter: 0,
-            history: Vec::new(),
-            history_idx: None,
-            saved_input: String::new(),
+            composer: Composer::default(),
             slash_selection: 0,
             session_picker: None,
             model_options: Vec::new(),
@@ -899,161 +878,20 @@ impl App {
         }
     }
 
-    /// Byte offset of the char boundary one character left of the cursor.
-    /// `cursor` indexes `input` by byte, so movement must step whole UTF-8
-    /// chars — a naive `cursor -= 1` lands mid-character and panics on slice.
-    fn prev_char_boundary(&self) -> usize {
-        self.input[..self.cursor]
-            .chars()
-            .next_back()
-            .map_or(0, |c| self.cursor - c.len_utf8())
-    }
-
-    /// Byte offset of the char boundary one character right of the cursor.
-    fn next_char_boundary(&self) -> usize {
-        self.input[self.cursor..]
-            .chars()
-            .next()
-            .map_or(self.cursor, |c| self.cursor + c.len_utf8())
-    }
-
-    pub(crate) fn insert_char(&mut self, c: char) {
-        self.snap_out_of_chip();
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-    }
-
-    pub(crate) fn insert_str(&mut self, s: &str) {
-        self.snap_out_of_chip();
-        self.input.insert_str(self.cursor, s);
-        self.cursor += s.len();
-    }
-
-    pub(crate) fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let prev = self.prev_char_boundary();
-        if let Some((start, end, i)) = self.chip_overlapping(prev, self.cursor) {
-            self.remove_chip(start, end, i);
-            return;
-        }
-        self.input.remove(prev);
-        self.cursor = prev;
-    }
-
-    pub(crate) fn delete_forward(&mut self) {
-        if self.cursor >= self.input.len() {
-            return;
-        }
-        let next = self.next_char_boundary();
-        if let Some((start, end, i)) = self.chip_overlapping(self.cursor, next) {
-            self.remove_chip(start, end, i);
-            return;
-        }
-        self.input.remove(self.cursor);
-    }
-
-    /// Ctrl+W: delete the word before the cursor. A chip in the way is removed
-    /// whole rather than half-eaten into a fragment.
-    pub(crate) fn delete_word_back(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let before = &self.input[..self.cursor];
-        let trimmed = before.trim_end();
-        let new_end = trimmed
-            .rfind(|c: char| c.is_whitespace())
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        if let Some((start, end, i)) = self.chip_overlapping(new_end, self.cursor) {
-            self.remove_chip(start, end, i);
-            return;
-        }
-        self.input.replace_range(new_end..self.cursor, "");
-        self.cursor = new_end;
-    }
-
-    /// A paste chip is atomic. If the buffer byte range `[lo, hi)` overlaps a
-    /// chip, return its full span `[start, end)` and `pending_pastes` index, so
-    /// an edit can remove the whole chip instead of leaving a corrupted
-    /// placeholder fragment — which would both silently drop the pasted content
-    /// and leak the partial chip text to the agent.
-    fn chip_overlapping(&self, lo: usize, hi: usize) -> Option<(usize, usize, usize)> {
-        self.pending_pastes.iter().enumerate().find_map(|(i, p)| {
-            let start = self.input.find(&p.placeholder)?;
-            let end = start + p.placeholder.len();
-            (start < hi && lo < end).then_some((start, end, i))
-        })
-    }
-
-    /// Remove the chip spanning `[start, end)` (pending index `i`); park the
-    /// cursor where the chip began.
-    fn remove_chip(&mut self, start: usize, end: usize, i: usize) {
-        self.input.replace_range(start..end, "");
-        self.cursor = start;
-        self.pending_pastes.remove(i);
-    }
-
-    /// If the cursor sits strictly inside a chip, move it to the chip's end so
-    /// an insert lands beside the chip rather than splitting the placeholder.
-    fn snap_out_of_chip(&mut self) {
-        if let Some((_, end, _)) = self.chip_overlapping(self.cursor, self.cursor) {
-            self.cursor = end;
-        }
-    }
-
-    /// Number of lines at or above which a paste collapses into a chip.
-    const PASTE_COLLAPSE_MIN_LINES: usize = 4;
-
-    /// Insert pasted text at the cursor. A multi-line block (>= 4 lines)
-    /// collapses into a `[ pasted-text#N M lines ]` chip whose full content is
-    /// stashed in `pending_pastes` and restored at commit; smaller pastes go in
-    /// inline like ordinary typing.
+    /// Route a bracketed paste into the composer (a ≥4-line block collapses to a
+    /// `[ pasted-text#N ]` chip), wrapping it with the cross-cutting exit-hint
+    /// clear and slash-autocomplete reset that the composer itself doesn't own.
     pub(crate) fn handle_paste(&mut self, pasted: String) {
         self.clear_exit_hint();
-        // Normalize line endings so the chip's line count and the agent message
-        // are clean regardless of where the text was copied from.
-        let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
-        let lines = pasted.split('\n').count();
-        if lines >= Self::PASTE_COLLAPSE_MIN_LINES {
-            self.paste_counter += 1;
-            let placeholder = format!("[ pasted-text#{} {} lines ]", self.paste_counter, lines);
-            self.insert_str(&placeholder);
-            self.pending_pastes.push(PendingPaste {
-                placeholder,
-                content: pasted,
-            });
-        } else {
-            self.insert_str(&pasted);
-        }
+        self.composer.paste(pasted);
         self.reset_slash_selection();
-    }
-
-    /// Swap every paste chip back for its full content. Placeholders are unique,
-    /// so a plain replace is unambiguous; a chip the user deleted is simply
-    /// absent and replaces nothing.
-    pub(crate) fn expand_pastes(&self, mut text: String) -> String {
-        for p in &self.pending_pastes {
-            text = text.replace(&p.placeholder, &p.content);
-        }
-        text
-    }
-
-    pub(crate) fn move_left(&mut self) {
-        self.cursor = self.prev_char_boundary();
-    }
-
-    pub(crate) fn move_right(&mut self) {
-        self.cursor = self.next_char_boundary();
     }
 
     /// Push a user prompt into the transcript + input history (shared by submit
     /// and the queue drain). Does not send anything.
     pub(crate) fn push_user_prompt(&mut self, text: String) {
         self.exit_pending = false;
-        self.history.push(text.clone());
-        self.history_idx = None;
+        self.composer.push_history(text.clone());
         self.blocks.push(UIBlock::User(text));
     }
 
@@ -1076,8 +914,7 @@ impl App {
     pub(crate) fn recall_last_queued(&mut self) -> bool {
         match self.queue.pop() {
             Some(text) => {
-                self.input = text;
-                self.cursor = self.input.len();
+                self.composer.set_text(text);
                 true
             }
             None => false,
@@ -1090,20 +927,15 @@ impl App {
     }
 
     pub(crate) fn submit(&mut self) -> Option<String> {
-        let text = self.input.trim().to_string();
-        if text.is_empty() || self.mode != Mode::Idle {
+        if self.mode != Mode::Idle {
             return None;
         }
-        // Swap paste chips back for their full content before the text leaves the
-        // composer — the agent must see what was pasted, not the placeholder.
-        let text = self.expand_pastes(text);
-        // Don't push the user block from the typed buffer — `Session::prompt`
-        // emits `UserPromptCommitted` after the hook chain runs so the
-        // visible block matches what hit history. Just clear the input.
-        self.input.clear();
-        self.cursor = 0;
-        self.pending_pastes.clear();
-        Some(text)
+        // `take_submit` trims, swaps paste chips back for their full content
+        // (the agent must see what was pasted, not the placeholder), and clears
+        // the buffer. We don't push the user block from the typed text —
+        // `Session::prompt` emits `UserPromptCommitted` after the hook chain so
+        // the visible block matches what hit history.
+        self.composer.take_submit()
     }
 
     pub(crate) fn add_assistant_notice(&mut self, text: String) {
@@ -1119,7 +951,7 @@ impl App {
         self.committed = 0;
         self.reset_transcript_view();
         self.current_chunk_idx = None;
-        self.history_idx = None;
+        self.composer.reset_history_browse();
         self.last_usage = None;
         self.pending_user_display = None;
         self.session_picker = None;
@@ -1523,7 +1355,7 @@ impl App {
     }
 
     pub(crate) fn slash_suggestions(&self) -> Vec<SlashCommand> {
-        slash_suggestions(&self.input, self.skills.as_deref())
+        slash_suggestions(&self.composer.input, self.skills.as_deref())
     }
 
     pub(crate) fn reset_slash_selection(&mut self) {
@@ -1558,36 +1390,12 @@ impl App {
 
     pub(crate) fn history_prev(&mut self) {
         self.exit_pending = false;
-        if self.history.is_empty() {
-            return;
-        }
-        let idx = match self.history_idx {
-            None => {
-                self.saved_input = self.input.clone();
-                self.history.len() - 1
-            }
-            Some(0) => return,
-            Some(i) => i - 1,
-        };
-        self.history_idx = Some(idx);
-        self.input = self.history[idx].clone();
-        self.cursor = self.input.len();
+        self.composer.history_prev();
     }
 
     pub(crate) fn history_next(&mut self) {
         self.exit_pending = false;
-        let idx = match self.history_idx {
-            None => return,
-            Some(i) => i,
-        };
-        if idx + 1 >= self.history.len() {
-            self.history_idx = None;
-            self.input = self.saved_input.clone();
-        } else {
-            self.history_idx = Some(idx + 1);
-            self.input = self.history[idx + 1].clone();
-        }
-        self.cursor = self.input.len();
+        self.composer.history_next();
     }
 
     /// Update pending tool elapsed times each tick
@@ -2131,30 +1939,30 @@ mod tests {
         // 1 byte, landing mid-character and panicking on the next slice/render.
         let mut app = test_app();
         for c in "中a文".chars() {
-            app.insert_char(c);
+            app.composer.insert_char(c);
             assert!(
-                app.input.is_char_boundary(app.cursor),
+                app.composer.input.is_char_boundary(app.composer.cursor),
                 "cursor must stay on a char boundary after insert"
             );
         }
-        assert_eq!(app.input, "中a文");
-        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(app.composer.input, "中a文");
+        assert_eq!(app.composer.cursor, app.composer.input.len());
 
         // Slicing at the cursor (what draw_input does) must not panic.
-        let _ = &app.input[..app.cursor];
+        let _ = &app.composer.input[..app.composer.cursor];
 
         // Walk left across every char, then delete them.
         for _ in 0..3 {
-            app.move_left();
-            assert!(app.input.is_char_boundary(app.cursor));
+            app.composer.move_left();
+            assert!(app.composer.input.is_char_boundary(app.composer.cursor));
         }
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.composer.cursor, 0);
 
-        app.cursor = app.input.len();
-        app.backspace(); // removes "文"
-        assert_eq!(app.input, "中a");
-        assert!(app.input.is_char_boundary(app.cursor));
-        assert_eq!(app.cursor, app.input.len());
+        app.composer.cursor = app.composer.input.len();
+        app.composer.backspace(); // removes "文"
+        assert_eq!(app.composer.input, "中a");
+        assert!(app.composer.input.is_char_boundary(app.composer.cursor));
+        assert_eq!(app.composer.cursor, app.composer.input.len());
     }
 
     #[test]
@@ -2216,14 +2024,14 @@ mod tests {
         app.enqueue("older".to_string());
         app.enqueue("newest".to_string());
         assert!(app.recall_last_queued());
-        assert_eq!(app.input, "newest");
-        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(app.composer.input, "newest");
+        assert_eq!(app.composer.cursor, app.composer.input.len());
         assert_eq!(app.queue, vec!["older"]);
         // Empty queue → no-op.
-        app.input.clear();
+        app.composer.input.clear();
         app.queue.clear();
         assert!(!app.recall_last_queued());
-        assert_eq!(app.input, "");
+        assert_eq!(app.composer.input, "");
     }
 
     #[test]
@@ -2266,7 +2074,10 @@ mod tests {
             text: "steer".to_string(),
         });
         assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "steer"));
-        assert_eq!(app.history.last().map(|s| s.as_str()), Some("steer"));
+        assert_eq!(
+            app.composer.history.last().map(|s| s.as_str()),
+            Some("steer")
+        );
         assert!(app.pending_injects.is_empty());
     }
 
@@ -2296,7 +2107,10 @@ mod tests {
             text: "from-start".to_string(),
         });
         assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "from-start"));
-        assert_eq!(app.history.last().map(|s| s.as_str()), Some("from-start"));
+        assert_eq!(
+            app.composer.history.last().map(|s| s.as_str()),
+            Some("from-start")
+        );
     }
 
     #[test]
@@ -2501,46 +2315,46 @@ mod paste_tests {
     fn block_paste_collapses_to_chip() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd\ne".into()); // 5 lines >= 4
-        assert_eq!(app.input, "[ pasted-text#1 5 lines ]");
-        assert_eq!(app.pending_pastes.len(), 1);
-        assert_eq!(app.pending_pastes[0].content, "a\nb\nc\nd\ne");
+        assert_eq!(app.composer.input, "[ pasted-text#1 5 lines ]");
+        assert_eq!(app.composer.pending_pastes.len(), 1);
+        assert_eq!(app.composer.pending_pastes[0].content, "a\nb\nc\nd\ne");
     }
 
     #[test]
     fn small_paste_inserts_inline() {
         let mut app = app();
         app.handle_paste("a\nb\nc".into()); // 3 lines < 4
-        assert_eq!(app.input, "a\nb\nc");
-        assert!(app.pending_pastes.is_empty());
+        assert_eq!(app.composer.input, "a\nb\nc");
+        assert!(app.composer.pending_pastes.is_empty());
     }
 
     #[test]
     fn crlf_is_normalized_in_count_and_content() {
         let mut app = app();
         app.handle_paste("a\r\nb\r\nc\r\nd".into()); // 4 lines after normalize
-        assert_eq!(app.input, "[ pasted-text#1 4 lines ]");
-        assert_eq!(app.pending_pastes[0].content, "a\nb\nc\nd");
+        assert_eq!(app.composer.input, "[ pasted-text#1 4 lines ]");
+        assert_eq!(app.composer.pending_pastes[0].content, "a\nb\nc\nd");
     }
 
     #[test]
     fn submit_expands_chip_and_clears_pending() {
         let mut app = app();
         app.handle_paste("w\nx\ny\nz".into()); // 4 lines
-        app.insert_str(" review this");
+        app.composer.insert_str(" review this");
         let out = app.submit().unwrap();
         assert_eq!(out, "w\nx\ny\nz review this");
-        assert!(app.input.is_empty());
-        assert!(app.pending_pastes.is_empty());
+        assert!(app.composer.input.is_empty());
+        assert!(app.composer.pending_pastes.is_empty());
     }
 
     #[test]
     fn two_pastes_number_and_both_expand() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into());
-        app.insert_str(" ");
+        app.composer.insert_str(" ");
         app.handle_paste("e\nf\ng\nh\ni".into());
-        assert!(app.input.contains("#1"));
-        assert!(app.input.contains("#2"));
+        assert!(app.composer.input.contains("#1"));
+        assert!(app.composer.input.contains("#2"));
         let out = app.submit().unwrap();
         assert!(out.contains("a\nb\nc\nd"));
         assert!(out.contains("e\nf\ng\nh\ni"));
@@ -2550,10 +2364,10 @@ mod paste_tests {
     fn backspace_removes_whole_chip() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into());
-        assert_eq!(app.pending_pastes.len(), 1);
-        app.backspace(); // cursor at chip's right edge
-        assert_eq!(app.input, "");
-        assert!(app.pending_pastes.is_empty());
+        assert_eq!(app.composer.pending_pastes.len(), 1);
+        app.composer.backspace(); // cursor at chip's right edge
+        assert_eq!(app.composer.input, "");
+        assert!(app.composer.pending_pastes.is_empty());
     }
 
     #[test]
@@ -2562,7 +2376,7 @@ mod paste_tests {
         app.handle_paste("a\nb\nc\nd".into());
         let _ = app.submit();
         app.handle_paste("e\nf\ng\nh".into());
-        assert!(app.input.contains("#2"));
+        assert!(app.composer.input.contains("#2"));
     }
 
     // --- atomic-edit guards: a chip is never half-deleted into a fragment that
@@ -2572,41 +2386,41 @@ mod paste_tests {
     fn ctrl_w_removes_whole_chip_no_leak() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into()); // cursor at chip's right edge
-        app.delete_word_back();
-        assert_eq!(app.input, "");
-        assert!(app.pending_pastes.is_empty());
-        assert_eq!(app.expand_pastes(app.input.clone()), "");
+        app.composer.delete_word_back();
+        assert_eq!(app.composer.input, "");
+        assert!(app.composer.pending_pastes.is_empty());
+        assert_eq!(app.composer.expand_pastes(app.composer.input.clone()), "");
     }
 
     #[test]
     fn delete_forward_at_chip_start_removes_chip() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into());
-        app.cursor = 0;
-        app.delete_forward();
-        assert_eq!(app.input, "");
-        assert!(app.pending_pastes.is_empty());
+        app.composer.cursor = 0;
+        app.composer.delete_forward();
+        assert_eq!(app.composer.input, "");
+        assert!(app.composer.pending_pastes.is_empty());
     }
 
     #[test]
     fn backspace_inside_chip_removes_whole_chip() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into());
-        app.cursor = 5; // mid-chip
-        app.backspace();
-        assert_eq!(app.input, "");
-        assert!(app.pending_pastes.is_empty());
+        app.composer.cursor = 5; // mid-chip
+        app.composer.backspace();
+        assert_eq!(app.composer.input, "");
+        assert!(app.composer.pending_pastes.is_empty());
     }
 
     #[test]
     fn typing_inside_chip_snaps_and_keeps_chip_intact() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into());
-        let chip = app.input.clone();
-        app.cursor = 5; // mid-chip
-        app.insert_char('x');
-        assert_eq!(app.input, format!("{chip}x")); // x landed after the chip
-        assert_eq!(app.pending_pastes.len(), 1);
+        let chip = app.composer.input.clone();
+        app.composer.cursor = 5; // mid-chip
+        app.composer.insert_char('x');
+        assert_eq!(app.composer.input, format!("{chip}x")); // x landed after the chip
+        assert_eq!(app.composer.pending_pastes.len(), 1);
         assert_eq!(app.submit().unwrap(), "a\nb\nc\ndx");
     }
 }

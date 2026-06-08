@@ -57,7 +57,7 @@ pub(crate) fn band_height(app: &App, term_rows: u16) -> u16 {
 
 /// Input box height (incl. borders), growing with newline-separated lines.
 fn input_height(app: &App, cap: u16) -> u16 {
-    let lines = app.input.split('\n').count().max(1) as u16;
+    let lines = app.composer.input.split('\n').count().max(1) as u16;
     (lines + 2).clamp(3, cap.saturating_sub(2).max(3))
 }
 
@@ -527,7 +527,7 @@ mod queue_render_tests {
     fn hint_text_depends_on_queue_presence() {
         let mut a = app();
         a.mode = Mode::Thinking;
-        a.input = "typing".into();
+        a.composer.input = "typing".into();
         assert_eq!(
             queued_hint(&a).as_deref(),
             Some("Enter queue · Ctrl+S send now")
@@ -545,9 +545,9 @@ mod queue_render_tests {
         a.mode = Mode::Idle;
         assert_eq!(queued_region_height(&a), 0);
         a.mode = Mode::Thinking;
-        a.input = "x".into(); // hint only
+        a.composer.input = "x".into(); // hint only
         assert_eq!(queued_region_height(&a), 1);
-        a.input.clear();
+        a.composer.input.clear();
         a.queue = vec!["one".into(), "two".into()]; // blank + 2 rows + hint
         assert_eq!(queued_region_height(&a), 4);
     }
@@ -1390,8 +1390,8 @@ mod tests {
             PathBuf::from("."),
         );
         // Mixed CJK + ASCII, cursor mid-string on a char boundary.
-        app.input = "中文a测试".to_string();
-        app.cursor = "中文a".len();
+        app.composer.input = "中文a测试".to_string();
+        app.composer.cursor = "中文a".len();
 
         let mut term = test_terminal(80, 24);
         // Would panic on a non-char-boundary slice if cursor math were byte-naive.
@@ -1421,8 +1421,8 @@ mod tests {
         );
 
         // With typed text the glyph still leads the line.
-        app.input = "hello".to_string();
-        app.cursor = app.input.len();
+        app.composer.input = "hello".to_string();
+        app.composer.cursor = app.composer.input.len();
         let mut term = test_terminal(80, 24);
         term.draw(|f| draw(f, &mut app)).unwrap();
         assert!(

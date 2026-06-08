@@ -12,7 +12,8 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::console::app::{App, Mode, PendingPaste};
+use crate::console::app::{App, Mode};
+use crate::console::composer::PendingPaste;
 use crate::console::{
     format_tokens, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, PEACH, RED, SUBTEXT,
     SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
@@ -30,7 +31,7 @@ pub(crate) fn queued_hint(app: &App) -> Option<String> {
         return None;
     }
     let has_queue = !app.queue.is_empty();
-    let typing = !app.input.is_empty();
+    let typing = !app.composer.input.is_empty();
     if !has_queue && !typing {
         return None;
     }
@@ -292,7 +293,7 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(if idle { ACCENT } else { TEXT_DIM }),
     );
 
-    let content = if app.input.is_empty() {
+    let content = if app.composer.input.is_empty() {
         let placeholder = if idle {
             "Type a message…"
         } else {
@@ -304,11 +305,12 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         ]))
     } else {
         Text::from(
-            app.input
+            app.composer
+                .input
                 .split('\n')
                 .enumerate()
                 .map(|(i, l)| {
-                    let mut line = input_line(l, &app.pending_pastes);
+                    let mut line = input_line(l, &app.composer.pending_pastes);
                     // Prompt glyph on the first line; align continuation lines.
                     let lead = if i == 0 {
                         prompt.clone()
@@ -341,10 +343,10 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 
     // Cursor is shown whenever the input has focus — idle or busy (you can type
     // while the agent works to queue / steer). It sits just past the prompt glyph.
-    let before = &app.input[..app.cursor];
+    let before = &app.composer.input[..app.composer.cursor];
     let row = before.matches('\n').count() as u16;
     let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let col = UnicodeWidthStr::width(&app.input[line_start..app.cursor]) as u16;
+    let col = UnicodeWidthStr::width(&app.composer.input[line_start..app.composer.cursor]) as u16;
     f.set_cursor(area.x + 1 + PROMPT_W + col, area.y + 1 + row);
 }
 
