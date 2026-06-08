@@ -18,6 +18,7 @@ use crate::console::app::App;
 use crate::console::{BG, BORDER, TEXT_DIM};
 
 pub(crate) mod blocks;
+pub(crate) mod layout;
 pub(crate) mod pickers;
 pub(crate) mod stream_commit;
 pub(crate) mod tool_block;
@@ -26,6 +27,9 @@ pub(crate) mod widgets;
 // Re-export per-frame primitives callers still reference by their old
 // `console::render::*` path so this split is a pure file move from outside.
 pub(crate) use blocks::{block_lines, welcome_lines};
+// Runner reaches these by the old `render::*` path; `draw` (below) uses the rest.
+pub(crate) use layout::{band_height, viewport_height};
+use layout::{input_height, picker_open, MODEL_PICKER_MAX_OPTION_ROWS};
 pub(crate) use pickers::{
     render_mcp_picker, render_model_picker, render_session_picker, render_skill_picker,
 };
@@ -33,70 +37,6 @@ pub(crate) use widgets::{
     draw_footer, draw_input, draw_loading, draw_queued, draw_slash_suggestions,
     queued_region_height, MAX_SLASH_ROWS,
 };
-
-/// Height (rows) of the bottom band — status line + queued strip + slash
-/// suggestions + input box + footer. Independent of the transcript above it.
-pub(crate) fn band_height(app: &App, term_rows: u16) -> u16 {
-    let cap = term_rows.saturating_sub(1).max(3);
-    // While a picker is open the user is answering, not typing — the band
-    // collapses to status + footer and the picker takes the room above
-    // (it replaces the input region rather than sitting beside an empty box).
-    if picker_open(app) {
-        return 2.min(cap);
-    }
-    let input_h = input_height(app, cap);
-    let sugg = app.slash_suggestions();
-    let sugg_h = if !sugg.is_empty() {
-        (sugg.len() as u16).min(MAX_SLASH_ROWS)
-    } else {
-        0
-    };
-    let queued_h = queued_region_height(app);
-    (1 + queued_h + sugg_h + input_h + 1).min(cap)
-}
-
-/// Input box height (incl. borders), growing with newline-separated lines.
-fn input_height(app: &App, cap: u16) -> u16 {
-    let lines = app.input.split('\n').count().max(1) as u16;
-    (lines + 2).clamp(3, cap.saturating_sub(2).max(3))
-}
-
-/// Whether any picker is currently open (tool-initiated `ask_user` or a
-/// slash-command picker). When one is, the inline viewport grows to give it
-/// room above the band.
-fn picker_open(app: &App) -> bool {
-    app.inline_picker.is_some()
-        || app.model_picker.is_some()
-        || app.session_picker.is_some()
-        || app.skill_picker.is_some()
-        || app.mcp_picker.is_some()
-}
-
-/// Height (rows) of the inline viewport. The runner rebuilds the `Terminal`
-/// whenever this changes — which, with a fixed band, is only on picker
-/// open/close or multi-line input growth.
-///
-/// - `ask_user` (a tool-initiated `inline_picker`): just the picker + the
-///   status/footer band, so the conversation stays visible in native scrollback
-///   *above* the picker (it replaces the input region, CC-style).
-/// - slash-command pickers (`/model`, `/sessions`, …): the whole terminal, since
-///   they're entered intentionally and benefit from the room.
-/// - otherwise: just the band.
-pub(crate) fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 {
-    let cap = term_rows.saturating_sub(1).max(3);
-    if let Some(p) = &app.inline_picker {
-        let picker_h = super::inline_picker::picker_height(p, term_cols);
-        return (picker_h + 2).min(cap); // picker + status + footer
-    }
-    if app.model_picker.is_some()
-        || app.session_picker.is_some()
-        || app.skill_picker.is_some()
-        || app.mcp_picker.is_some()
-    {
-        return cap;
-    }
-    band_height(app, term_rows).min(cap)
-}
 
 /// Blit pre-wrapped `lines` (one `Line` per visual row — `block_lines` already
 /// wraps to width) into the `insert_before` scratch buffer, one row each. This
@@ -204,14 +144,26 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
             );
         }
     } else if let Some(picker) = &app.model_picker {
-        let max_rows = (body_area.height as usize).saturating_sub(4).max(1);
+        // Model picker anchors to the bottom of the body area — like the
+        // inline ask_user picker — so the conversation in native scrollback
+        // above the TUI is visible. `viewport_height` only grows the TUI by
+        // the picker's natural height, not the whole terminal.
+        let options = &app.model_options;
+        let max_rows = MODEL_PICKER_MAX_OPTION_ROWS;
         let mut lines: Vec<Line> = Vec::new();
-        render_model_picker(&mut lines, picker, &app.model_options, max_rows);
+        render_model_picker(&mut lines, picker, options, max_rows);
+        let desired = lines.len() as u16;
+        let h = desired.min(body_area.height);
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(h)])
+            .split(body_area);
+        let picker_area = split[1];
         f.render_widget(
             Paragraph::new(Text::from(lines))
                 .style(Style::default().bg(BG))
                 .wrap(Wrap { trim: false }),
-            body_area,
+            picker_area,
         );
     } else if let Some(picker) = &app.session_picker {
         let max_rows = (body_area.height as usize).saturating_sub(3).max(1);
@@ -482,7 +434,7 @@ mod queue_render_tests {
     fn hint_text_depends_on_queue_presence() {
         let mut a = app();
         a.mode = Mode::Thinking;
-        a.input = "typing".into();
+        a.composer.input = "typing".into();
         assert_eq!(
             queued_hint(&a).as_deref(),
             Some("Enter queue · Ctrl+S send now")
@@ -500,9 +452,9 @@ mod queue_render_tests {
         a.mode = Mode::Idle;
         assert_eq!(queued_region_height(&a), 0);
         a.mode = Mode::Thinking;
-        a.input = "x".into(); // hint only
+        a.composer.input = "x".into(); // hint only
         assert_eq!(queued_region_height(&a), 1);
-        a.input.clear();
+        a.composer.input.clear();
         a.queue = vec!["one".into(), "two".into()]; // blank + 2 rows + hint
         assert_eq!(queued_region_height(&a), 4);
     }
@@ -512,6 +464,7 @@ mod queue_render_tests {
 mod tests {
     use super::*;
     use crate::console::app::{Mode, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
+    use crate::console::render::layout::model_picker_height;
     use crate::console::render::tool_block::compact_tool_args;
     use crate::console::{format_context, DIFF_ADD_BG, DIFF_DEL_BG};
     use ratatui::{backend::TestBackend, Terminal};
@@ -596,6 +549,97 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("effort:"));
         assert!(content.contains("high") && content.contains("max"));
+    }
+
+    /// `model_picker_height` is selection-stable: walking `sel` across the
+    /// scroll-window boundary or across a reasoning↔non-reasoning boundary
+    /// must NOT change the returned height — otherwise the runner rebuilds
+    /// the viewport and the user sees a full-screen flicker on every `↓`.
+    #[test]
+    fn model_picker_height_is_stable_across_navigation() {
+        let opt = |p: &str, m: &str, l: &[&str]| crate::llm::ModelOption {
+            provider: p.to_string(),
+            model: m.to_string(),
+            effort_levels: l.iter().map(|s| s.to_string()).collect(),
+            context: None,
+        };
+        // 20 options, mixed effort. Walk sel across the full range — including
+        // both the scroll-window boundary at sel=15 and the
+        // reasoning↔non-reasoning boundary inside the mix.
+        let options: Vec<crate::llm::ModelOption> = (0..20)
+            .map(|i| {
+                if i % 2 == 0 {
+                    opt("p", &format!("m{i}"), &["high"])
+                } else {
+                    opt("p", &format!("m{i}"), &[])
+                }
+            })
+            .collect();
+        let mut picker = crate::console::app::ModelPicker {
+            selected: 0,
+            effort_idx: 0,
+        };
+        let baseline = model_picker_height(&picker, &options);
+        for sel in 0..options.len() {
+            picker.selected = sel;
+            let h = model_picker_height(&picker, &options);
+            assert_eq!(
+                h, baseline,
+                "model_picker_height must not change when sel moves (sel={sel}, h={h}, baseline={baseline})"
+            );
+        }
+        // Also unchanged when effort is cycled (effort doesn't enter the math).
+        picker.cycle_effort(crate::console::SelectionDirection::Next, &options);
+        assert_eq!(model_picker_height(&picker, &options), baseline);
+
+        // Sanity: the formula handles edge cases.
+        // Empty options → 3.
+        let empty: Vec<crate::llm::ModelOption> = vec![];
+        assert_eq!(model_picker_height(&picker, &empty), 3);
+        // 1 option, no effort: blank + header + 1 option + footer = 4.
+        let one = vec![opt("p", "m0", &[])];
+        assert_eq!(model_picker_height(&picker, &one), 4);
+        // 1 option, with effort: 5.
+        let one_effort = vec![opt("p", "m0", &["high"])];
+        assert_eq!(model_picker_height(&picker, &one_effort), 5);
+        // 16 options, no effort, list overflows: 2 + 0 + 1 + 15 + 1 + 1 = 20.
+        let sixteen: Vec<crate::llm::ModelOption> =
+            (0..16).map(|i| opt("p", &format!("m{i}"), &[])).collect();
+        assert_eq!(model_picker_height(&picker, &sixteen), 20);
+        // 20 options, with effort, list overflows: 2 + 1 + 1 + 15 + 1 + 1 = 21.
+        let twenty: Vec<crate::llm::ModelOption> = (0..20)
+            .map(|i| opt("p", &format!("m{i}"), &["high"]))
+            .collect();
+        assert_eq!(model_picker_height(&picker, &twenty), 21);
+    }
+
+    /// `viewport_height` for the model picker must always include the band
+    /// height (status + footer) plus the picker's natural height, clamped to
+    /// the terminal — never returning 0 in normal use.
+    #[test]
+    fn viewport_height_clamps_model_picker_to_terminal() {
+        let opt = |p: &str, m: &str, l: &[&str]| crate::llm::ModelOption {
+            provider: p.to_string(),
+            model: m.to_string(),
+            effort_levels: l.iter().map(|s| s.to_string()).collect(),
+            context: None,
+        };
+        let options: Vec<crate::llm::ModelOption> = (0..20)
+            .map(|i| opt("p", &format!("m{i}"), &["high"]))
+            .collect();
+        let mut app = App::new(
+            "p".to_string(),
+            "m0".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        app.set_model_options(options, None);
+        app.show_model_picker();
+
+        // 8-row terminal: ph=21 + bh=2 = 23, clamped to cap=7.
+        assert_eq!(viewport_height(&app, 80, 8), 7);
+        // 100-row terminal: ph=21 + bh=2 = 23.
+        assert_eq!(viewport_height(&app, 80, 100), 23);
     }
 
     #[test]
@@ -778,6 +822,53 @@ mod tests {
     }
 
     #[test]
+    fn render_skill_tool_collapses_body_to_one_line() {
+        // The skill tool returns the whole skill body wrapped in <skill name>.
+        // The block must show a single "loaded skill instructions" line, never
+        // the wrapper or the body (model reads it, not the user).
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        app.blocks.push(UIBlock::Tool(ToolCallEntry {
+            id: "s1".to_string(),
+            name: "skill".to_string(),
+            arguments: r#"{"name":"brainstorming"}"#.to_string(),
+            status: ToolStatus::Success(
+                "<skill name=\"brainstorming\">\nSECRET_BODY_LINE_ONE\nSECRET_BODY_LINE_TWO\n</skill>"
+                    .to_string(),
+            ),
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 3,
+        }));
+
+        let term = render_blocks(&app, 80, 24);
+        let content = buffer_content(&term);
+        assert!(
+            content.contains("skill"),
+            "header still shows the tool name"
+        );
+        assert!(
+            content.contains("loaded skill instructions"),
+            "skill block shows the one-line confirmation"
+        );
+        assert!(
+            !content.contains("SECRET_BODY_LINE_ONE"),
+            "the skill body must not spill into the transcript"
+        );
+        assert!(
+            !content.contains("<skill name"),
+            "the <skill> wrapper must not render"
+        );
+        assert!(
+            !content.contains("more lines"),
+            "no '… N more lines' tail for the collapsed skill block"
+        );
+    }
+
+    #[test]
     fn render_edit_file_shows_diff_lines() {
         let mut app = App::new(
             "test".to_string(),
@@ -928,6 +1019,7 @@ mod tests {
                 crate::cli::sessions::SessionRecord {
                     session_id: "alpha".to_string(),
                     project_slug: "p".to_string(),
+                    title: "add session title".to_string(),
                     started_at: Some(1_735_787_045),
                     last_modified: Some(1_735_787_045),
                     agent_messages: 3,
@@ -946,7 +1038,6 @@ mod tests {
             ],
             selected: 0,
             mode: crate::console::app::SessionPickerMode::List,
-            current_session_id: "alpha".to_string(),
             projects_dir: std::path::PathBuf::from("/tmp"),
         });
 
@@ -955,9 +1046,20 @@ mod tests {
 
         let content = buffer_content(&term);
         assert!(content.contains("Sessions"), "should show picker title");
-        assert!(content.contains("STARTED"), "should show columns header");
-        assert!(content.contains("2025-01-"), "should render row timestamps");
-        assert!(content.contains("▸"), "should mark current session with ▸");
+        // Two-line rows: a derived title line over a dim meta line.
+        assert!(
+            content.contains("add session title"),
+            "should render the derived title"
+        );
+        assert!(
+            content.contains("(no message yet)"),
+            "title-less session falls back to a placeholder"
+        );
+        assert!(
+            content.contains("2025-01-"),
+            "meta line shows the timestamp"
+        );
+        assert!(content.contains("tok"), "meta line shows token count");
         assert!(
             content.contains("details"),
             "footer should advertise → details"
@@ -1207,8 +1309,8 @@ mod tests {
             PathBuf::from("."),
         );
         // Mixed CJK + ASCII, cursor mid-string on a char boundary.
-        app.input = "中文a测试".to_string();
-        app.cursor = "中文a".len();
+        app.composer.input = "中文a测试".to_string();
+        app.composer.cursor = "中文a".len();
 
         let mut term = test_terminal(80, 24);
         // Would panic on a non-char-boundary slice if cursor math were byte-naive.
@@ -1219,6 +1321,33 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("中"), "should render wide chars");
         assert!(content.contains("试"), "should render the full input");
+    }
+
+    #[test]
+    fn input_bar_shows_prompt_glyph() {
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        // Empty input: the ❯ prompt sits left of the placeholder.
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_content(&term).contains('❯'),
+            "input bar should show the ❯ prompt glyph"
+        );
+
+        // With typed text the glyph still leads the line.
+        app.composer.input = "hello".to_string();
+        app.composer.cursor = app.composer.input.len();
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_content(&term).contains("❯ hello"),
+            "prompt glyph should prefix the typed input"
+        );
     }
 
     #[test]
@@ -1356,7 +1485,6 @@ mod tests {
             }],
             selected: 0,
             mode: crate::console::app::SessionPickerMode::List,
-            current_session_id: "alpha".to_string(),
             projects_dir: std::path::PathBuf::from("/tmp"),
         });
 

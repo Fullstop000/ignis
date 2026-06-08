@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use super::composer::Composer;
+use super::connect::{ConnectAdvance, ConnectFlow, ConnectOutcome, ConnectResult};
 use super::{
     format_elapsed, next_selection, slash_suggestions, SelectionDirection, SlashCommand, SPINNERS,
     THINKING_VERBS,
@@ -52,188 +54,6 @@ pub(crate) enum UIBlock {
     Tool(ToolCallEntry),
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// `/connect` picker-request builders. Each returns a fully-formed
-// `PickerRequest` for the runner's `picker_tx` mpsc; the reply oneshot is
-// fire-and-forget because the flow's state lives in `App::connect_draft`,
-// not in awaiting tasks. The picker-completion path in `keys.rs` reads the
-// draft to know which step's answer it just received.
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Step 1: pick a provider from the baked-in `SPECS` catalog. The currently-
-/// active provider (if any) is mentioned in the question text so users who
-/// re-run `/connect` to rotate a key know what they're about to overwrite.
-fn build_provider_picker(current_provider: Option<&str>) -> crate::console::picker::PickerRequest {
-    use crate::console::picker::{PickerOption, PickerQuestion, PickerRequest};
-    let options: Vec<PickerOption> = crate::llm::providers::all()
-        .iter()
-        .map(|spec| PickerOption {
-            label: spec.display_name.to_string(),
-            description: provider_description(spec),
-            preview: None,
-        })
-        .collect();
-    let question = match current_provider {
-        Some(id) => format!("Connect a provider (current: {id})"),
-        None => "Connect a provider — pick one to configure".to_string(),
-    };
-    let (tx, _rx) = tokio::sync::oneshot::channel();
-    PickerRequest {
-        questions: vec![PickerQuestion {
-            question,
-            kind: "connect".to_string(),
-            header: "Provider".to_string(),
-            multi_select: false,
-            allow_other: false,
-            text_input: false,
-            mask: false,
-            options,
-        }],
-        reply: tx,
-    }
-}
-
-/// Step 2: API-key entry. Text-input mode, masked (no shoulder-surfing).
-fn build_api_key_picker(provider_display: &str) -> crate::console::picker::PickerRequest {
-    use crate::console::picker::{PickerQuestion, PickerRequest};
-    let (tx, _rx) = tokio::sync::oneshot::channel();
-    PickerRequest {
-        questions: vec![PickerQuestion {
-            question: format!("Paste your API key for {provider_display}"),
-            kind: "connect".to_string(),
-            header: "API Key".to_string(),
-            multi_select: false,
-            allow_other: false,
-            text_input: true,
-            mask: true,
-            options: vec![],
-        }],
-        reply: tx,
-    }
-}
-
-/// Step 3: default-model picker, scoped to the chosen provider's `&[ModelSpec]`.
-fn build_model_picker(
-    spec: &crate::llm::providers::ProviderSpec,
-) -> crate::console::picker::PickerRequest {
-    use crate::console::picker::{PickerOption, PickerQuestion, PickerRequest};
-    let options: Vec<PickerOption> = spec
-        .models
-        .iter()
-        .map(|m| PickerOption {
-            label: m.name.to_string(),
-            description: model_description(m),
-            preview: None,
-        })
-        .collect();
-    let (tx, _rx) = tokio::sync::oneshot::channel();
-    PickerRequest {
-        questions: vec![PickerQuestion {
-            question: format!("Pick a default model for {}", spec.display_name),
-            kind: "connect".to_string(),
-            header: "Model".to_string(),
-            multi_select: false,
-            allow_other: false,
-            text_input: false,
-            mask: false,
-            options,
-        }],
-        reply: tx,
-    }
-}
-
-/// One-line endpoint hint for the provider row, synthesized from the first
-/// endpoint's `base_url`. Strips the protocol so the URL doesn't dominate
-/// the line.
-fn provider_description(spec: &crate::llm::providers::ProviderSpec) -> String {
-    if spec.id == "custom" {
-        return "Edit ~/.ignis/config.toml after selecting (api_url + models required)."
-            .to_string();
-    }
-    let host = spec
-        .endpoints
-        .first()
-        .map(|e| {
-            e.base_url
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .to_string()
-        })
-        .unwrap_or_default();
-    if spec.api_key_required {
-        host
-    } else {
-        // Local-only providers don't take a key — call that out so users
-        // don't expect to be prompted for one.
-        format!("{host}  (no key required)")
-    }
-}
-
-/// One-line model-row hint: context window if known, else empty. Keeps the
-/// row short — full effort/reasoning details live in `/model`.
-fn model_description(m: &crate::llm::providers::ModelSpec) -> String {
-    match m.context {
-        Some(ctx) => format!("context {}", super::format::format_context(ctx)),
-        None => String::new(),
-    }
-}
-
-/// `/connect` multi-step flow state. Created when the user types `/connect`,
-/// cleared on completion or cancel. The picker-completion path in `keys.rs`
-/// drives advancement: each step's answer feeds the next, and the final
-/// step persists to `~/.ignis/config.toml` + `~/.ignis/state.json`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ConnectStep {
-    PickProvider,
-    EnterApiKey,
-    PickModel,
-}
-
-#[derive(Clone)]
-pub(crate) struct ConnectDraft {
-    pub(crate) step: ConnectStep,
-    /// Provider id (the `SPECS` key, e.g. "openai"). Set after step 1.
-    pub(crate) provider_id: Option<String>,
-    /// Provider display name (e.g. "OpenAI"). Used for the API-key prompt.
-    pub(crate) provider_display: Option<String>,
-    /// Raw API key as typed. Stays in memory until the persist step writes
-    /// `[providers.<id>] api_key = "…"` to `config.toml`. None for Ollama
-    /// and similar providers with `api_key_required = false`.
-    pub(crate) api_key: Option<String>,
-    /// Selected model name (e.g. "gpt-5.5"). Set after step 3.
-    pub(crate) model: Option<String>,
-}
-
-// Manual `Debug` that redacts `api_key` — a derived impl would print the
-// plaintext key the moment something `dbg!(&draft)`s or a tracing span captures
-// `App` state. Keep the redaction; never derive Debug on this struct.
-impl std::fmt::Debug for ConnectDraft {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectDraft")
-            .field("step", &self.step)
-            .field("provider_id", &self.provider_id)
-            .field("provider_display", &self.provider_display)
-            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
-            .field("model", &self.model)
-            .finish()
-    }
-}
-
-/// What `advance_connect` tells the caller (`keys.rs`) to do next.
-#[derive(Debug)]
-pub(crate) enum ConnectAdvance {
-    /// Send this picker over `picker_tx` — it's the next step in the flow.
-    NextPicker(crate::console::picker::PickerRequest),
-    /// Connect succeeded. The agent loop needs a fresh config from disk so
-    /// its in-memory `agent_config` reflects the new `api_key` (the existing
-    /// `SetModel` variant doesn't carry providers, hence the dedicated
-    /// `ReloadConfig` request).
-    Saved,
-    /// Connect aborted (user picked Custom, persist failed, etc). A user-
-    /// facing notice has already been added; the caller does nothing else.
-    Failed,
-}
-
 /// List = the session table; Detail = drill-in for one session showing turn
 /// waterfall + token/tool rollups. Right pushes List→Detail; Left/Esc pops back.
 #[derive(Debug, Clone)]
@@ -249,21 +69,18 @@ pub(crate) struct SessionPicker {
     pub(crate) sessions: Vec<crate::cli::sessions::SessionRecord>,
     pub(crate) selected: usize,
     pub(crate) mode: SessionPickerMode,
-    pub(crate) current_session_id: String,
     pub(crate) projects_dir: std::path::PathBuf,
 }
 
 impl SessionPicker {
     pub(crate) fn new(
         sessions: Vec<crate::cli::sessions::SessionRecord>,
-        current_session_id: String,
         projects_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             sessions,
             selected: 0,
             mode: SessionPickerMode::List,
-            current_session_id,
             projects_dir,
         }
     }
@@ -466,14 +283,6 @@ pub(crate) enum Mode {
     ToolRunning, // tool execution in progress
 }
 
-/// A pasted block collapsed into a chip. The `placeholder` text lives inline in
-/// the composer buffer; `expand_pastes` swaps it back for `content` at commit so
-/// the agent never sees the chip. Placeholders are unique (monotonic counter).
-pub(crate) struct PendingPaste {
-    pub(crate) placeholder: String,
-    pub(crate) content: String,
-}
-
 pub(crate) struct App {
     pub(crate) provider: String,
     pub(crate) model: String,
@@ -483,16 +292,8 @@ pub(crate) struct App {
     pub(crate) cwd: PathBuf,
 
     pub(crate) blocks: Vec<UIBlock>,
-    pub(crate) input: String,
-    pub(crate) cursor: usize,
-    /// Collapsed paste blocks (chip ↔ full content) currently in the composer.
-    pub(crate) pending_pastes: Vec<PendingPaste>,
-    /// Monotonic `#N` counter for paste chips. Never reset, so numbering keeps
-    /// climbing across messages and every placeholder string stays unique.
-    pub(crate) paste_counter: usize,
-    pub(crate) history: Vec<String>,
-    pub(crate) history_idx: Option<usize>,
-    pub(crate) saved_input: String, // saved input when browsing history
+    /// The text composer: input buffer, cursor, paste chips, input history.
+    pub(crate) composer: Composer,
     pub(crate) slash_selection: usize,
     pub(crate) session_picker: Option<SessionPicker>,
     /// Choices for the `/model` picker, flattened from config.
@@ -508,11 +309,11 @@ pub(crate) struct App {
     /// through the normal `UIBlock::Tool` flush path
     /// (`block_lines` → `ask_user_resume_trace`) — no separate live channel.
     pub(crate) inline_picker: Option<super::inline_picker::InlinePickerState>,
-    /// `/connect` flow state. `Some` while the multi-step picker is open
-    /// (provider → API key → model), `None` otherwise. The picker-completion
-    /// path in `keys.rs` checks this to route picker answers back into
+    /// `/connect` provider-setup wizard. Active while the multi-step picker is
+    /// open (provider → API key → model). The picker-completion path in
+    /// `keys.rs` checks `connect.is_active()` to route picker answers back into
     /// `advance_connect` instead of treating them as tool-initiated answers.
-    pub(crate) connect_draft: Option<ConnectDraft>,
+    pub(crate) connect: ConnectFlow,
 
     pub(crate) mode: Mode,
     pub(crate) tick: u64,
@@ -584,6 +385,12 @@ pub(crate) struct App {
     /// Shared external-subprocess hook registry — used by `/hooks reload`
     /// and (clone-handed) by the assistant-render seam in `runner.rs`.
     pub(crate) hooks: Option<crate::extensions::ExtensionRegistry>,
+    /// Compact text to render for the next committed user prompt, in place of
+    /// the prompt actually sent to the model. Set when a `/skill-name` command
+    /// expands its full body into the prompt — the transcript shows the typed
+    /// command, the model still receives the body. `take()`-consumed on commit;
+    /// cleared at turn-end so a hook-blocked turn can't carry it into the next.
+    pub(crate) pending_user_display: Option<String>,
 }
 
 impl App {
@@ -596,13 +403,7 @@ impl App {
             session_id,
             cwd,
             blocks: Vec::new(),
-            input: String::new(),
-            cursor: 0,
-            pending_pastes: Vec::new(),
-            paste_counter: 0,
-            history: Vec::new(),
-            history_idx: None,
-            saved_input: String::new(),
+            composer: Composer::default(),
             slash_selection: 0,
             session_picker: None,
             model_options: Vec::new(),
@@ -610,7 +411,7 @@ impl App {
             skill_picker: None,
             mcp_picker: None,
             inline_picker: None,
-            connect_draft: None,
+            connect: ConnectFlow::default(),
             mode: Mode::Idle,
             tick: 0,
             stream_start: None,
@@ -636,6 +437,7 @@ impl App {
             update_notice: None,
             git_branch,
             hooks: None,
+            pending_user_display: None,
         }
     }
 
@@ -860,7 +662,13 @@ impl App {
                 // into history — render it so scrollback matches what the
                 // model received. With no hooks installed, `text` equals
                 // what the user typed; the user perceives no delay.
-                self.push_user_prompt(text);
+                //
+                // A `/skill-name` command is the exception: it commits the full
+                // skill body to history but sets `pending_user_display` to the
+                // typed command, so the transcript shows the compact invocation
+                // instead of the expansion (CC/Codex behavior).
+                let shown = self.pending_user_display.take().unwrap_or(text);
+                self.push_user_prompt(shown);
             }
             AgentEvent::Warning { source, message } => {
                 // Surfaces hook-chain failures (and any other ignis-side
@@ -886,161 +694,20 @@ impl App {
         }
     }
 
-    /// Byte offset of the char boundary one character left of the cursor.
-    /// `cursor` indexes `input` by byte, so movement must step whole UTF-8
-    /// chars — a naive `cursor -= 1` lands mid-character and panics on slice.
-    fn prev_char_boundary(&self) -> usize {
-        self.input[..self.cursor]
-            .chars()
-            .next_back()
-            .map_or(0, |c| self.cursor - c.len_utf8())
-    }
-
-    /// Byte offset of the char boundary one character right of the cursor.
-    fn next_char_boundary(&self) -> usize {
-        self.input[self.cursor..]
-            .chars()
-            .next()
-            .map_or(self.cursor, |c| self.cursor + c.len_utf8())
-    }
-
-    pub(crate) fn insert_char(&mut self, c: char) {
-        self.snap_out_of_chip();
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-    }
-
-    pub(crate) fn insert_str(&mut self, s: &str) {
-        self.snap_out_of_chip();
-        self.input.insert_str(self.cursor, s);
-        self.cursor += s.len();
-    }
-
-    pub(crate) fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let prev = self.prev_char_boundary();
-        if let Some((start, end, i)) = self.chip_overlapping(prev, self.cursor) {
-            self.remove_chip(start, end, i);
-            return;
-        }
-        self.input.remove(prev);
-        self.cursor = prev;
-    }
-
-    pub(crate) fn delete_forward(&mut self) {
-        if self.cursor >= self.input.len() {
-            return;
-        }
-        let next = self.next_char_boundary();
-        if let Some((start, end, i)) = self.chip_overlapping(self.cursor, next) {
-            self.remove_chip(start, end, i);
-            return;
-        }
-        self.input.remove(self.cursor);
-    }
-
-    /// Ctrl+W: delete the word before the cursor. A chip in the way is removed
-    /// whole rather than half-eaten into a fragment.
-    pub(crate) fn delete_word_back(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let before = &self.input[..self.cursor];
-        let trimmed = before.trim_end();
-        let new_end = trimmed
-            .rfind(|c: char| c.is_whitespace())
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        if let Some((start, end, i)) = self.chip_overlapping(new_end, self.cursor) {
-            self.remove_chip(start, end, i);
-            return;
-        }
-        self.input.replace_range(new_end..self.cursor, "");
-        self.cursor = new_end;
-    }
-
-    /// A paste chip is atomic. If the buffer byte range `[lo, hi)` overlaps a
-    /// chip, return its full span `[start, end)` and `pending_pastes` index, so
-    /// an edit can remove the whole chip instead of leaving a corrupted
-    /// placeholder fragment — which would both silently drop the pasted content
-    /// and leak the partial chip text to the agent.
-    fn chip_overlapping(&self, lo: usize, hi: usize) -> Option<(usize, usize, usize)> {
-        self.pending_pastes.iter().enumerate().find_map(|(i, p)| {
-            let start = self.input.find(&p.placeholder)?;
-            let end = start + p.placeholder.len();
-            (start < hi && lo < end).then_some((start, end, i))
-        })
-    }
-
-    /// Remove the chip spanning `[start, end)` (pending index `i`); park the
-    /// cursor where the chip began.
-    fn remove_chip(&mut self, start: usize, end: usize, i: usize) {
-        self.input.replace_range(start..end, "");
-        self.cursor = start;
-        self.pending_pastes.remove(i);
-    }
-
-    /// If the cursor sits strictly inside a chip, move it to the chip's end so
-    /// an insert lands beside the chip rather than splitting the placeholder.
-    fn snap_out_of_chip(&mut self) {
-        if let Some((_, end, _)) = self.chip_overlapping(self.cursor, self.cursor) {
-            self.cursor = end;
-        }
-    }
-
-    /// Number of lines at or above which a paste collapses into a chip.
-    const PASTE_COLLAPSE_MIN_LINES: usize = 4;
-
-    /// Insert pasted text at the cursor. A multi-line block (>= 4 lines)
-    /// collapses into a `[ pasted-text#N M lines ]` chip whose full content is
-    /// stashed in `pending_pastes` and restored at commit; smaller pastes go in
-    /// inline like ordinary typing.
+    /// Route a bracketed paste into the composer (a ≥4-line block collapses to a
+    /// `[ pasted-text#N ]` chip), wrapping it with the cross-cutting exit-hint
+    /// clear and slash-autocomplete reset that the composer itself doesn't own.
     pub(crate) fn handle_paste(&mut self, pasted: String) {
         self.clear_exit_hint();
-        // Normalize line endings so the chip's line count and the agent message
-        // are clean regardless of where the text was copied from.
-        let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
-        let lines = pasted.split('\n').count();
-        if lines >= Self::PASTE_COLLAPSE_MIN_LINES {
-            self.paste_counter += 1;
-            let placeholder = format!("[ pasted-text#{} {} lines ]", self.paste_counter, lines);
-            self.insert_str(&placeholder);
-            self.pending_pastes.push(PendingPaste {
-                placeholder,
-                content: pasted,
-            });
-        } else {
-            self.insert_str(&pasted);
-        }
+        self.composer.paste(pasted);
         self.reset_slash_selection();
-    }
-
-    /// Swap every paste chip back for its full content. Placeholders are unique,
-    /// so a plain replace is unambiguous; a chip the user deleted is simply
-    /// absent and replaces nothing.
-    pub(crate) fn expand_pastes(&self, mut text: String) -> String {
-        for p in &self.pending_pastes {
-            text = text.replace(&p.placeholder, &p.content);
-        }
-        text
-    }
-
-    pub(crate) fn move_left(&mut self) {
-        self.cursor = self.prev_char_boundary();
-    }
-
-    pub(crate) fn move_right(&mut self) {
-        self.cursor = self.next_char_boundary();
     }
 
     /// Push a user prompt into the transcript + input history (shared by submit
     /// and the queue drain). Does not send anything.
     pub(crate) fn push_user_prompt(&mut self, text: String) {
         self.exit_pending = false;
-        self.history.push(text.clone());
-        self.history_idx = None;
+        self.composer.push_history(text.clone());
         self.blocks.push(UIBlock::User(text));
     }
 
@@ -1063,8 +730,7 @@ impl App {
     pub(crate) fn recall_last_queued(&mut self) -> bool {
         match self.queue.pop() {
             Some(text) => {
-                self.input = text;
-                self.cursor = self.input.len();
+                self.composer.set_text(text);
                 true
             }
             None => false,
@@ -1077,20 +743,15 @@ impl App {
     }
 
     pub(crate) fn submit(&mut self) -> Option<String> {
-        let text = self.input.trim().to_string();
-        if text.is_empty() || self.mode != Mode::Idle {
+        if self.mode != Mode::Idle {
             return None;
         }
-        // Swap paste chips back for their full content before the text leaves the
-        // composer — the agent must see what was pasted, not the placeholder.
-        let text = self.expand_pastes(text);
-        // Don't push the user block from the typed buffer — `Session::prompt`
-        // emits `UserPromptCommitted` after the hook chain runs so the
-        // visible block matches what hit history. Just clear the input.
-        self.input.clear();
-        self.cursor = 0;
-        self.pending_pastes.clear();
-        Some(text)
+        // `take_submit` trims, swaps paste chips back for their full content
+        // (the agent must see what was pasted, not the placeholder), and clears
+        // the buffer. We don't push the user block from the typed text —
+        // `Session::prompt` emits `UserPromptCommitted` after the hook chain so
+        // the visible block matches what hit history.
+        self.composer.take_submit()
     }
 
     pub(crate) fn add_assistant_notice(&mut self, text: String) {
@@ -1106,8 +767,9 @@ impl App {
         self.committed = 0;
         self.reset_transcript_view();
         self.current_chunk_idx = None;
-        self.history_idx = None;
+        self.composer.reset_history_browse();
         self.last_usage = None;
+        self.pending_user_display = None;
         self.session_picker = None;
         self.add_assistant_notice(format!("Started new session `{}`.", self.session_id));
     }
@@ -1126,11 +788,7 @@ impl App {
         projects_dir: std::path::PathBuf,
     ) {
         self.exit_pending = false;
-        self.session_picker = Some(SessionPicker::new(
-            sessions,
-            self.session_id.clone(),
-            projects_dir,
-        ));
+        self.session_picker = Some(SessionPicker::new(sessions, projects_dir));
     }
 
     pub(crate) fn select_session_picker(&mut self, direction: SelectionDirection) {
@@ -1154,161 +812,80 @@ impl App {
         self.effort = effort;
     }
 
-    /// `/connect` — start the multi-step provider-setup flow. Returns the
-    /// first picker (provider selection); the caller (`keys.rs`) sends it
-    /// over `picker_tx`. The runner installs it as `app.inline_picker`, the
-    /// user picks, and the picker-completion path routes back here via
-    /// [`Self::advance_connect`].
-    ///
-    /// Returns `None` only if a picker is already open — the caller emits
-    /// "another picker is open" instead of stomping the existing one.
+    /// `/connect` — start the multi-step provider-setup flow. Returns the first
+    /// picker (provider selection); the caller (`keys.rs`) sends it over
+    /// `picker_tx`. The runner installs it as `app.inline_picker`, the user
+    /// picks, and the picker-completion path routes back here via
+    /// [`Self::advance_connect`]. Thin coordinator over [`ConnectFlow::start`]:
+    /// it supplies the App-side inputs (is a picker open? the current provider)
+    /// and turns a "picker already open" refusal into a notice + `None`.
     pub(crate) fn start_connect(&mut self) -> Option<crate::console::picker::PickerRequest> {
         self.exit_pending = false;
-        if self.inline_picker.is_some() {
-            self.add_assistant_notice(
-                "/connect: another picker is open; close it first.".to_string(),
-            );
-            return None;
+        let current = (!self.provider.is_empty()).then(|| self.provider.clone());
+        match self.connect.start(self.inline_picker.is_some(), current) {
+            Ok(req) => Some(req),
+            Err(notice) => {
+                self.add_assistant_notice(notice);
+                None
+            }
         }
-        let current_provider = (!self.provider.is_empty()).then(|| self.provider.clone());
-        self.connect_draft = Some(ConnectDraft {
-            step: ConnectStep::PickProvider,
-            provider_id: None,
-            provider_display: None,
-            api_key: None,
-            model: None,
-        });
-        Some(build_provider_picker(current_provider.as_deref()))
     }
 
     /// Drive the `/connect` flow one step forward given the picker's answer.
-    /// Called from `keys.rs` when an inline picker completes AND a draft is
-    /// active. Mutates `connect_draft`, may emit notices, and on the final
-    /// step writes `config.toml` + `state.json` and refreshes the UI's
-    /// `provider`/`model` fields so the banner reflects the new pick.
+    /// Coordinator over [`ConnectFlow::advance`]: it emits the flow's notices
+    /// and, on either success, rebuilds the `/model` list so the connected
+    /// provider's models appear in-session; a `Switched` result also adopts the
+    /// new `provider`/`model` (clearing `effort`). The agent loop gets a separate
+    /// `ReloadConfig` request from `keys.rs` on `Saved`.
     pub(crate) fn advance_connect(
         &mut self,
         answers: Vec<crate::console::picker::PickerAnswer>,
     ) -> ConnectAdvance {
-        use crate::console::picker::PickerAnswer;
-        // The draft must be set by `start_connect` before this is called; a
-        // missing draft is a programming error, not a user-facing situation.
-        let Some(draft) = self.connect_draft.as_mut() else {
-            return ConnectAdvance::Failed;
-        };
-        let answer = match answers.into_iter().next() {
-            Some(PickerAnswer::Single(s)) => s,
-            // Connect pickers are all single-select; a Multi answer means the
-            // picker shape got out of sync somewhere — treat as cancel.
-            _ => {
-                self.connect_draft = None;
-                return ConnectAdvance::Failed;
-            }
-        };
-        match draft.step {
-            ConnectStep::PickProvider => {
-                let Some(spec) = crate::llm::providers::all()
-                    .iter()
-                    .find(|s| s.display_name == answer)
-                else {
-                    self.connect_draft = None;
-                    self.add_assistant_notice(format!("Unknown provider: {answer}"));
-                    return ConnectAdvance::Failed;
-                };
-                // The `custom` brand requires `api_url` + `models` fields that
-                // need a multi-field form; we don't build that wizard in v1.
-                // Bail out with a pointer to the example config so the user
-                // knows where to go.
-                if spec.id == "custom" {
-                    self.connect_draft = None;
-                    self.add_assistant_notice(
-                        "For custom providers, edit ~/.ignis/config.toml — see config.example.toml."
-                            .to_string(),
-                    );
-                    return ConnectAdvance::Failed;
+        let current = (!self.provider.is_empty() && !self.model.is_empty())
+            .then(|| (self.provider.clone(), self.model.clone()));
+        let current_ref = current.as_ref().map(|(p, m)| (p.as_str(), m.as_str()));
+        match self.connect.advance(answers, current_ref) {
+            ConnectOutcome::NextPicker(req) => ConnectAdvance::NextPicker(req),
+            ConnectOutcome::Done { notices, result } => {
+                for notice in notices {
+                    self.add_assistant_notice(notice);
                 }
-                draft.provider_id = Some(spec.id.to_string());
-                draft.provider_display = Some(spec.display_name.to_string());
-                // Ollama-class providers skip the key step entirely.
-                if spec.api_key_required {
-                    draft.step = ConnectStep::EnterApiKey;
-                    ConnectAdvance::NextPicker(build_api_key_picker(spec.display_name))
-                } else {
-                    draft.step = ConnectStep::PickModel;
-                    ConnectAdvance::NextPicker(build_model_picker(spec))
+                match result {
+                    ConnectResult::Switched(provider, model) => {
+                        self.provider = provider;
+                        self.model = model;
+                        self.effort = None;
+                        self.rebuild_model_options();
+                        ConnectAdvance::Saved
+                    }
+                    ConnectResult::KeptCurrent => {
+                        self.rebuild_model_options();
+                        ConnectAdvance::Saved
+                    }
+                    ConnectResult::Failed => ConnectAdvance::Failed,
                 }
-            }
-            ConnectStep::EnterApiKey => {
-                draft.api_key = Some(answer);
-                let provider_id = draft.provider_id.clone().unwrap_or_default();
-                let Some(spec) = crate::llm::providers::lookup(&provider_id) else {
-                    self.connect_draft = None;
-                    self.add_assistant_notice(format!("Unknown provider id: {provider_id}"));
-                    return ConnectAdvance::Failed;
-                };
-                draft.step = ConnectStep::PickModel;
-                ConnectAdvance::NextPicker(build_model_picker(spec))
-            }
-            ConnectStep::PickModel => {
-                draft.model = Some(answer);
-                self.persist_connect()
             }
         }
     }
 
-    /// Write the draft to disk and update in-memory `App` fields. Called from
-    /// `advance_connect` after the model picker resolves; split out so the
-    /// flow stays readable.
-    fn persist_connect(&mut self) -> ConnectAdvance {
-        let Some(draft) = self.connect_draft.take() else {
-            return ConnectAdvance::Failed;
-        };
-        let (provider_id, model) = match (draft.provider_id, draft.model) {
-            (Some(p), Some(m)) => (p, m),
-            _ => return ConnectAdvance::Failed,
-        };
-        // Key may be empty for providers that don't require one (Ollama). The
-        // config writer is only called when there's actually a key to store —
-        // otherwise we'd write `api_key = ""` which is meaningless.
-        if let Some(api_key) = draft
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            if let Err(e) = crate::config::write_provider_key(&provider_id, api_key) {
-                self.add_assistant_notice(format!(
-                    "Failed to write ~/.ignis/config.toml: {e}. Nothing saved."
-                ));
-                return ConnectAdvance::Failed;
-            }
+    /// Rebuild the `/model` list from the freshly-written config so a
+    /// newly-connected provider's whole model catalog is selectable in-session,
+    /// without a restart. Mirrors the startup path and the agent loop's
+    /// `ReloadConfig`.
+    fn rebuild_model_options(&mut self) {
+        let catalog = crate::llm::catalog::load();
+        match crate::config::load_config() {
+            Ok(cfg) => self.model_options = cfg.model_options(&catalog),
+            Err(e) => log::error!("/connect: model list not refreshed: {e}"),
         }
-        // Default-model write into state.json. Failure here is recoverable —
-        // the api_key is the expensive thing the user typed; preserve it and
-        // tell the user to /model manually.
-        if let Err(e) = crate::state::persist_model_selection(&provider_id, &model, None) {
-            self.add_assistant_notice(format!(
-                "Provider saved but default model not set: {e}. Run /model to set it."
-            ));
-        }
-        // Refresh the in-memory UI so the banner/footer show the new pick on
-        // next draw. The agent loop gets a separate ReloadConfig request.
-        self.provider = provider_id.clone();
-        self.model = model.clone();
-        self.effort = None;
-        self.add_assistant_notice(format!(
-            "✓ Connected to {provider_id}. Default model: {model}.\n  \
-             Wrote ~/.ignis/config.toml and ~/.ignis/state.json."
-        ));
-        ConnectAdvance::Saved
     }
 
     /// Discard the in-flight `/connect` draft and emit a one-line notice.
     /// Called from `keys.rs` when the user presses Esc/Ctrl-C while a connect
-    /// picker is open.
+    /// picker is open. A cancel with no draft in flight is a silent no-op.
     pub(crate) fn cancel_connect(&mut self) {
-        if self.connect_draft.take().is_some() {
-            self.add_assistant_notice("/connect cancelled.".to_string());
+        if let Some(notice) = self.connect.cancel() {
+            self.add_assistant_notice(notice);
         }
     }
 
@@ -1419,6 +996,7 @@ impl App {
         self.current_chunk_idx = None;
         self.session_picker = None;
         self.last_usage = None;
+        self.pending_user_display = None;
 
         if messages.is_empty() {
             self.add_assistant_notice(format!("Resumed empty session `{}`.", session_id));
@@ -1508,7 +1086,7 @@ impl App {
     }
 
     pub(crate) fn slash_suggestions(&self) -> Vec<SlashCommand> {
-        slash_suggestions(&self.input, self.skills.as_deref())
+        slash_suggestions(&self.composer.input, self.skills.as_deref())
     }
 
     pub(crate) fn reset_slash_selection(&mut self) {
@@ -1543,36 +1121,12 @@ impl App {
 
     pub(crate) fn history_prev(&mut self) {
         self.exit_pending = false;
-        if self.history.is_empty() {
-            return;
-        }
-        let idx = match self.history_idx {
-            None => {
-                self.saved_input = self.input.clone();
-                self.history.len() - 1
-            }
-            Some(0) => return,
-            Some(i) => i - 1,
-        };
-        self.history_idx = Some(idx);
-        self.input = self.history[idx].clone();
-        self.cursor = self.input.len();
+        self.composer.history_prev();
     }
 
     pub(crate) fn history_next(&mut self) {
         self.exit_pending = false;
-        let idx = match self.history_idx {
-            None => return,
-            Some(i) => i,
-        };
-        if idx + 1 >= self.history.len() {
-            self.history_idx = None;
-            self.input = self.saved_input.clone();
-        } else {
-            self.history_idx = Some(idx + 1);
-            self.input = self.history[idx + 1].clone();
-        }
-        self.cursor = self.input.len();
+        self.composer.history_next();
     }
 
     /// Update pending tool elapsed times each tick
@@ -1702,6 +1256,7 @@ mod connect_tests {
     //! so it's exercised separately by `config::tests::write_provider_key_*`
     //! and `state` tests — these tests cover everything up to that.
     use super::*;
+    use crate::console::connect::ConnectStep;
     use crate::console::picker::PickerAnswer;
     use std::path::PathBuf;
 
@@ -1721,7 +1276,7 @@ mod connect_tests {
         let mut app = fresh_app();
         let req = app.start_connect().expect("should return a picker");
         // Draft is at step 1, all fields unset.
-        let draft = app.connect_draft.as_ref().expect("draft must exist");
+        let draft = app.connect.draft().expect("draft must exist");
         assert_eq!(draft.step, ConnectStep::PickProvider);
         assert!(draft.provider_id.is_none());
         assert!(draft.api_key.is_none());
@@ -1763,7 +1318,7 @@ mod connect_tests {
             },
         ));
         assert!(app.start_connect().is_none());
-        assert!(app.connect_draft.is_none(), "no draft on refusal");
+        assert!(app.connect.draft().is_none(), "no draft on refusal");
     }
 
     #[test]
@@ -1781,7 +1336,7 @@ mod connect_tests {
             }
             other => panic!("expected NextPicker(api-key), got {other:?}"),
         }
-        let draft = app.connect_draft.as_ref().unwrap();
+        let draft = app.connect.draft().unwrap();
         assert_eq!(draft.step, ConnectStep::EnterApiKey);
         assert_eq!(draft.provider_id.as_deref(), Some("openai"));
     }
@@ -1799,10 +1354,7 @@ mod connect_tests {
             }
             other => panic!("expected NextPicker(model), got {other:?}"),
         }
-        assert_eq!(
-            app.connect_draft.as_ref().unwrap().step,
-            ConnectStep::PickModel
-        );
+        assert_eq!(app.connect.draft().unwrap().step, ConnectStep::PickModel);
     }
 
     #[test]
@@ -1814,7 +1366,7 @@ mod connect_tests {
         )]);
         assert!(matches!(outcome, ConnectAdvance::Failed));
         // Draft cleared; user got a notice pointing at config.toml.
-        assert!(app.connect_draft.is_none());
+        assert!(app.connect.draft().is_none());
         let last = app
             .blocks
             .iter()
@@ -1834,7 +1386,7 @@ mod connect_tests {
         let _ = app.start_connect().unwrap();
         let outcome = app.advance_connect(vec![PickerAnswer::Single("Not A Real Provider".into())]);
         assert!(matches!(outcome, ConnectAdvance::Failed));
-        assert!(app.connect_draft.is_none());
+        assert!(app.connect.draft().is_none());
     }
 
     #[test]
@@ -1853,9 +1405,51 @@ mod connect_tests {
             }
             other => panic!("expected NextPicker(model), got {other:?}"),
         }
-        let draft = app.connect_draft.as_ref().unwrap();
+        let draft = app.connect.draft().unwrap();
         assert_eq!(draft.step, ConnectStep::PickModel);
         assert_eq!(draft.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn model_picker_offers_keep_current_when_a_model_is_active() {
+        // Re-connecting (a model is already active) — the model step leads with
+        // a "keep current" row so the user can connect without switching away.
+        let mut app = App::new(
+            "deepseek".to_string(),
+            "deepseek-v4-flash".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        let _ = app.start_connect().unwrap();
+        let _ = app.advance_connect(vec![PickerAnswer::Single("OpenAI".into())]);
+        let outcome = app.advance_connect(vec![PickerAnswer::Single("sk-test".into())]);
+        match outcome {
+            ConnectAdvance::NextPicker(req) => {
+                let opts = &req.questions[0].options;
+                assert_eq!(opts[0].label, "Keep current model");
+                assert!(opts[0].description.contains("deepseek/deepseek-v4-flash"));
+                // The provider's real models follow the keep row.
+                assert!(opts.iter().skip(1).any(|o| o.label == "gpt-5.5"));
+            }
+            other => panic!("expected model picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_picker_has_no_keep_row_on_first_connect() {
+        // No active model yet — nothing to keep, so only the provider's models.
+        let mut app = fresh_app();
+        let _ = app.start_connect().unwrap();
+        let _ = app.advance_connect(vec![PickerAnswer::Single("OpenAI".into())]);
+        let outcome = app.advance_connect(vec![PickerAnswer::Single("sk-test".into())]);
+        match outcome {
+            ConnectAdvance::NextPicker(req) => {
+                let opts = &req.questions[0].options;
+                assert!(opts.iter().all(|o| o.label != "Keep current model"));
+                assert_eq!(opts[0].label, "gpt-5.5");
+            }
+            other => panic!("expected model picker, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1866,7 +1460,7 @@ mod connect_tests {
         let _ = app.start_connect().unwrap();
         let _ = app.advance_connect(vec![PickerAnswer::Single("DeepSeek".into())]);
         let _ = app.advance_connect(vec![PickerAnswer::Single("sk-supersecret".into())]);
-        let draft = app.connect_draft.as_ref().unwrap();
+        let draft = app.connect.draft().unwrap();
         let dbg = format!("{:?}", draft);
         assert!(
             !dbg.contains("sk-supersecret"),
@@ -1883,9 +1477,9 @@ mod connect_tests {
         let mut app = fresh_app();
         let _ = app.start_connect().unwrap();
         let _ = app.advance_connect(vec![PickerAnswer::Single("OpenAI".into())]);
-        assert!(app.connect_draft.is_some());
+        assert!(app.connect.is_active());
         app.cancel_connect();
-        assert!(app.connect_draft.is_none());
+        assert!(app.connect.draft().is_none());
         let last = app
             .blocks
             .iter()
@@ -1902,7 +1496,7 @@ mod connect_tests {
     fn cancel_connect_with_no_draft_is_silent_noop() {
         let mut app = fresh_app();
         app.cancel_connect();
-        assert!(app.connect_draft.is_none());
+        assert!(app.connect.draft().is_none());
         // No notice was emitted (the assistant transcript stays empty).
         assert!(!app
             .blocks
@@ -2117,30 +1711,30 @@ mod tests {
         // 1 byte, landing mid-character and panicking on the next slice/render.
         let mut app = test_app();
         for c in "中a文".chars() {
-            app.insert_char(c);
+            app.composer.insert_char(c);
             assert!(
-                app.input.is_char_boundary(app.cursor),
+                app.composer.input.is_char_boundary(app.composer.cursor),
                 "cursor must stay on a char boundary after insert"
             );
         }
-        assert_eq!(app.input, "中a文");
-        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(app.composer.input, "中a文");
+        assert_eq!(app.composer.cursor, app.composer.input.len());
 
         // Slicing at the cursor (what draw_input does) must not panic.
-        let _ = &app.input[..app.cursor];
+        let _ = &app.composer.input[..app.composer.cursor];
 
         // Walk left across every char, then delete them.
         for _ in 0..3 {
-            app.move_left();
-            assert!(app.input.is_char_boundary(app.cursor));
+            app.composer.move_left();
+            assert!(app.composer.input.is_char_boundary(app.composer.cursor));
         }
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.composer.cursor, 0);
 
-        app.cursor = app.input.len();
-        app.backspace(); // removes "文"
-        assert_eq!(app.input, "中a");
-        assert!(app.input.is_char_boundary(app.cursor));
-        assert_eq!(app.cursor, app.input.len());
+        app.composer.cursor = app.composer.input.len();
+        app.composer.backspace(); // removes "文"
+        assert_eq!(app.composer.input, "中a");
+        assert!(app.composer.input.is_char_boundary(app.composer.cursor));
+        assert_eq!(app.composer.cursor, app.composer.input.len());
     }
 
     #[test]
@@ -2202,14 +1796,14 @@ mod tests {
         app.enqueue("older".to_string());
         app.enqueue("newest".to_string());
         assert!(app.recall_last_queued());
-        assert_eq!(app.input, "newest");
-        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(app.composer.input, "newest");
+        assert_eq!(app.composer.cursor, app.composer.input.len());
         assert_eq!(app.queue, vec!["older"]);
         // Empty queue → no-op.
-        app.input.clear();
+        app.composer.input.clear();
         app.queue.clear();
         assert!(!app.recall_last_queued());
-        assert_eq!(app.input, "");
+        assert_eq!(app.composer.input, "");
     }
 
     #[test]
@@ -2252,7 +1846,10 @@ mod tests {
             text: "steer".to_string(),
         });
         assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "steer"));
-        assert_eq!(app.history.last().map(|s| s.as_str()), Some("steer"));
+        assert_eq!(
+            app.composer.history.last().map(|s| s.as_str()),
+            Some("steer")
+        );
         assert!(app.pending_injects.is_empty());
     }
 
@@ -2282,7 +1879,40 @@ mod tests {
             text: "from-start".to_string(),
         });
         assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "from-start"));
-        assert_eq!(app.history.last().map(|s| s.as_str()), Some("from-start"));
+        assert_eq!(
+            app.composer.history.last().map(|s| s.as_str()),
+            Some("from-start")
+        );
+    }
+
+    #[test]
+    fn skill_commit_renders_typed_command_not_expanded_body() {
+        // A /skill-name turn commits the full skill body to history but sets
+        // `pending_user_display` to the typed command. The transcript must show
+        // the compact invocation, not the expansion (CC/Codex behavior).
+        let mut app = test_app();
+        app.pending_user_display = Some("/brainstorming fix the bug".to_string());
+        app.handle_event(AgentEvent::UserPromptCommitted {
+            text: "The \"brainstorming\" skill is now active … (full body)".to_string(),
+        });
+        assert!(
+            matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "/brainstorming fix the bug"),
+            "transcript shows the typed command, not the skill body"
+        );
+        // Consumed, so the next normal prompt renders its own committed text.
+        assert!(app.pending_user_display.is_none());
+    }
+
+    #[test]
+    fn normal_commit_renders_committed_text_verbatim() {
+        // Regression guard on the `unwrap_or`: with no override, the committed
+        // (post-hook) text renders unchanged.
+        let mut app = test_app();
+        assert!(app.pending_user_display.is_none());
+        app.handle_event(AgentEvent::UserPromptCommitted {
+            text: "hello world".to_string(),
+        });
+        assert!(matches!(app.blocks.last(), Some(UIBlock::User(t)) if t == "hello world"));
     }
 
     #[test]
@@ -2457,46 +2087,46 @@ mod paste_tests {
     fn block_paste_collapses_to_chip() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd\ne".into()); // 5 lines >= 4
-        assert_eq!(app.input, "[ pasted-text#1 5 lines ]");
-        assert_eq!(app.pending_pastes.len(), 1);
-        assert_eq!(app.pending_pastes[0].content, "a\nb\nc\nd\ne");
+        assert_eq!(app.composer.input, "[ pasted-text#1 5 lines ]");
+        assert_eq!(app.composer.pending_pastes.len(), 1);
+        assert_eq!(app.composer.pending_pastes[0].content, "a\nb\nc\nd\ne");
     }
 
     #[test]
     fn small_paste_inserts_inline() {
         let mut app = app();
         app.handle_paste("a\nb\nc".into()); // 3 lines < 4
-        assert_eq!(app.input, "a\nb\nc");
-        assert!(app.pending_pastes.is_empty());
+        assert_eq!(app.composer.input, "a\nb\nc");
+        assert!(app.composer.pending_pastes.is_empty());
     }
 
     #[test]
     fn crlf_is_normalized_in_count_and_content() {
         let mut app = app();
         app.handle_paste("a\r\nb\r\nc\r\nd".into()); // 4 lines after normalize
-        assert_eq!(app.input, "[ pasted-text#1 4 lines ]");
-        assert_eq!(app.pending_pastes[0].content, "a\nb\nc\nd");
+        assert_eq!(app.composer.input, "[ pasted-text#1 4 lines ]");
+        assert_eq!(app.composer.pending_pastes[0].content, "a\nb\nc\nd");
     }
 
     #[test]
     fn submit_expands_chip_and_clears_pending() {
         let mut app = app();
         app.handle_paste("w\nx\ny\nz".into()); // 4 lines
-        app.insert_str(" review this");
+        app.composer.insert_str(" review this");
         let out = app.submit().unwrap();
         assert_eq!(out, "w\nx\ny\nz review this");
-        assert!(app.input.is_empty());
-        assert!(app.pending_pastes.is_empty());
+        assert!(app.composer.input.is_empty());
+        assert!(app.composer.pending_pastes.is_empty());
     }
 
     #[test]
     fn two_pastes_number_and_both_expand() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into());
-        app.insert_str(" ");
+        app.composer.insert_str(" ");
         app.handle_paste("e\nf\ng\nh\ni".into());
-        assert!(app.input.contains("#1"));
-        assert!(app.input.contains("#2"));
+        assert!(app.composer.input.contains("#1"));
+        assert!(app.composer.input.contains("#2"));
         let out = app.submit().unwrap();
         assert!(out.contains("a\nb\nc\nd"));
         assert!(out.contains("e\nf\ng\nh\ni"));
@@ -2506,10 +2136,10 @@ mod paste_tests {
     fn backspace_removes_whole_chip() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into());
-        assert_eq!(app.pending_pastes.len(), 1);
-        app.backspace(); // cursor at chip's right edge
-        assert_eq!(app.input, "");
-        assert!(app.pending_pastes.is_empty());
+        assert_eq!(app.composer.pending_pastes.len(), 1);
+        app.composer.backspace(); // cursor at chip's right edge
+        assert_eq!(app.composer.input, "");
+        assert!(app.composer.pending_pastes.is_empty());
     }
 
     #[test]
@@ -2518,7 +2148,7 @@ mod paste_tests {
         app.handle_paste("a\nb\nc\nd".into());
         let _ = app.submit();
         app.handle_paste("e\nf\ng\nh".into());
-        assert!(app.input.contains("#2"));
+        assert!(app.composer.input.contains("#2"));
     }
 
     // --- atomic-edit guards: a chip is never half-deleted into a fragment that
@@ -2528,41 +2158,41 @@ mod paste_tests {
     fn ctrl_w_removes_whole_chip_no_leak() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into()); // cursor at chip's right edge
-        app.delete_word_back();
-        assert_eq!(app.input, "");
-        assert!(app.pending_pastes.is_empty());
-        assert_eq!(app.expand_pastes(app.input.clone()), "");
+        app.composer.delete_word_back();
+        assert_eq!(app.composer.input, "");
+        assert!(app.composer.pending_pastes.is_empty());
+        assert_eq!(app.composer.expand_pastes(app.composer.input.clone()), "");
     }
 
     #[test]
     fn delete_forward_at_chip_start_removes_chip() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into());
-        app.cursor = 0;
-        app.delete_forward();
-        assert_eq!(app.input, "");
-        assert!(app.pending_pastes.is_empty());
+        app.composer.cursor = 0;
+        app.composer.delete_forward();
+        assert_eq!(app.composer.input, "");
+        assert!(app.composer.pending_pastes.is_empty());
     }
 
     #[test]
     fn backspace_inside_chip_removes_whole_chip() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into());
-        app.cursor = 5; // mid-chip
-        app.backspace();
-        assert_eq!(app.input, "");
-        assert!(app.pending_pastes.is_empty());
+        app.composer.cursor = 5; // mid-chip
+        app.composer.backspace();
+        assert_eq!(app.composer.input, "");
+        assert!(app.composer.pending_pastes.is_empty());
     }
 
     #[test]
     fn typing_inside_chip_snaps_and_keeps_chip_intact() {
         let mut app = app();
         app.handle_paste("a\nb\nc\nd".into());
-        let chip = app.input.clone();
-        app.cursor = 5; // mid-chip
-        app.insert_char('x');
-        assert_eq!(app.input, format!("{chip}x")); // x landed after the chip
-        assert_eq!(app.pending_pastes.len(), 1);
+        let chip = app.composer.input.clone();
+        app.composer.cursor = 5; // mid-chip
+        app.composer.insert_char('x');
+        assert_eq!(app.composer.input, format!("{chip}x")); // x landed after the chip
+        assert_eq!(app.composer.pending_pastes.len(), 1);
         assert_eq!(app.submit().unwrap(), "a\nb\nc\ndx");
     }
 }

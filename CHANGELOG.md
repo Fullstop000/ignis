@@ -13,9 +13,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - extensions: `Stop` event honours the Claude Code inversion — a `decision: "block"` on `Stop` keeps the loop alive and surfaces the reason as a `<system-reminder>` framed `"stopped continuation: <reason>"`. Lets users wire "don't stop until tests pass" guardrails without a new event.
 - extensions: `SystemPromptCompose` fires once per LLM call (not per session) — extensions can prune or rewrite the assembled system prompt (which includes git status/diff, AGENTS.md, the skills catalog, and MCP instructions) to A/B test prompt density for token-efficiency research.
 - extensions: three new example extensions — `examples/extensions/bash-deny-rm-rf/` (PreToolUse block), `examples/extensions/auto-test/` (PostToolUse `additionalContext`), `examples/extensions/system-prompt-trim/` (SystemPromptCompose rewrite).
+- TUI — `/sessions` shows a per-row title (from the session's first message) and hides the session you're already in. ([#144](https://github.com/Fullstop000/ignis/pull/144))
+- Providers — Zhipu GLM (BigModel open platform, China) is now a built-in OpenAI-compatible provider; configure with `[providers.zhipu]` and `model = "zhipu/glm-5.1"`. ([#143](https://github.com/Fullstop000/ignis/pull/143))
 
 ### Changed
 - extensions: rename of the user-facing surface. Config lives at `~/.ignis/extensions.json` and the slash command is `/extensions` (with `/extensions list` and `/extensions reload`). v1 hook configs at `~/.ignis/hooks.json` continue to be read as a back-compat fallback, and `/hooks` remains as a deprecated alias for `/extensions`. JSON top-level key accepts either `"extensions"` (preferred) or `"hooks"` (legacy).
+- TUI — `/connect`'s final step now imports the provider's whole model list into `/model` and just picks which one is active, offering a "Keep current model" row so rotating a key needn't switch models. ([#143](https://github.com/Fullstop000/ignis/pull/143))
+
+### Fixed
+- TUI — after `/connect`, the newly-connected provider's models now appear in `/model` in the same session (the picker list was only built at startup). ([#143](https://github.com/Fullstop000/ignis/pull/143))
+
+## [0.36.2] - 2026-06-08
+
+### Fixed
+- TUI — resizing the terminal (e.g. dragging between monitors) no longer leaves duplicate input bars stacked on screen. ([#138](https://github.com/Fullstop000/ignis/pull/138))
+- TUI — resuming a session via `/sessions` reliably repaints the conversation history instead of sometimes leaving a blank screen with only the input bar. ([#140](https://github.com/Fullstop000/ignis/pull/140))
+
+## [0.36.1] - 2026-06-08
+
+### Fixed
+- TUI — `/model` picker anchors above the input (replacing it, CC-style) instead of taking over the whole body. The conversation in native scrollback above the TUI stays visible while the picker is open. ([#134](https://github.com/Fullstop000/ignis/pull/134))
+
+## [0.36.0] - 2026-06-08
+
+### Added
+- TUI — the input bar shows a `❯` prompt at its left edge. ([#133](https://github.com/Fullstop000/ignis/pull/133))
+
+### Changed
+- TUI — invoking a skill (`/skill-name` or the `skill` tool) shows a compact line in the transcript instead of the full skill body. ([#136](https://github.com/Fullstop000/ignis/pull/136))
+
+### Fixed
+- TUI — a momentarily unresponsive terminal no longer crashes the session mid-render; the inline view rides out the hiccup and recovers. ([#135](https://github.com/Fullstop000/ignis/pull/135))
 
 ## [0.35.0] - 2026-06-06
 

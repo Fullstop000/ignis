@@ -54,6 +54,10 @@ pub struct SessionRecord {
     pub session_id: String,
     pub project_slug: String,
     pub project_start_dir: Option<String>,
+    /// One-line, length-bounded preview of the first user message, derived
+    /// lazily at parse time and shown as the session's title in the picker.
+    /// Empty when the session has no user text yet (or for legacy `.json`).
+    pub title: String,
     pub started_at: Option<u64>,
     pub last_modified: Option<u64>,
     pub message_count: u64,
@@ -384,6 +388,20 @@ pub fn session_detail(
     Ok(SessionDetail { record, turns })
 }
 
+/// Collapse a user message into a single-line, length-bounded title: all
+/// whitespace runs (incl. newlines) become single spaces, trimmed, then capped
+/// by char count so we never carry a whole pasted block around. The final
+/// width-aware truncation to the band happens at render time.
+fn first_message_title(content: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() > MAX_CHARS {
+        normalized.chars().take(MAX_CHARS).collect()
+    } else {
+        normalized
+    }
+}
+
 pub fn parse_session(
     session_id: &str,
     project_slug: &str,
@@ -455,6 +473,13 @@ pub fn parse_session(
                     }
                 } else if role == "user" {
                     rec.user_queries += 1;
+                    // Derive the title from the first user message that has
+                    // text; keep trying until one is non-empty.
+                    if rec.title.is_empty() {
+                        if let Some(text) = payload.get("content").and_then(|v| v.as_str()) {
+                            rec.title = first_message_title(text);
+                        }
+                    }
                 } else if role == "tool" {
                     if let Some(content) = payload.get("content").and_then(|v| v.as_str()) {
                         if let Ok(parsed) = serde_json::from_str::<Value>(content) {
@@ -898,6 +923,8 @@ mod tests {
         assert_eq!(rec.project_slug, "proj-slug");
         assert_eq!(rec.project_start_dir.as_deref(), Some("/home/u/proj"));
         assert_eq!(rec.started_at, Some(1779800000));
+        // Title is derived from the first user message ("hi").
+        assert_eq!(rec.title, "hi");
         assert_eq!(rec.message_count, 5);
         // 5 messages in fixture = 1 user + 2 assistant + 2 tool.
         assert_eq!(rec.agent_messages, 2);
@@ -911,6 +938,26 @@ mod tests {
         expected.insert("bash".to_string(), 1);
         expected.insert("read".to_string(), 1);
         assert_eq!(rec.tool_calls, expected);
+    }
+
+    #[test]
+    fn first_message_title_collapses_whitespace_and_caps() {
+        assert_eq!(first_message_title("  fix\n  the   bug \n"), "fix the bug");
+        assert_eq!(first_message_title("   "), "");
+        let long = "x".repeat(200);
+        assert_eq!(first_message_title(&long).chars().count(), 120);
+    }
+
+    #[test]
+    fn parse_session_title_uses_first_nonempty_user_message() {
+        // A blank first user turn is skipped; the next one with text wins.
+        let jsonl = [
+            r#"{"type":"message","timestamp":1,"payload":{"role":"user","content":"   "}}"#,
+            r#"{"type":"message","timestamp":2,"payload":{"role":"user","content":"real first prompt"}}"#,
+        ]
+        .join("\n");
+        let rec = parse_session("s", "p", &jsonl, None).unwrap();
+        assert_eq!(rec.title, "real first prompt");
     }
 
     #[test]
@@ -971,6 +1018,7 @@ mod tests {
             session_id: "sess-<dangerous>".to_string(),
             project_slug: "-home-u-proj".to_string(),
             project_start_dir: Some("/home/u/proj".to_string()),
+            title: "fix the bug".to_string(),
             started_at: Some(1735787045),
             last_modified: Some(1735787100),
             message_count: 10,
