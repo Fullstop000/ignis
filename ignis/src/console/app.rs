@@ -69,21 +69,18 @@ pub(crate) struct SessionPicker {
     pub(crate) sessions: Vec<crate::cli::sessions::SessionRecord>,
     pub(crate) selected: usize,
     pub(crate) mode: SessionPickerMode,
-    pub(crate) current_session_id: String,
     pub(crate) projects_dir: std::path::PathBuf,
 }
 
 impl SessionPicker {
     pub(crate) fn new(
         sessions: Vec<crate::cli::sessions::SessionRecord>,
-        current_session_id: String,
         projects_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             sessions,
             selected: 0,
             mode: SessionPickerMode::List,
-            current_session_id,
             projects_dir,
         }
     }
@@ -791,11 +788,7 @@ impl App {
         projects_dir: std::path::PathBuf,
     ) {
         self.exit_pending = false;
-        self.session_picker = Some(SessionPicker::new(
-            sessions,
-            self.session_id.clone(),
-            projects_dir,
-        ));
+        self.session_picker = Some(SessionPicker::new(sessions, projects_dir));
     }
 
     pub(crate) fn select_session_picker(&mut self, direction: SelectionDirection) {
