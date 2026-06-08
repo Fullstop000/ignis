@@ -214,6 +214,25 @@ static SPECS: &[ProviderSpec] = &[
             },
         ],
     },
+    // ── Zhipu GLM (BigModel open platform, China) ───────────────────────────
+    ProviderSpec {
+        id: "zhipu",
+        display_name: "Zhipu GLM (BigModel)",
+        endpoints: &[Endpoint {
+            protocol: Protocol::OpenAi,
+            base_url: "https://open.bigmodel.cn/api/paas/v4",
+            auth: Auth::Bearer,
+        }],
+        api_key_required: true,
+        request_headers: &[],
+        models: &[ModelSpec {
+            // GLM controls reasoning via a `thinking` body param, not OpenAI's
+            // reasoning_effort, so leave the effort list empty.
+            name: "glm-5.1",
+            context: Some(200_000),
+            reasoning_effort: &[],
+        }],
+    },
     // ── Ollama (local; no key, no tool support) ─────────────────────────────
     ProviderSpec {
         id: "ollama",
@@ -314,6 +333,9 @@ mod tests {
         let moonshot = lookup("moonshot-platform-cn").unwrap();
         assert_eq!(moonshot.models[0].name, "kimi-k2.6");
         assert!(moonshot.models.iter().any(|m| m.name == "kimi-k2.5"));
+
+        let zhipu = lookup("zhipu").unwrap();
+        assert_eq!(zhipu.models[0].name, "glm-5.1");
     }
 
     #[test]

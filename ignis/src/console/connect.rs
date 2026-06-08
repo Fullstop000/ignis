@@ -71,12 +71,23 @@ pub(crate) enum ConnectAdvance {
 pub(crate) enum ConnectOutcome {
     /// The flow continues; install this picker.
     NextPicker(PickerRequest),
-    /// The flow ended. Emit `notices` in order; if `applied` is `Some`, `App`
-    /// should adopt the new `(provider, model)` and request a config reload.
+    /// The flow ended. Emit `notices` in order, then act on `result`.
     Done {
         notices: Vec<String>,
-        applied: Option<(String, String)>,
+        result: ConnectResult,
     },
+}
+
+/// How a finished `/connect` should land. On either success the provider's
+/// models are now in config, so `App` rebuilds its `/model` list and requests a
+/// config reload; only `Switched` also changes the active selection.
+pub(crate) enum ConnectResult {
+    /// Connected and switched the active model to `(provider, model)`.
+    Switched(String, String),
+    /// Connected; keep the current active model (its models are still imported).
+    KeptCurrent,
+    /// Aborted — a notice already explains why; change nothing.
+    Failed,
 }
 
 #[derive(Default)]
@@ -119,15 +130,21 @@ impl ConnectFlow {
         Ok(build_provider_picker(current_provider.as_deref()))
     }
 
-    /// Drive the flow one step forward given the picker's answer. Mutates the
-    /// draft, and on the final step writes `config.toml` + `state.json`.
-    pub(crate) fn advance(&mut self, answers: Vec<PickerAnswer>) -> ConnectOutcome {
+    /// Drive the flow one step forward given the picker's answer. `current` is
+    /// the active `(provider, model)`, if any — the model step uses it to offer
+    /// a "keep current" row. On the final step writes `config.toml`
+    /// (+ `state.json` when a model is activated).
+    pub(crate) fn advance(
+        &mut self,
+        answers: Vec<PickerAnswer>,
+        current: Option<(&str, &str)>,
+    ) -> ConnectOutcome {
         // The draft must be set by `start` before this is called; a missing
         // draft is a programming error, not a user-facing situation.
         let Some(draft) = self.draft.as_mut() else {
             return ConnectOutcome::Done {
                 notices: vec![],
-                applied: None,
+                result: ConnectResult::Failed,
             };
         };
         let answer = match answers.into_iter().next() {
@@ -138,7 +155,7 @@ impl ConnectFlow {
                 self.draft = None;
                 return ConnectOutcome::Done {
                     notices: vec![],
-                    applied: None,
+                    result: ConnectResult::Failed,
                 };
             }
         };
@@ -151,7 +168,7 @@ impl ConnectFlow {
                     self.draft = None;
                     return ConnectOutcome::Done {
                         notices: vec![format!("Unknown provider: {answer}")],
-                        applied: None,
+                        result: ConnectResult::Failed,
                     };
                 };
                 // The `custom` brand requires `api_url` + `models` fields that
@@ -164,7 +181,7 @@ impl ConnectFlow {
                             "For custom providers, edit ~/.ignis/config.toml — see config.example.toml."
                                 .to_string(),
                         ],
-                        applied: None,
+                        result: ConnectResult::Failed,
                     };
                 }
                 draft.provider_id = Some(spec.id.to_string());
@@ -175,7 +192,7 @@ impl ConnectFlow {
                     ConnectOutcome::NextPicker(build_api_key_picker(spec.display_name))
                 } else {
                     draft.step = ConnectStep::PickModel;
-                    ConnectOutcome::NextPicker(build_model_picker(spec))
+                    ConnectOutcome::NextPicker(build_model_picker(spec, current))
                 }
             }
             ConnectStep::EnterApiKey => {
@@ -185,14 +202,16 @@ impl ConnectFlow {
                     self.draft = None;
                     return ConnectOutcome::Done {
                         notices: vec![format!("Unknown provider id: {provider_id}")],
-                        applied: None,
+                        result: ConnectResult::Failed,
                     };
                 };
                 draft.step = ConnectStep::PickModel;
-                ConnectOutcome::NextPicker(build_model_picker(spec))
+                ConnectOutcome::NextPicker(build_model_picker(spec, current))
             }
             ConnectStep::PickModel => {
-                draft.model = Some(answer);
+                // None when the user chose "keep current model": import the
+                // provider's models without changing the active selection.
+                draft.model = (answer != KEEP_CURRENT_MODEL).then_some(answer);
                 let draft = self.draft.take().expect("draft set above");
                 persist(draft)
             }
@@ -206,53 +225,71 @@ impl ConnectFlow {
     }
 }
 
-/// Write the resolved draft to disk. Returns the notices to show and, on
-/// success, the `(provider, model)` for `App` to adopt.
+/// Sentinel label for the "don't switch" row in the connect model picker.
+const KEEP_CURRENT_MODEL: &str = "Keep current model";
+
+/// Write the resolved draft to disk. `draft.model` is `None` when the user chose
+/// to keep their current active model. Returns the notices to show and how the
+/// connect should land.
 fn persist(draft: ConnectDraft) -> ConnectOutcome {
     let mut notices = Vec::new();
-    let (provider_id, model) = match (draft.provider_id, draft.model) {
-        (Some(p), Some(m)) => (p, m),
-        _ => {
-            return ConnectOutcome::Done {
-                notices,
-                applied: None,
-            }
-        }
+    let Some(provider_id) = draft.provider_id else {
+        return ConnectOutcome::Done {
+            notices,
+            result: ConnectResult::Failed,
+        };
     };
-    // Key may be empty for providers that don't require one (Ollama). The config
-    // writer is only called when there's actually a key to store — otherwise
-    // we'd write `api_key = ""` which is meaningless.
-    if let Some(api_key) = draft
+    // Register the provider in config.toml. With a key, write it; keyless
+    // providers (e.g. Ollama) still get an empty `[providers.<id>]` table so
+    // `Config::model_options` lists their models after the reload.
+    let written = match draft
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        if let Err(e) = crate::config::write_provider_key(&provider_id, api_key) {
-            notices.push(format!(
-                "Failed to write ~/.ignis/config.toml: {e}. Nothing saved."
-            ));
-            return ConnectOutcome::Done {
-                notices,
-                applied: None,
-            };
-        }
-    }
-    // Default-model write into state.json. Failure here is recoverable — the
-    // api_key is the expensive thing the user typed; preserve it and tell the
-    // user to /model manually.
-    if let Err(e) = crate::state::persist_model_selection(&provider_id, &model, None) {
+        Some(api_key) => crate::config::write_provider_key(&provider_id, api_key),
+        None => crate::config::ensure_provider(&provider_id),
+    };
+    if let Err(e) = written {
         notices.push(format!(
-            "Provider saved but default model not set: {e}. Run /model to set it."
+            "Failed to write ~/.ignis/config.toml: {e}. Nothing saved."
         ));
+        return ConnectOutcome::Done {
+            notices,
+            result: ConnectResult::Failed,
+        };
     }
-    notices.push(format!(
-        "✓ Connected to {provider_id}. Default model: {model}.\n  \
-         Wrote ~/.ignis/config.toml and ~/.ignis/state.json."
-    ));
-    ConnectOutcome::Done {
-        notices,
-        applied: Some((provider_id, model)),
+    match draft.model {
+        // The user picked a model — make it the active selection.
+        Some(model) => {
+            // state.json write failure is recoverable: the api_key is the
+            // expensive thing the user typed; keep it and point at /model.
+            if let Err(e) = crate::state::persist_model_selection(&provider_id, &model, None) {
+                notices.push(format!(
+                    "Provider saved but active model not set: {e}. Run /model to set it."
+                ));
+            }
+            notices.push(format!(
+                "✓ Connected to {provider_id}. Active model: {provider_id}/{model}."
+            ));
+            ConnectOutcome::Done {
+                notices,
+                result: ConnectResult::Switched(provider_id, model),
+            }
+        }
+        // "Keep current model" — import the provider's models but leave the
+        // active selection untouched.
+        None => {
+            notices.push(format!(
+                "✓ Connected to {provider_id}. Its models are now in /model; \
+                 active model unchanged."
+            ));
+            ConnectOutcome::Done {
+                notices,
+                result: ConnectResult::KeptCurrent,
+            }
+        }
     }
 }
 
@@ -314,21 +351,32 @@ fn build_api_key_picker(provider_display: &str) -> PickerRequest {
     }
 }
 
-/// Step 3: default-model picker, scoped to the chosen provider's `&[ModelSpec]`.
-fn build_model_picker(spec: &crate::llm::providers::ProviderSpec) -> PickerRequest {
-    let options: Vec<PickerOption> = spec
-        .models
-        .iter()
-        .map(|m| PickerOption {
-            label: m.name.to_string(),
-            description: model_description(m),
+/// Step 3: the active-model picker for the chosen provider. Lists every model in
+/// the provider's `&[ModelSpec]` — connecting imports all of them into `/model`
+/// regardless of the pick; this step only chooses which one is active now. When
+/// a model is already active, a "keep current" row lets the user connect (e.g.
+/// to rotate a key) without switching away from it.
+fn build_model_picker(
+    spec: &crate::llm::providers::ProviderSpec,
+    current: Option<(&str, &str)>,
+) -> PickerRequest {
+    let mut options: Vec<PickerOption> = Vec::new();
+    if let Some((provider, model)) = current {
+        options.push(PickerOption {
+            label: KEEP_CURRENT_MODEL.to_string(),
+            description: format!("stay on {provider}/{model}"),
             preview: None,
-        })
-        .collect();
+        });
+    }
+    options.extend(spec.models.iter().map(|m| PickerOption {
+        label: m.name.to_string(),
+        description: model_description(m),
+        preview: None,
+    }));
     let (tx, _rx) = tokio::sync::oneshot::channel();
     PickerRequest {
         questions: vec![PickerQuestion {
-            question: format!("Pick a default model for {}", spec.display_name),
+            question: format!("Set the active model for {}", spec.display_name),
             kind: "connect".to_string(),
             header: "Model".to_string(),
             multi_select: false,

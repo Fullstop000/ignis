@@ -35,6 +35,9 @@ api_key = "sk-cp-your-key"
 # [providers."moonshot-platform-cn"]
 # api_key = "sk-your-moonshot-key"
 #
+# [providers.zhipu]                  # GLM / BigModel open platform (China)
+# api_key = "your-glm-api-key"
+#
 # [providers.ollama]                 # local; no API key needed
 
 # ─ Optional provider overrides ────────────────────────────────────────────────

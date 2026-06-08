@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - TUI — `/sessions` shows a per-row title (from the session's first message) and hides the session you're already in. ([#144](https://github.com/Fullstop000/ignis/pull/144))
+- Providers — Zhipu GLM (BigModel open platform, China) is now a built-in OpenAI-compatible provider; configure with `[providers.zhipu]` and `model = "zhipu/glm-5.1"`. ([#143](https://github.com/Fullstop000/ignis/pull/143))
+
+### Changed
+- TUI — `/connect`'s final step now imports the provider's whole model list into `/model` and just picks which one is active, offering a "Keep current model" row so rotating a key needn't switch models. ([#143](https://github.com/Fullstop000/ignis/pull/143))
+
+### Fixed
+- TUI — after `/connect`, the newly-connected provider's models now appear in `/model` in the same session (the picker list was only built at startup). ([#143](https://github.com/Fullstop000/ignis/pull/143))
 
 ## [0.36.2] - 2026-06-08
 
