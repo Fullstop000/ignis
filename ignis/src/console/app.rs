@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use super::composer::Composer;
+use super::connect::{ConnectAdvance, ConnectFlow, ConnectOutcome};
 use super::{
     format_elapsed, next_selection, slash_suggestions, SelectionDirection, SlashCommand, SPINNERS,
     THINKING_VERBS,
@@ -51,188 +52,6 @@ pub(crate) enum UIBlock {
     /// "✻ Thinking" header instead of being silently glued onto the reply.
     Reasoning(String),
     Tool(ToolCallEntry),
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// `/connect` picker-request builders. Each returns a fully-formed
-// `PickerRequest` for the runner's `picker_tx` mpsc; the reply oneshot is
-// fire-and-forget because the flow's state lives in `App::connect_draft`,
-// not in awaiting tasks. The picker-completion path in `keys.rs` reads the
-// draft to know which step's answer it just received.
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Step 1: pick a provider from the baked-in `SPECS` catalog. The currently-
-/// active provider (if any) is mentioned in the question text so users who
-/// re-run `/connect` to rotate a key know what they're about to overwrite.
-fn build_provider_picker(current_provider: Option<&str>) -> crate::console::picker::PickerRequest {
-    use crate::console::picker::{PickerOption, PickerQuestion, PickerRequest};
-    let options: Vec<PickerOption> = crate::llm::providers::all()
-        .iter()
-        .map(|spec| PickerOption {
-            label: spec.display_name.to_string(),
-            description: provider_description(spec),
-            preview: None,
-        })
-        .collect();
-    let question = match current_provider {
-        Some(id) => format!("Connect a provider (current: {id})"),
-        None => "Connect a provider — pick one to configure".to_string(),
-    };
-    let (tx, _rx) = tokio::sync::oneshot::channel();
-    PickerRequest {
-        questions: vec![PickerQuestion {
-            question,
-            kind: "connect".to_string(),
-            header: "Provider".to_string(),
-            multi_select: false,
-            allow_other: false,
-            text_input: false,
-            mask: false,
-            options,
-        }],
-        reply: tx,
-    }
-}
-
-/// Step 2: API-key entry. Text-input mode, masked (no shoulder-surfing).
-fn build_api_key_picker(provider_display: &str) -> crate::console::picker::PickerRequest {
-    use crate::console::picker::{PickerQuestion, PickerRequest};
-    let (tx, _rx) = tokio::sync::oneshot::channel();
-    PickerRequest {
-        questions: vec![PickerQuestion {
-            question: format!("Paste your API key for {provider_display}"),
-            kind: "connect".to_string(),
-            header: "API Key".to_string(),
-            multi_select: false,
-            allow_other: false,
-            text_input: true,
-            mask: true,
-            options: vec![],
-        }],
-        reply: tx,
-    }
-}
-
-/// Step 3: default-model picker, scoped to the chosen provider's `&[ModelSpec]`.
-fn build_model_picker(
-    spec: &crate::llm::providers::ProviderSpec,
-) -> crate::console::picker::PickerRequest {
-    use crate::console::picker::{PickerOption, PickerQuestion, PickerRequest};
-    let options: Vec<PickerOption> = spec
-        .models
-        .iter()
-        .map(|m| PickerOption {
-            label: m.name.to_string(),
-            description: model_description(m),
-            preview: None,
-        })
-        .collect();
-    let (tx, _rx) = tokio::sync::oneshot::channel();
-    PickerRequest {
-        questions: vec![PickerQuestion {
-            question: format!("Pick a default model for {}", spec.display_name),
-            kind: "connect".to_string(),
-            header: "Model".to_string(),
-            multi_select: false,
-            allow_other: false,
-            text_input: false,
-            mask: false,
-            options,
-        }],
-        reply: tx,
-    }
-}
-
-/// One-line endpoint hint for the provider row, synthesized from the first
-/// endpoint's `base_url`. Strips the protocol so the URL doesn't dominate
-/// the line.
-fn provider_description(spec: &crate::llm::providers::ProviderSpec) -> String {
-    if spec.id == "custom" {
-        return "Edit ~/.ignis/config.toml after selecting (api_url + models required)."
-            .to_string();
-    }
-    let host = spec
-        .endpoints
-        .first()
-        .map(|e| {
-            e.base_url
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .to_string()
-        })
-        .unwrap_or_default();
-    if spec.api_key_required {
-        host
-    } else {
-        // Local-only providers don't take a key — call that out so users
-        // don't expect to be prompted for one.
-        format!("{host}  (no key required)")
-    }
-}
-
-/// One-line model-row hint: context window if known, else empty. Keeps the
-/// row short — full effort/reasoning details live in `/model`.
-fn model_description(m: &crate::llm::providers::ModelSpec) -> String {
-    match m.context {
-        Some(ctx) => format!("context {}", super::format::format_context(ctx)),
-        None => String::new(),
-    }
-}
-
-/// `/connect` multi-step flow state. Created when the user types `/connect`,
-/// cleared on completion or cancel. The picker-completion path in `keys.rs`
-/// drives advancement: each step's answer feeds the next, and the final
-/// step persists to `~/.ignis/config.toml` + `~/.ignis/state.json`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ConnectStep {
-    PickProvider,
-    EnterApiKey,
-    PickModel,
-}
-
-#[derive(Clone)]
-pub(crate) struct ConnectDraft {
-    pub(crate) step: ConnectStep,
-    /// Provider id (the `SPECS` key, e.g. "openai"). Set after step 1.
-    pub(crate) provider_id: Option<String>,
-    /// Provider display name (e.g. "OpenAI"). Used for the API-key prompt.
-    pub(crate) provider_display: Option<String>,
-    /// Raw API key as typed. Stays in memory until the persist step writes
-    /// `[providers.<id>] api_key = "…"` to `config.toml`. None for Ollama
-    /// and similar providers with `api_key_required = false`.
-    pub(crate) api_key: Option<String>,
-    /// Selected model name (e.g. "gpt-5.5"). Set after step 3.
-    pub(crate) model: Option<String>,
-}
-
-// Manual `Debug` that redacts `api_key` — a derived impl would print the
-// plaintext key the moment something `dbg!(&draft)`s or a tracing span captures
-// `App` state. Keep the redaction; never derive Debug on this struct.
-impl std::fmt::Debug for ConnectDraft {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectDraft")
-            .field("step", &self.step)
-            .field("provider_id", &self.provider_id)
-            .field("provider_display", &self.provider_display)
-            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
-            .field("model", &self.model)
-            .finish()
-    }
-}
-
-/// What `advance_connect` tells the caller (`keys.rs`) to do next.
-#[derive(Debug)]
-pub(crate) enum ConnectAdvance {
-    /// Send this picker over `picker_tx` — it's the next step in the flow.
-    NextPicker(crate::console::picker::PickerRequest),
-    /// Connect succeeded. The agent loop needs a fresh config from disk so
-    /// its in-memory `agent_config` reflects the new `api_key` (the existing
-    /// `SetModel` variant doesn't carry providers, hence the dedicated
-    /// `ReloadConfig` request).
-    Saved,
-    /// Connect aborted (user picked Custom, persist failed, etc). A user-
-    /// facing notice has already been added; the caller does nothing else.
-    Failed,
 }
 
 /// List = the session table; Detail = drill-in for one session showing turn
@@ -493,11 +312,11 @@ pub(crate) struct App {
     /// through the normal `UIBlock::Tool` flush path
     /// (`block_lines` → `ask_user_resume_trace`) — no separate live channel.
     pub(crate) inline_picker: Option<super::inline_picker::InlinePickerState>,
-    /// `/connect` flow state. `Some` while the multi-step picker is open
-    /// (provider → API key → model), `None` otherwise. The picker-completion
-    /// path in `keys.rs` checks this to route picker answers back into
+    /// `/connect` provider-setup wizard. Active while the multi-step picker is
+    /// open (provider → API key → model). The picker-completion path in
+    /// `keys.rs` checks `connect.is_active()` to route picker answers back into
     /// `advance_connect` instead of treating them as tool-initiated answers.
-    pub(crate) connect_draft: Option<ConnectDraft>,
+    pub(crate) connect: ConnectFlow,
 
     pub(crate) mode: Mode,
     pub(crate) tick: u64,
@@ -595,7 +414,7 @@ impl App {
             skill_picker: None,
             mcp_picker: None,
             inline_picker: None,
-            connect_draft: None,
+            connect: ConnectFlow::default(),
             mode: Mode::Idle,
             tick: 0,
             stream_start: None,
@@ -1000,161 +819,59 @@ impl App {
         self.effort = effort;
     }
 
-    /// `/connect` — start the multi-step provider-setup flow. Returns the
-    /// first picker (provider selection); the caller (`keys.rs`) sends it
-    /// over `picker_tx`. The runner installs it as `app.inline_picker`, the
-    /// user picks, and the picker-completion path routes back here via
-    /// [`Self::advance_connect`].
-    ///
-    /// Returns `None` only if a picker is already open — the caller emits
-    /// "another picker is open" instead of stomping the existing one.
+    /// `/connect` — start the multi-step provider-setup flow. Returns the first
+    /// picker (provider selection); the caller (`keys.rs`) sends it over
+    /// `picker_tx`. The runner installs it as `app.inline_picker`, the user
+    /// picks, and the picker-completion path routes back here via
+    /// [`Self::advance_connect`]. Thin coordinator over [`ConnectFlow::start`]:
+    /// it supplies the App-side inputs (is a picker open? the current provider)
+    /// and turns a "picker already open" refusal into a notice + `None`.
     pub(crate) fn start_connect(&mut self) -> Option<crate::console::picker::PickerRequest> {
         self.exit_pending = false;
-        if self.inline_picker.is_some() {
-            self.add_assistant_notice(
-                "/connect: another picker is open; close it first.".to_string(),
-            );
-            return None;
+        let current = (!self.provider.is_empty()).then(|| self.provider.clone());
+        match self.connect.start(self.inline_picker.is_some(), current) {
+            Ok(req) => Some(req),
+            Err(notice) => {
+                self.add_assistant_notice(notice);
+                None
+            }
         }
-        let current_provider = (!self.provider.is_empty()).then(|| self.provider.clone());
-        self.connect_draft = Some(ConnectDraft {
-            step: ConnectStep::PickProvider,
-            provider_id: None,
-            provider_display: None,
-            api_key: None,
-            model: None,
-        });
-        Some(build_provider_picker(current_provider.as_deref()))
     }
 
     /// Drive the `/connect` flow one step forward given the picker's answer.
-    /// Called from `keys.rs` when an inline picker completes AND a draft is
-    /// active. Mutates `connect_draft`, may emit notices, and on the final
-    /// step writes `config.toml` + `state.json` and refreshes the UI's
-    /// `provider`/`model` fields so the banner reflects the new pick.
+    /// Coordinator over [`ConnectFlow::advance`]: it emits the flow's notices
+    /// and, on success, adopts the new `provider`/`model` (clearing `effort`) so
+    /// the banner reflects the pick. The agent loop gets a separate
+    /// `ReloadConfig` request from `keys.rs` on `Saved`.
     pub(crate) fn advance_connect(
         &mut self,
         answers: Vec<crate::console::picker::PickerAnswer>,
     ) -> ConnectAdvance {
-        use crate::console::picker::PickerAnswer;
-        // The draft must be set by `start_connect` before this is called; a
-        // missing draft is a programming error, not a user-facing situation.
-        let Some(draft) = self.connect_draft.as_mut() else {
-            return ConnectAdvance::Failed;
-        };
-        let answer = match answers.into_iter().next() {
-            Some(PickerAnswer::Single(s)) => s,
-            // Connect pickers are all single-select; a Multi answer means the
-            // picker shape got out of sync somewhere — treat as cancel.
-            _ => {
-                self.connect_draft = None;
-                return ConnectAdvance::Failed;
-            }
-        };
-        match draft.step {
-            ConnectStep::PickProvider => {
-                let Some(spec) = crate::llm::providers::all()
-                    .iter()
-                    .find(|s| s.display_name == answer)
-                else {
-                    self.connect_draft = None;
-                    self.add_assistant_notice(format!("Unknown provider: {answer}"));
-                    return ConnectAdvance::Failed;
-                };
-                // The `custom` brand requires `api_url` + `models` fields that
-                // need a multi-field form; we don't build that wizard in v1.
-                // Bail out with a pointer to the example config so the user
-                // knows where to go.
-                if spec.id == "custom" {
-                    self.connect_draft = None;
-                    self.add_assistant_notice(
-                        "For custom providers, edit ~/.ignis/config.toml — see config.example.toml."
-                            .to_string(),
-                    );
-                    return ConnectAdvance::Failed;
+        match self.connect.advance(answers) {
+            ConnectOutcome::NextPicker(req) => ConnectAdvance::NextPicker(req),
+            ConnectOutcome::Done { notices, applied } => {
+                for notice in notices {
+                    self.add_assistant_notice(notice);
                 }
-                draft.provider_id = Some(spec.id.to_string());
-                draft.provider_display = Some(spec.display_name.to_string());
-                // Ollama-class providers skip the key step entirely.
-                if spec.api_key_required {
-                    draft.step = ConnectStep::EnterApiKey;
-                    ConnectAdvance::NextPicker(build_api_key_picker(spec.display_name))
-                } else {
-                    draft.step = ConnectStep::PickModel;
-                    ConnectAdvance::NextPicker(build_model_picker(spec))
+                match applied {
+                    Some((provider, model)) => {
+                        self.provider = provider;
+                        self.model = model;
+                        self.effort = None;
+                        ConnectAdvance::Saved
+                    }
+                    None => ConnectAdvance::Failed,
                 }
             }
-            ConnectStep::EnterApiKey => {
-                draft.api_key = Some(answer);
-                let provider_id = draft.provider_id.clone().unwrap_or_default();
-                let Some(spec) = crate::llm::providers::lookup(&provider_id) else {
-                    self.connect_draft = None;
-                    self.add_assistant_notice(format!("Unknown provider id: {provider_id}"));
-                    return ConnectAdvance::Failed;
-                };
-                draft.step = ConnectStep::PickModel;
-                ConnectAdvance::NextPicker(build_model_picker(spec))
-            }
-            ConnectStep::PickModel => {
-                draft.model = Some(answer);
-                self.persist_connect()
-            }
         }
-    }
-
-    /// Write the draft to disk and update in-memory `App` fields. Called from
-    /// `advance_connect` after the model picker resolves; split out so the
-    /// flow stays readable.
-    fn persist_connect(&mut self) -> ConnectAdvance {
-        let Some(draft) = self.connect_draft.take() else {
-            return ConnectAdvance::Failed;
-        };
-        let (provider_id, model) = match (draft.provider_id, draft.model) {
-            (Some(p), Some(m)) => (p, m),
-            _ => return ConnectAdvance::Failed,
-        };
-        // Key may be empty for providers that don't require one (Ollama). The
-        // config writer is only called when there's actually a key to store —
-        // otherwise we'd write `api_key = ""` which is meaningless.
-        if let Some(api_key) = draft
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            if let Err(e) = crate::config::write_provider_key(&provider_id, api_key) {
-                self.add_assistant_notice(format!(
-                    "Failed to write ~/.ignis/config.toml: {e}. Nothing saved."
-                ));
-                return ConnectAdvance::Failed;
-            }
-        }
-        // Default-model write into state.json. Failure here is recoverable —
-        // the api_key is the expensive thing the user typed; preserve it and
-        // tell the user to /model manually.
-        if let Err(e) = crate::state::persist_model_selection(&provider_id, &model, None) {
-            self.add_assistant_notice(format!(
-                "Provider saved but default model not set: {e}. Run /model to set it."
-            ));
-        }
-        // Refresh the in-memory UI so the banner/footer show the new pick on
-        // next draw. The agent loop gets a separate ReloadConfig request.
-        self.provider = provider_id.clone();
-        self.model = model.clone();
-        self.effort = None;
-        self.add_assistant_notice(format!(
-            "✓ Connected to {provider_id}. Default model: {model}.\n  \
-             Wrote ~/.ignis/config.toml and ~/.ignis/state.json."
-        ));
-        ConnectAdvance::Saved
     }
 
     /// Discard the in-flight `/connect` draft and emit a one-line notice.
     /// Called from `keys.rs` when the user presses Esc/Ctrl-C while a connect
-    /// picker is open.
+    /// picker is open. A cancel with no draft in flight is a silent no-op.
     pub(crate) fn cancel_connect(&mut self) {
-        if self.connect_draft.take().is_some() {
-            self.add_assistant_notice("/connect cancelled.".to_string());
+        if let Some(notice) = self.connect.cancel() {
+            self.add_assistant_notice(notice);
         }
     }
 
@@ -1525,6 +1242,7 @@ mod connect_tests {
     //! so it's exercised separately by `config::tests::write_provider_key_*`
     //! and `state` tests — these tests cover everything up to that.
     use super::*;
+    use crate::console::connect::ConnectStep;
     use crate::console::picker::PickerAnswer;
     use std::path::PathBuf;
 
@@ -1544,7 +1262,7 @@ mod connect_tests {
         let mut app = fresh_app();
         let req = app.start_connect().expect("should return a picker");
         // Draft is at step 1, all fields unset.
-        let draft = app.connect_draft.as_ref().expect("draft must exist");
+        let draft = app.connect.draft().expect("draft must exist");
         assert_eq!(draft.step, ConnectStep::PickProvider);
         assert!(draft.provider_id.is_none());
         assert!(draft.api_key.is_none());
@@ -1586,7 +1304,7 @@ mod connect_tests {
             },
         ));
         assert!(app.start_connect().is_none());
-        assert!(app.connect_draft.is_none(), "no draft on refusal");
+        assert!(app.connect.draft().is_none(), "no draft on refusal");
     }
 
     #[test]
@@ -1604,7 +1322,7 @@ mod connect_tests {
             }
             other => panic!("expected NextPicker(api-key), got {other:?}"),
         }
-        let draft = app.connect_draft.as_ref().unwrap();
+        let draft = app.connect.draft().unwrap();
         assert_eq!(draft.step, ConnectStep::EnterApiKey);
         assert_eq!(draft.provider_id.as_deref(), Some("openai"));
     }
@@ -1622,10 +1340,7 @@ mod connect_tests {
             }
             other => panic!("expected NextPicker(model), got {other:?}"),
         }
-        assert_eq!(
-            app.connect_draft.as_ref().unwrap().step,
-            ConnectStep::PickModel
-        );
+        assert_eq!(app.connect.draft().unwrap().step, ConnectStep::PickModel);
     }
 
     #[test]
@@ -1637,7 +1352,7 @@ mod connect_tests {
         )]);
         assert!(matches!(outcome, ConnectAdvance::Failed));
         // Draft cleared; user got a notice pointing at config.toml.
-        assert!(app.connect_draft.is_none());
+        assert!(app.connect.draft().is_none());
         let last = app
             .blocks
             .iter()
@@ -1657,7 +1372,7 @@ mod connect_tests {
         let _ = app.start_connect().unwrap();
         let outcome = app.advance_connect(vec![PickerAnswer::Single("Not A Real Provider".into())]);
         assert!(matches!(outcome, ConnectAdvance::Failed));
-        assert!(app.connect_draft.is_none());
+        assert!(app.connect.draft().is_none());
     }
 
     #[test]
@@ -1676,7 +1391,7 @@ mod connect_tests {
             }
             other => panic!("expected NextPicker(model), got {other:?}"),
         }
-        let draft = app.connect_draft.as_ref().unwrap();
+        let draft = app.connect.draft().unwrap();
         assert_eq!(draft.step, ConnectStep::PickModel);
         assert_eq!(draft.api_key.as_deref(), Some("sk-test"));
     }
@@ -1689,7 +1404,7 @@ mod connect_tests {
         let _ = app.start_connect().unwrap();
         let _ = app.advance_connect(vec![PickerAnswer::Single("DeepSeek".into())]);
         let _ = app.advance_connect(vec![PickerAnswer::Single("sk-supersecret".into())]);
-        let draft = app.connect_draft.as_ref().unwrap();
+        let draft = app.connect.draft().unwrap();
         let dbg = format!("{:?}", draft);
         assert!(
             !dbg.contains("sk-supersecret"),
@@ -1706,9 +1421,9 @@ mod connect_tests {
         let mut app = fresh_app();
         let _ = app.start_connect().unwrap();
         let _ = app.advance_connect(vec![PickerAnswer::Single("OpenAI".into())]);
-        assert!(app.connect_draft.is_some());
+        assert!(app.connect.is_active());
         app.cancel_connect();
-        assert!(app.connect_draft.is_none());
+        assert!(app.connect.draft().is_none());
         let last = app
             .blocks
             .iter()
@@ -1725,7 +1440,7 @@ mod connect_tests {
     fn cancel_connect_with_no_draft_is_silent_noop() {
         let mut app = fresh_app();
         app.cancel_connect();
-        assert!(app.connect_draft.is_none());
+        assert!(app.connect.draft().is_none());
         // No notice was emitted (the assistant transcript stays empty).
         assert!(!app
             .blocks

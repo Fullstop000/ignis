@@ -185,7 +185,7 @@ pub(crate) async fn handle_key(
     // ESC and Ctrl+C — must come before global handlers and the busy-mode
     // gate, because the picker is the only thing the user is interacting with.
     if let Some(state) = app.inline_picker.as_mut() {
-        use crate::console::app::ConnectAdvance;
+        use crate::console::connect::ConnectAdvance;
         use crate::console::picker::PickerResponse;
         use inline_picker::KeyOutcome;
         let outcome = state.on_key(key);
@@ -211,7 +211,7 @@ pub(crate) async fn handle_key(
                 // Multi-step `/connect`: route the answer back into the draft
                 // state machine. The advance returns the next picker to open
                 // (steps 1 and 2) or signals success (step 3 persisted).
-                if app.connect_draft.is_some() {
+                if app.connect.is_active() {
                     match app.advance_connect(answers) {
                         ConnectAdvance::NextPicker(req) => {
                             let _ = picker_tx.send(req).await;
