@@ -134,6 +134,42 @@ pub(crate) fn handle_paste(app: &mut App, data: String) {
     }
 }
 
+/// Dispatch a multi-select **toggle** picker (`/skills`, `/mcp`): ↑/↓ move the
+/// highlight, Enter/Space toggle the highlighted row's `[x]/[ ]` checkbox (the
+/// checkbox is the feedback — no transcript notice per toggle), Esc closes it,
+/// and any other char closes it *and* falls through so the char still types.
+/// `$select`/`$toggle` are this picker's `App` methods; `$field` is its
+/// `Option<…Picker>`. The model and session pickers don't use this — they carry
+/// bespoke behavior (effort cycling, List/Detail drill-in).
+macro_rules! toggle_picker {
+    ($app:ident, $key:ident, $field:ident, $select:ident, $toggle:ident) => {
+        if $app.$field.is_some() {
+            match $key.code {
+                KeyCode::Up => {
+                    $app.$select(SelectionDirection::Previous);
+                    return;
+                }
+                KeyCode::Down => {
+                    $app.$select(SelectionDirection::Next);
+                    return;
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    $app.$toggle();
+                    return;
+                }
+                KeyCode::Esc => {
+                    $app.$field = None;
+                    return;
+                }
+                KeyCode::Char(_) => {
+                    $app.$field = None;
+                }
+                _ => {}
+            }
+        }
+    };
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_key(
     app: &mut App,
@@ -409,57 +445,20 @@ pub(crate) async fn handle_key(
         }
     }
 
-    if app.skill_picker.is_some() {
-        match key.code {
-            KeyCode::Up => {
-                app.select_skill_picker(SelectionDirection::Previous);
-                return;
-            }
-            KeyCode::Down => {
-                app.select_skill_picker(SelectionDirection::Next);
-                return;
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                // The picker's [x]/[ ] checkbox is the feedback; don't emit a
-                // notice into the transcript on every toggle.
-                app.toggle_selected_skill();
-                return;
-            }
-            KeyCode::Esc => {
-                app.skill_picker = None;
-                return;
-            }
-            KeyCode::Char(_) => {
-                app.skill_picker = None;
-            }
-            _ => {}
-        }
-    }
-
-    if app.mcp_picker.is_some() {
-        match key.code {
-            KeyCode::Up => {
-                app.select_mcp_picker(SelectionDirection::Previous);
-                return;
-            }
-            KeyCode::Down => {
-                app.select_mcp_picker(SelectionDirection::Next);
-                return;
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                app.toggle_selected_mcp_server();
-                return;
-            }
-            KeyCode::Esc => {
-                app.mcp_picker = None;
-                return;
-            }
-            KeyCode::Char(_) => {
-                app.mcp_picker = None;
-            }
-            _ => {}
-        }
-    }
+    toggle_picker!(
+        app,
+        key,
+        skill_picker,
+        select_skill_picker,
+        toggle_selected_skill
+    );
+    toggle_picker!(
+        app,
+        key,
+        mcp_picker,
+        select_mcp_picker,
+        toggle_selected_mcp_server
+    );
 
     // Idle-specific arms first (submit + history/slash navigation); every other
     // key falls through to `apply_edit_key`, the single home of the editor arms
