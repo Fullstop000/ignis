@@ -5,7 +5,9 @@ Usage:
     python compare_runs.py --csv a.csv --csv b.csv [--csv c.csv ...] [-o out.html]
         --label "kimi-2.6" --label "deepseek-v4-flash@max" [--label "MiniMax-M3"]
         --href /reports/kimi   --href /reports/ds                [--href /reports/mm3]
-        --title "TB 2.1 · 3-way · 2026-06-06"
+        --price-cny "6.50,1.10,27.00" --price-cny "1.00,0.02,2.00" [--price-cny "2.10,0.42,8.40"]
+        --fx-cny-per-usd 7.10
+        --title "TB 2.1 · kimi-2.6 vs deepseek-v4-flash@max vs MiniMax-M3"
 
 CSVs are joined by task slug, with dots collapsed to dashes so TB renames like
 `install-windows-3.11` / `install-windows-3-11` align. Every task that appears
@@ -13,8 +15,10 @@ in at least one input gets a row; the cell for any missing model shows `—`.
 
 The page surfaces:
 
-1. Headline table — score, resolved%, bucket counts, tokens, cost-per-pass —
-   one column per run, with the winning value bold-green.
+1. Headline table — score, resolved%, bucket counts, tokens, est. cost, and
+   cost / passed task — one column per run, with the winning value bold-green.
+   Cost rows render only when `--price-cny` is supplied for at least one run;
+   runs without a price show `—` in those cells.
 2. Pass-count histogram — "all N passed", "(N-1)/N passed", ... "0/N passed".
 3. Per-task table — one column per run, sortable, ordered by divergence
    (most-disagreed tasks first).
@@ -145,7 +149,8 @@ function sortTable(th) {
 """
 
 
-def _aggregate(rows: dict[str, Row]) -> dict:
+def _aggregate(rows: dict[str, Row], price_cny: tuple[float, float, float] | None,
+               fx_cny_per_usd: float) -> dict:
     buckets = Counter(r.bucket for r in rows.values())
     passed = buckets["passed"]
     failed = buckets["failed"]
@@ -155,6 +160,16 @@ def _aggregate(rows: dict[str, Row]) -> dict:
     n_in = sum(r.n_input_tokens for r in rows.values())
     n_out = sum(r.n_output_tokens for r in rows.values())
     n_cache = sum(r.n_cache_read_tokens for r in rows.values())
+
+    cost_usd: float | None = None
+    cost_per_pass_usd: float | None = None
+    if price_cny is not None:
+        miss_p, hit_p, out_p = price_cny  # CNY per 1M tokens
+        miss_in = max(0, n_in - n_cache)
+        cost_cny = (miss_in * miss_p + n_cache * hit_p + n_out * out_p) / 1_000_000
+        cost_usd = cost_cny / fx_cny_per_usd
+        cost_per_pass_usd = (cost_usd / passed) if passed else None
+
     return {
         "passed": passed, "failed": failed, "errored": errored, "total": total,
         "score_pct": (passed / total * 100) if total else 0.0,
@@ -163,7 +178,24 @@ def _aggregate(rows: dict[str, Row]) -> dict:
         "n_in": n_in, "n_out": n_out, "n_cache": n_cache,
         "cache_hit_pct": (n_cache / n_in * 100) if n_in else 0.0,
         "tokens_per_pass": (n_in / passed) if passed else 0,
+        "cost_usd": cost_usd,
+        "cost_per_pass_usd": cost_per_pass_usd,
     }
+
+
+def _cost_cells(values: list[float | None], fmt) -> str:
+    """Headline row helper for cost — lower is better, runs without a price
+    show `—` and don't compete for the winner highlight."""
+    priced = [v for v in values if v is not None]
+    best = min(priced) if priced else None
+    out: list[str] = []
+    for v in values:
+        if v is None:
+            out.append("<td>—</td>")
+            continue
+        cls = "winner" if (best is not None and v == best and len(priced) > 1) else ""
+        out.append(f'<td class="{cls}">{fmt(v)}</td>')
+    return "".join(out)
 
 
 def _render_headline(stats: list[dict], labels: list[str]) -> str:
@@ -238,6 +270,20 @@ def _render_headline(stats: list[dict], labels: list[str]) -> str:
         )
         + "</tr>"
     )
+
+    # Cost rows render only when at least one run has prices. Each row covers
+    # all N runs; runs without prices show "—" and are excluded from the winner
+    # comparison.
+    if any(s["cost_usd"] is not None for s in stats):
+        rows.append("<tr><td>Est. cost ‡</td>" + _cost_cells(
+            [s["cost_usd"] for s in stats],
+            lambda v: f"≈${v:.2f}",
+        ) + "</tr>")
+        rows.append("<tr><td>Cost / passed task ‡</td>" + _cost_cells(
+            [s["cost_per_pass_usd"] for s in stats],
+            lambda v: f"≈${v:.2f}",
+        ) + "</tr>")
+
     return f"""<div class="headline">
 <table>
 <thead><tr><th></th>{head}</tr></thead>
@@ -320,11 +366,15 @@ def _render_table(joined: list[tuple[str, list[Row | None], int]], labels: list[
 </table>"""
 
 
-def render(csvs: list[Path], labels: list[str], hrefs: list[str | None], title: str) -> str:
+def render(csvs: list[Path], labels: list[str], hrefs: list[str | None],
+           prices: list[tuple[float, float, float] | None], fx_cny_per_usd: float,
+           title: str) -> str:
     if len(csvs) != len(labels):
         raise ValueError(f"got {len(csvs)} csvs but {len(labels)} labels — one --label per --csv")
     if len(hrefs) < len(csvs):
         hrefs = hrefs + [None] * (len(csvs) - len(hrefs))
+    if len(prices) < len(csvs):
+        prices = prices + [None] * (len(csvs) - len(prices))
     per_run = [_read_csv(p) for p in csvs]
     keys = sorted({k for run in per_run for k in run})
 
@@ -337,13 +387,23 @@ def render(csvs: list[Path], labels: list[str], hrefs: list[str | None], title: 
         joined.append((display, runs, passes))
 
     counts = Counter(p for _, _, p in joined)
-    stats = [_aggregate(run) for run in per_run]
+    stats = [_aggregate(run, price, fx_cny_per_usd) for run, price in zip(per_run, prices)]
 
     link_parts = [
         f'<a href="{html.escape(h)}">{html.escape(lbl)}</a>' if h else html.escape(lbl)
         for lbl, h in zip(labels, hrefs)
     ]
     meta_links = "  ·  ".join(link_parts)
+
+    cost_footnote = ""
+    if any(s["cost_usd"] is not None for s in stats):
+        cost_footnote = (
+            f"<p style=\"color:#888;font-size:0.78rem;margin:0.5rem 0 0\">"
+            f"‡ Cost = (input − cache) × miss-price + cache × hit-price + output × out-price, "
+            f"summed across all trials and converted at "
+            f"≈1 USD = {fx_cny_per_usd:.2f} CNY. Per-run prices configured via "
+            f"<code>--price-cny</code> in CNY/1M tokens.</p>"
+        )
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
@@ -353,6 +413,7 @@ def render(csvs: list[Path], labels: list[str], hrefs: list[str | None], title: 
 
 <h2>Headline</h2>
 {_render_headline(stats, labels)}
+{cost_footnote}
 
 <h2>Per-task agreement</h2>
 {_render_histogram(counts, len(joined), len(per_run))}
@@ -365,6 +426,18 @@ def render(csvs: list[Path], labels: list[str], hrefs: list[str | None], title: 
 </body></html>"""
 
 
+def _parse_price(s: str) -> tuple[float, float, float]:
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            f"--price-cny needs 3 comma-separated numbers (miss,hit,out); got {s!r}"
+        )
+    try:
+        return (float(parts[0]), float(parts[1]), float(parts[2]))
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"--price-cny: {e}") from e
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description="Render a side-by-side HTML comparison across 2+ harbor bench CSVs.")
     p.add_argument("--csv", dest="csvs", action="append", type=Path, required=True,
@@ -373,6 +446,12 @@ def main(argv: list[str]) -> int:
                    help="display label for the corresponding --csv (repeat).")
     p.add_argument("--href", dest="hrefs", action="append", default=[],
                    help="URL the corresponding label links to (repeat; optional).")
+    p.add_argument("--price-cny", dest="prices", action="append", default=[],
+                   type=_parse_price,
+                   help='per-run CNY/1M-token price as "miss,hit,out" '
+                        '(repeat; pass an empty string "" or omit to skip a run).')
+    p.add_argument("--fx-cny-per-usd", type=float, default=7.10,
+                   help="CNY per USD for cost conversion (default 7.10).")
     p.add_argument("-o", "--output", type=Path, default=Path("compare.html"))
     p.add_argument("--title", default=None)
     args = p.parse_args(argv)
@@ -382,8 +461,10 @@ def main(argv: list[str]) -> int:
         args.labels = [c.stem for c in args.csvs]
     if len(args.labels) != len(args.csvs):
         p.error(f"got {len(args.csvs)} --csv but {len(args.labels)} --label; one label per csv")
+    if args.prices and len(args.prices) > len(args.csvs):
+        p.error("more --price-cny than --csv")
     title = args.title or "  vs  ".join(args.labels)
-    html_str = render(args.csvs, args.labels, args.hrefs, title)
+    html_str = render(args.csvs, args.labels, args.hrefs, args.prices, args.fx_cny_per_usd, title)
     args.output.write_text(html_str)
     print(f"wrote {args.output} ({len(html_str):,} bytes)")
     return 0
