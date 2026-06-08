@@ -86,7 +86,8 @@ if _interactive; then
         "anthropic/claude-sonnet-4-6:anthropic/claude-sonnet-4-6" \
         "openai/gpt-5:openai/gpt-5" \
         "gemini/gemini-2-5-pro:gemini/gemini-2-5-pro" \
-        "kimi-code/k2-thinking:kimi-code/k2-thinking")"
+        "kimi-code/k2-thinking:kimi-code/k2-thinking" \
+        "zhipu/glm-5.1:zhipu/glm-5.1")"
 
     [ -z "${ENV:-}" ] && ENV="$(_pick "Sandbox env:" \
         "daytona" \
@@ -111,6 +112,7 @@ case "$provider" in
     deepseek)  key_env=DEEPSEEK_API_KEY ;;
     kimi-code) key_env=KIMI_CODE_API_KEY ;;
     minimax-token-plan) key_env=MINIMAX_TOKEN_PLAN_API_KEY ;;
+    zhipu)     key_env=ZHIPU_API_KEY ;;
     *) echo "run.sh: unknown provider '$provider' in MODEL=$MODEL" >&2; exit 2 ;;
 esac
 _toml_key() { # $1 = section header (e.g. [web_search]); reads api_key under it.
