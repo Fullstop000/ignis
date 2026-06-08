@@ -378,6 +378,14 @@ pub async fn run_console(
     // Last terminal size, to detect resizes (which ratatui 0.26 inline doesn't
     // repaint cleanly — see the rebuild in the draw section).
     let mut last_term_size = crossterm::terminal::size()?;
+    // Timestamp of the most recent `Event::Resize`. A beat after a resize
+    // settles we force one full clear + re-anchor (see the draw section): the
+    // terminal — notably conpty/Windows Terminal on a cross-DPI monitor drag —
+    // reflows and leaves duplicate band rows in the visible area that our
+    // band-only per-frame diff never scrubs (this is the "only ignis stacks"
+    // bug; vim/htop full-repaint after a resize, so they stay clean). A single
+    // settle repaint mirrors what the next message already does for free.
+    let mut last_resize: Option<std::time::Instant> = None;
     terminal.draw(|f| draw(f, &mut app))?;
 
     loop {
@@ -479,6 +487,9 @@ pub async fn run_console(
                     .await;
                 }
                 Event::Paste(data) => crate::console::keys::handle_paste(&mut app, data),
+                // A resize (incl. same-grid-size DPI changes) must force a
+                // settle re-anchor — see `last_resize` and the draw section.
+                Event::Resize(_, _) => last_resize = Some(std::time::Instant::now()),
                 // No mouse capture in inline mode — wheel scroll and click-drag
                 // selection are handled natively by the terminal/scrollback.
                 _ => {}
@@ -543,15 +554,24 @@ pub async fn run_console(
         if last_draw.elapsed() >= frame {
             app.tick_update();
             // Rebuild the inline viewport when the band height changes (picker
-            // open/close, multi-line input) OR the terminal itself resized.
-            // ratatui 0.26's inline autoresize leaves the old band stranded in
-            // scrollback (#77); taking over with clear()+fresh viewport on any
-            // size change re-anchors cleanly.
+            // open/close, multi-line input) OR the terminal resized. ratatui
+            // 0.26's inline autoresize leaves the old band stranded in
+            // scrollback (#77); taking over with clear()+fresh viewport
+            // re-anchors cleanly.
             let term_size = crossterm::terminal::size()?;
             let want_rows = render::viewport_height(&app, term_size.0, term_size.1);
-            let resized = term_size != last_term_size;
-            if want_rows != viewport_rows || resized {
-                if resized {
+            let size_changed = term_size != last_term_size;
+            // A beat after the last resize event, force one full clear +
+            // re-anchor to scrub the terminal's late reflow duplicates (the
+            // cross-DPI-drag stacking; the reported grid size can't see a
+            // same-size DPI change, and a band-only diff never wipes rows the
+            // terminal duplicated in the visible area). Fires once per settle.
+            // The delay lets a slow terminal (conpty/WT over WSL2) finish
+            // reflowing before we repaint; tune here if duplicates survive.
+            const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+            let settled = last_resize.is_some_and(|t| t.elapsed() >= RESIZE_SETTLE);
+            if want_rows != viewport_rows || size_changed || settled {
+                if size_changed || settled {
                     // ratatui's inline clear() only scrubs downward, so on a
                     // resize the old band (reflowed by the terminal above the
                     // new anchor) is left stranded (#77). Wipe the whole screen
@@ -566,9 +586,16 @@ pub async fn run_console(
                 }
                 // Commit the new band size only if the re-anchor succeeded; a
                 // timed-out DSR keeps the old viewport and retries next frame.
+                // Consume the resize marker only on a *settle* re-anchor that
+                // landed — so the live size-change rebuilds during a drag don't
+                // clear it early (the settle would never fire), and a timed-out
+                // settle (common on WSL2/conpty) is retried next frame.
                 if try_rebuild(&mut terminal, want_rows)? {
                     viewport_rows = want_rows;
                     last_term_size = term_size;
+                    if settled {
+                        last_resize = None;
+                    }
                 }
             }
             draw_tolerant(&mut terminal, &mut app)?;
