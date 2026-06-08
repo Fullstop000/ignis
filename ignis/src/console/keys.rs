@@ -544,21 +544,9 @@ pub(crate) async fn submit_text(
                 &app.cwd,
             )
             .unwrap_or_default();
-            if !records.iter().any(|r| r.session_id == app.session_id) {
-                let user_count = app
-                    .blocks
-                    .iter()
-                    .filter(|b| matches!(b, crate::console::app::UIBlock::User(_)))
-                    .count() as u64;
-                records.push(crate::cli::sessions::SessionRecord {
-                    session_id: app.session_id.clone(),
-                    project_slug: crate::session::project_slug(&app.cwd),
-                    project_start_dir: Some(app.cwd.to_string_lossy().to_string()),
-                    last_modified: Some(u64::MAX),
-                    user_queries: user_count,
-                    ..Default::default()
-                });
-            }
+            // The picker is for jumping to a *different* session; resuming the
+            // one you're already in is a no-op, so drop the current session.
+            records.retain(|r| r.session_id != app.session_id);
             records.sort_by_key(|r| std::cmp::Reverse(r.last_modified.unwrap_or(0)));
             app.show_session_picker(records, projects_dir);
         }

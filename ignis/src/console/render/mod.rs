@@ -1019,6 +1019,7 @@ mod tests {
                 crate::cli::sessions::SessionRecord {
                     session_id: "alpha".to_string(),
                     project_slug: "p".to_string(),
+                    title: "add session title".to_string(),
                     started_at: Some(1_735_787_045),
                     last_modified: Some(1_735_787_045),
                     agent_messages: 3,
@@ -1037,7 +1038,6 @@ mod tests {
             ],
             selected: 0,
             mode: crate::console::app::SessionPickerMode::List,
-            current_session_id: "alpha".to_string(),
             projects_dir: std::path::PathBuf::from("/tmp"),
         });
 
@@ -1046,9 +1046,20 @@ mod tests {
 
         let content = buffer_content(&term);
         assert!(content.contains("Sessions"), "should show picker title");
-        assert!(content.contains("STARTED"), "should show columns header");
-        assert!(content.contains("2025-01-"), "should render row timestamps");
-        assert!(content.contains("▸"), "should mark current session with ▸");
+        // Two-line rows: a derived title line over a dim meta line.
+        assert!(
+            content.contains("add session title"),
+            "should render the derived title"
+        );
+        assert!(
+            content.contains("(no message yet)"),
+            "title-less session falls back to a placeholder"
+        );
+        assert!(
+            content.contains("2025-01-"),
+            "meta line shows the timestamp"
+        );
+        assert!(content.contains("tok"), "meta line shows token count");
         assert!(
             content.contains("details"),
             "footer should advertise → details"
@@ -1474,7 +1485,6 @@ mod tests {
             }],
             selected: 0,
             mode: crate::console::app::SessionPickerMode::List,
-            current_session_id: "alpha".to_string(),
             projects_dir: std::path::PathBuf::from("/tmp"),
         });
 
