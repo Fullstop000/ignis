@@ -503,6 +503,19 @@ fn config_path() -> Result<PathBuf, anyhow::Error> {
 ///
 /// Returns the path written, for the TUI to surface in its success message.
 pub fn write_provider_key(provider_id: &str, api_key: &str) -> Result<PathBuf, anyhow::Error> {
+    upsert_provider(provider_id, Some(api_key))
+}
+
+/// Ensure `[providers.<id>]` exists in `~/.ignis/config.toml` without setting a
+/// key — for keyless providers (e.g. Ollama), so `Config::model_options` (which
+/// only lists configured provider tables) includes their models after connect.
+pub fn ensure_provider(provider_id: &str) -> Result<PathBuf, anyhow::Error> {
+    upsert_provider(provider_id, None)
+}
+
+/// Ensure `[providers.<id>]` exists, optionally setting `api_key`, preserving
+/// all other content. Backs [`write_provider_key`] and [`ensure_provider`].
+fn upsert_provider(provider_id: &str, api_key: Option<&str>) -> Result<PathBuf, anyhow::Error> {
     let path = config_path()?;
     let mut doc = if path.exists() {
         std::fs::read_to_string(&path)
@@ -521,15 +534,17 @@ pub fn write_provider_key(provider_id: &str, api_key: &str) -> Result<PathBuf, a
         .as_table_mut()
         .ok_or_else(|| anyhow!("`providers` in config.toml is not a table"))?;
 
-    // Ensure `[providers.<id>]` exists, then set api_key without clobbering
-    // anything else under it.
+    // Ensure `[providers.<id>]` exists, then set api_key (if any) without
+    // clobbering anything else under it.
     if !providers.contains_key(provider_id) {
         providers.insert(provider_id, toml_edit::Item::Table(toml_edit::Table::new()));
     }
     let entry = providers[provider_id]
         .as_table_mut()
         .ok_or_else(|| anyhow!("`providers.{provider_id}` is not a table"))?;
-    entry["api_key"] = toml_edit::value(api_key);
+    if let Some(api_key) = api_key {
+        entry["api_key"] = toml_edit::value(api_key);
+    }
 
     // Atomic write: a crash mid-write on `config.toml` would leave a truncated
     // file and the next launch can't recover (a parse failure halts startup).
@@ -816,6 +831,23 @@ protocol = "openai"
     }
 
     #[test]
+    fn zhipu_resolves_to_bigmodel_openai_endpoint() {
+        let cfg: Config = toml::from_str(
+            r#"
+model = "zhipu/glm-5.1"
+[providers.zhipu]
+api_key = "x"
+"#,
+        )
+        .unwrap();
+        let r = cfg.resolve().unwrap();
+        assert_eq!(r.protocol, Protocol::OpenAi);
+        assert_eq!(r.base_url, "https://open.bigmodel.cn/api/paas/v4");
+        assert_eq!(r.auth, Auth::Bearer);
+        assert_eq!(r.model, "glm-5.1");
+    }
+
+    #[test]
     fn baked_request_headers_are_resolved_and_user_agent_can_override() {
         let cfg: Config = toml::from_str(
             r#"
@@ -921,6 +953,7 @@ api_key = "x"
             mode: None,
             permission_grants: vec![],
             update_check: None,
+            statusline_hidden: vec![],
         });
         assert_eq!(cfg.active_model().as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(cfg.active_effort().as_deref(), Some("high"));
@@ -1170,6 +1203,7 @@ api_key = "x"
             mode: None,
             permission_grants: vec![],
             update_check: None,
+            statusline_hidden: vec![],
         });
         assert_eq!(cfg.active_model().as_deref(), Some("gpt-4o"));
         assert_eq!(cfg.active_effort(), None);

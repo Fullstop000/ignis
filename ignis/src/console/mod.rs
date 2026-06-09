@@ -9,6 +9,8 @@
 pub mod app;
 pub mod clipboard;
 pub(crate) mod colors;
+pub(crate) mod composer;
+pub(crate) mod connect;
 pub(crate) mod format;
 pub(crate) mod git;
 pub mod highlight;

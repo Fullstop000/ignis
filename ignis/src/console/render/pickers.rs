@@ -7,9 +7,13 @@ use ratatui::{
 };
 
 use crate::cli::sessions::{format_timestamp_short, SessionDetail, TurnEvent};
-use crate::console::app::{McpPicker, ModelPicker, SessionPicker, SessionPickerMode, SkillPicker};
+use crate::console::app::{
+    App, McpPicker, ModelPicker, SessionPicker, SessionPickerMode, SettingsPanel, SettingsTab,
+    SkillPicker, STATUSLINE_SEGMENTS,
+};
 use crate::console::{
-    format_context, truncate, ACCENT, BG, GREEN, MAUVE, RED, SUBTEXT, TEXT, TEXT_DIM,
+    format_context, format_elapsed, format_tokens, truncate, ACCENT, BG, GREEN, MAUVE, RED,
+    SUBTEXT, TEXT, TEXT_DIM,
 };
 
 use super::widgets::picker_window;
@@ -21,7 +25,7 @@ pub(crate) fn render_session_picker(
 ) {
     match &picker.mode {
         SessionPickerMode::List => render_session_picker_list(lines, picker, max_rows),
-        SessionPickerMode::Detail(detail) => render_session_picker_detail(lines, picker, detail),
+        SessionPickerMode::Detail(detail) => render_session_picker_detail(lines, detail),
     }
 }
 
@@ -47,19 +51,10 @@ fn render_session_picker_list(
         return;
     }
 
-    // Column header. The leading "  " holds the same 2-char gutter the rows
-    // use for the ▸ marker, so columns stay aligned regardless of selection.
-    lines.push(Line::from(Span::styled(
-        format!(
-            "  {:<18} {:<17}{:>6}{:>8}{:>9}{:>8}",
-            "ID", "STARTED", "MSGS", "TURNS", "TOK", "TOOLS"
-        ),
-        Style::default().fg(TEXT_DIM),
-    )));
-
-    // Window the list so the selected row stays in view when there are more
-    // sessions than fit in the band (closes #62).
-    let visible = max_rows.max(1);
+    // Each session is a two-line row — a full-width title line over a dim meta
+    // line — so half as many rows fit in the band as there are lines available
+    // (windowing keeps the selected row in view; closes #62).
+    let visible = (max_rows / 2).max(1);
     let (start, end) = picker_window(picker.selected, visible, picker.sessions.len());
     if start > 0 {
         lines.push(Line::from(Span::styled(
@@ -70,32 +65,41 @@ fn render_session_picker_list(
     for (offset, r) in picker.sessions[start..end].iter().enumerate() {
         let idx = start + offset;
         let selected = idx == picker.selected;
-        let is_current = r.session_id == picker.current_session_id;
-        let style = if selected {
+
+        // Line 1: the title, or a dim fallback when there's no user text yet.
+        let title = if r.title.is_empty() {
+            "(no message yet)".to_string()
+        } else {
+            fit_title(&r.title, TITLE_MAX_CELLS)
+        };
+        let title_style = if selected {
             Style::default().fg(BG).bg(ACCENT)
+        } else if r.title.is_empty() {
+            Style::default().fg(TEXT_DIM)
         } else {
             Style::default().fg(TEXT)
         };
-        let marker = if is_current { "▸ " } else { "  " };
+        lines.push(Line::from(Span::styled(format!("  {title}"), title_style)));
+
+        // Line 2: dim meta — started · short id · turns · tokens.
         let started = r
             .started_at
             .map(format_timestamp_short)
             .unwrap_or_else(|| "?".to_string());
         let tokens = fmt_tokens(r.input_tokens + r.output_tokens);
-        let id_col = truncate_id_short(&r.session_id);
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{}{:<18} {:<17}{:>6}{:>8}{:>9}{:>8}",
-                marker,
-                id_col,
-                started,
-                r.agent_messages,
-                r.user_queries,
-                tokens,
-                r.tool_call_count
-            ),
-            style,
-        )));
+        let meta = format!(
+            "{} · {} · {} msgs · {} tok",
+            started,
+            truncate_id_short(&r.session_id),
+            r.agent_messages,
+            tokens,
+        );
+        let meta_style = if selected {
+            Style::default().fg(BG).bg(ACCENT)
+        } else {
+            Style::default().fg(TEXT_DIM)
+        };
+        lines.push(Line::from(Span::styled(format!("    {meta}"), meta_style)));
     }
     let below = picker.sessions.len().saturating_sub(end);
     if below > 0 {
@@ -123,29 +127,47 @@ fn truncate_id_short(id: &str) -> String {
     }
 }
 
-fn render_session_picker_detail(
-    lines: &mut Vec<Line<'static>>,
-    picker: &SessionPicker,
-    detail: &SessionDetail,
-) {
+/// Visible cap for the title line so a long or CJK-heavy first message can't
+/// overflow the band on a normal-width terminal.
+const TITLE_MAX_CELLS: usize = 72;
+
+/// Truncate `title` to at most `max_cells` display columns, appending `…` when
+/// it has to cut. Width-aware (CJK glyphs are 2 cells) so the line never
+/// overflows by counting chars where it should count cells.
+fn fit_title(title: &str, max_cells: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if UnicodeWidthStr::width(title) <= max_cells {
+        return title.to_string();
+    }
+    let budget = max_cells.saturating_sub(1); // reserve a cell for the ellipsis
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in title.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+fn render_session_picker_detail(lines: &mut Vec<Line<'static>>, detail: &SessionDetail) {
     let r = &detail.record;
     let started = r
         .started_at
         .map(format_timestamp_short)
         .unwrap_or_else(|| "—".to_string());
-    let is_current = r.session_id == picker.current_session_id;
 
-    // Header row: ◆ <id>  (current)
+    // Header row: ◆ <id>
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled("  ◆ ", Style::default().fg(MAUVE)),
         Span::styled(
             truncate_id(&r.session_id),
             Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if is_current { "  (current)" } else { "" },
-            Style::default().fg(GREEN),
         ),
     ]));
 
@@ -777,4 +799,210 @@ pub(crate) fn render_model_picker(
         "  Up/Down model · ←/→ effort · Enter apply · Esc cancel",
         Style::default().fg(TEXT_DIM),
     )));
+}
+
+/// `/settings` control panel — a tab bar (Stats | Statusline) over the active
+/// tab's body. Reads `App` directly for the live Stats view.
+pub(crate) fn render_settings_panel(
+    lines: &mut Vec<Line<'static>>,
+    panel: &SettingsPanel,
+    app: &App,
+) {
+    lines.push(Line::from(""));
+    // Title + tab bar: active tab reverse-highlighted in the accent color.
+    let mut header = vec![Span::styled(
+        "  ⚙ Settings   ",
+        Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
+    )];
+    for (label, active) in [
+        ("Stats", panel.tab == SettingsTab::Stats),
+        ("Statusline", panel.tab == SettingsTab::Statusline),
+    ] {
+        let style = if active {
+            Style::default()
+                .fg(BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT_DIM)
+        };
+        header.push(Span::styled(format!(" {label} "), style));
+        header.push(Span::raw(" "));
+    }
+    lines.push(Line::from(header));
+    lines.push(Line::from(""));
+
+    match panel.tab {
+        SettingsTab::Stats => render_stats_tab(lines, app),
+        SettingsTab::Statusline => render_statusline_tab(lines, panel, app),
+    }
+
+    lines.push(Line::from(""));
+    let hint = match panel.tab {
+        SettingsTab::Stats => "  ←/→ tab · Esc close",
+        SettingsTab::Statusline => "  ←/→ tab · ↑/↓ move · Space toggle · Esc close",
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(TEXT_DIM),
+    )));
+}
+
+/// Footer-segment checklist — Space/Enter toggles each segment on/off. The
+/// mode badge is intentionally not listed (always shown for safety).
+fn render_statusline_tab(lines: &mut Vec<Line<'static>>, panel: &SettingsPanel, app: &App) {
+    for (i, (id, label)) in STATUSLINE_SEGMENTS.iter().enumerate() {
+        let selected = i == panel.statusline_idx;
+        let marker = if selected { ">" } else { " " };
+        let check = if app.statusline_shows(id) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let style = if selected {
+            Style::default()
+                .fg(BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {marker} {check} "),
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled((*label).to_string(), style),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        "      ( AFK / HANDS-FREE badge is always shown )",
+        Style::default().fg(TEXT_DIM),
+    )));
+}
+
+/// Live read-only stats for the current session.
+fn render_stats_tab(lines: &mut Vec<Line<'static>>, app: &App) {
+    let label = Style::default().fg(TEXT_DIM);
+    let val = Style::default().fg(TEXT);
+    let mut row = |k: &str, spans: Vec<Span<'static>>| {
+        let mut l = vec![Span::styled(format!("  {:<9}", k), label)];
+        l.extend(spans);
+        lines.push(Line::from(l));
+    };
+
+    // Context gauge (against the active model's window).
+    let (ctx_tokens, ctx_pct) = app.context_usage();
+    let bar_w = 14usize;
+    let filled = (ctx_pct as usize * bar_w / 100).min(bar_w);
+    let bar: String = "█".repeat(filled) + &"░".repeat(bar_w - filled);
+    row(
+        "context",
+        vec![
+            Span::styled(bar, Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("  {ctx_pct}%  ({} tok)", format_tokens(ctx_tokens as usize)),
+                val,
+            ),
+        ],
+    );
+
+    // Cumulative session tokens.
+    let u = &app.cumulative_usage;
+    row(
+        "tokens",
+        vec![Span::styled(
+            format!(
+                "\u{2191} {}   \u{2193} {}",
+                format_tokens(u.input_tokens as usize),
+                format_tokens(u.output_tokens as usize)
+            ),
+            val,
+        )],
+    );
+    if u.cache_read_tokens > 0 || u.cache_write_tokens > 0 {
+        row(
+            "cache",
+            vec![Span::styled(
+                format!(
+                    "read {}   write {}",
+                    format_tokens(u.cache_read_tokens as usize),
+                    format_tokens(u.cache_write_tokens as usize)
+                ),
+                val,
+            )],
+        );
+    }
+
+    // Turns / messages.
+    row(
+        "turns",
+        vec![Span::styled(
+            format!(
+                "{}   \u{00b7}   {} msgs",
+                app.turn_count(),
+                app.message_count()
+            ),
+            val,
+        )],
+    );
+
+    // Top tools.
+    let tally = app.tool_tally();
+    if tally.is_empty() {
+        row("tools", vec![Span::styled("\u{2014}".to_string(), label)]);
+    } else {
+        let shown: Vec<String> = tally
+            .iter()
+            .take(4)
+            .map(|(n, c)| format!("{n} {c}"))
+            .collect();
+        let mut s = shown.join(" \u{00b7} ");
+        let extra = tally.len().saturating_sub(4);
+        if extra > 0 {
+            s.push_str(&format!(" \u{00b7} +{extra}"));
+        }
+        row("tools", vec![Span::styled(s, val)]);
+    }
+
+    // Uptime + active model.
+    row(
+        "uptime",
+        vec![Span::styled(
+            format_elapsed(app.session_uptime().as_millis()),
+            val,
+        )],
+    );
+    let model = match &app.effort {
+        Some(e) => format!("{}/{} ({e})", app.provider, app.model),
+        None => format!("{}/{}", app.provider, app.model),
+    };
+    row("model", vec![Span::styled(model, val)]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn fit_title_passes_short_title_through() {
+        assert_eq!(fit_title("fix the bug", 72), "fix the bug");
+    }
+
+    #[test]
+    fn fit_title_truncates_long_ascii_to_exact_width() {
+        let out = fit_title(&"a".repeat(100), 10);
+        assert!(out.ends_with('…'));
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 10);
+    }
+
+    #[test]
+    fn fit_title_truncates_cjk_by_display_width_not_chars() {
+        // 6 CJK glyphs = 12 cells; capped to 7 must land on exactly 7 cells
+        // (3 double-width glyphs + the ellipsis), proving width-awareness.
+        let out = fit_title("添加会话标题", 7);
+        assert!(out.ends_with('…'));
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 7);
+    }
 }

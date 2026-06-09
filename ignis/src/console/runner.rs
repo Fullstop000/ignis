@@ -3,14 +3,11 @@
 //! per-frame draw + key-poll cycle. Everything stateful about the live UI
 //! flows through here; `App` is the in-memory model the loop drives.
 use crossterm::{
-    event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, MouseEventKind,
-    },
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, text::Line, Terminal, TerminalOptions, Viewport};
 use std::io;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -22,41 +19,88 @@ use crate::console::keys::{handle_key, ActiveInject};
 use crate::console::render::{self, draw};
 use crate::{AgentEvent, Message, Session};
 
-/// Create a fullscreen (alternate-screen) terminal over stdout. ratatui's
-/// default Viewport::Fullscreen owns the whole frame and reflows on resize
-/// automatically — no per-band height bookkeeping, no rebuild loop.
-fn make_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+/// Create an inline-viewport terminal over stdout: a fixed `viewport_rows`-tall
+/// live band pinned at the bottom of the normal buffer. Finalized conversation
+/// blocks are pushed into the terminal's real scrollback via `insert_before`,
+/// so native copy, native scroll, and tmux detach/reattach all work. The band
+/// height is fixed per `Terminal`; it is rebuilt only when the band needs to
+/// grow/shrink (e.g. a picker opens).
+fn make_terminal(viewport_rows: u16) -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     let backend = CrosstermBackend::new(io::stdout());
-    Terminal::new(backend)
+    Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(viewport_rows.max(2)),
+        },
+    )
 }
 
-/// RAII guard for the alternate-screen + raw-mode pair. On drop (Err-bubble,
-/// panic, or clean exit) it restores the user's prior terminal state.
-/// Without this, any `?` after `EnterAlternateScreen` would strand the user
-/// in an empty alt screen with no way back to their shell prompt.
+/// True for crossterm's transient "cursor position could not be read within a
+/// normal duration" error. Re-anchoring the inline viewport (on a rebuild or a
+/// resize) queries the cursor row via a DSR (`ESC[6n`) and waits up to ~2s for
+/// the terminal to reply; under output backpressure on a slow pty (WSL2, tmux)
+/// that reply can land late. It's recoverable — skip this frame's rebuild/draw
+/// and retry next tick — so it must NOT be `?`-bubbled into tearing down the
+/// whole TUI and losing the live session. `ErrorKind::Other` + the message text
+/// is the only signal crossterm 0.27 gives; any other I/O error stays fatal.
+fn transient_cursor_read_error(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Other && e.to_string().contains("cursor position could not be read")
+}
+
+/// Rebuild the inline-viewport terminal at `rows`, tolerating the transient
+/// cursor-read timeout. `Ok(true)` = rebuilt (caller commits the new size);
+/// `Ok(false)` = the terminal didn't answer in time, so the old viewport is
+/// kept and the caller should leave its size state untouched to retry next
+/// frame; `Err` = a real I/O failure that should propagate.
+fn try_rebuild(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    rows: u16,
+) -> io::Result<bool> {
+    match make_terminal(rows) {
+        Ok(t) => {
+            *terminal = t;
+            Ok(true)
+        }
+        Err(e) if transient_cursor_read_error(&e) => {
+            log::warn!("inline viewport rebuild skipped (cursor read timeout): {e}");
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Draw the live band, tolerating the transient cursor-read timeout (a resize
+/// racing `draw`'s autoresize can trigger a DSR). Swallows only that specific
+/// timeout — every other draw error propagates.
+fn draw_tolerant(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> io::Result<()> {
+    match terminal.draw(|f| draw(f, app)) {
+        Ok(_) => Ok(()),
+        Err(e) if transient_cursor_read_error(&e) => {
+            log::warn!("inline draw skipped (cursor read timeout): {e}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// RAII guard for raw-mode + bracketed paste. On drop (Err-bubble, panic, or
+/// clean exit) it restores the user's prior terminal state. Inline rendering
+/// stays in the *normal* buffer (no alternate screen) so the conversation
+/// remains in native scrollback after exit; no mouse capture, so click-drag
+/// selection works.
 struct TerminalGuard;
 
 impl TerminalGuard {
     fn install() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableMouseCapture
-        )?;
-        // Panic hook: a panic inside ratatui / the main loop would otherwise
-        // print its message into the alt-screen the user can't see. Restore
-        // the terminal first, then chain through to the prior hook.
+        execute!(io::stdout(), EnableBracketedPaste)?;
         let prior_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                DisableMouseCapture,
-                DisableBracketedPaste,
-                LeaveAlternateScreen
-            );
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
             prior_hook(info);
         }));
         Ok(Self)
@@ -66,12 +110,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -89,6 +128,9 @@ pub async fn run_console(
     hook_registry: crate::hooks::HookRegistry,
 ) -> Result<(), anyhow::Error> {
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
+    // Apply the persisted `/settings` Statusline choices (hidden footer
+    // segments) before the first render.
+    app.statusline_hidden = crate::state::load_state().statusline_hidden;
     // Context windows: config override → cached models.dev → compaction threshold.
     // The cache loads instantly; refresh runs in the background for next launch.
     let catalog = crate::llm::catalog::load();
@@ -102,17 +144,23 @@ pub async fn run_console(
     app.set_model_options(config.model_options(&catalog), config.active_effort());
     tokio::spawn(crate::llm::catalog::refresh_if_stale());
 
-    // Render fullscreen in the alternate-screen buffer: the whole terminal is
-    // ours, native scrollback is preserved across the session, and quit/exit
-    // restores whatever was on the user's terminal before launch. Transcript
-    // history lives in `app.transcript` and scrolls in-app. `_term_guard`
-    // restores the user's terminal on early-return or panic.
+    // Render inline in the normal buffer: finalized blocks are pushed into the
+    // terminal's real scrollback, so native copy/scroll/tmux-reattach all work.
+    // A fixed-height band stays pinned at the bottom. `_term_guard` restores raw
+    // mode on early-return or panic.
     let _term_guard = TerminalGuard::install()?;
-    let mut terminal = make_terminal()?;
+    let init_size = crossterm::terminal::size()?;
+    let mut viewport_rows = render::viewport_height(&app, init_size.0, init_size.1);
+    let mut terminal = make_terminal(viewport_rows)?;
 
-    // Welcome banner: first lines of the in-app transcript. Scrolls with the
-    // conversation rather than being pinned chrome.
-    app.commit_transcript_lines(render::welcome_lines(&app));
+    // Welcome banner: pushed into scrollback above the band, like any block.
+    {
+        let welcome = render::welcome_lines(&app);
+        let h = welcome.len() as u16;
+        if h > 0 {
+            terminal.insert_before(h, |buf| render::render_block_into(buf, &welcome))?;
+        }
+    }
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
@@ -327,6 +375,20 @@ pub async fn run_console(
     // slow terminals (e.g. Windows Terminal over WSL2).
     let frame = std::time::Duration::from_millis(33); // ~30fps cap
     let mut last_draw = std::time::Instant::now();
+    // The in-progress block's already-streamed row count lives on `app`
+    // (`app.committed_rows`) so a session reset (`/clear`, `/resume`) resets it
+    // in lockstep with `app.committed` — see reset_transcript_view.
+    // Last terminal size, to detect resizes (which ratatui 0.26 inline doesn't
+    // repaint cleanly — see the rebuild in the draw section).
+    let mut last_term_size = crossterm::terminal::size()?;
+    // Timestamp of the most recent `Event::Resize`. A beat after a resize
+    // settles we force one full clear + re-anchor (see the draw section): the
+    // terminal — notably conpty/Windows Terminal on a cross-DPI monitor drag —
+    // reflows and leaves duplicate band rows in the visible area that our
+    // band-only per-frame diff never scrubs (this is the "only ignis stacks"
+    // bug; vim/htop full-repaint after a resize, so they stay clean). A single
+    // settle repaint mirrors what the next message already does for free.
+    let mut last_resize: Option<std::time::Instant> = None;
     terminal.draw(|f| draw(f, &mut app))?;
 
     loop {
@@ -428,16 +490,11 @@ pub async fn run_console(
                     .await;
                 }
                 Event::Paste(data) => crate::console::keys::handle_paste(&mut app, data),
-                // Mouse wheel scrolls the transcript (3 lines/notch). ScrollUp
-                // releases auto-follow; ScrollDown re-enables it at the bottom.
-                Event::Mouse(me) => match me.kind {
-                    MouseEventKind::ScrollUp => app.scroll_transcript_up(3),
-                    MouseEventKind::ScrollDown => {
-                        let visible = app.transcript_visible_rows.max(1);
-                        app.scroll_transcript_down(3, visible);
-                    }
-                    _ => {}
-                },
+                // A resize (incl. same-grid-size DPI changes) must force a
+                // settle re-anchor — see `last_resize` and the draw section.
+                Event::Resize(_, _) => last_resize = Some(std::time::Instant::now()),
+                // No mouse capture in inline mode — wheel scroll and click-drag
+                // selection are handled natively by the terminal/scrollback.
                 _ => {}
             }
         }
@@ -446,35 +503,143 @@ pub async fn run_console(
             break;
         }
 
-        // Fullscreen viewport reflows on resize automatically — no rebuild loop.
-        // Append newly-finalized blocks to the in-app transcript buffer.
-        let width = terminal.size()?.width;
-        while app.committed < app.blocks.len() && app.block_done(app.committed) {
-            let lines = render::block_lines(&app.blocks[app.committed], app.tick, &app.cwd, width);
-            if !lines.is_empty() {
-                app.commit_transcript_lines(lines);
+        // Session reset (`/clear`, `/resume`): wipe the visible screen AND the
+        // scrollback history, then re-anchor a fresh viewport, so old output
+        // doesn't linger when scrolling up. `committed`/`committed_rows` were
+        // already reset in App, so the new session's blocks commit from the top.
+        //
+        // Compute the target viewport height *before* the rebuild — the
+        // pending viewport_rows is from the previous frame (e.g. 2 rows while
+        // a picker was open), but the picker just closed, so the new size is
+        // the band height. Building the post-clear terminal at the right size
+        // up front means the commit loop below runs in the correct viewport
+        // and the draw-time rebuild check is a no-op.
+        let term_size = crossterm::terminal::size()?;
+        let want_rows = render::viewport_height(&app, term_size.0, term_size.1);
+        if app.pending_screen_clear {
+            execute!(
+                io::stdout(),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
+                crossterm::cursor::MoveTo(0, 0)
+            )?;
+            // Leave `pending_screen_clear` set if the rebuild's DSR times out,
+            // so the re-anchor is retried next frame instead of crashing.
+            if try_rebuild(&mut terminal, want_rows)? {
+                app.pending_screen_clear = false;
+                viewport_rows = want_rows;
+                last_term_size = term_size;
             }
-            app.committed += 1;
         }
 
-        // The `ask_user` trace is committed via the usual block flush above
-        // (block_lines special-cases UIBlock::Tool{name:"ask_user"} into a
-        // compact trace via ask_user_resume_trace). No separate live-flush
-        // path — that used to double-emit.
+        // Push settled rows into the terminal's native scrollback via
+        // insert_before — the terminal owns them from there (native scroll +
+        // copy + tmux-reattach persistence). Finalized blocks flush whole; the
+        // in-progress assistant/reasoning block streams its *stable* rows as
+        // they settle (stream_commit), so text flows smoothly into scrollback
+        // rather than appearing all at once. A pending tool block waits.
+        let width = terminal.size()?.width;
+        // Collect the new rows for every block we're about to commit in this
+        // frame, then hand them to insert_before as a single batch. Calling
+        // insert_before multiple times in succession overwrites prior inserts
+        // — each call's `clear()` only protects the live viewport, so earlier
+        // buffer content gets shifted up off the top of the terminal by
+        // subsequent `append_lines` calls and overwritten. One call per frame
+        // preserves the full ordered history (matters for /resume which
+        // commits N blocks back-to-back after a screen clear). For the
+        // streaming case, the loop breaks after the first in-progress block,
+        // so the batch is always exactly the new rows of that one block.
+        let mut batch: Vec<Line<'static>> = Vec::new();
+        // Defer commits while a screen-clear re-anchor is still pending. A
+        // timed-out `try_rebuild` (DSR cursor-read backpressure on WSL2/tmux)
+        // leaves `pending_screen_clear` set, and the next frame `Clear(All)`s
+        // again. Committing now would advance `committed` into blocks the
+        // re-clear then wipes — a resumed transcript paints once, gets erased,
+        // and never repaints (committed == blocks.len(), so nothing is left to
+        // push). Hold off; once the re-anchor lands we commit the batch at once.
+        while !app.pending_screen_clear && app.committed < app.blocks.len() {
+            let block = &app.blocks[app.committed];
+            let done = app.block_done(app.committed);
+            let rows = if done {
+                render::block_lines(block, app.tick, &app.cwd, width)
+            } else if render::stream_commit::is_streamed(block) {
+                render::stream_commit::stable_rows(block, app.tick, &app.cwd, width)
+            } else {
+                break; // pending tool: nothing to commit until it finalizes
+            };
+            let start = app.committed_rows.min(rows.len());
+            let new = &rows[start..];
+            batch.extend_from_slice(new);
+            if done {
+                app.committed += 1;
+                app.committed_rows = 0;
+            } else {
+                app.committed_rows += new.len();
+                break; // in-progress block is last; nothing after it yet
+            }
+        }
+        if !batch.is_empty() {
+            let h = batch.len() as u16;
+            terminal.insert_before(h, |buf| render::render_block_into(buf, &batch))?;
+        }
 
         // Coalesced redraw of the live band: at most once per frame interval.
         if last_draw.elapsed() >= frame {
             app.tick_update();
-            terminal.draw(|f| draw(f, &mut app))?;
+            // Rebuild the inline viewport when the band height changes (picker
+            // open/close, multi-line input) OR the terminal resized. ratatui
+            // 0.26's inline autoresize leaves the old band stranded in
+            // scrollback (#77); taking over with clear()+fresh viewport
+            // re-anchors cleanly.
+            let term_size = crossterm::terminal::size()?;
+            let want_rows = render::viewport_height(&app, term_size.0, term_size.1);
+            let size_changed = term_size != last_term_size;
+            // A beat after the last resize event, force one full clear +
+            // re-anchor to scrub the terminal's late reflow duplicates (the
+            // cross-DPI-drag stacking; the reported grid size can't see a
+            // same-size DPI change, and a band-only diff never wipes rows the
+            // terminal duplicated in the visible area). Fires once per settle.
+            // The delay lets a slow terminal (conpty/WT over WSL2) finish
+            // reflowing before we repaint; tune here if duplicates survive.
+            const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+            let settled = last_resize.is_some_and(|t| t.elapsed() >= RESIZE_SETTLE);
+            if want_rows != viewport_rows || size_changed || settled {
+                if size_changed || settled {
+                    // ratatui's inline clear() only scrubs downward, so on a
+                    // resize the old band (reflowed by the terminal above the
+                    // new anchor) is left stranded (#77). Wipe the whole screen
+                    // and re-anchor fresh; committed scrollback stays in history.
+                    execute!(
+                        io::stdout(),
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                        crossterm::cursor::MoveTo(0, 0)
+                    )?;
+                } else {
+                    terminal.clear()?;
+                }
+                // Commit the new band size only if the re-anchor succeeded; a
+                // timed-out DSR keeps the old viewport and retries next frame.
+                // Consume the resize marker only on a *settle* re-anchor that
+                // landed — so the live size-change rebuilds during a drag don't
+                // clear it early (the settle would never fire), and a timed-out
+                // settle (common on WSL2/conpty) is retried next frame.
+                if try_rebuild(&mut terminal, want_rows)? {
+                    viewport_rows = want_rows;
+                    last_term_size = term_size;
+                    if settled {
+                        last_resize = None;
+                    }
+                }
+            }
+            draw_tolerant(&mut terminal, &mut app)?;
             last_draw = std::time::Instant::now();
         }
     }
 
-    // The terminal cursor was hidden by ratatui at construction; restore it
-    // before the guard drops so it's visible after exit. `_term_guard`
-    // (TerminalGuard::install above) then runs LeaveAlternateScreen +
-    // disable_raw_mode on the way out, covering this clean-exit path, all
-    // `?`-bubbled Err returns, and panics in the main loop.
+    // Restore the cursor before the guard drops. The band stays in the normal
+    // buffer, so the conversation remains in scrollback after exit. `_term_guard`
+    // disables raw mode + bracketed paste on the way out (clean exit, `?`-bubbled
+    // Err returns, and panics).
     terminal.show_cursor()?;
     Ok(())
 }
@@ -649,6 +814,27 @@ mod tests {
             tool_calls: None,
             created_at_ms: None,
         }
+    }
+
+    #[test]
+    fn cursor_read_timeout_is_classified_transient() {
+        // The exact string crossterm 0.27 returns when a DSR (`ESC[6n`) reply
+        // doesn't arrive within its ~2s window. This must be treated as
+        // recoverable so a slow-pty hiccup skips a frame instead of killing
+        // the whole TUI.
+        let e =
+            std::io::Error::other("The cursor position could not be read within a normal duration");
+        assert!(transient_cursor_read_error(&e));
+    }
+
+    #[test]
+    fn real_io_errors_stay_fatal() {
+        // A genuinely broken terminal/pipe must still propagate — only the
+        // cursor-read timeout is swallowed.
+        let pipe = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        assert!(!transient_cursor_read_error(&pipe));
+        let other = std::io::Error::other("some other backend failure");
+        assert!(!transient_cursor_read_error(&other));
     }
 
     #[tokio::test]

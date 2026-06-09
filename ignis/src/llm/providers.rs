@@ -139,6 +139,77 @@ static SPECS: &[ProviderSpec] = &[
             reasoning_effort: &[],
         }],
     },
+    // ── Volcengine Ark Coding Plan (flat-fee, aggregates third-party models) ─
+    // The `/api/coding/v3` path consumes Coding Plan quota; the sibling
+    // `/api/v3` is the pay-as-you-go inference endpoint and bypasses the plan.
+    // Ark routes to multiple vendors under a single subscription — these names
+    // are the literal `model` strings the Ark Coding Plan accepts, not the
+    // upstream vendor IDs (e.g. `minimax-m3` here vs `MiniMax-M3` under
+    // `minimax-token-plan`). Context windows left None to defer to models.dev;
+    // reasoning_effort left empty pending Ark-side knob confirmation.
+    ProviderSpec {
+        id: "ark-coding",
+        display_name: "Ark Coding Plan",
+        endpoints: &[Endpoint {
+            protocol: Protocol::OpenAi,
+            base_url: "https://ark.cn-beijing.volces.com/api/coding/v3",
+            auth: Auth::Bearer,
+        }],
+        api_key_required: true,
+        request_headers: &[],
+        models: &[
+            ModelSpec {
+                name: "doubao-seed-2.0-code",
+                context: None,
+                reasoning_effort: &[],
+            },
+            ModelSpec {
+                name: "doubao-seed-2.0-pro",
+                context: None,
+                reasoning_effort: &[],
+            },
+            ModelSpec {
+                name: "doubao-seed-2.0-lite",
+                context: None,
+                reasoning_effort: &[],
+            },
+            ModelSpec {
+                name: "doubao-seed-code",
+                context: None,
+                reasoning_effort: &[],
+            },
+            ModelSpec {
+                name: "minimax-m2.7",
+                context: None,
+                reasoning_effort: &[],
+            },
+            ModelSpec {
+                name: "minimax-m3",
+                context: None,
+                reasoning_effort: &[],
+            },
+            ModelSpec {
+                name: "glm-5.1",
+                context: None,
+                reasoning_effort: &[],
+            },
+            ModelSpec {
+                name: "deepseek-v4-flash",
+                context: None,
+                reasoning_effort: &[],
+            },
+            ModelSpec {
+                name: "deepseek-v4-pro",
+                context: None,
+                reasoning_effort: &[],
+            },
+            ModelSpec {
+                name: "kimi-k2.6",
+                context: None,
+                reasoning_effort: &[],
+            },
+        ],
+    },
     // ── Moonshot AI open platform (China) ───────────────────────────────────
     ProviderSpec {
         id: "moonshot-platform-cn",
@@ -213,6 +284,25 @@ static SPECS: &[ProviderSpec] = &[
                 reasoning_effort: &[],
             },
         ],
+    },
+    // ── Zhipu GLM (BigModel open platform, China) ───────────────────────────
+    ProviderSpec {
+        id: "zhipu",
+        display_name: "Zhipu GLM (BigModel)",
+        endpoints: &[Endpoint {
+            protocol: Protocol::OpenAi,
+            base_url: "https://open.bigmodel.cn/api/paas/v4",
+            auth: Auth::Bearer,
+        }],
+        api_key_required: true,
+        request_headers: &[],
+        models: &[ModelSpec {
+            // GLM controls reasoning via a `thinking` body param, not OpenAI's
+            // reasoning_effort, so leave the effort list empty.
+            name: "glm-5.1",
+            context: Some(200_000),
+            reasoning_effort: &[],
+        }],
     },
     // ── Ollama (local; no key, no tool support) ─────────────────────────────
     ProviderSpec {
@@ -314,6 +404,29 @@ mod tests {
         let moonshot = lookup("moonshot-platform-cn").unwrap();
         assert_eq!(moonshot.models[0].name, "kimi-k2.6");
         assert!(moonshot.models.iter().any(|m| m.name == "kimi-k2.5"));
+
+        let zhipu = lookup("zhipu").unwrap();
+        assert_eq!(zhipu.models[0].name, "glm-5.1");
+
+        let ark = lookup("ark-coding").unwrap();
+        assert_eq!(
+            ark.endpoints[0].base_url,
+            "https://ark.cn-beijing.volces.com/api/coding/v3"
+        );
+        // Multi-vendor aggregation under one subscription — sample one from each
+        // vendor cluster to catch accidental removals from the curated list.
+        for name in &[
+            "glm-5.1",
+            "minimax-m3",
+            "deepseek-v4-flash",
+            "kimi-k2.6",
+            "doubao-seed-2.0-code",
+        ] {
+            assert!(
+                ark.models.iter().any(|m| &m.name == name),
+                "ark-coding missing model {name}"
+            );
+        }
     }
 
     #[test]

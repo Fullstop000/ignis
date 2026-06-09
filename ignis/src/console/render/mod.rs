@@ -4,6 +4,7 @@
 //! carry previews. Everything else is delegated to one of the submodules
 //! below.
 use ratatui::{
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
@@ -11,53 +12,92 @@ use ratatui::{
     Frame,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::console::app::App;
 use crate::console::{BG, BORDER, TEXT_DIM};
 
 pub(crate) mod blocks;
+pub(crate) mod layout;
 pub(crate) mod pickers;
+pub(crate) mod stream_commit;
 pub(crate) mod tool_block;
 pub(crate) mod widgets;
 
 // Re-export per-frame primitives callers still reference by their old
 // `console::render::*` path so this split is a pure file move from outside.
 pub(crate) use blocks::{block_lines, welcome_lines};
+// Runner reaches these by the old `render::*` path; `draw` (below) uses the rest.
+pub(crate) use layout::{band_height, viewport_height};
+use layout::{input_height, picker_open, MODEL_PICKER_MAX_OPTION_ROWS};
 pub(crate) use pickers::{
-    render_mcp_picker, render_model_picker, render_session_picker, render_skill_picker,
+    render_mcp_picker, render_model_picker, render_session_picker, render_settings_panel,
+    render_skill_picker,
 };
 pub(crate) use widgets::{
     draw_footer, draw_input, draw_loading, draw_queued, draw_slash_suggestions,
     queued_region_height, MAX_SLASH_ROWS,
 };
 
-/// Height (rows) of the bottom band — status line + queued strip + slash
-/// suggestions + input box + footer. Independent of the transcript above it.
-pub(crate) fn band_height(app: &App, term_rows: u16) -> u16 {
-    let cap = term_rows.saturating_sub(1).max(3);
-    let input_h = input_height(app, cap);
-    let sugg = app.slash_suggestions();
-    let sugg_h = if !sugg.is_empty() {
-        (sugg.len() as u16).min(MAX_SLASH_ROWS)
-    } else {
-        0
-    };
-    let queued_h = queued_region_height(app);
-    (1 + queued_h + sugg_h + input_h + 1).min(cap)
+/// Blit pre-wrapped `lines` (one `Line` per visual row — `block_lines` already
+/// wraps to width) into the `insert_before` scratch buffer, one row each. This
+/// is the inline path that pushes finalized blocks into native scrollback.
+pub(crate) fn render_block_into(buf: &mut Buffer, lines: &[Line]) {
+    let area = buf.area;
+    // Paint the whole buffer with the app background first: insert_before cells
+    // otherwise default to the terminal's own bg, leaving the scrollback a
+    // different shade than the band. Spans rarely set a bg, so this fill shows
+    // through everywhere except explicit code-bg spans.
+    buf.set_style(area, Style::default().bg(BG));
+    for (i, line) in lines.iter().enumerate() {
+        let y = area.y.saturating_add(i as u16);
+        if y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        buf.set_line(area.x, y, line, area.width);
+    }
+    blank_wide_char_continuations(buf);
 }
 
-/// Input box height (incl. borders), growing with newline-separated lines.
-fn input_height(app: &App, cap: u16) -> u16 {
-    let lines = app.input.split('\n').count().max(1) as u16;
-    (lines + 2).clamp(3, cap.saturating_sub(2).max(3))
+/// Empty the cell that follows each double-width glyph (CJK, emoji).
+///
+/// `Terminal::insert_before` flushes *every* buffer cell to the backend — it
+/// skips the `diff` step that, in a normal draw, drops the blank continuation
+/// cell after a wide glyph. The backend then prints that blank `" "` at the
+/// column the wide glyph already advanced past, leaving a stray space after
+/// every wide char. Clearing the continuation symbol makes the backend print
+/// nothing there, so the glyph keeps its natural two columns.
+fn blank_wide_char_continuations(buf: &mut Buffer) {
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        let mut x = area.left();
+        while x < area.right() {
+            let w = UnicodeWidthStr::width(buf.get(x, y).symbol());
+            if w >= 2 {
+                if x + 1 < area.right() {
+                    buf.get_mut(x + 1, y).set_symbol("");
+                }
+                x += 2;
+            } else {
+                x += 1;
+            }
+        }
+    }
 }
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let size = f.size();
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
-    // Fullscreen layout: transcript (or whatever picker has taken the area)
-    // fills the top; the input band sits permanently at the bottom.
-    let band_h = band_height(app, size.height);
+    // Inline layout: `size` IS the viewport. With no picker the band fills it
+    // entirely (the conversation is in native scrollback above). With a picker
+    // open the viewport is grown by `viewport_height`, and the picker takes the
+    // top while the band stays pinned at the bottom.
+    let band_h = if picker_open(app) {
+        band_height(app, size.height)
+    } else {
+        size.height
+    };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(band_h)])
@@ -65,35 +105,19 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let body_area = outer[0];
     let band_area = outer[1];
 
-    // Body area: tool-initiated pickers (ask_user / permission / connect /
-    // afk) anchor to the BOTTOM of the body — same convention Claude Code
-    // and Codex use — with the transcript still visible above. Sized to the
-    // picker's natural height, capped at 70% so context behind it stays in
-    // view. Slash-command pickers (model/session/skill/mcp) continue to take
-    // the full body since they're entered intentionally and benefit from the
-    // room.
-    if app.inline_picker.is_some() {
-        // Compute the bottom picker slice in a scope holding only an
-        // immutable borrow, so render_transcript can take `&mut app` after.
-        // The picker takes exactly its natural height (clamped to body) and
-        // whatever's left becomes transcript context above — no proactive
-        // share cap. Capping was clipping the input/footer of tiny pickers
-        // (e.g. a 7-row text-input picker on an 8-row body) even when the
-        // full body could have shown them.
-        let (picker_area, above) = {
-            let picker = app.inline_picker.as_ref().expect("checked above");
-            let desired = super::inline_picker::picker_height(picker, body_area.width);
-            let h = desired.min(body_area.height).max(1);
-            let split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(h)])
-                .split(body_area);
-            (split[1], split[0])
-        };
-        if above.height > 0 {
-            render_transcript(f, above, app);
-        }
-        let picker = app.inline_picker.as_ref().expect("still set");
+    // Body area: a tool-initiated picker (ask_user / permission / connect /
+    // afk) anchors to the BOTTOM of the body at its natural height. The area
+    // above it stays blank — the conversation is in native scrollback above
+    // the whole inline viewport. Slash-command pickers (model/session/skill/
+    // mcp) take the full body since they're entered intentionally.
+    if let Some(picker) = &app.inline_picker {
+        let desired = super::inline_picker::picker_height(picker, body_area.width);
+        let h = desired.min(body_area.height).max(1);
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(h)])
+            .split(body_area);
+        let picker_area = split[1];
         if picker.is_reviewing() {
             let mut lines: Vec<Line> = Vec::new();
             super::inline_picker::render_review(&mut lines, picker, picker_area.width);
@@ -121,14 +145,26 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
             );
         }
     } else if let Some(picker) = &app.model_picker {
-        let max_rows = (body_area.height as usize).saturating_sub(4).max(1);
+        // Model picker anchors to the bottom of the body area — like the
+        // inline ask_user picker — so the conversation in native scrollback
+        // above the TUI is visible. `viewport_height` only grows the TUI by
+        // the picker's natural height, not the whole terminal.
+        let options = &app.model_options;
+        let max_rows = MODEL_PICKER_MAX_OPTION_ROWS;
         let mut lines: Vec<Line> = Vec::new();
-        render_model_picker(&mut lines, picker, &app.model_options, max_rows);
+        render_model_picker(&mut lines, picker, options, max_rows);
+        let desired = lines.len() as u16;
+        let h = desired.min(body_area.height);
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(h)])
+            .split(body_area);
+        let picker_area = split[1];
         f.render_widget(
             Paragraph::new(Text::from(lines))
                 .style(Style::default().bg(BG))
                 .wrap(Wrap { trim: false }),
-            body_area,
+            picker_area,
         );
     } else if let Some(picker) = &app.session_picker {
         let max_rows = (body_area.height as usize).saturating_sub(3).max(1);
@@ -160,8 +196,33 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
                 .wrap(Wrap { trim: false }),
             body_area,
         );
-    } else {
-        render_transcript(f, body_area, app);
+    } else if let Some(panel) = &app.settings_panel {
+        let mut lines: Vec<Line> = Vec::new();
+        render_settings_panel(&mut lines, panel, app);
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().bg(BG))
+                .wrap(Wrap { trim: false }),
+            body_area,
+        );
+    }
+    // No picker → `body_area` is zero-height; the band fills the viewport and
+    // the conversation is in native scrollback above it.
+
+    // Band: status … footer. While a picker is open the band is just status +
+    // footer (no input box / slash / queued) — the picker above is the input.
+    if picker_open(app) {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(band_area);
+        draw_loading(f, split[0], app);
+        draw_footer(f, split[2], app);
+        return;
     }
 
     // Band: laid out from the top of `band_area` down. Order is the same as
@@ -199,48 +260,6 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     draw_footer(f, band_layout[4], app);
 }
 
-/// Largest scroll offset that still shows the last line of `total` in a
-/// `visible`-row viewport: `total - visible` (0 when everything fits). Shared
-/// by `render_transcript`, the mouse wheel, PgDn, and `End` so they all agree
-/// on "the bottom".
-pub(crate) fn natural_max_offset(total: usize, visible: usize) -> usize {
-    total.saturating_sub(visible)
-}
-
-/// Render the in-app transcript into `area`. Honors `app.auto_follow`
-/// (recomputes scroll_offset to the natural bottom) and `app.scroll_offset`
-/// (sticky position when the user has scrolled up). No "N more lines" hints —
-/// the window is exactly the visible slice.
-fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
-    if area.height == 0 {
-        return;
-    }
-    let total = app.transcript.len();
-    let visible = area.height as usize;
-    // Record the real visible-row count so PgDn / the mouse wheel can detect
-    // "at the natural bottom" and re-enable auto-follow.
-    app.transcript_visible_rows = visible;
-    let max_offset = natural_max_offset(total, visible);
-    // Auto-follow recomputes offset each frame; manual scroll keeps the
-    // user's offset, clamped to the current max in case content shrunk.
-    if app.auto_follow || app.scroll_offset > max_offset {
-        app.scroll_offset = max_offset;
-    }
-    if total == 0 {
-        return;
-    }
-
-    let start = app.scroll_offset.min(total);
-    let end = (start + visible).min(total);
-    let slice: Vec<Line> = app.transcript[start..end].to_vec();
-
-    f.render_widget(
-        Paragraph::new(Text::from(slice))
-            .style(Style::default().bg(BG))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
 /// Split-layout render for the `ask_user` picker when at least one option
 /// carries a `preview`. The band is divided:
 ///   - top: blank + header strip + question (3 rows)
@@ -325,25 +344,18 @@ mod queue_render_tests {
         App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"))
     }
 
-    /// Regression: a long `ask_user` trace once re-wrapped at render while
-    /// being counted as a single row, pushing the newest transcript line off
-    /// the bottom — it read as "the running status bar covers the chat
-    /// history". With the trace wrapped at commit time, the newest line stays
-    /// visible. Exercises the real block_lines → transcript → render path.
+    /// Regression: a long `ask_user` trace once produced rows wider than the
+    /// viewport. Inline rendering blits `block_lines` rows verbatim into
+    /// scrollback (no render-time re-wrap), so an over-width row would be
+    /// truncated. `block_lines` must therefore hard-break over-wide words so
+    /// every row fits the width.
     #[test]
-    fn long_ask_user_trace_keeps_newest_line_visible() {
+    fn long_ask_user_trace_wraps_within_width() {
         use crate::console::app::{ToolCallEntry, ToolStatus, UIBlock};
-        use ratatui::{backend::TestBackend, text::Line, Terminal};
         use std::time::Instant;
+        use unicode_width::UnicodeWidthStr;
 
-        // Viewport SHORTER than the transcript so auto-follow pins to the
-        // bottom — the condition under which an over-wide line's render-time
-        // re-wrap pushes the newest row off the bottom.
-        let (width, height) = (40u16, 4u16);
-        let mut a = app();
-        for i in 0..6 {
-            a.commit_transcript_lines(vec![Line::from(format!("ctx{i}"))]);
-        }
+        let width = 40u16;
         let result = serde_json::json!({
             "answers": [{
                 "question": "PR #127 green. Two feat: commits since v0.34.0. \
@@ -361,26 +373,36 @@ mod queue_render_tests {
             elapsed_ms: 0,
         });
         let lines = blocks::block_lines(&block, 0, std::path::Path::new("/tmp"), width);
-        a.commit_transcript_lines(lines);
-        a.commit_transcript_lines(vec![Line::from("NEWEST_SENTINEL")]);
+        for line in &lines {
+            let cols: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(
+                cols <= width as usize,
+                "ask_user trace row exceeds width {width} ({cols} cols): {line:?}"
+            );
+        }
+    }
 
-        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
-        term.draw(|f| {
-            let area = f.size();
-            super::render_transcript(f, area, &mut a);
-        })
-        .unwrap();
-        let rendered: String = term
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(
-            rendered.contains("NEWEST_SENTINEL"),
-            "newest transcript line was clipped behind the band:\n{rendered}"
+    #[test]
+    fn render_block_into_blanks_wide_char_continuation() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::text::Line;
+        // "🔥 x": fire (width 2) at cell 0, its continuation at cell 1, space at
+        // 2, 'x' at 3. The continuation must be an EMPTY symbol so insert_before
+        // doesn't flush it as a stray space (which would push 'x' to cell 4).
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+        super::render_block_into(&mut buf, &[Line::from("🔥 x")]);
+        assert_eq!(
+            buf.get(1, 0).symbol(),
+            "",
+            "wide-char continuation must be blank"
         );
+        assert_eq!(buf.get(2, 0).symbol(), " ");
+        assert_eq!(buf.get(3, 0).symbol(), "x");
     }
 
     #[test]
@@ -410,91 +432,6 @@ mod queue_render_tests {
     }
 
     #[test]
-    fn auto_follow_pins_view_to_bottom() {
-        // App starts with auto_follow=true, scroll_offset=0. After several
-        // lines are committed, the renderer pins scroll_offset to the natural
-        // bottom = `total - visible` (no hints reserve a row anymore).
-        let mut a = app();
-        for i in 0..20 {
-            a.commit_transcript_lines(vec![Line::from(format!("line {i}"))]);
-        }
-        // Simulate a render: visible=5, total=20 → max_offset = 20 - 5 = 15.
-        let max_offset = natural_max_offset(a.transcript.len(), 5);
-        if a.auto_follow {
-            a.scroll_offset = max_offset;
-        }
-        assert_eq!(a.scroll_offset, 15);
-        assert!(a.auto_follow);
-    }
-
-    #[test]
-    fn scroll_up_disables_auto_follow_when_offset_moves() {
-        let mut a = app();
-        for i in 0..30 {
-            a.commit_transcript_lines(vec![Line::from(format!("line {i}"))]);
-        }
-        a.scroll_offset = 20;
-        a.scroll_transcript_up(8);
-        assert_eq!(a.scroll_offset, 12);
-        assert!(!a.auto_follow, "real scroll must release auto-follow");
-        // Walking further up clamps at 0, never underflows.
-        a.scroll_transcript_up(100);
-        assert_eq!(a.scroll_offset, 0);
-        assert!(!a.auto_follow);
-    }
-
-    #[test]
-    fn scroll_up_at_top_preserves_auto_follow() {
-        // codex P2: PgUp at offset 0 (already at the top, or before the
-        // transcript grew past the viewport) is a no-op; it must NOT silently
-        // flip auto_follow off — that would un-pin the view from the bottom
-        // when later content arrives.
-        let mut a = app();
-        a.commit_transcript_lines(vec![Line::from("a"), Line::from("b")]);
-        assert_eq!(a.scroll_offset, 0);
-        assert!(a.auto_follow);
-        a.scroll_transcript_up(10);
-        assert_eq!(a.scroll_offset, 0);
-        assert!(a.auto_follow, "no-move PgUp must keep follow on");
-    }
-
-    #[test]
-    fn new_session_clears_transcript_and_resets_scroll() {
-        // codex P3: switching sessions used to leave the previous session's
-        // rendered lines in `transcript`, since only `blocks`/`committed`
-        // got reset. New session output then appeared *below* the stale tail.
-        let mut a = app();
-        a.commit_transcript_lines(vec![Line::from("old line 1"), Line::from("old line 2")]);
-        a.scroll_offset = 1;
-        a.auto_follow = false;
-
-        a.start_new_session("sess-new".to_string());
-
-        // Only the "Started new session" notice is in `blocks` — `transcript`
-        // is reset until the runner flushes the new session's blocks.
-        assert!(a.transcript.is_empty());
-        assert_eq!(a.scroll_offset, 0);
-        assert!(a.auto_follow);
-        assert_eq!(a.session_id, "sess-new");
-    }
-
-    #[test]
-    fn scroll_down_to_bottom_resumes_auto_follow() {
-        let mut a = app();
-        for i in 0..30 {
-            a.commit_transcript_lines(vec![Line::from(format!("line {i}"))]);
-        }
-        a.scroll_offset = 5;
-        a.auto_follow = false;
-        // visible=10, total=30 → natural max_offset = 30 - 10 = 20.
-        // PgDn(18) from offset 5 → next=23, which exceeds 20, so we snap to
-        // 20 and re-enable auto_follow.
-        a.scroll_transcript_down(18, 10);
-        assert_eq!(a.scroll_offset, 20);
-        assert!(a.auto_follow);
-    }
-
-    #[test]
     fn hint_is_none_when_idle_or_clean_busy() {
         let mut a = app();
         a.mode = Mode::Idle;
@@ -507,7 +444,7 @@ mod queue_render_tests {
     fn hint_text_depends_on_queue_presence() {
         let mut a = app();
         a.mode = Mode::Thinking;
-        a.input = "typing".into();
+        a.composer.input = "typing".into();
         assert_eq!(
             queued_hint(&a).as_deref(),
             Some("Enter queue · Ctrl+S send now")
@@ -525,9 +462,9 @@ mod queue_render_tests {
         a.mode = Mode::Idle;
         assert_eq!(queued_region_height(&a), 0);
         a.mode = Mode::Thinking;
-        a.input = "x".into(); // hint only
+        a.composer.input = "x".into(); // hint only
         assert_eq!(queued_region_height(&a), 1);
-        a.input.clear();
+        a.composer.input.clear();
         a.queue = vec!["one".into(), "two".into()]; // blank + 2 rows + hint
         assert_eq!(queued_region_height(&a), 4);
     }
@@ -537,8 +474,10 @@ mod queue_render_tests {
 mod tests {
     use super::*;
     use crate::console::app::{Mode, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
+    use crate::console::format_context;
+    use crate::console::render::layout::model_picker_height;
     use crate::console::render::tool_block::compact_tool_args;
-    use crate::console::{format_context, DIFF_ADD_BG, DIFF_DEL_BG};
+    use crate::console::{DIFF_ADD_BG, DIFF_DEL_BG, PEACH, RED, YELLOW};
     use ratatui::{backend::TestBackend, Terminal};
     use std::path::PathBuf;
 
@@ -621,6 +560,97 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("effort:"));
         assert!(content.contains("high") && content.contains("max"));
+    }
+
+    /// `model_picker_height` is selection-stable: walking `sel` across the
+    /// scroll-window boundary or across a reasoning↔non-reasoning boundary
+    /// must NOT change the returned height — otherwise the runner rebuilds
+    /// the viewport and the user sees a full-screen flicker on every `↓`.
+    #[test]
+    fn model_picker_height_is_stable_across_navigation() {
+        let opt = |p: &str, m: &str, l: &[&str]| crate::llm::ModelOption {
+            provider: p.to_string(),
+            model: m.to_string(),
+            effort_levels: l.iter().map(|s| s.to_string()).collect(),
+            context: None,
+        };
+        // 20 options, mixed effort. Walk sel across the full range — including
+        // both the scroll-window boundary at sel=15 and the
+        // reasoning↔non-reasoning boundary inside the mix.
+        let options: Vec<crate::llm::ModelOption> = (0..20)
+            .map(|i| {
+                if i % 2 == 0 {
+                    opt("p", &format!("m{i}"), &["high"])
+                } else {
+                    opt("p", &format!("m{i}"), &[])
+                }
+            })
+            .collect();
+        let mut picker = crate::console::app::ModelPicker {
+            selected: 0,
+            effort_idx: 0,
+        };
+        let baseline = model_picker_height(&picker, &options);
+        for sel in 0..options.len() {
+            picker.selected = sel;
+            let h = model_picker_height(&picker, &options);
+            assert_eq!(
+                h, baseline,
+                "model_picker_height must not change when sel moves (sel={sel}, h={h}, baseline={baseline})"
+            );
+        }
+        // Also unchanged when effort is cycled (effort doesn't enter the math).
+        picker.cycle_effort(crate::console::SelectionDirection::Next, &options);
+        assert_eq!(model_picker_height(&picker, &options), baseline);
+
+        // Sanity: the formula handles edge cases.
+        // Empty options → 3.
+        let empty: Vec<crate::llm::ModelOption> = vec![];
+        assert_eq!(model_picker_height(&picker, &empty), 3);
+        // 1 option, no effort: blank + header + 1 option + footer = 4.
+        let one = vec![opt("p", "m0", &[])];
+        assert_eq!(model_picker_height(&picker, &one), 4);
+        // 1 option, with effort: 5.
+        let one_effort = vec![opt("p", "m0", &["high"])];
+        assert_eq!(model_picker_height(&picker, &one_effort), 5);
+        // 16 options, no effort, list overflows: 2 + 0 + 1 + 15 + 1 + 1 = 20.
+        let sixteen: Vec<crate::llm::ModelOption> =
+            (0..16).map(|i| opt("p", &format!("m{i}"), &[])).collect();
+        assert_eq!(model_picker_height(&picker, &sixteen), 20);
+        // 20 options, with effort, list overflows: 2 + 1 + 1 + 15 + 1 + 1 = 21.
+        let twenty: Vec<crate::llm::ModelOption> = (0..20)
+            .map(|i| opt("p", &format!("m{i}"), &["high"]))
+            .collect();
+        assert_eq!(model_picker_height(&picker, &twenty), 21);
+    }
+
+    /// `viewport_height` for the model picker must always include the band
+    /// height (status + footer) plus the picker's natural height, clamped to
+    /// the terminal — never returning 0 in normal use.
+    #[test]
+    fn viewport_height_clamps_model_picker_to_terminal() {
+        let opt = |p: &str, m: &str, l: &[&str]| crate::llm::ModelOption {
+            provider: p.to_string(),
+            model: m.to_string(),
+            effort_levels: l.iter().map(|s| s.to_string()).collect(),
+            context: None,
+        };
+        let options: Vec<crate::llm::ModelOption> = (0..20)
+            .map(|i| opt("p", &format!("m{i}"), &["high"]))
+            .collect();
+        let mut app = App::new(
+            "p".to_string(),
+            "m0".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        app.set_model_options(options, None);
+        app.show_model_picker();
+
+        // 8-row terminal: ph=21 + bh=2 = 23, clamped to cap=7.
+        assert_eq!(viewport_height(&app, 80, 8), 7);
+        // 100-row terminal: ph=21 + bh=2 = 23.
+        assert_eq!(viewport_height(&app, 80, 100), 23);
     }
 
     #[test]
@@ -743,8 +773,6 @@ mod tests {
 
     #[test]
     fn render_reasoning_shows_header_and_dim_color() {
-        use crate::console::colors::TEXT_DIM;
-
         let mut app = App::new(
             "test".to_string(),
             "model".to_string(),
@@ -800,6 +828,53 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("read_file"), "should show tool name");
         assert!(content.contains("file content"), "should show tool output");
+    }
+
+    #[test]
+    fn render_skill_tool_collapses_body_to_one_line() {
+        // The skill tool returns the whole skill body wrapped in <skill name>.
+        // The block must show a single "loaded skill instructions" line, never
+        // the wrapper or the body (model reads it, not the user).
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        app.blocks.push(UIBlock::Tool(ToolCallEntry {
+            id: "s1".to_string(),
+            name: "skill".to_string(),
+            arguments: r#"{"name":"brainstorming"}"#.to_string(),
+            status: ToolStatus::Success(
+                "<skill name=\"brainstorming\">\nSECRET_BODY_LINE_ONE\nSECRET_BODY_LINE_TWO\n</skill>"
+                    .to_string(),
+            ),
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 3,
+        }));
+
+        let term = render_blocks(&app, 80, 24);
+        let content = buffer_content(&term);
+        assert!(
+            content.contains("skill"),
+            "header still shows the tool name"
+        );
+        assert!(
+            content.contains("loaded skill instructions"),
+            "skill block shows the one-line confirmation"
+        );
+        assert!(
+            !content.contains("SECRET_BODY_LINE_ONE"),
+            "the skill body must not spill into the transcript"
+        );
+        assert!(
+            !content.contains("<skill name"),
+            "the <skill> wrapper must not render"
+        );
+        assert!(
+            !content.contains("more lines"),
+            "no '… N more lines' tail for the collapsed skill block"
+        );
     }
 
     #[test]
@@ -953,6 +1028,7 @@ mod tests {
                 crate::cli::sessions::SessionRecord {
                     session_id: "alpha".to_string(),
                     project_slug: "p".to_string(),
+                    title: "add session title".to_string(),
                     started_at: Some(1_735_787_045),
                     last_modified: Some(1_735_787_045),
                     agent_messages: 3,
@@ -971,7 +1047,6 @@ mod tests {
             ],
             selected: 0,
             mode: crate::console::app::SessionPickerMode::List,
-            current_session_id: "alpha".to_string(),
             projects_dir: std::path::PathBuf::from("/tmp"),
         });
 
@@ -980,9 +1055,20 @@ mod tests {
 
         let content = buffer_content(&term);
         assert!(content.contains("Sessions"), "should show picker title");
-        assert!(content.contains("STARTED"), "should show columns header");
-        assert!(content.contains("2025-01-"), "should render row timestamps");
-        assert!(content.contains("▸"), "should mark current session with ▸");
+        // Two-line rows: a derived title line over a dim meta line.
+        assert!(
+            content.contains("add session title"),
+            "should render the derived title"
+        );
+        assert!(
+            content.contains("(no message yet)"),
+            "title-less session falls back to a placeholder"
+        );
+        assert!(
+            content.contains("2025-01-"),
+            "meta line shows the timestamp"
+        );
+        assert!(content.contains("tok"), "meta line shows token count");
         assert!(
             content.contains("details"),
             "footer should advertise → details"
@@ -1063,7 +1149,6 @@ mod tests {
 
     #[test]
     fn render_footer_hands_free_badge_is_peach() {
-        use crate::console::colors::PEACH;
         use crate::permissions::{runtime::PermissionState, Mode as PermMode};
 
         let mut app = App::new(
@@ -1101,7 +1186,6 @@ mod tests {
 
     #[test]
     fn render_footer_fully_unattended_badge_is_red() {
-        use crate::console::colors::RED;
         use crate::permissions::{runtime::PermissionState, Mode as PermMode};
 
         let mut app = App::new(
@@ -1157,7 +1241,6 @@ mod tests {
     #[test]
     fn render_footer_shows_update_segment_when_notice_set() {
         use crate::cli::upgrade::UpdateNotice;
-        use crate::console::colors::YELLOW;
 
         let mut app = App::new(
             "openai".to_string(),
@@ -1232,8 +1315,8 @@ mod tests {
             PathBuf::from("."),
         );
         // Mixed CJK + ASCII, cursor mid-string on a char boundary.
-        app.input = "中文a测试".to_string();
-        app.cursor = "中文a".len();
+        app.composer.input = "中文a测试".to_string();
+        app.composer.cursor = "中文a".len();
 
         let mut term = test_terminal(80, 24);
         // Would panic on a non-char-boundary slice if cursor math were byte-naive.
@@ -1244,6 +1327,33 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("中"), "should render wide chars");
         assert!(content.contains("试"), "should render the full input");
+    }
+
+    #[test]
+    fn input_bar_shows_prompt_glyph() {
+        let mut app = App::new(
+            "test".to_string(),
+            "model".to_string(),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        // Empty input: the ❯ prompt sits left of the placeholder.
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_content(&term).contains('❯'),
+            "input bar should show the ❯ prompt glyph"
+        );
+
+        // With typed text the glyph still leads the line.
+        app.composer.input = "hello".to_string();
+        app.composer.cursor = app.composer.input.len();
+        let mut term = test_terminal(80, 24);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_content(&term).contains("❯ hello"),
+            "prompt glyph should prefix the typed input"
+        );
     }
 
     #[test]
@@ -1381,7 +1491,6 @@ mod tests {
             }],
             selected: 0,
             mode: crate::console::app::SessionPickerMode::List,
-            current_session_id: "alpha".to_string(),
             projects_dir: std::path::PathBuf::from("/tmp"),
         });
 
@@ -1431,75 +1540,6 @@ mod tests {
         assert!(
             content.contains("hi there"),
             "should show assistant message"
-        );
-    }
-
-    #[test]
-    fn inline_picker_anchors_to_bottom_with_transcript_above() {
-        use crate::console::picker::{PickerOption, PickerQuestion};
-        let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
-            "default".to_string(),
-            PathBuf::from("/tmp"),
-        );
-        // Fill scrollback so something is pinned just above the picker via
-        // auto-follow — that's the regression we're guarding: tool-initiated
-        // pickers used to wipe the transcript and take the full body.
-        for i in 0..40 {
-            app.commit_transcript_lines(vec![Line::from(format!("FILLER_{i}"))]);
-        }
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        app.inline_picker = Some(crate::console::inline_picker::InlinePickerState::new(
-            crate::console::picker::PickerRequest {
-                questions: vec![PickerQuestion {
-                    question: "PICKER_QUESTION".into(),
-                    kind: "permission".into(),
-                    header: "Allow?".into(),
-                    multi_select: false,
-                    allow_other: false,
-                    text_input: false,
-                    mask: false,
-                    options: vec![
-                        PickerOption {
-                            label: "Approve once".into(),
-                            description: "Run this command and continue.".into(),
-                            preview: None,
-                        },
-                        PickerOption {
-                            label: "Deny".into(),
-                            description: "Reject this tool call.".into(),
-                            preview: None,
-                        },
-                    ],
-                }],
-                reply: tx,
-            },
-        ));
-        let mut term = test_terminal(80, 24);
-        term.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = term.backend().buffer();
-        let w = buf.area.width as usize;
-        let h = buf.area.height as usize;
-        let row_text = |y: usize| -> String {
-            buf.content[y * w..(y + 1) * w]
-                .iter()
-                .map(|c| c.symbol())
-                .collect()
-        };
-        let picker_row = (0..h)
-            .find(|y| row_text(*y).contains("PICKER_QUESTION"))
-            .expect("picker question must render");
-        let filler_row = (0..h)
-            .find(|y| row_text(*y).contains("FILLER_"))
-            .expect("transcript must still be visible above the picker");
-        assert!(
-            filler_row < picker_row,
-            "transcript row {filler_row} should sit ABOVE picker row {picker_row}",
-        );
-        assert!(
-            picker_row >= h / 3,
-            "picker should anchor toward bottom (question at row {picker_row} of {h})",
         );
     }
 

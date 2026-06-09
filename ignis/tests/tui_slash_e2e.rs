@@ -52,9 +52,12 @@ impl TuiProcess {
         let output_for_thread = Arc::clone(&output);
         let writer_for_thread = Arc::clone(&writer);
 
-        // Fullscreen viewport doesn't query cursor position; the reader just
-        // drains pty output into `output` for later assertions.
-        let _ = writer_for_thread; // master writer kept alive via `self.writer`
+        // The inline viewport (`Viewport::Inline`) queries cursor position via
+        // DSR (`ESC[6n`) on startup and on every rebuild (resize / picker
+        // open-close). A real terminal replies; the reader thread must too, or
+        // ratatui errors ("cursor position could not be read") and the TUI
+        // exits before rendering. Answer each query with a fixed report — the
+        // anchor row doesn't matter for these output-content assertions.
         std::thread::spawn(move || {
             let mut buf = [0; 4096];
             loop {
@@ -62,6 +65,14 @@ impl TuiProcess {
                     Ok(0) => break,
                     Ok(n) => {
                         let text = String::from_utf8_lossy(&buf[..n]);
+                        let dsr = text.matches("\x1b[6n").count();
+                        if dsr > 0 {
+                            let mut w = writer_for_thread.lock().unwrap();
+                            for _ in 0..dsr {
+                                let _ = w.write_all(b"\x1b[1;1R");
+                            }
+                            let _ = w.flush();
+                        }
                         output_for_thread.lock().unwrap().push_str(&text);
                     }
                     Err(_) => break,

@@ -9,6 +9,11 @@ pub struct SkillTool {
 }
 
 impl SkillTool {
+    /// Inherent mirror of the `StaticTool::NAME` const so callers (e.g. the
+    /// tool-block renderer) can match on `SkillTool::NAME` without importing
+    /// the trait — same pattern as `EditFileTool`/`CreateFileTool`.
+    pub const NAME: &'static str = "skill";
+
     pub fn new(registry: Arc<SkillRegistry>) -> Self {
         Self { registry }
     }

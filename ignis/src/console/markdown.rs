@@ -227,13 +227,13 @@ enum Align {
 }
 
 /// A line that could be a table row: non-empty and contains a pipe.
-fn is_table_row(line: &str) -> bool {
+pub(crate) fn is_table_row(line: &str) -> bool {
     let t = line.trim();
     !t.is_empty() && t.contains('|')
 }
 
 /// A GitHub-style separator/alignment row: every cell is `:?-+:?`.
-fn is_separator_row(line: &str) -> bool {
+pub(crate) fn is_separator_row(line: &str) -> bool {
     let cells = split_cells(line);
     !cells.is_empty()
         && cells.iter().all(|c| {

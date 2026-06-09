@@ -9,7 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - hooks: env-var allowlist + filesystem sandbox (Linux Landlock, macOS Seatbelt) for hook subprocesses, defaults-on; SIGTERM-then-SIGKILL grace on timeout; stdout/stderr capped at 1 MiB per stream. ([#109](https://github.com/Fullstop000/ignis/pull/109))
+
+## [0.37.1] - 2026-06-09
+
+### Added
+- Providers — Ark Coding Plan (`ark-coding`) — Volcengine's flat-fee subscription aggregating 10 models (`doubao-seed-*`, `minimax-m{2.7,3}`, `glm-5.1`, `deepseek-v4-{flash,pro}`, `kimi-k2.6`). Set `ARK_CODING_PLAN_TOKEN` and pick `ark-coding/<model>` via `/model`. ([#149](https://github.com/Fullstop000/ignis/pull/149))
+- TUI — `/settings` opens a control panel: a live **Stats** tab (context %, tokens, turns, tools, uptime) and a **Statusline** tab to show/hide individual status-bar segments. ([#151](https://github.com/Fullstop000/ignis/pull/151))
+
+### Fixed
+- TUI — no longer crashes at startup in a git repository whose working diff contains a multibyte character near the truncation point. ([#151](https://github.com/Fullstop000/ignis/pull/151))
+
+## [0.37.0] - 2026-06-09
+
+### Added
+- TUI — `/sessions` shows a per-row title (from the session's first message) and hides the session you're already in. ([#144](https://github.com/Fullstop000/ignis/pull/144))
+- Providers — Zhipu GLM (BigModel open platform, China) is now a built-in OpenAI-compatible provider; configure with `[providers.zhipu]` and `model = "zhipu/glm-5.1"`. ([#143](https://github.com/Fullstop000/ignis/pull/143))
+
+### Changed
+- TUI — `/connect`'s final step now imports the provider's whole model list into `/model` and just picks which one is active, offering a "Keep current model" row so rotating a key needn't switch models. ([#143](https://github.com/Fullstop000/ignis/pull/143))
+
+### Fixed
+- TUI — after `/connect`, the newly-connected provider's models now appear in `/model` in the same session (the picker list was only built at startup). ([#143](https://github.com/Fullstop000/ignis/pull/143))
+
+## [0.36.2] - 2026-06-08
+
+### Fixed
+- TUI — resizing the terminal (e.g. dragging between monitors) no longer leaves duplicate input bars stacked on screen. ([#138](https://github.com/Fullstop000/ignis/pull/138))
+- TUI — resuming a session via `/sessions` reliably repaints the conversation history instead of sometimes leaving a blank screen with only the input bar. ([#140](https://github.com/Fullstop000/ignis/pull/140))
+
+## [0.36.1] - 2026-06-08
+
+### Fixed
+- TUI — `/model` picker anchors above the input (replacing it, CC-style) instead of taking over the whole body. The conversation in native scrollback above the TUI stays visible while the picker is open. ([#134](https://github.com/Fullstop000/ignis/pull/134))
+
+## [0.36.0] - 2026-06-08
+
+### Added
+- TUI — the input bar shows a `❯` prompt at its left edge. ([#133](https://github.com/Fullstop000/ignis/pull/133))
+
+### Changed
+- TUI — invoking a skill (`/skill-name` or the `skill` tool) shows a compact line in the transcript instead of the full skill body. ([#136](https://github.com/Fullstop000/ignis/pull/136))
+
+### Fixed
+- TUI — a momentarily unresponsive terminal no longer crashes the session mid-render; the inline view rides out the hiccup and recovers. ([#135](https://github.com/Fullstop000/ignis/pull/135))
+
+## [0.35.0] - 2026-06-06
+
+### Added
 - TUI — `/hooks` (and the alias `/hooks list`) now prints the in-memory hook chains — one block per event, each entry showing the program path, its argv tail, and the per-hook timeout — and still re-reads `~/.ignis/hooks.json` from disk under `/hooks reload`. An empty registry prints a single `[info] no hooks registered` line pointing at the file and the reload action. ([#127](https://github.com/Fullstop000/ignis/pull/127))
+
+### Changed
+- TUI renders inline in the terminal's normal buffer — the conversation lives in native scrollback, so terminal copy/scroll and tmux detach-reattach work, and assistant text streams in as it settles. ([#131](https://github.com/Fullstop000/ignis/pull/131))
 
 ### Fixed
 - Interrupting a turn with `Ctrl+C` no longer breaks the next message — an interrupted tool call is closed out so the conversation continues instead of being rejected by the provider. ([#129](https://github.com/Fullstop000/ignis/pull/129))
@@ -34,9 +84,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Internal — renamed agent-loop events so a `Turn` is the whole user exchange and a `Run` is one LLM round (`AgentStart`/`AgentEnd` → `TurnStart`/`TurnEnd`; old `TurnStart`/`TurnEnd` → `RunStart`/`RunEnd`). No user-visible change. ([#121](https://github.com/Fullstop000/ignis/pull/121))
 - Internal — `Agent::run` is now a stable control-flow skeleton over named lifecycle moments (`before_llm_call`, `call_llm`, `after_llm_call`, `emit_fatal`); telemetry, hooks, and message assembly moved out of the loop body. No user-visible change. ([#122](https://github.com/Fullstop000/ignis/pull/122))
 - Internal — dropped the experimental `IGNIS_HISTORY_TRIM` modes (`mask-only`, `strip-wide`, `both`) and the unused tool-result mask path. The only knob is now `strip-think` (TOML) / `IGNIS_HISTORY_TRIM=off|<anything>` (env). No user-visible change for the shipped default. ([#126](https://github.com/Fullstop000/ignis/pull/126))
-=======
-- hooks: env-var allowlist + Linux Landlock sandbox for hook subprocesses; SIGTERM grace on timeout; stdout/stderr capped at 1 MiB. ([#109](https://github.com/Fullstop000/ignis/pull/109))
->>>>>>> 2679260 (docs(hooks): document v2 sandbox; replace v1 unsandboxed warning)
 
 ### Fixed
 - TUI message queue now routes queued slash commands through the same dispatcher Enter uses, so `/compact`, `/model`, and other commands typed while the agent is busy actually run on drain instead of being sent to the LLM as literal user messages. Slash-command autocomplete is also surfaced while busy so the queued line can be completed from the dropdown. ([#106](https://github.com/Fullstop000/ignis/pull/106))
