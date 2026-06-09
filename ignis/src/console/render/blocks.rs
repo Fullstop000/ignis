@@ -405,6 +405,40 @@ mod tests {
         assert!(rails.iter().all(|s| s.style.fg == Some(MAUVE)));
     }
 
+    /// The rail must run down *every wrapped continuation row*, not just the
+    /// first row of each literal line — a long message wraps to several visual
+    /// rows and each one starts with the mauve `▌ `.
+    #[test]
+    fn user_rail_spans_wrapped_continuations() {
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+        let block = UIBlock::User(long.into());
+        let width = 24; // forces several wrapped rows
+        let lines = block_lines(&block, 0, Path::new("/tmp"), width);
+        // Skip the leading blank spacer (an empty span trims to ""); keep real rows.
+        let content_rows: Vec<_> = lines
+            .iter()
+            .filter(|l| !flatten(&[(*l).clone()]).trim().is_empty())
+            .collect();
+        assert!(
+            content_rows.len() >= 3,
+            "expected the line to wrap: {content_rows:?}"
+        );
+        for row in &content_rows {
+            let first = &row.spans[0];
+            assert_eq!(first.content, "▌ ", "row missing rail: {row:?}");
+            assert_eq!(first.style.fg, Some(MAUVE));
+            let cols: usize = row
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(
+                cols <= width as usize,
+                "railed row {cols} exceeds width {width}"
+            );
+        }
+    }
+
     /// Tool blocks render the Claude-Code gutter: a `●` header + `╰` result, the
     /// raw tool name, and none of the old `┌ │ └` box drawing.
     #[test]
@@ -447,5 +481,20 @@ mod tests {
         );
         assert_eq!(bullet_color(&err), Some(RED));
         assert!(flatten(&err).contains("boom"));
+    }
+
+    /// A tool that succeeds with no output still gets a gutter line so the block
+    /// reads as complete rather than a bare dangling header.
+    #[test]
+    fn tool_block_empty_success_shows_no_output() {
+        let lines = block_lines(
+            &tool("bash", ToolStatus::Success("   \n".into())),
+            0,
+            Path::new("/tmp"),
+            60,
+        );
+        let joined = flatten(&lines);
+        assert!(joined.contains('╰'), "still has a gutter line: {joined:?}");
+        assert!(joined.contains("(no output)"), "{joined:?}");
     }
 }

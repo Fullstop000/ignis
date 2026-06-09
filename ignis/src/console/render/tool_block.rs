@@ -206,6 +206,13 @@ pub(crate) fn render_tool_block(
                 for sl in out.lines().take(max) {
                     push_diff_line(lines, sl, &ext, width);
                 }
+            } else if out.trim().is_empty() {
+                // A tool that succeeds with no output still gets one gutter line
+                // so the block reads as complete, not a bare dangling header.
+                lines.push(Line::from(vec![
+                    gutter(true),
+                    Span::styled("(no output)", Style::default().fg(TEXT_DIM)),
+                ]));
             } else {
                 for (i, sl) in out.lines().take(max).enumerate() {
                     lines.push(Line::from(vec![
@@ -272,7 +279,7 @@ fn diff_file_ext(args_json: &str) -> String {
 /// Render one diff line under the tool gutter. Added (`+`) and removed (`-`)
 /// lines get a solid background filling the row and syntax-highlighted code;
 /// other lines render plain. `width` is the messages-area width (for the
-/// full-row background). The 4-space prefix aligns the hunk under the `⎿`.
+/// full-row background). The 4-space prefix aligns the hunk under the `╰`.
 fn push_diff_line(lines: &mut Vec<Line<'static>>, raw: &str, ext: &str, width: u16) {
     let prefix = Span::raw("    ");
     let (sign, bg, sign_fg) = match raw.as_bytes().first() {

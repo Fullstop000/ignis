@@ -11,7 +11,7 @@
 //! retroactive construct is a GFM table (its header flips to a box once the
 //! `|---|` separator arrives, and column widths re-align as body rows stream).
 //! Code fences are append-only (committed `│ code` rows never change; only a
-//! closing `└────` is appended), and setext headings aren't supported. So the
+//! closing `╰────` is appended), and setext headings aren't supported. So the
 //! rule is: commit every completed line, *except* a trailing run of table-row
 //! lines outside a code fence (held until a non-table line proves the table is
 //! done) and the incomplete final line (no newline yet).
