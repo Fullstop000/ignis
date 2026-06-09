@@ -52,7 +52,7 @@ pub(crate) fn block_lines(
                 return lines;
             }
             lines.push(Line::from(""));
-            for line in render_md_block(text, false) {
+            for line in render_md_block(text, false, width) {
                 let indent = leading_space_cols(&line);
                 lines.extend(wrap_line(&line, width, indent));
             }

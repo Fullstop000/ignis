@@ -1,6 +1,6 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     sanitize, ACCENT, BORDER, CODE_BG, GREEN, LAVENDER, MAUVE, PEACH, SUBTEXT, TEAL, TEXT, YELLOW,
@@ -102,8 +102,11 @@ pub(crate) fn render_md_spans(text: &str, base_style: Style) -> Vec<Span<'static
     spans
 }
 
-/// Render a full assistant text block as Lines with basic markdown awareness
-pub(crate) fn render_md_block(text: &str, is_streaming: bool) -> Vec<Line<'static>> {
+/// Render a full assistant text block as Lines with basic markdown awareness.
+/// `width` is the terminal column count; it bounds table layout so the box
+/// never sprawls past the screen (downstream `wrap_line` can't repair a
+/// pre-rendered border without garbling it).
+pub(crate) fn render_md_block(text: &str, is_streaming: bool, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let base = Style::default().fg(TEXT);
     let mut in_code_block = false;
@@ -156,7 +159,7 @@ pub(crate) fn render_md_block(text: &str, is_streaming: bool) -> Vec<Line<'stati
 
         // Table: a row followed by a `|---|`-style separator on the next line.
         if is_table_row(raw_line) && src.get(i + 1).map(|n| is_separator_row(n)).unwrap_or(false) {
-            let (table_lines, consumed) = render_table(&src[i..]);
+            let (table_lines, consumed) = render_table(&src[i..], width);
             lines.extend(table_lines);
             i += consumed;
             continue;
@@ -279,10 +282,89 @@ fn pad_cell(cell: &str, width: usize, align: Align) -> String {
     }
 }
 
+/// Shrink natural column widths so the whole box fits `width` columns. The box
+/// overhead is `3 + 3*ncols` (the leading `  │` plus ` … │` per column), so the
+/// content budget is `width - overhead`. If the natural widths already fit, they
+/// are returned unchanged. Otherwise we water-fill narrowest-first: each column
+/// takes the smaller of its natural width and an even share of the remaining
+/// budget, so slim columns keep their size and the surplus flows to wide ones
+/// (which then wrap — see [[wrap_cell]]).
+fn fit_column_widths(natural: &[usize], width: u16) -> Vec<usize> {
+    let ncols = natural.len();
+    if ncols == 0 {
+        return Vec::new();
+    }
+    let budget = (width as usize).saturating_sub(3 + 3 * ncols);
+    if natural.iter().sum::<usize>() <= budget {
+        return natural.to_vec();
+    }
+    let mut order: Vec<usize> = (0..ncols).collect();
+    order.sort_by_key(|&c| natural[c]);
+    let mut widths = vec![0usize; ncols];
+    let mut remaining = budget;
+    let mut left = ncols;
+    for &c in &order {
+        let share = (remaining / left).max(1); // never collapse a column below 1
+        let w = natural[c].min(share);
+        widths[c] = w;
+        remaining = remaining.saturating_sub(w);
+        left -= 1;
+    }
+    widths
+}
+
+/// Word-wrap a single cell to `width` display columns, breaking over-long runs
+/// (a path, a `snake_case` token) at the column boundary. Returns one entry per
+/// visual sub-row; an empty cell yields a single empty row so the column keeps
+/// its slot in the grid.
+fn wrap_cell(cell: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in cell.split(' ') {
+        let ww = UnicodeWidthStr::width(word);
+        if ww > width {
+            // Longer than a whole row: flush, then hard-break by columns.
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            for ch in word.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if cur_w + cw > width && !cur.is_empty() {
+                    lines.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                cur.push(ch);
+                cur_w += cw;
+            }
+        } else {
+            let sep = usize::from(!cur.is_empty());
+            if cur_w + sep + ww > width && !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            if !cur.is_empty() {
+                cur.push(' ');
+                cur_w += 1;
+            }
+            cur.push_str(word);
+            cur_w += ww;
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
 /// Render a markdown table given a slice whose first line is the header and
 /// second is the separator; consumes body rows until a non-row line. Returns
 /// the rendered lines and how many source lines were consumed.
-fn render_table(block: &[String]) -> (Vec<Line<'static>>, usize) {
+fn render_table(block: &[String], width: u16) -> (Vec<Line<'static>>, usize) {
     let header = split_cells(&block[0]);
     let aligns_src = split_cells(&block[1]);
     let mut body: Vec<Vec<String>> = Vec::new();
@@ -307,13 +389,15 @@ fn render_table(block: &[String]) -> (Vec<Line<'static>>, usize) {
                 .unwrap_or(Align::Left)
         })
         .collect();
-    let mut widths = vec![0usize; ncols];
-    for (c, w) in widths.iter_mut().enumerate() {
+    let mut natural = vec![0usize; ncols];
+    for (c, w) in natural.iter_mut().enumerate() {
         *w = UnicodeWidthStr::width(cell_at(&header, c));
         for row in &body {
             *w = (*w).max(UnicodeWidthStr::width(cell_at(row, c)));
         }
     }
+    // Bound the box to the terminal; over-wide columns wrap instead of sprawling.
+    let widths = fit_column_widths(&natural, width);
 
     let border = Style::default().fg(BORDER);
     let head_style = Style::default().fg(TEAL).add_modifier(Modifier::BOLD);
@@ -327,23 +411,32 @@ fn render_table(block: &[String]) -> (Vec<Line<'static>>, usize) {
         }
         Line::from(Span::styled(s, border))
     };
-    let data_row = |cells: &[String], style: Style| -> Line<'static> {
-        let mut spans: Vec<Span<'static>> = vec![Span::styled("  │", border)];
-        for c in 0..ncols {
-            let padded = pad_cell(cell_at(cells, c), widths[c], aligns[c]);
-            spans.push(Span::styled(format!(" {padded} "), style));
-            spans.push(Span::styled("│", border));
-        }
-        Line::from(spans)
+    // A logical row is as tall as its tallest wrapped cell; each visual sub-row
+    // redraws the vertical borders so the grid stays closed.
+    let data_row = |cells: &[String], style: Style| -> Vec<Line<'static>> {
+        let wrapped: Vec<Vec<String>> = (0..ncols)
+            .map(|c| wrap_cell(cell_at(cells, c), widths[c]))
+            .collect();
+        let height = wrapped.iter().map(|w| w.len()).max().unwrap_or(1);
+        (0..height)
+            .map(|r| {
+                let mut spans: Vec<Span<'static>> = vec![Span::styled("  │", border)];
+                for (c, w) in widths.iter().enumerate() {
+                    let sub = wrapped[c].get(r).map(String::as_str).unwrap_or("");
+                    let padded = pad_cell(sub, *w, aligns[c]);
+                    spans.push(Span::styled(format!(" {padded} "), style));
+                    spans.push(Span::styled("│", border));
+                }
+                Line::from(spans)
+            })
+            .collect()
     };
 
-    let mut out = vec![
-        rule('┌', '┬', '┐'),
-        data_row(&header, head_style),
-        rule('├', '┼', '┤'),
-    ];
+    let mut out = vec![rule('┌', '┬', '┐')];
+    out.extend(data_row(&header, head_style));
+    out.push(rule('├', '┼', '┤'));
     for row in &body {
-        out.push(data_row(row, cell_style));
+        out.extend(data_row(row, cell_style));
     }
     out.push(rule('└', '┴', '┘'));
     (out, consumed)
@@ -374,7 +467,7 @@ mod table_tests {
 |------|-----|------|
 | Alice | 30 | Beijing |
 | Bob | 25 | Shanghai |";
-        let out = flat(&render_md_block(md, false));
+        let out = flat(&render_md_block(md, false, 80));
         assert_eq!(
             out,
             vec![
@@ -395,7 +488,7 @@ mod table_tests {
 |------|----:|
 | Pen | 3 |
 | Notebook | 12 |";
-        let out = flat(&render_md_block(md, false));
+        let out = flat(&render_md_block(md, false, 80));
         // Qty column width 3 (header "Qty"); values right-aligned.
         assert!(out.iter().any(|l| l.contains("│   3 │")), "rows: {out:?}");
         assert!(out.iter().any(|l| l.contains("│  12 │")), "rows: {out:?}");
@@ -408,7 +501,7 @@ mod table_tests {
 |:-:|---|
 | ab | x |
 | c | y |";
-        let out = flat(&render_md_block(md, false));
+        let out = flat(&render_md_block(md, false, 80));
         // K column width 2 ("ab"); "c" centered → " c". Cell is ` ` + content + ` `.
         assert!(
             out.iter().any(|l| l.starts_with("  │ c  │")),
@@ -423,7 +516,7 @@ mod table_tests {
 | x |
 |---|
 | 中文 |";
-        let out = flat(&render_md_block(md, false));
+        let out = flat(&render_md_block(md, false, 80));
         assert_eq!(out[0], "  ┌──────┐", "top border: {out:?}");
         assert_eq!(out[3], "  │ 中文 │", "cjk row: {out:?}");
     }
@@ -431,7 +524,7 @@ mod table_tests {
     #[test]
     fn pipe_block_without_separator_falls_back_to_plaintext() {
         let md = "| a | b |\n| c | d |";
-        let out = flat(&render_md_block(md, false));
+        let out = flat(&render_md_block(md, false, 80));
         assert!(
             out.iter().all(|l| !l.contains('┌') && !l.contains('│')),
             "should not render a box without a separator row: {out:?}"
@@ -443,10 +536,96 @@ mod table_tests {
     #[test]
     fn table_surrounded_by_prose_renders_both() {
         let md = "before\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nafter";
-        let out = flat(&render_md_block(md, false));
+        let out = flat(&render_md_block(md, false, 80));
         assert!(out.iter().any(|l| l.contains("before")));
         assert!(out.iter().any(|l| l.starts_with("  ┌")));
         assert!(out.iter().any(|l| l.contains("after")));
+    }
+
+    /// Display width of a flattened row.
+    fn w(s: &str) -> usize {
+        UnicodeWidthStr::width(s)
+    }
+
+    #[test]
+    fn wide_table_fits_terminal_width() {
+        // A table whose natural content width far exceeds the terminal. Cells
+        // must wrap inside their columns so the box fits `width`; otherwise the
+        // pre-rendered border sprawls past the screen and downstream wrap_line
+        // hard-breaks it into a garbled mess (the reported bug).
+        let md = "\
+| # | Layer | Detail |
+|---|-------|--------|
+| 1 | Env allowlist | UNIVERSAL_ENV_ALLOWLIST equals PATH HOME USER LANG, then Command::env_clear() plus explicit per-name cmd.env so the hook sees only universal plus declared names |
+| 2 | Filesystem sandbox | Linux Landlock ABI V1 and macOS sandbox_init Seatbelt, per-hook sandbox bool default true reading the hook folder and system cert and lib paths |";
+        let width = 60u16;
+        let out = flat(&render_md_block(md, false, width));
+
+        for line in &out {
+            assert!(
+                w(line) <= width as usize,
+                "row exceeds width {width} (w={}): {line:?}",
+                w(line)
+            );
+        }
+        // The box stays intact: one top border and one bottom border, each
+        // spanning corner-to-corner (not split across wrapped rows).
+        assert!(
+            out.first()
+                .is_some_and(|l| l.starts_with("  ┌") && l.ends_with('┐')),
+            "top border: {:?}",
+            out.first()
+        );
+        assert!(
+            out.last()
+                .is_some_and(|l| l.starts_with("  └") && l.ends_with('┘')),
+            "bottom border: {:?}",
+            out.last()
+        );
+        // Content is wrapped, not truncated away — a distinctive token from the
+        // long cell still appears somewhere in the rendered table.
+        assert!(
+            out.iter().any(|l| l.contains("env_clear")),
+            "long-cell content was lost: {out:?}"
+        );
+    }
+
+    #[test]
+    fn table_refits_when_width_changes() {
+        // Resize: the live band re-renders each block with the current terminal
+        // width every frame, so the same table must lay out cleanly at any
+        // width. (Already-committed scrollback is frozen by the terminal — that
+        // is a property of inline rendering, not of table layout.)
+        let md = "\
+| Key | Value |
+|-----|-------|
+| sandbox | Linux Landlock ABI V1 and macOS sandbox_init Seatbelt, default true |
+| grace | SIGTERM then a one second grace window then SIGKILL via libc::kill |";
+        for width in [30u16, 50, 80, 120] {
+            let out = flat(&render_md_block(md, false, width));
+            for line in &out {
+                assert!(
+                    w(line) <= width as usize,
+                    "width {width}: row exceeds it (w={}): {line:?}",
+                    w(line)
+                );
+            }
+            assert!(
+                out.first()
+                    .is_some_and(|l| l.starts_with("  ┌") && l.ends_with('┐')),
+                "width {width}: broken top border {:?}",
+                out.first()
+            );
+        }
+        // Narrowing wraps more, so it produces at least as many rows as widening.
+        let narrow = flat(&render_md_block(md, false, 30));
+        let wide = flat(&render_md_block(md, false, 120));
+        assert!(
+            narrow.len() >= wide.len(),
+            "narrower terminal should wrap into more rows: {} vs {}",
+            narrow.len(),
+            wide.len()
+        );
     }
 }
 
