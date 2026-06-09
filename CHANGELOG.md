@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.37.1] - 2026-06-09
 
 ### Added
 - Providers — Ark Coding Plan (`ark-coding`) — Volcengine's flat-fee subscription aggregating 10 models (`doubao-seed-*`, `minimax-m{2.7,3}`, `glm-5.1`, `deepseek-v4-{flash,pro}`, `kimi-k2.6`). Set `ARK_CODING_PLAN_TOKEN` and pick `ark-coding/<model>` via `/model`. ([#149](https://github.com/Fullstop000/ignis/pull/149))
