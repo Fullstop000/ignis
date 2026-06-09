@@ -194,7 +194,9 @@ pub async fn run_console(
     app.hooks = Some(hook_registry);
 
     let ui_skill_registry = skill_registry.clone();
-    let runner_skill_registry = skill_registry.clone();
+    // `mut` so an `AgentRequest::ReloadSkills` can swap in a freshly-scanned
+    // registry; the UI rebuilds its own `App.skills` clone in parallel.
+    let mut runner_skill_registry = skill_registry.clone();
     app.skills = Some(ui_skill_registry);
 
     let runner_mcp_registry = mcp_registry.clone();
@@ -241,6 +243,14 @@ pub async fn run_console(
                         Ok(reloaded) => agent_config = reloaded,
                         Err(e) => log::error!("ReloadConfig: failed to re-read config.toml: {e}"),
                     }
+                    continue;
+                }
+                AgentRequest::ReloadSkills(registry) => {
+                    // The user pressed `r` in the `/skills` picker. Adopt the
+                    // *same* registry the UI just built, so both share one `Arc`
+                    // — a later enable/disable toggle (interior mutability) is
+                    // then visible to the next prompt without another reload.
+                    runner_skill_registry = registry;
                     continue;
                 }
             };
