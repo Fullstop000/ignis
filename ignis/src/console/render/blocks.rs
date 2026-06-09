@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::console::app::{App, UIBlock};
 use crate::console::markdown::render_md_block;
-use crate::console::{sanitize, ACCENT, SUBTEXT, TEXT, TEXT_DIM};
+use crate::console::{sanitize, ACCENT, MAUVE, SUBTEXT, TEXT, TEXT_DIM};
 
 use super::tool_block::{ask_user_resume_trace, render_tool_block};
 
@@ -28,17 +28,23 @@ pub(crate) fn block_lines(
     match block {
         UIBlock::User(text) => {
             lines.push(Line::from(""));
-            for (i, l) in text.lines().enumerate() {
-                let prefix = if i == 0 { "👤 " } else { "   " };
-                let line = Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(ACCENT)),
-                    Span::styled(
-                        sanitize(l),
-                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                    ),
-                ]);
-                // Continuation rows align under the prompt text (past "👤 ").
-                lines.extend(wrap_line(&line, width, 3));
+            // Special left-rail style: a mauve "▌" bar runs down every visual row
+            // (including wrapped continuations) so the user's own words read as one
+            // accented block. No background fill — keeps scrollback select/copy
+            // clean. Mauve deliberately differs from the blue composer border and
+            // the green/yellow/red tool bullets.
+            for l in text.lines() {
+                let content = Line::from(Span::styled(
+                    sanitize(l),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ));
+                // Wrap the text alone to the rail-inset width, then draw the rail
+                // on each resulting row for a continuous bar.
+                for row in wrap_line(&content, width.saturating_sub(2), 0) {
+                    let mut spans = vec![Span::styled("▌ ", Style::default().fg(MAUVE))];
+                    spans.extend(row.spans);
+                    lines.push(Line::from(spans));
+                }
             }
         }
         UIBlock::Assistant(text) => {
@@ -272,6 +278,7 @@ pub(crate) fn welcome_lines(app: &App) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
     use crate::console::app::{ToolCallEntry, ToolStatus, UIBlock};
+    use crate::console::{GREEN, RED, YELLOW};
     use std::time::Instant;
     use unicode_width::UnicodeWidthStr;
 
@@ -343,5 +350,102 @@ mod tests {
                 line_cols(l),
             );
         }
+    }
+
+    fn flatten(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The bullet `●`'s foreground colour (header status colour).
+    fn bullet_color(lines: &[Line]) -> Option<ratatui::style::Color> {
+        lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.content.starts_with('●'))
+            .and_then(|s| s.style.fg)
+    }
+
+    fn tool(name: &str, status: ToolStatus) -> UIBlock {
+        UIBlock::Tool(ToolCallEntry {
+            id: "1".into(),
+            name: name.into(),
+            arguments: r#"{"command":"echo hi"}"#.into(),
+            status,
+            started_at: Instant::now(),
+            elapsed_ms: 12,
+        })
+    }
+
+    /// User messages render the mauve `▌` left-rail on every visual row — never
+    /// the old `👤` emoji (which also left a stray wide-char space in scrollback).
+    #[test]
+    fn user_block_uses_mauve_rail() {
+        let block = UIBlock::User("first line\nsecond line".into());
+        let lines = block_lines(&block, 0, Path::new("/tmp"), 40);
+        let text = flatten(&lines);
+        assert!(text.contains("▌ "), "expected the rail prefix: {text:?}");
+        assert!(!text.contains('👤'), "emoji prefix must be gone: {text:?}");
+        assert!(text.contains("first line") && text.contains("second line"));
+        // Every rail span is mauve.
+        let rails: Vec<_> = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .filter(|s| s.content == "▌ ")
+            .collect();
+        assert_eq!(rails.len(), 2, "one rail per literal line: {text:?}");
+        assert!(rails.iter().all(|s| s.style.fg == Some(MAUVE)));
+    }
+
+    /// Tool blocks render the Claude-Code gutter: a `●` header + `╰` result, the
+    /// raw tool name, and none of the old `┌ │ └` box drawing.
+    #[test]
+    fn tool_block_renders_cc_gutter_no_box() {
+        let block = tool("bash", ToolStatus::Success("hello\nworld".into()));
+        let lines = block_lines(&block, 0, Path::new("/tmp"), 60);
+        let joined = flatten(&lines);
+        assert!(
+            lines.iter().any(|l| l
+                .spans
+                .first()
+                .map(|s| s.content.starts_with('●'))
+                .unwrap_or(false)),
+            "header bullet: {joined:?}"
+        );
+        assert!(joined.contains("bash"), "raw tool name kept: {joined:?}");
+        assert!(joined.contains('╰'), "gutter connector: {joined:?}");
+        for ch in ['┌', '└', '│'] {
+            assert!(
+                !joined.contains(ch),
+                "box char {ch} must be gone: {joined:?}"
+            );
+        }
+        assert_eq!(bullet_color(&lines), Some(GREEN), "success bullet is green");
+    }
+
+    /// The bullet colour encodes status: yellow pending, green success, red error.
+    #[test]
+    fn tool_block_bullet_color_tracks_status() {
+        let pending = block_lines(&tool("grep", ToolStatus::Pending), 0, Path::new("/tmp"), 60);
+        assert_eq!(bullet_color(&pending), Some(YELLOW));
+        // Pending shows a spinner on the `╰` line, not in the bullet.
+        assert!(flatten(&pending).contains("running…"));
+
+        let err = block_lines(
+            &tool("grep", ToolStatus::Error("boom".into())),
+            0,
+            Path::new("/tmp"),
+            60,
+        );
+        assert_eq!(bullet_color(&err), Some(RED));
+        assert!(flatten(&err).contains("boom"));
     }
 }

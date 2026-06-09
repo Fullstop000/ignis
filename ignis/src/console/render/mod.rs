@@ -311,6 +311,7 @@ fn render_inline_picker_split(
     let right_lines = super::inline_picker::preview_pane_lines(picker);
     let preview_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(BORDER))
         .title(Span::styled(
             " Preview ",
@@ -745,8 +746,8 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("Hello"), "should show user text");
         assert!(
-            content.contains('👤'),
-            "user turn should carry the emoji prefix"
+            content.contains('▌'),
+            "user turn should carry the mauve left-rail"
         );
     }
 

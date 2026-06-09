@@ -119,7 +119,7 @@ pub(crate) fn render_md_block(text: &str, is_streaming: bool) -> Vec<Line<'stati
             if in_code_block {
                 // End code block
                 lines.push(Line::from(Span::styled(
-                    "  └────",
+                    "  ╰────",
                     Style::default().fg(BORDER),
                 )));
                 in_code_block = false;
@@ -133,7 +133,7 @@ pub(crate) fn render_md_block(text: &str, is_streaming: bool) -> Vec<Line<'stati
                     format!(" {} ", code_lang)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled("  ┌────", Style::default().fg(BORDER)),
+                    Span::styled("  ╭────", Style::default().fg(BORDER)),
                     Span::styled(
                         label,
                         Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
