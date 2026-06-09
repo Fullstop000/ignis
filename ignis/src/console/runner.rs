@@ -17,6 +17,7 @@ use crate::console::format::AgentRequest;
 use crate::console::inline_picker;
 use crate::console::keys::{handle_key, ActiveInject};
 use crate::console::render::{self, draw};
+use crate::console::render_diag::RenderDiag;
 use crate::{AgentEvent, Message, Session};
 
 /// Create an inline-viewport terminal over stdout: a fixed `viewport_rows`-tall
@@ -389,6 +390,25 @@ pub async fn run_console(
     // bug; vim/htop full-repaint after a resize, so they stay clean). A single
     // settle repaint mirrors what the next message already does for free.
     let mut last_resize: Option<std::time::Instant> = None;
+    // Re-anchor episode state for `pending_screen_clear`. A reset (`/clear`,
+    // `/resume`) wipes the screen and must re-anchor the inline viewport before
+    // any block can commit (the band never draws conversation content — it only
+    // flows into native scrollback via the commit loop below). Re-anchoring
+    // queries the cursor with a DSR (`ESC[6n`); on WSL2/conpty that can stall
+    // indefinitely. `clear_started` marks when the current episode began (None
+    // when not pending) so we wipe the screen ONCE per episode rather than every
+    // frame, and `reanchor_attempts` bounds how long we gate rendering on a DSR
+    // that isn't landing before falling back to a DSR-free re-anchor.
+    let mut clear_started: Option<std::time::Instant> = None;
+    let mut reanchor_attempts: u32 = 0;
+    // After this many consecutive failed re-anchors (each blocks ~the crossterm
+    // DSR timeout, ~2s), stop gating all rendering and re-anchor without a DSR.
+    // Bounds the blank window to a few seconds instead of forever — the "blank
+    // after input, full content on resume" wedge.
+    const MAX_REANCHOR_ATTEMPTS: u32 = 2;
+    // Opt-in render-loop health heartbeat (frames / commits / re-anchors) to
+    // `~/.ignis/logs/ignis.log`, for diagnosing rendering issues in the field.
+    let mut diag = RenderDiag::from_env();
     terminal.draw(|f| draw(f, &mut app))?;
 
     loop {
@@ -517,18 +537,82 @@ pub async fn run_console(
         let term_size = crossterm::terminal::size()?;
         let want_rows = render::viewport_height(&app, term_size.0, term_size.1);
         if app.pending_screen_clear {
-            execute!(
-                io::stdout(),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
-                crossterm::cursor::MoveTo(0, 0)
-            )?;
-            // Leave `pending_screen_clear` set if the rebuild's DSR times out,
-            // so the re-anchor is retried next frame instead of crashing.
+            // Wipe the visible screen AND scrollback exactly ONCE per episode.
+            // Repeating Clear(All) every frame floods the terminal and worsens
+            // the very DSR backpressure that keeps the re-anchor from landing.
+            if clear_started.is_none() {
+                execute!(
+                    io::stdout(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
+                    crossterm::cursor::MoveTo(0, 0)
+                )?;
+                clear_started = Some(std::time::Instant::now());
+                reanchor_attempts = 0;
+                log::info!(
+                    "render: re-anchor started (blocks={}, committed={}, want_rows={})",
+                    app.blocks.len(),
+                    app.committed,
+                    want_rows
+                );
+            }
             if try_rebuild(&mut terminal, want_rows)? {
+                // Re-anchor landed: resume commits from the top of scrollback.
+                if reanchor_attempts > 0 {
+                    let waited = clear_started.map(|t| t.elapsed()).unwrap_or_default();
+                    log::info!(
+                        "render: re-anchor landed after {} retr{} ({}ms) — resuming commits",
+                        reanchor_attempts,
+                        if reanchor_attempts == 1 { "y" } else { "ies" },
+                        waited.as_millis()
+                    );
+                }
+                diag.on_reanchor_ok();
                 app.pending_screen_clear = false;
+                clear_started = None;
+                reanchor_attempts = 0;
                 viewport_rows = want_rows;
                 last_term_size = term_size;
+            } else {
+                diag.on_reanchor_failed();
+                reanchor_attempts += 1;
+                let waited = clear_started.map(|t| t.elapsed()).unwrap_or_default();
+                let pending_blocks = app.blocks.len().saturating_sub(app.committed);
+                if reanchor_attempts >= MAX_REANCHOR_ATTEMPTS {
+                    // Backstop: the re-anchor DSR isn't answering (WSL2/conpty
+                    // under backpressure). Gating all commits on it leaves the
+                    // screen blank while the agent keeps working — the "blank
+                    // after input, full content on resume" wedge. Re-anchor
+                    // WITHOUT a DSR via `terminal.clear()` (resets the back
+                    // buffer using the known viewport area) and resume commits.
+                    // Leave `viewport_rows` untouched so the draw-time resize
+                    // check still converges the band to `want_rows` on a later,
+                    // non-gating rebuild.
+                    log::warn!(
+                        "render: re-anchor DSR unresponsive after {} attempts ({}ms) — \
+                         forcing DSR-free re-anchor so {} block(s) can paint \
+                         (blocks={}, committed={})",
+                        reanchor_attempts,
+                        waited.as_millis(),
+                        pending_blocks,
+                        app.blocks.len(),
+                        app.committed
+                    );
+                    let _ = terminal.clear();
+                    diag.on_forced_reanchor();
+                    app.pending_screen_clear = false;
+                    clear_started = None;
+                    reanchor_attempts = 0;
+                } else {
+                    log::warn!(
+                        "render: re-anchor DSR not landed (attempt {}/{}, {}ms) — \
+                         holding {} block(s); retrying",
+                        reanchor_attempts,
+                        MAX_REANCHOR_ATTEMPTS,
+                        waited.as_millis(),
+                        pending_blocks
+                    );
+                }
             }
         }
 
@@ -556,13 +640,14 @@ pub async fn run_console(
         // frame(s) via `committed`/`committed_rows`.
         let max_rows = render::max_commit_rows(width);
         let mut batch: Vec<Line<'static>> = Vec::new();
-        // Defer commits while a screen-clear re-anchor is still pending. A
-        // timed-out `try_rebuild` (DSR cursor-read backpressure on WSL2/tmux)
-        // leaves `pending_screen_clear` set, and the next frame `Clear(All)`s
-        // again. Committing now would advance `committed` into blocks the
-        // re-clear then wipes — a resumed transcript paints once, gets erased,
-        // and never repaints (committed == blocks.len(), so nothing is left to
-        // push). Hold off; once the re-anchor lands we commit the batch at once.
+        // Defer commits while a screen-clear re-anchor is still pending.
+        // Committing before the re-anchor lands would advance `committed` into
+        // blocks the next Clear(All) wipes — a resumed transcript paints once,
+        // gets erased, and never repaints. So we hold off; once the re-anchor
+        // lands we commit the batch at once. Crucially, the re-anchor above is
+        // bounded (MAX_REANCHOR_ATTEMPTS): if its DSR never answers we force a
+        // DSR-free re-anchor and clear the flag, so this gate can't wedge
+        // rendering blank indefinitely (the "blank after input" bug).
         while !app.pending_screen_clear
             && app.committed < app.blocks.len()
             && batch.len() < max_rows
@@ -594,11 +679,13 @@ pub async fn run_console(
         if !batch.is_empty() {
             let h = batch.len() as u16;
             terminal.insert_before(h, |buf| render::render_block_into(buf, &batch))?;
+            diag.on_commit(batch.len());
         }
 
         // Coalesced redraw of the live band: at most once per frame interval.
         if last_draw.elapsed() >= frame {
             app.tick_update();
+            diag.on_frame();
             // Rebuild the inline viewport when the band height changes (picker
             // open/close, multi-line input) OR the terminal resized. ratatui
             // 0.26's inline autoresize leaves the old band stranded in
@@ -647,6 +734,8 @@ pub async fn run_console(
             draw_tolerant(&mut terminal, &mut app)?;
             last_draw = std::time::Instant::now();
         }
+
+        diag.heartbeat();
     }
 
     // Restore the cursor before the guard drops. The band stays in the normal

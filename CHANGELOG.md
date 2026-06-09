@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- TUI — on WSL2/conpty, the conversation no longer stays blank after you send a message while the agent keeps working; inline rendering recovers instead of only repainting on resume. ([#154](https://github.com/Fullstop000/ignis/pull/154))
 - TUI — `/sessions` no longer crashes when resuming a long transcript; the history is now committed to scrollback in bounded chunks instead of one oversized buffer that overflowed ratatui's cell limit. ([#155](https://github.com/Fullstop000/ignis/pull/155))
 
 ## [0.37.1] - 2026-06-09
@@ -15,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Providers — Ark Coding Plan (`ark-coding`) — Volcengine's flat-fee subscription aggregating 10 models (`doubao-seed-*`, `minimax-m{2.7,3}`, `glm-5.1`, `deepseek-v4-{flash,pro}`, `kimi-k2.6`). Set `ARK_CODING_PLAN_TOKEN` and pick `ark-coding/<model>` via `/model`. ([#149](https://github.com/Fullstop000/ignis/pull/149))
 - TUI — `/settings` opens a control panel: a live **Stats** tab (context %, tokens, turns, tools, uptime) and a **Statusline** tab to show/hide individual status-bar segments. ([#151](https://github.com/Fullstop000/ignis/pull/151))
+
+### Changed
+- TUI — tool calls, your messages, and boxes restyled toward Claude Code's look: gutter-style tool blocks (a status-colored `●` bullet + `╰` result), a mauve rail down your turns, and rounded composer/code-fence corners. ([#153](https://github.com/Fullstop000/ignis/pull/153))
 
 ### Fixed
 - TUI — no longer crashes at startup in a git repository whose working diff contains a multibyte character near the truncation point. ([#151](https://github.com/Fullstop000/ignis/pull/151))
