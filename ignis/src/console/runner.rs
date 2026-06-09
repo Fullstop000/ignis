@@ -549,6 +549,12 @@ pub async fn run_console(
         // commits N blocks back-to-back after a screen clear). For the
         // streaming case, the loop breaks after the first in-progress block,
         // so the batch is always exactly the new rows of that one block.
+        // Cap rows per frame so the single `insert_before` buffer (width * rows
+        // cells) stays within ratatui's u16 limit — see `max_commit_rows`. A
+        // long `/resume` transcript would otherwise commit every block in one
+        // oversized batch and panic; the remainder now streams on the next
+        // frame(s) via `committed`/`committed_rows`.
+        let max_rows = render::max_commit_rows(width);
         let mut batch: Vec<Line<'static>> = Vec::new();
         // Defer commits while a screen-clear re-anchor is still pending. A
         // timed-out `try_rebuild` (DSR cursor-read backpressure on WSL2/tmux)
@@ -557,7 +563,10 @@ pub async fn run_console(
         // re-clear then wipes — a resumed transcript paints once, gets erased,
         // and never repaints (committed == blocks.len(), so nothing is left to
         // push). Hold off; once the re-anchor lands we commit the batch at once.
-        while !app.pending_screen_clear && app.committed < app.blocks.len() {
+        while !app.pending_screen_clear
+            && app.committed < app.blocks.len()
+            && batch.len() < max_rows
+        {
             let block = &app.blocks[app.committed];
             let done = app.block_done(app.committed);
             let rows = if done {
@@ -568,14 +577,18 @@ pub async fn run_console(
                 break; // pending tool: nothing to commit until it finalizes
             };
             let start = app.committed_rows.min(rows.len());
-            let new = &rows[start..];
-            batch.extend_from_slice(new);
-            if done {
+            // Take only what fits under this frame's row budget. A block taller
+            // than the cap splits across frames: `committed` stays put until its
+            // final row lands, with `committed_rows` marking the split point.
+            let take = (rows.len() - start).min(max_rows - batch.len());
+            batch.extend_from_slice(&rows[start..start + take]);
+            let drained = start + take == rows.len();
+            if done && drained {
                 app.committed += 1;
                 app.committed_rows = 0;
             } else {
-                app.committed_rows += new.len();
-                break; // in-progress block is last; nothing after it yet
+                app.committed_rows = start + take;
+                break; // in-progress block, or a finalized block split by the cap
             }
         }
         if !batch.is_empty() {

@@ -39,6 +39,21 @@ pub(crate) use widgets::{
     queued_region_height, MAX_SLASH_ROWS,
 };
 
+/// Max rows a single `insert_before` may carry at `width` columns.
+///
+/// `insert_before` builds a `width * height` cell scratch buffer, but
+/// `Rect::area()` saturates at `u16::MAX` (65535) and `insert_before` skips
+/// `Rect::new`'s aspect-clamp (it builds the area with a struct literal). So a
+/// call whose `width * height >= 65536` under-allocates the cell Vec while the
+/// buffer area still reports the full height — and `render_block_into`'s
+/// `set_style` then runs off the end ("index out of bounds: the len is 65535
+/// but the index is 65535"). Splitting a commit so each frame stays at or below
+/// this many rows keeps every buffer within the limit. Bites `/resume` of a
+/// long transcript, which commits every block in one batch.
+pub(crate) fn max_commit_rows(width: u16) -> usize {
+    (u16::MAX as usize / (width.max(1) as usize)).max(1)
+}
+
 /// Blit pre-wrapped `lines` (one `Line` per visual row — `block_lines` already
 /// wraps to width) into the `insert_before` scratch buffer, one row each. This
 /// is the inline path that pushes finalized blocks into native scrollback.
@@ -403,6 +418,40 @@ mod queue_render_tests {
         );
         assert_eq!(buf.get(2, 0).symbol(), " ");
         assert_eq!(buf.get(3, 0).symbol(), "x");
+    }
+
+    #[test]
+    fn max_commit_rows_keeps_insert_before_buffer_in_bounds() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::text::Line;
+        // Regression for the `/resume` panic on a long transcript: committing
+        // the whole history in one `insert_before(h, ..)` built a
+        // `width * h >= 65536` scratch buffer, whose backing Vec saturates at
+        // 65535 cells while the area still reports the full size — so
+        // `render_block_into`'s `set_style` ran off the end (panic
+        // "index out of bounds: the len is 65535 but the index is 65535").
+        // The runner now caps each frame at `max_commit_rows(width)`; a
+        // full-cap batch must render without panicking.
+        for width in [1u16, 64, 80, 120, 200, 256, 1000] {
+            let rows = super::max_commit_rows(width);
+            assert!(
+                rows * width as usize <= u16::MAX as usize,
+                "cap overflows at width {width}: {rows} rows"
+            );
+            assert!(rows >= 1);
+            // The runner builds insert_before's area with a struct literal (no
+            // `Rect::new` aspect-clamp) — mirror that exactly.
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: rows as u16,
+            };
+            let mut buf = Buffer::empty(area);
+            let lines: Vec<Line> = (0..rows).map(|_| Line::from("x")).collect();
+            super::render_block_into(&mut buf, &lines); // must not panic
+        }
     }
 
     #[test]
