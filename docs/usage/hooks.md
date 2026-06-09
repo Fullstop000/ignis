@@ -209,6 +209,26 @@ up. Reload also clears the per-session "Landlock unavailable" warning
 suppression set, so a freshly-edited hook gets its degradation notice
 again if the kernel doesn't support Landlock.
 
+## Verifying the sandbox
+
+The v2 sandbox is regression-tested by `ignis/tests/sandbox_e2e.rs`
+(25 tests across 8 layers: env-allowlist, filesystem, SIGTERM grace,
+buffer cap, lifecycle, composition, macOS Seatbelt quirks, status
+reporting) plus `ignis/tests/hook_sandbox.rs` (the original 2-test
+"hook cannot write outside `$TMPDIR`" smoke test). Run the whole
+suite:
+
+```sh
+cargo test --test sandbox_e2e
+cargo test --test hook_sandbox
+```
+
+The dispatcher also surfaces the confinement state on every hook
+invocation as the `sandbox_status` field on `HookOutcome`
+(`FullyEnforced` / `NotEnforced` / `PlatformUnsupported` / `Disabled`).
+The same value is recorded on the `ignis.hook` `tracing` span as
+`sandbox.status` for dashboards.
+
 ## Failure UI
 
 Every soft failure commits a `[warn] <event>: <reason> (<hook-name>)`

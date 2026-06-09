@@ -182,9 +182,9 @@ impl HookRegistry {
         for spec in &specs {
             let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx, Some(tx)).await;
             match outcome {
-                HookOutcome::Mutated(next) => current = next,
-                HookOutcome::PassThrough => {}
-                HookOutcome::Blocked { stderr } => {
+                HookOutcome::Mutated { updated, .. } => current = updated,
+                HookOutcome::PassThrough { .. } => {}
+                HookOutcome::Blocked { stderr, .. } => {
                     // Honour the block. Spec: "Hook exits 2 → Block the
                     // turn (only event where blocking makes sense —
                     // UserPromptSubmit). Show stderr to user." Emit the
@@ -198,7 +198,7 @@ impl HookRegistry {
                     .await;
                     return PromptHookResult::Blocked { stderr: trimmed };
                 }
-                HookOutcome::SoftFailed { reason } => {
+                HookOutcome::SoftFailed { reason, .. } => {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
                     break;
                 }
@@ -234,9 +234,9 @@ impl HookRegistry {
         for spec in &specs {
             let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx, Some(tx)).await;
             match outcome {
-                HookOutcome::Mutated(next) => current = next,
-                HookOutcome::PassThrough => {}
-                HookOutcome::Blocked { stderr } => {
+                HookOutcome::Mutated { updated, .. } => current = updated,
+                HookOutcome::PassThrough { .. } => {}
+                HookOutcome::Blocked { stderr, .. } => {
                     emit_warning(
                         tx,
                         event,
@@ -248,7 +248,7 @@ impl HookRegistry {
                     )
                     .await;
                 }
-                HookOutcome::SoftFailed { reason } => {
+                HookOutcome::SoftFailed { reason, .. } => {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
                     break;
                 }

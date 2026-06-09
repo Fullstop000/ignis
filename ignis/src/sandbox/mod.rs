@@ -233,6 +233,59 @@ pub fn apply_with_paths(reads: &[PathBuf], writes: &[PathBuf]) -> std::io::Resul
     SandboxPolicy::new(reads, writes).apply()
 }
 
+/// Whether the host kernel will actually enforce a sandbox primitive for
+/// this process. Used by integration tests to decide whether to assert
+/// the strict "write was denied" contract or to downgrade to a smoke
+/// test on a host without confinement support.
+///
+/// * **Linux** — probes Landlock via a raw
+///   `landlock_create_ruleset(NULL, 0, VERSION)` syscall. Returns `true`
+///   on any kernel that recognises the syscall (5.13+), `false` on
+///   `ENOSYS` / `EOPNOTSUPP`.
+/// * **macOS** — `sandbox_init` is present on every supported version
+///   (10.5+), so this is `true`. We can't probe it without confining
+///   this process, so we trust the documented ABI.
+/// * **Other targets** — `false` (the dispatcher reports
+///   `PlatformUnsupported` and tests should downgrade accordingly).
+///
+/// `is_kernel_sandbox_available()` does NOT consult `spec.sandbox` — it
+/// only answers "would the *kernel* confine this process if asked?". The
+/// caller's `sandbox_status` is the combination of this and the
+/// per-hook `sandbox: bool` opt-out.
+pub fn is_kernel_sandbox_available() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(probe_kernel_sandbox_available)
+}
+
+fn probe_kernel_sandbox_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+        // SAFETY: NULL + size 0 + flags = VERSION is documented to never
+        // mutate userspace; it only reports the supported ABI as the
+        // return value. A return of >= 1 means the kernel recognises
+        // Landlock; -1 with ENOSYS / EOPNOTSUPP means it doesn't.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<libc::c_void>(),
+                0usize,
+                LANDLOCK_CREATE_RULESET_VERSION,
+            )
+        };
+        ret >= 1
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

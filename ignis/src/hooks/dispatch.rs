@@ -78,20 +78,38 @@ fn should_emit_sandbox_warning(name: &str) -> bool {
 /// Outcome of a single hook invocation. None of these are errors at the
 /// caller's level — `HookRegistry` decides whether each maps to "keep
 /// running the chain", "stop with original value", etc.
+///
+/// Every variant carries the [`SandboxStatus`] observed for this run so
+/// tests (and future telemetry consumers) can assert what the child was
+/// actually subjected to — `FullyEnforced` on macOS Seatbelt, `FullyEnforced`
+/// on Linux with Landlock, `NotEnforced` on a Linux kernel without Landlock,
+/// `PlatformUnsupported` on Windows / other-Unix, or `Disabled` if the
+/// caller opted out via `sandbox: false`. The status is computed once and
+/// recorded on the `ignis.hook` tracing span; the same value is what the
+/// field exposes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookOutcome {
     /// Exit 0, parsed JSON, hook had a rewrite. Carry it forward.
-    Mutated(String),
+    Mutated {
+        updated: String,
+        sandbox_status: SandboxStatus,
+    },
     /// Exit 0, but the hook did not produce a rewrite (or said
     /// `"continue": true` without `updatedInput`/`updatedOutput`). Caller
     /// passes through the original text and moves on.
-    PassThrough,
+    PassThrough { sandbox_status: SandboxStatus },
     /// Exit 2 — hook explicitly blocked the chain. Stderr is shown to the
     /// user when this is honoured (only `UserPromptSubmit`).
-    Blocked { stderr: String },
+    Blocked {
+        stderr: String,
+        sandbox_status: SandboxStatus,
+    },
     /// Anything else (non-zero exit, malformed JSON, missing binary,
     /// timeout). Caller uses the original text and surfaces a Warning.
-    SoftFailed { reason: String },
+    SoftFailed {
+        reason: String,
+        sandbox_status: SandboxStatus,
+    },
 }
 
 /// Context carried into each dispatch call so the envelope's `session_id`
@@ -131,13 +149,22 @@ pub async fn run_hook(
 ) -> HookOutcome {
     let started = std::time::Instant::now();
     let cmd_name = spec.display_name();
+    // Compute the sandbox status once at the top so every HookOutcome we
+    // build downstream can carry the same value (and so we can return
+    // early on envelope-encode failure with a useful `Disabled` status).
+    // The actual confinement install happens in the child's `pre_exec`
+    // — this is a *telemetry* view of what the kernel *will* do, not a
+    // guarantee that it did. macOS Seatbelt's `sandbox_init` runs in the
+    // child and either succeeds (matching FullyEnforced) or fails the
+    // exec (surfacing as `SoftFailed` from the spawn call below).
+    let sandbox_status = sandbox_status_for_telemetry(spec);
     let span = tracing::info_span!(
         "ignis.hook",
         event = event.as_str(),
         command = %cmd_name,
         duration_ms = tracing::field::Empty,
         outcome = tracing::field::Empty,
-        sandbox.status = tracing::field::Empty,
+        sandbox.status = sandbox_status.as_str(),
     );
     let _enter = span.enter();
 
@@ -162,6 +189,7 @@ pub async fn run_hook(
                 started,
                 HookOutcome::SoftFailed {
                     reason: format!("envelope encode failed: {e}"),
+                    sandbox_status,
                 },
             );
         }
@@ -202,6 +230,24 @@ pub async fn run_hook(
     // the read allowlist when it's unknown.
     let hook_folder: Option<std::path::PathBuf> = spec.program.parent().map(|p| p.to_path_buf());
     let want_sandbox = spec.sandbox;
+    // Set the child's CWD to the hook's own directory. Two reasons:
+    //   1. **Seatbelt bash-startup fix.** On macOS, bash's `shell-init`
+    //      and `job-working-directory` startup probes call `getcwd()`
+    //      (which under Seatbelt traverses the path with `stat()`).
+    //      With the parent's CWD inherited — typically the user's
+    //      project root, NOT in the read allowlist — every bash hook
+    //      soft-fails with EPERM noise on stderr. Setting CWD to the
+    //      hook's own folder (which IS in the read allowlist) makes
+    //      `getcwd()` succeed and the startup noise disappear.
+    //   2. **Predictable relative paths.** Hook scripts can resolve
+    //      siblings (`require "./lib"`, `source ./helpers.sh`) without
+    //      knowing where the user invoked ignis from. Falls back to
+    //      `/` (a directory Seatbelt/Landlock can read) when the
+    //      program is a bare name resolved by PATH.
+    let child_cwd: &std::path::Path = hook_folder
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new("/"));
+    cmd.current_dir(child_cwd);
     #[cfg(unix)]
     {
         // Note: `tokio::process::Command::pre_exec` is the tokio-owned method
@@ -247,16 +293,15 @@ pub async fn run_hook(
                 started,
                 HookOutcome::SoftFailed {
                     reason: format!("spawn failed: {e}"),
+                    sandbox_status,
                 },
             );
         }
     };
 
-    // Record sandbox status for telemetry. We re-evaluate the kernel ABI
-    // level in the parent (cheap, no restriction applied) so dashboards see
-    // whether the child got real confinement.
-    let sandbox_status = sandbox_status_for_telemetry(spec);
-    span.record("sandbox.status", sandbox_status.as_str());
+    // Warn (once per session) on hooks that ran without confinement. The
+    // status was already recorded on the span at the top; this branch just
+    // surfaces the degradation to the UI.
     let unconfined_reason = match sandbox_status {
         SandboxStatus::NotEnforced => Some("Landlock unavailable on this kernel"),
         SandboxStatus::PlatformUnsupported => Some("sandboxing unavailable on this platform"),
@@ -361,6 +406,7 @@ pub async fn run_hook(
                 started,
                 HookOutcome::SoftFailed {
                     reason: format!("wait failed: {e}"),
+                    sandbox_status,
                 },
             );
         }
@@ -405,6 +451,7 @@ pub async fn run_hook(
                 started,
                 HookOutcome::SoftFailed {
                     reason: format!("timed out after {}ms", spec.timeout_ms),
+                    sandbox_status,
                 },
             );
         }
@@ -427,19 +474,33 @@ pub async fn run_hook(
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
 
     if status.code() == Some(2) {
-        return record(&span, started, HookOutcome::Blocked { stderr });
+        return record(
+            &span,
+            started,
+            HookOutcome::Blocked {
+                stderr,
+                sandbox_status,
+            },
+        );
     }
     if !status.success() {
         let reason = match status.code() {
             Some(code) => format!("exit {code}: {}", trim_stderr(&stderr)),
             None => format!("terminated by signal: {}", trim_stderr(&stderr)),
         };
-        return record(&span, started, HookOutcome::SoftFailed { reason });
+        return record(
+            &span,
+            started,
+            HookOutcome::SoftFailed {
+                reason,
+                sandbox_status,
+            },
+        );
     }
 
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
-        return record(&span, started, HookOutcome::PassThrough);
+        return record(&span, started, HookOutcome::PassThrough { sandbox_status });
     }
     let parsed: HookOutput = match serde_json::from_str(trimmed) {
         Ok(p) => p,
@@ -449,13 +510,21 @@ pub async fn run_hook(
                 started,
                 HookOutcome::SoftFailed {
                     reason: format!("invalid JSON on stdout: {e}"),
+                    sandbox_status,
                 },
             );
         }
     };
 
     if parsed.r#continue == Some(false) {
-        return record(&span, started, HookOutcome::Blocked { stderr });
+        return record(
+            &span,
+            started,
+            HookOutcome::Blocked {
+                stderr,
+                sandbox_status,
+            },
+        );
     }
 
     let rewrite = parsed.hook_specific_output.and_then(|s| match event {
@@ -463,8 +532,15 @@ pub async fn run_hook(
         HookEvent::AssistantMessageRender => s.updated_output,
     });
     match rewrite {
-        Some(updated) => record(&span, started, HookOutcome::Mutated(updated)),
-        None => record(&span, started, HookOutcome::PassThrough),
+        Some(updated) => record(
+            &span,
+            started,
+            HookOutcome::Mutated {
+                updated,
+                sandbox_status,
+            },
+        ),
+        None => record(&span, started, HookOutcome::PassThrough { sandbox_status }),
     }
 }
 
@@ -472,63 +548,25 @@ pub async fn run_hook(
 /// NOT actually install Landlock here — that happens in the child's
 /// `pre_exec`. This is just for span attributes / dashboards.
 ///
-/// On Linux, the kernel-level ABI is probed once per session via a raw
-/// `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`
-/// syscall. The result is cached: kernels either support Landlock or not,
-/// it doesn't change at runtime.
+/// On Linux, the kernel-level ABI is probed once per session via
+/// [`crate::sandbox::is_kernel_sandbox_available`] and cached: kernels
+/// either support Landlock or not, it doesn't change at runtime. macOS
+/// Seatbelt ships unconditionally; we trust the documented ABI rather
+/// than probe (a probe call would actually confine this process).
 fn sandbox_status_for_telemetry(spec: &HookSpec) -> SandboxStatus {
     if !spec.sandbox {
         return SandboxStatus::Disabled;
     }
-    #[cfg(target_os = "linux")]
-    {
-        use std::sync::OnceLock;
-        static CACHED: OnceLock<SandboxStatus> = OnceLock::new();
-        *CACHED.get_or_init(probe_landlock_kernel)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // `sandbox_init` has shipped on every macOS since 10.5 (2007).
-        // We don't probe it (a probe call would actually confine this
-        // process); we just trust the ABI and report `FullyEnforced`
-        // when the user opted in. The actual install happens in the
-        // child's `pre_exec` — if it fails the child fails to exec
-        // and the dispatcher surfaces a `SoftFailed` outcome.
+    if crate::sandbox::is_kernel_sandbox_available() {
         SandboxStatus::FullyEnforced
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        SandboxStatus::PlatformUnsupported
-    }
-}
-
-/// Probe the kernel's Landlock ABI version once per session. Returns
-/// `FullyEnforced` on any kernel that recognises the syscall (V1+),
-/// `NotEnforced` when the syscall returns -1 (ENOSYS / EOPNOTSUPP). The
-/// parent's status is what the child *will* see, modulo race conditions
-/// that don't exist for a CPU-feature LSM.
-#[cfg(target_os = "linux")]
-fn probe_landlock_kernel() -> SandboxStatus {
-    // Raw syscall: `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`.
-    // Returns the supported ABI version (>= 1) on success, or -1 with errno
-    // ENOSYS / EOPNOTSUPP when Landlock is not available.
-    //
-    // SAFETY: passing NULL + size 0 + flags = 1 (LANDLOCK_CREATE_RULESET_VERSION).
-    // That argument tuple is documented to never mutate userspace; it only
-    // reports the supported ABI as the return value.
-    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<libc::c_void>(),
-            0usize,
-            LANDLOCK_CREATE_RULESET_VERSION,
-        )
-    };
-    if ret >= 1 {
-        SandboxStatus::FullyEnforced
-    } else {
+    } else if cfg!(target_os = "linux") {
+        // Linux kernel without Landlock: the platform supports the
+        // primitive concept but the running kernel doesn't expose it.
+        // The dispatcher will warn once per session.
         SandboxStatus::NotEnforced
+    } else {
+        // Any other Unix / Windows: no sandbox implementation at all.
+        SandboxStatus::PlatformUnsupported
     }
 }
 
@@ -547,8 +585,8 @@ async fn emit_buffer_warning(tx: Option<&EventSender>, hook: &str, stream: &str)
 fn record(span: &tracing::Span, started: std::time::Instant, outcome: HookOutcome) -> HookOutcome {
     span.record("duration_ms", started.elapsed().as_millis() as u64);
     let label = match &outcome {
-        HookOutcome::Mutated(_) => "mutated",
-        HookOutcome::PassThrough => "pass_through",
+        HookOutcome::Mutated { .. } => "mutated",
+        HookOutcome::PassThrough { .. } => "pass_through",
         HookOutcome::Blocked { .. } => "blocked",
         HookOutcome::SoftFailed { .. } => "failed",
     };
@@ -603,7 +641,7 @@ mod tests {
             ..HookSpec::default()
         };
         let out = run_hook(&spec, HookEvent::UserPromptSubmit, "original", &ctx(), None).await;
-        assert_eq!(out, HookOutcome::Mutated("rewritten".to_string()));
+        assert!(matches!(out, HookOutcome::Mutated { ref updated, .. } if updated == "rewritten"));
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -618,7 +656,7 @@ mod tests {
             ..HookSpec::default()
         };
         let out = run_hook(&spec, HookEvent::UserPromptSubmit, "original", &ctx(), None).await;
-        assert_eq!(out, HookOutcome::PassThrough);
+        assert!(matches!(out, HookOutcome::PassThrough { .. }));
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -638,7 +676,7 @@ mod tests {
         };
         let out = run_hook(&spec, HookEvent::UserPromptSubmit, "x", &ctx(), None).await;
         match out {
-            HookOutcome::Blocked { stderr } => assert!(stderr.contains("nope")),
+            HookOutcome::Blocked { stderr, .. } => assert!(stderr.contains("nope")),
             other => panic!("expected Blocked, got {other:?}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
@@ -660,7 +698,7 @@ mod tests {
         };
         let out = run_hook(&spec, HookEvent::UserPromptSubmit, "x", &ctx(), None).await;
         match out {
-            HookOutcome::SoftFailed { reason } => assert!(reason.contains("invalid JSON")),
+            HookOutcome::SoftFailed { reason, .. } => assert!(reason.contains("invalid JSON")),
             other => panic!("expected SoftFailed, got {other:?}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
@@ -690,7 +728,7 @@ mod tests {
         };
         let out = run_hook(&spec, HookEvent::UserPromptSubmit, "x", &ctx(), None).await;
         match out {
-            HookOutcome::SoftFailed { reason } => assert!(reason.contains("timed out")),
+            HookOutcome::SoftFailed { reason, .. } => assert!(reason.contains("timed out")),
             other => panic!("expected SoftFailed, got {other:?}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
@@ -732,7 +770,7 @@ mod tests {
         .await;
         let elapsed = t0.elapsed();
         match out {
-            HookOutcome::SoftFailed { reason } => assert!(reason.contains("timed out")),
+            HookOutcome::SoftFailed { reason, .. } => assert!(reason.contains("timed out")),
             other => panic!("expected SoftFailed, got {other:?}"),
         }
         // Must return well within the long sleep (with slack for spawn).
@@ -799,7 +837,7 @@ printf '%s' "{\"hookSpecificOutput\":{\"updatedInput\":\"$out\"}}"
         };
         let out = run_hook(&spec_no_env, HookEvent::UserPromptSubmit, "x", &ctx(), None).await;
         let body = match out {
-            HookOutcome::Mutated(s) => s,
+            HookOutcome::Mutated { updated, .. } => updated,
             other => panic!("unexpected outcome: {other:?}"),
         };
         assert!(
@@ -828,7 +866,7 @@ printf '%s' "{\"hookSpecificOutput\":{\"updatedInput\":\"$out\"}}"
         )
         .await;
         let body2 = match out2 {
-            HookOutcome::Mutated(s) => s,
+            HookOutcome::Mutated { updated, .. } => updated,
             other => panic!("unexpected outcome: {other:?}"),
         };
         assert!(
@@ -843,19 +881,33 @@ printf '%s' "{\"hookSpecificOutput\":{\"updatedInput\":\"$out\"}}"
     /// SIGTERM grace: a hook that ignores SIGTERM and sleeps 30 s should be
     /// SIGKILL'd ~1 s after the configured timeout. Total wall time:
     /// `timeout + ~1 s`, well under the 30 s sleep.
-    #[cfg(unix)]
+    ///
+    /// **Linux only.** macOS resets SIGTERM to `SIG_DFL` on `exec` for
+    /// child processes without a controlling terminal (a security
+    /// hardening introduced in 10.5), so any SIG_IGN the child installs
+    /// in its own address space is overridden by the kernel before
+    /// delivery. The cooperative-exit test below (`sigterm_grace_with_cooperative_hook`)
+    /// covers the *primary* use of the grace window — a hook that
+    /// handles SIGTERM and exits cleanly — on both platforms.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sigterm_grace_kills_uncooperative_hook_after_one_second() {
         let tmp = crate::util::unique_temp_dir("ignis-hook-sigterm");
-        let script = write_script(
-            &tmp,
-            "ignore-term.sh",
-            // `trap '' TERM` ignores SIGTERM. The shell still respects
-            // SIGKILL, so after the 1 s grace we expect SIGKILL to land.
-            // `cat >/dev/null &` lets the hook still read stdin in the
-            // background so the dispatcher's write doesn't EPIPE.
-            "#!/bin/sh\ntrap '' TERM\ncat >/dev/null &\nsleep 30\n",
-        );
+        // Python one-liner: install SIG_IGN for SIGTERM, sleep 30s. Python
+        // is in the universal read allowlist, so the interpreter can exec
+        // under the Landlock sandbox. (This test is Linux-only; see the
+        // doc-comment for why we don't run it on macOS.)
+        let body = b"\
+#!/usr/bin/env python3
+import signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+try:
+    sys.stdin.read()
+except Exception:
+    pass
+time.sleep(30)
+";
+        let script = write_script(&tmp, "ignore-term.py", std::str::from_utf8(body).unwrap());
         let spec = HookSpec {
             program: script,
             args: vec![],
@@ -867,7 +919,7 @@ printf '%s' "{\"hookSpecificOutput\":{\"updatedInput\":\"$out\"}}"
         let elapsed = t0.elapsed();
 
         match out {
-            HookOutcome::SoftFailed { reason } => assert!(reason.contains("timed out")),
+            HookOutcome::SoftFailed { reason, .. } => assert!(reason.contains("timed out")),
             other => panic!("expected SoftFailed, got {other:?}"),
         }
         // Lower bound: SIGTERM fires at ~100ms, then 1s grace, then SIGKILL.
@@ -881,6 +933,72 @@ printf '%s' "{\"hookSpecificOutput\":{\"updatedInput\":\"$out\"}}"
         assert!(
             elapsed < Duration::from_secs(3),
             "SIGKILL did not land promptly: elapsed = {elapsed:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// SIGTERM grace — cooperative hook: a hook that installs a SIGTERM
+    /// handler that exits cleanly should exit *before* the 1 s grace
+    /// elapses, with `SoftFailed { reason: "timed out" }` from the
+    /// dispatcher's perspective. This is the primary use of the grace
+    /// window (giving the hook a moment to flush) and runs on all Unix
+    /// targets — the child handles the signal itself, so the macOS
+    /// SIG_DFL-on-exec quirk doesn't apply.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_grace_with_cooperative_hook_exits_promptly() {
+        let tmp = crate::util::unique_temp_dir("ignis-hook-sigterm-coop");
+        // Python: install a SIGTERM handler that exits 0 immediately.
+        // This is exactly the production case — a hook that does some
+        // cleanup and shuts down on SIGTERM.
+        let body = b"\
+#!/usr/bin/env python3
+import signal, sys, time
+def _term(_signum, _frame):
+    sys.exit(0)
+signal.signal(signal.SIGTERM, _term)
+try:
+    sys.stdin.read()
+except Exception:
+    pass
+time.sleep(30)
+";
+        let script = write_script(&tmp, "cooperative.py", std::str::from_utf8(body).unwrap());
+        let spec = HookSpec {
+            program: script,
+            args: vec![],
+            timeout_ms: 100,
+            ..HookSpec::default()
+        };
+        let t0 = std::time::Instant::now();
+        let out = run_hook(&spec, HookEvent::UserPromptSubmit, "x", &ctx(), None).await;
+        let elapsed = t0.elapsed();
+
+        // The cooperative hook exits 0 after the SIGTERM, so from the
+        // dispatcher's view the call completed inside the grace window.
+        // We expect the *outer* timeout to still be reported — the
+        // dispatcher's outer timeout fires first and sends SIGTERM, then
+        // the child exits cleanly, then the dispatcher reports
+        // `timed out` because that's the *reason* the call returned at
+        // all (it never saw the child's exit before the timeout).
+        //
+        // On Linux: the dispatcher sends SIGTERM, the child exits 0,
+        // but the dispatcher's `child.wait()` resolves inside the
+        // 1s grace → return SoftFailed { reason: "timed out" }.
+        // Elapsed should be slightly more than the timeout (100ms) and
+        // well under 1.1s.
+        match out {
+            HookOutcome::SoftFailed { reason, .. } => assert!(reason.contains("timed out")),
+            other => panic!("expected SoftFailed, got {other:?}"),
+        }
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "outer timeout did not fire: elapsed = {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "grace window was not honoured on cooperative exit: elapsed = {elapsed:?}"
         );
 
         std::fs::remove_dir_all(&tmp).ok();

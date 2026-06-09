@@ -33,6 +33,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use ignis::hooks::{HookContext, HookRegistry, HookSpec, HooksConfig, PromptHookResult};
+use ignis::sandbox::is_kernel_sandbox_available;
 use tokio::sync::mpsc;
 
 fn write_executable(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
@@ -45,31 +46,11 @@ fn write_executable(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
 }
 
 /// Whether the kernel will actually enforce the sandbox on this host.
-///
-/// * **macOS** — Seatbelt (`sandbox_init`) is present on every supported
-///   version, so enforcement is unconditional.
-/// * **Linux** — probe Landlock with a raw
-///   `landlock_create_ruleset(NULL, 0, 1)`: returns the supported ABI
-///   version (>= 1) on success, -1 (ENOSYS) on kernels without Landlock.
-///   When absent the sandbox degrades to `NotEnforced` and we skip the
-///   write-block assertion rather than fail on a kernel gap.
-#[cfg(target_os = "macos")]
+/// Delegates to [`ignis::sandbox::is_kernel_sandbox_available`] so the
+/// production probe and the test probe cannot drift apart — both run the
+/// same Landlock ABI check on Linux and trust the Seatbelt ABI on macOS.
 fn sandbox_enforced() -> bool {
-    true
-}
-
-#[cfg(target_os = "linux")]
-fn sandbox_enforced() -> bool {
-    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<libc::c_void>(),
-            0usize,
-            LANDLOCK_CREATE_RULESET_VERSION,
-        )
-    };
-    ret >= 1
+    is_kernel_sandbox_available()
 }
 
 /// A hook that drains stdin, tries to write `leak_path`, then emits a

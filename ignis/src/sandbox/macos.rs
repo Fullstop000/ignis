@@ -39,7 +39,7 @@
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::raw::{c_char, c_int};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use super::SandboxStatus;
@@ -131,7 +131,7 @@ pub(super) fn build_profile(reads: &[PathBuf], writes: &[PathBuf]) -> CString {
 /// Emit an `(allow OP (subpath "PATH"))` line plus, for paths under
 /// the well-known macOS symlinked roots, a matching line for the
 /// post-resolution `/private/...` form.
-fn emit_allow(s: &mut String, op: &str, p: &PathBuf) {
+fn emit_allow(s: &mut String, op: &str, p: &Path) {
     let Some(path_str) = p.to_str() else {
         // Non-UTF-8 path: skip rather than emit a line we can't escape
         // correctly. Hooks on macOS with non-UTF-8 paths in the

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - hooks: env-var allowlist + filesystem sandbox (Linux Landlock, macOS Seatbelt) for hook subprocesses, defaults-on; SIGTERM-then-SIGKILL grace on timeout; stdout/stderr capped at 1 MiB per stream. ([#109](https://github.com/Fullstop000/ignis/pull/109))
+- hooks: `HookOutcome` now carries the per-call `sandbox_status` (`FullyEnforced` / `NotEnforced` / `PlatformUnsupported` / `Disabled`); new `sandbox::is_kernel_sandbox_available()` helper exposes the kernel-side check. `ignis/tests/sandbox_e2e.rs` adds 25 regression tests across 8 layers (env-allowlist, filesystem, SIGTERM grace, buffer cap, lifecycle, composition, macOS Seatbelt quirks, status reporting) and exercises both Landlock and Seatbelt end-to-end.
+- hooks: dispatcher now sets the child's CWD to the hook's script folder, fixing the macOS Seatbelt `shell-init` / `job-working-directory` EPERM noise that previously leaked into every hook's stderr.
 
 ## [0.37.1] - 2026-06-09
 
