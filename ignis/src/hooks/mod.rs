@@ -612,6 +612,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/a/hook.sh"),
                 args: vec!["--flag".to_string()],
                 timeout_ms: 7_000,
+                ..HookSpec::default()
             }],
             assistant_message_render: vec![],
         };
@@ -638,6 +639,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/opt/translate/run.py"),
                 args: vec![],
                 timeout_ms: 10_000,
+                ..HookSpec::default()
             }],
             assistant_message_render: vec![],
         };
@@ -660,17 +662,20 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: PathBuf::from("/opt/translate/run.py"),
                     args: vec!["--source".to_string(), "en".to_string()],
                     timeout_ms: 30_000,
+                    ..HookSpec::default()
                 },
                 HookSpec {
                     program: PathBuf::from("/opt/redact.sh"),
                     args: vec![],
                     timeout_ms: 5_000,
+                    ..HookSpec::default()
                 },
             ],
             assistant_message_render: vec![HookSpec {
                 program: PathBuf::from("/opt/translate/run.py"),
                 args: vec![],
                 timeout_ms: 10_000,
+                ..HookSpec::default()
             }],
         };
         let out = format_list(&cfg);
@@ -695,6 +700,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/opt/render.sh"),
                 args: vec![],
                 timeout_ms: 1_000,
+                ..HookSpec::default()
             }],
         };
         let out = format_list(&cfg);
@@ -723,11 +729,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: PathBuf::from("/opt/translate-to-french-v2.py"),
                     args: vec![],
                     timeout_ms: 10_000,
+                    ..HookSpec::default()
                 },
                 HookSpec {
                     program: PathBuf::from("/opt/redact.sh"),
                     args: vec![],
                     timeout_ms: 10_000,
+                    ..HookSpec::default()
                 },
             ],
             assistant_message_render: vec![],
@@ -766,11 +774,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/a"),
                 args: vec![],
                 timeout_ms: 1_000,
+                ..HookSpec::default()
             }],
             assistant_message_render: vec![HookSpec {
                 program: PathBuf::from("/b"),
                 args: vec![],
                 timeout_ms: 1_000,
+                ..HookSpec::default()
             }],
         };
         let out = format_list(&cfg);
