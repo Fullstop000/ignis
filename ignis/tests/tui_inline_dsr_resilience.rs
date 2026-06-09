@@ -193,3 +193,50 @@ fn inline_tui_survives_cursor_read_timeout_on_resize() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// Regression guard for the "blank after input, full content on resume" wedge.
+///
+/// In inline mode the live band never draws conversation content — every block
+/// (user prompt, assistant text, tool calls, notices) reaches the screen ONLY
+/// through the commit loop's `insert_before` into native scrollback. That loop
+/// is gated by `!app.pending_screen_clear`. A reset path (`/clear`, `/resume`)
+/// sets `pending_screen_clear`, and it is cleared only when the re-anchor's
+/// `try_rebuild` succeeds — which issues a DSR (`ESC[6n`) via ratatui's inline
+/// `compute_inline_size`. On WSL2/conpty that DSR can lag indefinitely, so the
+/// flag would stay set and the commit loop stay suppressed: nothing the agent
+/// produces paints, even though it keeps running and persisting.
+///
+/// The fix bounds the gate: after `MAX_REANCHOR_ATTEMPTS` failed re-anchors the
+/// runner forces a DSR-free re-anchor (`terminal.clear()`) and clears the flag,
+/// so content paints even if the DSR never answers. This test holds the DSR
+/// unanswered FOREVER across a `/clear` and asserts the queued "Started new
+/// session" notice still reaches the screen within a bounded window. Before the
+/// fix it never appears (wedged blank indefinitely); after it, the backstop
+/// flushes it.
+#[test]
+fn inline_reset_renders_even_if_reanchor_dsr_never_answers() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+
+    let mut tui = Tui::spawn(home.path(), project.path());
+    // Startup DSR answered → the banner paints (the commit loop is healthy).
+    tui.wait_for("Your AI coding agent");
+
+    // Stop answering DSR for good, then trigger a reset. `/clear` sets
+    // `pending_screen_clear` and queues a "Started new session" notice block
+    // that must flow to scrollback via the (gated) commit loop.
+    tui.answer_dsr.store(false, Ordering::SeqCst);
+    tui.send("/clear\r");
+
+    // The re-anchor's DSR is never answered. Each `try_rebuild` blocks ~2s on
+    // crossterm's DSR timeout; after MAX_REANCHOR_ATTEMPTS the backstop forces a
+    // DSR-free re-anchor and the gated notice flushes. Allow generous slack for
+    // the serialized timeouts. Pre-fix this `wait_for` would time out (blank
+    // forever); post-fix the notice appears.
+    tui.wait_for("Started new session");
+
+    // And the session stays interactive afterward — two Ctrl-Ds exit cleanly.
+    tui.send("\x04");
+    tui.wait_for("Press Ctrl-D again to exit");
+    tui.send("\x04");
+}
