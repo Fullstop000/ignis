@@ -87,7 +87,8 @@ if _interactive; then
         "openai/gpt-5:openai/gpt-5" \
         "gemini/gemini-2-5-pro:gemini/gemini-2-5-pro" \
         "kimi-code/k2-thinking:kimi-code/k2-thinking" \
-        "zhipu/glm-5.1:zhipu/glm-5.1")"
+        "zhipu/glm-5.1:zhipu/glm-5.1" \
+        "ark-coding/glm-5.1:ark-coding/glm-5.1")"
 
     [ -z "${ENV:-}" ] && ENV="$(_pick "Sandbox env:" \
         "daytona" \
@@ -113,6 +114,7 @@ case "$provider" in
     kimi-code) key_env=KIMI_CODE_API_KEY ;;
     minimax-token-plan) key_env=MINIMAX_TOKEN_PLAN_API_KEY ;;
     zhipu)     key_env=ZHIPU_API_KEY ;;
+    ark-coding) key_env=ARK_CODING_PLAN_TOKEN ;;
     *) echo "run.sh: unknown provider '$provider' in MODEL=$MODEL" >&2; exit 2 ;;
 esac
 _toml_key() { # $1 = section header (e.g. [web_search]); reads api_key under it.
@@ -125,9 +127,14 @@ _toml_key() { # $1 = section header (e.g. [web_search]); reads api_key under it.
         f && /^api_key/ {gsub(/^api_key *= *"/,""); gsub(/".*/,""); print; exit}
     ' "$CONFIG"
 }
-export "$key_env"="$(_toml_key "[providers.$provider]")"
-if [ -z "$(eval "echo \$$key_env")" ]; then
-    echo "run.sh: no api_key for [providers.$provider] in $CONFIG" >&2; exit 2
+# Pre-set env (e.g. ARK_CODING_PLAN_TOKEN exported from ~/.zshrc) wins; fall
+# back to the api_key in config.toml. Subscription plans put the master token
+# in shell rc, so this avoids forcing duplicate state in config.toml.
+if [ -z "${!key_env:-}" ]; then
+    export "$key_env"="$(_toml_key "[providers.$provider]")"
+fi
+if [ -z "${!key_env:-}" ]; then
+    echo "run.sh: no api_key for [providers.$provider] in $CONFIG and \$$key_env is unset" >&2; exit 2
 fi
 
 # ---------- optional web_search key (forwarded by the adapter into the sandbox)
