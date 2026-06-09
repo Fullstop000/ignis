@@ -103,6 +103,11 @@ pub(super) fn build_profile(reads: &[PathBuf], writes: &[PathBuf]) -> CString {
     s.push_str("(allow file-read* (subpath \"/System\"))\n");
     s.push_str("(allow file-read* (subpath \"/private/var/db/dyld\"))\n");
     s.push_str("(allow file-read* (subpath \"/private/preboot/Cryptexes\"))\n");
+    // dyld4's CacheFinder enumerates the root directory to discover
+    // firmlink targets (e.g. /System/Volumes/Preboot). `literal "/"`
+    // only grants directory-listing on the root itself, not recursive
+    // read access to user data. Verified on macOS 15.6 ARM64.
+    s.push_str("(allow file-read-data (literal \"/\"))\n");
 
     for p in reads {
         emit_allow(&mut s, "file-read*", p);
@@ -256,6 +261,7 @@ mod tests {
             "(allow file-read* (subpath \"/System\"))",
             "(allow file-read* (subpath \"/private/var/db/dyld\"))",
             "(allow file-read* (subpath \"/private/preboot/Cryptexes\"))",
+            "(allow file-read-data (literal \"/\"))",
         ] {
             assert!(p.contains(required), "missing essential: {required}\n{p}");
         }
