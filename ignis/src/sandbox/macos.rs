@@ -63,11 +63,14 @@ extern "C" {
 /// The generated profile starts with `(deny default)` so anything we
 /// don't explicitly allow is forbidden. The "universal essentials"
 /// list (`process-fork`, `process-exec*`, `signal (target self)`,
-/// `file-read-metadata`, `network*`, `mach-lookup`, `ipc-posix-shm`)
-/// is the smallest set we have observed lets a `python3` or
-/// `/bin/sh` hook execute at all on macOS — it intentionally matches
-/// the rough shape of the Linux defaults (filesystem confinement,
-/// no network filtering).
+/// `file-read-metadata`, `network*`, `mach-lookup`, `ipc-posix-shm`,
+/// `sysctl-read`, plus `file-read*` on the dyld shared-cache locations
+/// `/System`, `/private/var/db/dyld`, `/private/preboot/Cryptexes`) is
+/// the smallest set that lets a `python3` or `/bin/sh` hook execute at
+/// all on macOS — the dyld-cache reads in particular are mandatory or
+/// the dynamic linker can't start *any* binary. It intentionally
+/// matches the rough shape of the Linux defaults (filesystem
+/// confinement, no network filtering).
 pub(super) fn build_profile(reads: &[PathBuf], writes: &[PathBuf]) -> CString {
     let mut s = String::with_capacity(2048);
     s.push_str("(version 1)\n");
@@ -85,6 +88,21 @@ pub(super) fn build_profile(reads: &[PathBuf], writes: &[PathBuf]) -> CString {
     // (Python, Ruby, JVM) can talk to system services.
     s.push_str("(allow mach-lookup)\n");
     s.push_str("(allow ipc-posix-shm)\n");
+    // Dynamic-linker essentials. Every macOS executable is dynamically
+    // linked against libSystem; before `main`, dyld must read (mmap) the
+    // dyld shared cache. On modern macOS that cache lives under /System
+    // (incl. the Apple-Silicon /System/Cryptexes firmlink, whose backing
+    // store is /private/preboot/Cryptexes) and the legacy
+    // /private/var/db/dyld — NOT under /usr/lib. Without these
+    // `file-read*` grants, `(deny default)` blocks the mmap and NO binary
+    // can exec, so every hook soft-fails before it starts. `sysctl-read`
+    // covers libSystem's init-time hw.*/kern.* probes. All read-only
+    // system content (no user data), so granting them doesn't weaken the
+    // write-confinement / credential-exfil threat model.
+    s.push_str("(allow sysctl-read)\n");
+    s.push_str("(allow file-read* (subpath \"/System\"))\n");
+    s.push_str("(allow file-read* (subpath \"/private/var/db/dyld\"))\n");
+    s.push_str("(allow file-read* (subpath \"/private/preboot/Cryptexes\"))\n");
 
     for p in reads {
         emit_allow(&mut s, "file-read*", p);
@@ -231,6 +249,13 @@ mod tests {
             "(allow network*)",
             "(allow mach-lookup)",
             "(allow ipc-posix-shm)",
+            // dyld shared-cache + libSystem-init essentials: without
+            // these no dynamically-linked binary can exec under the
+            // (deny default) baseline.
+            "(allow sysctl-read)",
+            "(allow file-read* (subpath \"/System\"))",
+            "(allow file-read* (subpath \"/private/var/db/dyld\"))",
+            "(allow file-read* (subpath \"/private/preboot/Cryptexes\"))",
         ] {
             assert!(p.contains(required), "missing essential: {required}\n{p}");
         }
