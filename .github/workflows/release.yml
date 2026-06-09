@@ -61,3 +61,8 @@ jobs:
         with:
           files: ${{ env.ASSET }}
           fail_on_unmatched_files: true
+          # A hyphenated tag (e.g. v0.38.0-rc.1) is a semver prerelease: mark it
+          # so GitHub's /releases/latest keeps pointing at the last stable tag.
+          # install.sh resolves `latest` via that redirect, so RC builds stay
+          # opt-in (IGNIS_VERSION=<tag>) and never reach unpinned installs.
+          prerelease: ${{ contains(github.ref_name, '-') }}
