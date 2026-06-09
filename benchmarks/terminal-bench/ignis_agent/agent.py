@@ -43,6 +43,10 @@ _PROVIDERS: dict[str, tuple[str, str | None]] = {
     # Zhipu / BigModel — ignis hardcodes https://open.bigmodel.cn/api/paas/v4
     # (OpenAI-compatible). Only forward the key.
     "zhipu": ("ZHIPU_API_KEY", None),
+    # Volcengine Ark Coding Plan — ignis hardcodes
+    # https://ark.cn-beijing.volces.com/api/coding/v3 (OpenAI-compatible);
+    # only forward the bearer token.
+    "ark-coding": ("ARK_CODING_PLAN_TOKEN", None),
 }
 
 
