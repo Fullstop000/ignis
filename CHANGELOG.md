@@ -13,11 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - extensions: `Stop` event honours the Claude Code inversion — a `decision: "block"` on `Stop` keeps the loop alive and surfaces the reason as a `<system-reminder>` framed `"stopped continuation: <reason>"`. Lets users wire "don't stop until tests pass" guardrails without a new event.
 - extensions: `SystemPromptCompose` fires once per LLM call (not per session) — extensions can prune or rewrite the assembled system prompt (which includes git status/diff, AGENTS.md, the skills catalog, and MCP instructions) to A/B test prompt density for token-efficiency research.
 - extensions: three new example extensions — `examples/extensions/bash-deny-rm-rf/` (PreToolUse block), `examples/extensions/auto-test/` (PostToolUse `additionalContext`), `examples/extensions/system-prompt-trim/` (SystemPromptCompose rewrite).
+- Providers — Ark Coding Plan (`ark-coding`) — Volcengine's flat-fee subscription aggregating 10 models (`doubao-seed-*`, `minimax-m{2.7,3}`, `glm-5.1`, `deepseek-v4-{flash,pro}`, `kimi-k2.6`). Set `ARK_CODING_PLAN_TOKEN` and pick `ark-coding/<model>` via `/model`. ([#149](https://github.com/Fullstop000/ignis/pull/149))
+- TUI — `/settings` opens a control panel: a live **Stats** tab (context %, tokens, turns, tools, uptime) and a **Statusline** tab to show/hide individual status-bar segments. ([#151](https://github.com/Fullstop000/ignis/pull/151))
+
+### Changed
+- extensions: rename of the user-facing surface. Config lives at `~/.ignis/extensions.json` and the slash command is `/extensions` (with `/extensions list` and `/extensions reload`). v1 hook configs at `~/.ignis/hooks.json` continue to be read as a back-compat fallback, and `/hooks` remains as a deprecated alias for `/extensions`. JSON top-level key accepts either `"extensions"` (preferred) or `"hooks"` (legacy).
+
+### Fixed
+- TUI — no longer crashes at startup in a git repository whose working diff contains a multibyte character near the truncation point. ([#151](https://github.com/Fullstop000/ignis/pull/151))
+
+## [0.37.0] - 2026-06-09
+
+### Added
 - TUI — `/sessions` shows a per-row title (from the session's first message) and hides the session you're already in. ([#144](https://github.com/Fullstop000/ignis/pull/144))
 - Providers — Zhipu GLM (BigModel open platform, China) is now a built-in OpenAI-compatible provider; configure with `[providers.zhipu]` and `model = "zhipu/glm-5.1"`. ([#143](https://github.com/Fullstop000/ignis/pull/143))
 
 ### Changed
-- extensions: rename of the user-facing surface. Config lives at `~/.ignis/extensions.json` and the slash command is `/extensions` (with `/extensions list` and `/extensions reload`). v1 hook configs at `~/.ignis/hooks.json` continue to be read as a back-compat fallback, and `/hooks` remains as a deprecated alias for `/extensions`. JSON top-level key accepts either `"extensions"` (preferred) or `"hooks"` (legacy).
 - TUI — `/connect`'s final step now imports the provider's whole model list into `/model` and just picks which one is active, offering a "Keep current model" row so rotating a key needn't switch models. ([#143](https://github.com/Fullstop000/ignis/pull/143))
 
 ### Fixed

@@ -276,6 +276,57 @@ impl ModelPicker {
     }
 }
 
+/// Which tab the `/settings` control panel is showing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SettingsTab {
+    Stats,
+    Statusline,
+}
+
+impl SettingsTab {
+    /// Tab order, used to cycle with `←`/`→`/Tab.
+    const ORDER: [SettingsTab; 2] = [SettingsTab::Stats, SettingsTab::Statusline];
+}
+
+/// Footer segments the user can show/hide via `/settings` → Statusline, in
+/// footer render order. The AFK/HANDS-FREE mode badge and the update notice
+/// are intentionally absent — always shown (safety / transient).
+pub(crate) const STATUSLINE_SEGMENTS: [(&str, &str); 5] = [
+    ("cwd", "working directory"),
+    ("git", "git branch"),
+    ("turns", "turns"),
+    ("model", "model"),
+    ("tokens", "tokens / context %"),
+];
+
+/// `/settings` control panel. Stats is a read-only live view of the session;
+/// Statusline toggles which footer segments show (Space/Enter, persisted
+/// immediately like `/skills`).
+#[derive(Debug, Clone)]
+pub(crate) struct SettingsPanel {
+    pub(crate) tab: SettingsTab,
+    /// Highlighted segment row on the Statusline tab.
+    pub(crate) statusline_idx: usize,
+}
+
+impl SettingsPanel {
+    pub(crate) fn open() -> Self {
+        Self {
+            tab: SettingsTab::Stats,
+            statusline_idx: 0,
+        }
+    }
+
+    /// Cycle the active tab (`←`/`→`/Tab).
+    pub(crate) fn switch_tab(&mut self, direction: SelectionDirection) {
+        let cur = SettingsTab::ORDER
+            .iter()
+            .position(|t| *t == self.tab)
+            .unwrap_or(0);
+        self.tab = SettingsTab::ORDER[next_selection(cur, SettingsTab::ORDER.len(), direction)];
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Mode {
     Idle,
@@ -391,6 +442,19 @@ pub(crate) struct App {
     /// command, the model still receives the body. `take()`-consumed on commit;
     /// cleared at turn-end so a hook-blocked turn can't carry it into the next.
     pub(crate) pending_user_display: Option<String>,
+
+    /// `/settings` control panel (Stats | Statusline); `None` when closed.
+    pub(crate) settings_panel: Option<SettingsPanel>,
+    /// Cumulative provider-reported token usage across the whole session
+    /// (summed from every `AgentEvent::Usage`). `last_usage` keeps only the
+    /// latest turn; this is what the Stats tab totals. Reset on `/clear`.
+    pub(crate) cumulative_usage: crate::Usage,
+    /// When the current session started — for the Stats tab uptime. Reset on
+    /// `/clear` (`start_new_session`).
+    pub(crate) session_start: Instant,
+    /// Footer segments hidden via `/settings` → Statusline (segment ids).
+    /// Loaded from `state.json` at startup; empty = every segment shown.
+    pub(crate) statusline_hidden: Vec<String>,
 }
 
 impl App {
@@ -438,6 +502,10 @@ impl App {
             git_branch,
             hooks: None,
             pending_user_display: None,
+            settings_panel: None,
+            cumulative_usage: crate::Usage::default(),
+            session_start: Instant::now(),
+            statusline_hidden: Vec::new(),
         }
     }
 
@@ -609,8 +677,11 @@ impl App {
             }
             AgentEvent::RunEnd => {}
             AgentEvent::Usage(usage) => {
-                // Real provider-reported usage for the latest turn.
+                // Real provider-reported usage: `last_usage` tracks the latest
+                // turn (drives the context gauge); `cumulative_usage` totals the
+                // session (drives the Stats tab).
                 self.last_usage = Some(usage);
+                self.cumulative_usage.add(&usage);
             }
             AgentEvent::TurnEnd => {
                 self.mode = Mode::Idle;
@@ -769,6 +840,8 @@ impl App {
         self.current_chunk_idx = None;
         self.composer.reset_history_browse();
         self.last_usage = None;
+        self.cumulative_usage = crate::Usage::default();
+        self.session_start = Instant::now();
         self.pending_user_display = None;
         self.session_picker = None;
         self.add_assistant_notice(format!("Started new session `{}`.", self.session_id));
@@ -983,6 +1056,92 @@ impl App {
             .and_then(|(p, reg)| p.toggle(reg))
     }
 
+    pub(crate) fn show_settings_panel(&mut self) {
+        self.exit_pending = false;
+        self.settings_panel = Some(SettingsPanel::open());
+    }
+
+    /// Switch the settings panel's active tab (Tab / Left / Right).
+    pub(crate) fn settings_switch_tab(&mut self, direction: SelectionDirection) {
+        if let Some(p) = &mut self.settings_panel {
+            p.switch_tab(direction);
+        }
+    }
+
+    /// Move the cursor on the active tab: segment row on Statusline; no-op on
+    /// the read-only Stats tab.
+    pub(crate) fn settings_move(&mut self, direction: SelectionDirection) {
+        if let Some(p) = &mut self.settings_panel {
+            if p.tab == SettingsTab::Statusline {
+                p.statusline_idx =
+                    next_selection(p.statusline_idx, STATUSLINE_SEGMENTS.len(), direction);
+            }
+        }
+    }
+
+    /// Toggle the highlighted footer segment on the Statusline tab and persist
+    /// immediately (like `/skills`). No-op off the Statusline tab.
+    pub(crate) fn settings_toggle_statusline(&mut self) {
+        let idx = match &self.settings_panel {
+            Some(p) if p.tab == SettingsTab::Statusline => p.statusline_idx,
+            _ => return,
+        };
+        let Some((id, _)) = STATUSLINE_SEGMENTS.get(idx) else {
+            return;
+        };
+        let id = (*id).to_string();
+        if let Some(pos) = self.statusline_hidden.iter().position(|s| *s == id) {
+            self.statusline_hidden.remove(pos);
+        } else {
+            self.statusline_hidden.push(id);
+        }
+        let _ = crate::state::persist_statusline_hidden(&self.statusline_hidden);
+    }
+
+    /// Whether a footer segment id is currently shown (not hidden). Read by the
+    /// footer renderer.
+    pub(crate) fn statusline_shows(&self, id: &str) -> bool {
+        !self.statusline_hidden.iter().any(|s| s == id)
+    }
+
+    /// Close the settings panel (`Esc` / a typed char / Stats-tab `Enter`).
+    pub(crate) fn close_settings(&mut self) {
+        self.settings_panel = None;
+    }
+
+    /// User turns this session = committed user prompts.
+    pub(crate) fn turn_count(&self) -> usize {
+        self.blocks
+            .iter()
+            .filter(|b| matches!(b, UIBlock::User(_)))
+            .count()
+    }
+
+    /// Total transcript blocks (user + assistant + reasoning + tool).
+    pub(crate) fn message_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Per-tool call tally over the transcript, most-used first (ties by name).
+    pub(crate) fn tool_tally(&self) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for b in &self.blocks {
+            if let UIBlock::Tool(e) = b {
+                match counts.iter_mut().find(|(name, _)| *name == e.name) {
+                    Some(slot) => slot.1 += 1,
+                    None => counts.push((e.name.clone(), 1)),
+                }
+            }
+        }
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        counts
+    }
+
+    /// Wall-clock time since the session started (for the Stats tab uptime).
+    pub(crate) fn session_uptime(&self) -> std::time::Duration {
+        self.session_start.elapsed()
+    }
+
     pub(crate) fn render_session_history(
         &mut self,
         session_id: String,
@@ -996,6 +1155,12 @@ impl App {
         self.current_chunk_idx = None;
         self.session_picker = None;
         self.last_usage = None;
+        // Stats track this live session instance: a resumed transcript's prior
+        // token spend / uptime isn't replayed, so the Stats tab counts from the
+        // resume forward (turns/tools are still rebuilt from `blocks`). Mirrors
+        // `last_usage` resetting to None.
+        self.cumulative_usage = crate::Usage::default();
+        self.session_start = Instant::now();
         self.pending_user_display = None;
 
         if messages.is_empty() {
@@ -1552,6 +1717,7 @@ mod tests {
                 "/telemetry",
                 "/extensions",
                 "/hooks",
+                "/settings",
             ]
         );
     }
@@ -2194,5 +2360,117 @@ mod paste_tests {
         assert_eq!(app.composer.input, format!("{chip}x")); // x landed after the chip
         assert_eq!(app.composer.pending_pastes.len(), 1);
         assert_eq!(app.submit().unwrap(), "a\nb\nc\ndx");
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::{App, SettingsPanel, SettingsTab, ToolCallEntry, ToolStatus, UIBlock};
+    use crate::console::SelectionDirection;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn test_app() -> App {
+        App::new(
+            "openai".to_string(),
+            "gpt-5.5".to_string(),
+            "s".to_string(),
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    fn tool(name: &str) -> UIBlock {
+        UIBlock::Tool(ToolCallEntry {
+            id: "x".to_string(),
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+            status: ToolStatus::Pending,
+            started_at: Instant::now(),
+            elapsed_ms: 0,
+        })
+    }
+
+    #[test]
+    fn tab_switch_cycles_both_tabs_both_ways() {
+        let mut p = SettingsPanel::open();
+        assert_eq!(p.tab, SettingsTab::Stats, "opens on Stats");
+        p.switch_tab(SelectionDirection::Next);
+        assert_eq!(p.tab, SettingsTab::Statusline);
+        p.switch_tab(SelectionDirection::Next);
+        assert_eq!(p.tab, SettingsTab::Stats, "wraps around");
+        p.switch_tab(SelectionDirection::Previous);
+        assert_eq!(p.tab, SettingsTab::Statusline, "← wraps the other way");
+    }
+
+    #[test]
+    fn statusline_toggle_hides_and_persists_idempotently() {
+        let _env = crate::util::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = crate::util::unique_temp_dir("ignis-app-statusline-toggle");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        let mut app = test_app();
+        assert!(app.statusline_shows("git"), "shown by default");
+        app.show_settings_panel();
+        app.settings_switch_tab(SelectionDirection::Next); // Stats → Statusline
+        assert_eq!(
+            app.settings_panel.as_ref().unwrap().tab,
+            SettingsTab::Statusline
+        );
+        // Move to the "git" row (index 1) and toggle it off.
+        app.settings_move(SelectionDirection::Next);
+        app.settings_toggle_statusline();
+        assert!(!app.statusline_shows("git"), "git now hidden");
+        // Toggling again shows it; the set stays clean (no duplicates).
+        app.settings_toggle_statusline();
+        assert!(app.statusline_shows("git"));
+        assert!(app.statusline_hidden.is_empty());
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn turn_message_and_tool_counts_from_blocks() {
+        let mut app = test_app();
+        app.blocks.clear();
+        app.blocks.push(UIBlock::User("a".to_string()));
+        app.blocks.push(UIBlock::Assistant("hi".to_string()));
+        app.blocks.push(tool("bash"));
+        app.blocks.push(tool("bash"));
+        app.blocks.push(tool("edit_file"));
+        app.blocks.push(UIBlock::User("b".to_string()));
+
+        assert_eq!(app.turn_count(), 2, "two user prompts");
+        assert_eq!(app.message_count(), 6);
+
+        let tally = app.tool_tally();
+        assert_eq!(tally[0], ("bash".to_string(), 2), "most-used first");
+        assert_eq!(tally.iter().find(|(n, _)| n == "edit_file").unwrap().1, 1);
+    }
+
+    #[test]
+    fn cumulative_usage_sums_while_last_usage_overwrites() {
+        let mut app = test_app();
+        let u = |i: u64, o: u64| crate::Usage {
+            input_tokens: i,
+            output_tokens: o,
+            ..Default::default()
+        };
+        app.handle_event(crate::AgentEvent::Usage(u(100, 20)));
+        app.handle_event(crate::AgentEvent::Usage(u(50, 10)));
+        assert_eq!(app.cumulative_usage.input_tokens, 150);
+        assert_eq!(app.cumulative_usage.output_tokens, 30);
+        assert_eq!(
+            app.last_usage.unwrap().input_tokens,
+            50,
+            "last_usage keeps only the latest turn"
+        );
     }
 }

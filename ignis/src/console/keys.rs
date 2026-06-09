@@ -242,6 +242,10 @@ pub(crate) async fn handle_key(
     match (key.modifiers, key.code) {
         (_, KeyCode::Esc) => {
             app.clear_exit_hint();
+            if app.settings_panel.is_some() {
+                app.close_settings();
+                return;
+            }
             app.session_picker = None;
             app.model_picker = None;
             app.skill_picker = None;
@@ -382,6 +386,48 @@ pub(crate) async fn handle_key(
             }
             KeyCode::Char(_) => {
                 app.model_picker = None;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(tab) = app.settings_panel.as_ref().map(|p| p.tab) {
+        use crate::console::app::SettingsTab;
+        match key.code {
+            KeyCode::Tab | KeyCode::Right => {
+                app.settings_switch_tab(SelectionDirection::Next);
+                return;
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                app.settings_switch_tab(SelectionDirection::Previous);
+                return;
+            }
+            KeyCode::Up => {
+                app.settings_move(SelectionDirection::Previous);
+                return;
+            }
+            KeyCode::Down => {
+                app.settings_move(SelectionDirection::Next);
+                return;
+            }
+            // Space toggles a footer segment on the Statusline tab.
+            KeyCode::Char(' ') if tab == SettingsTab::Statusline => {
+                app.settings_toggle_statusline();
+                return;
+            }
+            KeyCode::Enter => {
+                match tab {
+                    // Statusline: Enter toggles like Space (stays open).
+                    SettingsTab::Statusline => app.settings_toggle_statusline(),
+                    // Stats is read-only — Enter just closes.
+                    SettingsTab::Stats => app.close_settings(),
+                }
+                return;
+            }
+            // Typing dismisses the panel, then falls through so the char lands
+            // in the composer (matches the other slash pickers' behavior).
+            KeyCode::Char(_) => {
+                app.close_settings();
             }
             _ => {}
         }
@@ -576,6 +622,7 @@ pub(crate) async fn submit_text(
         "/afk" if arg_count == 1 => handle_afk_toggle(app, picker_tx, notice_tx).await,
         "/telemetry" if arg_count == 1 => handle_telemetry_picker(app, picker_tx, notice_tx).await,
         "/extensions" | "/hooks" => handle_extensions_command(app, &text).await,
+        "/settings" if arg_count == 1 => app.show_settings_panel(),
         cmd if is_skill_command(app, cmd) => {
             let name = cmd.trim_start_matches('/').to_string();
             let reg = app.skills.clone().unwrap();

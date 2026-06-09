@@ -44,6 +44,10 @@ pub struct State {
     /// state file written before this field existed (serde defaults to None).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_check: Option<UpdateCheckState>,
+    /// Footer segments hidden via `/settings` → Statusline (segment ids like
+    /// `"git"`, `"turns"`). Empty / missing = every segment shown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statusline_hidden: Vec<String>,
 }
 
 fn state_path() -> Result<std::path::PathBuf, anyhow::Error> {
@@ -137,6 +141,14 @@ pub fn persist_update_check(check: Option<UpdateCheckState>) -> Result<(), anyho
     write_state(&state)
 }
 
+/// Persist the hidden-footer-segments set, preserving every other field.
+/// Called by the `/settings` Statusline tab on each toggle.
+pub fn persist_statusline_hidden(hidden: &[String]) -> Result<(), anyhow::Error> {
+    let mut state = load_state();
+    state.statusline_hidden = hidden.to_vec();
+    write_state(&state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +216,7 @@ mod tests {
             mode: None,
             permission_grants: vec![],
             update_check: None,
+            statusline_hidden: vec![],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -221,6 +234,7 @@ mod tests {
             mode: None,
             permission_grants: vec![],
             update_check: None,
+            statusline_hidden: vec![],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -245,6 +259,7 @@ mod tests {
             mode: None,
             permission_grants: vec![],
             update_check: None,
+            statusline_hidden: vec![],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -293,6 +308,7 @@ mod tests {
                 mode: Some(value.to_string()),
                 permission_grants: vec![],
                 update_check: None,
+                statusline_hidden: vec![],
             };
             let json = serde_json::to_string(&state).unwrap();
             let back: State = serde_json::from_str(&json).unwrap();
@@ -375,6 +391,49 @@ mod tests {
     fn update_check_none_omitted_from_json() {
         let json = serde_json::to_string(&State::default()).unwrap();
         assert!(!json.contains("update_check"));
+    }
+
+    #[test]
+    fn statusline_hidden_round_trip_and_default_omitted() {
+        let json = serde_json::to_string(&State::default()).unwrap();
+        assert!(!json.contains("statusline_hidden"), "default omits it");
+        let state = State {
+            statusline_hidden: vec!["git".to_string(), "turns".to_string()],
+            ..State::default()
+        };
+        let back: State = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(
+            back.statusline_hidden,
+            vec!["git".to_string(), "turns".to_string()]
+        );
+    }
+
+    #[test]
+    fn persist_statusline_hidden_preserves_siblings() {
+        let _env = crate::util::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = crate::util::unique_temp_dir("ignis-state-statusline-rmw");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        persist_model_selection("deepseek", "deepseek-v4-pro", Some("high")).unwrap();
+        persist_statusline_hidden(&["git".to_string()]).unwrap();
+        let s = load_state();
+        assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(s.statusline_hidden, vec!["git".to_string()]);
+
+        // Re-saving the model must not drop the hidden set.
+        persist_model_selection("openai", "gpt-5.5", None).unwrap();
+        let s = load_state();
+        assert_eq!(s.statusline_hidden, vec!["git".to_string()]);
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

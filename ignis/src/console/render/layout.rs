@@ -43,6 +43,7 @@ pub(crate) fn picker_open(app: &App) -> bool {
         || app.session_picker.is_some()
         || app.skill_picker.is_some()
         || app.mcp_picker.is_some()
+        || app.settings_panel.is_some()
 }
 
 /// Height (rows) of the inline viewport. The runner rebuilds the `Terminal`
@@ -68,7 +69,11 @@ pub(crate) fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 
         let bh = band_height(app, term_rows);
         return (ph + bh).min(cap);
     }
-    if app.session_picker.is_some() || app.skill_picker.is_some() || app.mcp_picker.is_some() {
+    if app.session_picker.is_some()
+        || app.skill_picker.is_some()
+        || app.mcp_picker.is_some()
+        || app.settings_panel.is_some()
+    {
         return cap;
     }
     band_height(app, term_rows).min(cap)

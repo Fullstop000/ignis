@@ -61,6 +61,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: Cow::Borrowed("/hooks"),
         description: Cow::Borrowed("Deprecated alias for `/extensions`."),
     },
+    SlashCommand {
+        name: Cow::Borrowed("/settings"),
+        description: Cow::Borrowed("Live session stats and status-bar segments"),
+    },
 ];
 
 pub(crate) fn slash_suggestions(

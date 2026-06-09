@@ -26,10 +26,16 @@
 #   MODEL=anthropic/claude-haiku-4-5 ./run.sh # skip the model prompt
 #   ENV=docker ./run.sh                       # skip the env prompt
 #   DRY_RUN=1 ./run.sh                        # print what would run, don't run
+#   IGNIS_VERSION=v0.38.0-rc.1 ./run.sh       # pin the in-sandbox ignis binary
+#
+# IGNIS_VERSION pins which release the sandbox installs (via the adapter's
+# `version` kwarg → install.sh IGNIS_VERSION). Use it to benchmark an RC whose
+# changes aren't in a stable release yet — `install.sh`'s default `latest`
+# skips prereleases, so an unpinned run would fetch the older stable binary.
 #
 # Env overrides (any subset): MODEL, ENV (daytona|docker|novita), DATASET,
 #                             NCONC, STORAGE_MB, TIMEOUT_MULT, MAX_RETRIES,
-#                             JOB_NAME, DRY_RUN, NO_PROMPT.
+#                             JOB_NAME, DRY_RUN, NO_PROMPT, IGNIS_VERSION.
 set -eo pipefail
 cd "$(dirname "$0")"
 
@@ -86,7 +92,9 @@ if _interactive; then
         "anthropic/claude-sonnet-4-6:anthropic/claude-sonnet-4-6" \
         "openai/gpt-5:openai/gpt-5" \
         "gemini/gemini-2-5-pro:gemini/gemini-2-5-pro" \
-        "kimi-code/k2-thinking:kimi-code/k2-thinking")"
+        "kimi-code/k2-thinking:kimi-code/k2-thinking" \
+        "zhipu/glm-5.1:zhipu/glm-5.1" \
+        "ark-coding/glm-5.1:ark-coding/glm-5.1")"
 
     [ -z "${ENV:-}" ] && ENV="$(_pick "Sandbox env:" \
         "daytona" \
@@ -111,6 +119,8 @@ case "$provider" in
     deepseek)  key_env=DEEPSEEK_API_KEY ;;
     kimi-code) key_env=KIMI_CODE_API_KEY ;;
     minimax-token-plan) key_env=MINIMAX_TOKEN_PLAN_API_KEY ;;
+    zhipu)     key_env=ZHIPU_API_KEY ;;
+    ark-coding) key_env=ARK_CODING_PLAN_TOKEN ;;
     *) echo "run.sh: unknown provider '$provider' in MODEL=$MODEL" >&2; exit 2 ;;
 esac
 _toml_key() { # $1 = section header (e.g. [web_search]); reads api_key under it.
@@ -123,9 +133,14 @@ _toml_key() { # $1 = section header (e.g. [web_search]); reads api_key under it.
         f && /^api_key/ {gsub(/^api_key *= *"/,""); gsub(/".*/,""); print; exit}
     ' "$CONFIG"
 }
-export "$key_env"="$(_toml_key "[providers.$provider]")"
-if [ -z "$(eval "echo \$$key_env")" ]; then
-    echo "run.sh: no api_key for [providers.$provider] in $CONFIG" >&2; exit 2
+# Pre-set env (e.g. ARK_CODING_PLAN_TOKEN exported from ~/.zshrc) wins; fall
+# back to the api_key in config.toml. Subscription plans put the master token
+# in shell rc, so this avoids forcing duplicate state in config.toml.
+if [ -z "${!key_env:-}" ]; then
+    export "$key_env"="$(_toml_key "[providers.$provider]")"
+fi
+if [ -z "${!key_env:-}" ]; then
+    echo "run.sh: no api_key for [providers.$provider] in $CONFIG and \$$key_env is unset" >&2; exit 2
 fi
 
 # ---------- optional web_search key (forwarded by the adapter into the sandbox)
@@ -155,6 +170,12 @@ slug="$(echo "$MODEL" | tr '/@' '--')"
 JOB_NAME="${JOB_NAME:-ignis-$slug-$ENV}"
 OUT="runs/$slug-$ENV-$ts"
 
+# ---------- optional version pin (forwarded to the adapter's `version` kwarg) --
+# Set → the sandbox installs exactly this tag instead of `latest`. Empty array
+# when unset, so the harbor invocation is unchanged for normal (latest) runs.
+version_kwarg=()
+[ -n "${IGNIS_VERSION:-}" ] && version_kwarg=(--agent-kwarg "version=$IGNIS_VERSION")
+
 # ---------- summary + confirm -------------------------------------------------
 {
     echo
@@ -162,6 +183,7 @@ OUT="runs/$slug-$ENV-$ts"
     echo "  benchmark : $DATASET"
     echo "  model     : $MODEL"
     echo "  env       : $ENV  (n=$NCONC, retries=$MAX_RETRIES, timeout x$TIMEOUT_MULT${STORAGE_MB:+, disk=${STORAGE_MB}MB})"
+    echo "  ignis ver : ${IGNIS_VERSION:-latest (install.sh resolves; skips prereleases)}"
     echo "  web_search: $([ -n "$ws_key" ] && echo "$ws_provider (key forwarded)" || echo "disabled (no key in config)")"
     echo "  output    : $OUT"
     echo "  job-name  : $JOB_NAME"
@@ -186,6 +208,7 @@ harbor run \
     -d "$DATASET" \
     -m "$MODEL" \
     --agent-import-path ignis_agent.agent:IgnisAgent \
+    "${version_kwarg[@]}" \
     -e "$ENV" \
     -n "$NCONC" \
     --max-retries "$MAX_RETRIES" \
