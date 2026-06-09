@@ -5,6 +5,11 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- TUI — `/sessions` no longer crashes when resuming a long transcript; the history is now committed to scrollback in bounded chunks instead of one oversized buffer that overflowed ratatui's cell limit. ([#155](https://github.com/Fullstop000/ignis/pull/155))
+
 ## [0.37.1] - 2026-06-09
 
 ### Added
