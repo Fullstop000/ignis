@@ -503,6 +503,22 @@ pub(crate) async fn handle_key(
         }
     }
 
+    // `r`/`R` hot-reloads the skill registry from disk while the picker stays
+    // open, so newly added / edited / removed SKILL.md files appear without a
+    // restart. Must run before `toggle_picker!`, which closes the picker on any
+    // char. The runner holds its own registry clone — signal it to rebuild too
+    // (mirrors `/connect` → ReloadConfig).
+    if app.skill_picker.is_some() && matches!(key.code, KeyCode::Char('r' | 'R')) {
+        let count = app.reload_skills(dirs::home_dir().as_deref());
+        let _ = prompt_tx.send(AgentRequest::ReloadSkills).await;
+        if count == 0 {
+            // A 0-row picker with a live selection index is a bug; close it and
+            // leave a breadcrumb in scrollback instead.
+            app.skill_picker = None;
+            app.add_assistant_notice("No skills found after reload.".to_string());
+        }
+        return;
+    }
     toggle_picker!(
         app,
         key,

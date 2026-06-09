@@ -194,7 +194,9 @@ pub async fn run_console(
     app.hooks = Some(hook_registry);
 
     let ui_skill_registry = skill_registry.clone();
-    let runner_skill_registry = skill_registry.clone();
+    // `mut` so an `AgentRequest::ReloadSkills` can swap in a freshly-scanned
+    // registry; the UI rebuilds its own `App.skills` clone in parallel.
+    let mut runner_skill_registry = skill_registry.clone();
     app.skills = Some(ui_skill_registry);
 
     let runner_mcp_registry = mcp_registry.clone();
@@ -241,6 +243,23 @@ pub async fn run_console(
                         Ok(reloaded) => agent_config = reloaded,
                         Err(e) => log::error!("ReloadConfig: failed to re-read config.toml: {e}"),
                     }
+                    continue;
+                }
+                AgentRequest::ReloadSkills => {
+                    // The user pressed `r` in the `/skills` picker; the UI
+                    // already rebuilt its own registry. Re-scan from disk here
+                    // too so the next prompt's session is built with the fresh
+                    // skill set — preserving disable choices from `state.json`.
+                    let disabled: std::collections::HashSet<String> = crate::state::load_state()
+                        .disabled_skills
+                        .into_iter()
+                        .collect();
+                    runner_skill_registry =
+                        std::sync::Arc::new(crate::skills::SkillRegistry::load(
+                            dirs::home_dir().as_deref(),
+                            &agent_cwd,
+                            disabled,
+                        ));
                     continue;
                 }
             };

@@ -141,16 +141,23 @@ impl SessionPicker {
 #[derive(Debug, Clone)]
 pub(crate) struct SkillPicker {
     pub(crate) selected: usize,
+    /// Transient one-line confirmation shown in the footer after `r` reloads
+    /// the registry (e.g. `↻ reloaded — 7 skills`). Cleared on navigation.
+    pub(crate) status: Option<String>,
 }
 
 impl SkillPicker {
     /// Open over a non-empty registry; returns `None` (so the caller can show
     /// a notice) when no skills are configured.
     pub(crate) fn open(registry: &crate::skills::SkillRegistry) -> Option<Self> {
-        (!registry.is_empty()).then_some(Self { selected: 0 })
+        (!registry.is_empty()).then_some(Self {
+            selected: 0,
+            status: None,
+        })
     }
 
     pub(crate) fn select(&mut self, direction: SelectionDirection, total: usize) {
+        self.status = None;
         self.selected = next_selection(self.selected, total, direction);
     }
 
@@ -1049,6 +1056,28 @@ impl App {
         }
     }
 
+    /// Re-scan the skill roots from disk and swap in a fresh registry,
+    /// preserving the user's enable/disable choices (re-read from `state.json`).
+    /// Returns the new skill count. If the picker is open, clamps its selection
+    /// to the new list and sets a one-line "reloaded" status. `home` is threaded
+    /// in (rather than read here) so tests can point at a temp dir; the UI side
+    /// updated here is paired with an `AgentRequest::ReloadSkills` to the runner
+    /// — its registry clone is otherwise left stale.
+    pub(crate) fn reload_skills(&mut self, home: Option<&std::path::Path>) -> usize {
+        let disabled: std::collections::HashSet<String> = crate::state::load_state()
+            .disabled_skills
+            .into_iter()
+            .collect();
+        let registry = crate::skills::SkillRegistry::load(home, &self.cwd, disabled);
+        let count = registry.all().len();
+        self.skills = Some(std::sync::Arc::new(registry));
+        if let Some(p) = &mut self.skill_picker {
+            p.selected = p.selected.min(count.saturating_sub(1));
+            p.status = Some(format!("↻ reloaded — {count} skills"));
+        }
+        count
+    }
+
     pub(crate) fn select_skill_picker(&mut self, direction: SelectionDirection) {
         let total = self.skills.as_deref().map(|r| r.all().len()).unwrap_or(0);
         if let Some(p) = &mut self.skill_picker {
@@ -1405,6 +1434,76 @@ mod copy_tests {
             matches!(last, UIBlock::Assistant(text) if text == "Copied to clipboard."),
             "Expected success notice, got {:?}",
             last
+        );
+    }
+
+    fn write_skill(skills_root: &std::path::Path, name: &str) {
+        let dir = skills_root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill {name}\n---\nbody"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reload_skills_picks_up_new_skill_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join(".ignis/skills");
+        write_skill(&skills_root, "alpha");
+
+        let mut app = test_app();
+        app.cwd = tmp.path().to_path_buf();
+        app.skills = Some(std::sync::Arc::new(crate::skills::SkillRegistry::load(
+            None,
+            &app.cwd,
+            std::collections::HashSet::new(),
+        )));
+        app.show_skill_picker();
+        assert_eq!(app.skills.as_deref().unwrap().all().len(), 1);
+
+        // A new skill lands on disk after the picker is already open.
+        write_skill(&skills_root, "beta");
+
+        let count = app.reload_skills(None);
+
+        assert_eq!(count, 2, "reload should re-scan disk and see the new skill");
+        assert_eq!(app.skills.as_deref().unwrap().all().len(), 2);
+        assert_eq!(
+            app.skill_picker.as_ref().unwrap().status.as_deref(),
+            Some("↻ reloaded — 2 skills"),
+        );
+    }
+
+    #[test]
+    fn reload_skills_clamps_selection_when_skills_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join(".ignis/skills");
+        for name in ["alpha", "beta", "gamma"] {
+            write_skill(&skills_root, name);
+        }
+
+        let mut app = test_app();
+        app.cwd = tmp.path().to_path_buf();
+        app.skills = Some(std::sync::Arc::new(crate::skills::SkillRegistry::load(
+            None,
+            &app.cwd,
+            std::collections::HashSet::new(),
+        )));
+        app.show_skill_picker();
+        app.skill_picker.as_mut().unwrap().selected = 2; // last row
+
+        std::fs::remove_dir_all(skills_root.join("beta")).unwrap();
+        std::fs::remove_dir_all(skills_root.join("gamma")).unwrap();
+
+        let count = app.reload_skills(None);
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            app.skill_picker.as_ref().unwrap().selected,
+            0,
+            "selection clamps to the new last row",
         );
     }
 
