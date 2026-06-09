@@ -762,7 +762,52 @@ pub async fn run_console(
     // disables raw mode + bracketed paste on the way out (clean exit, `?`-bubbled
     // Err returns, and panics).
     terminal.show_cursor()?;
+
+    // Leave a copy-pasteable resume hint below the band, like `claude --resume
+    // <id>`. We only reach this line on a clean Ctrl+D exit — every error path
+    // `?`-bubbles earlier — so it never fires on a crash. Skipped when the user
+    // sent nothing: an untouched session has nothing worth resuming. Uses
+    // `app.session_id`, which tracks the *current* session after any mid-run
+    // `/resume` or `/clear`, not the id we opened with.
+    if app.turn_count() > 0 {
+        let session_id = app.session_id.clone();
+        // Row just below the live band. The inline viewport anchors near the
+        // top after a short-history re-anchor and at the screen bottom in
+        // normal use; reading its area keeps the hint flush under the footer
+        // either way (vs. jumping to the screen bottom and leaving a gap).
+        let band_bottom = terminal.get_frame().size().bottom();
+        // Restore cooked mode first so `\n` and colors render normally.
+        drop(_term_guard);
+        let _ = print_resume_hint(&session_id, band_bottom);
+    }
     Ok(())
+}
+
+/// Print a `ignis --resume <id>` hint below the live band, where the shell
+/// prompt returns after exit. Best-effort: terminal I/O errors are swallowed —
+/// the session already ended cleanly and a missing hint is harmless.
+fn print_resume_hint(session_id: &str, band_bottom: u16) -> io::Result<()> {
+    use crossterm::{
+        cursor::MoveTo,
+        style::{Color, Print, ResetColor, SetForegroundColor},
+    };
+    execute!(
+        io::stdout(),
+        // Land just under the band (clamped to the screen, scrolls if needed),
+        // then a blank separator line before the hint.
+        MoveTo(0, band_bottom),
+        Print("\r\n"),
+        SetForegroundColor(Color::DarkGrey),
+        Print("Resume this session with:\r\n"),
+        ResetColor,
+        SetForegroundColor(Color::Rgb {
+            r: 0xcb,
+            g: 0xa6,
+            b: 0xf7,
+        }),
+        Print(format!("  ignis --resume {session_id}\r\n")),
+        ResetColor,
+    )
 }
 
 /// Prefix used to label the assistant block that carries an
