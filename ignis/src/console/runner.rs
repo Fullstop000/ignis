@@ -132,17 +132,17 @@ pub async fn run_console(
     // Apply the persisted `/settings` Statusline choices (hidden footer
     // segments) before the first render.
     app.statusline_hidden = crate::state::load_state().statusline_hidden;
-    // Context windows: config override → cached models.dev → compaction threshold.
-    // The cache loads instantly; refresh runs in the background for next launch.
+    // Model windows: config override → cached models.dev → compaction threshold.
+    // Each model's resolved window is baked into `model_options`; the footer
+    // gauge derives the active one from there on demand (see `App::context_window`),
+    // with the compaction threshold as the fallback. The cache loads instantly;
+    // refresh runs in the background for next launch.
     let catalog = crate::llm::catalog::load();
     app.fallback_context_window = config.compaction.threshold_tokens;
-    app.set_context_window(
-        config
-            .active_context(&catalog)
-            .map(|c| c as usize)
-            .unwrap_or(config.compaction.threshold_tokens),
-    );
     app.set_model_options(config.model_options(&catalog), config.active_effort());
+    // Keep the catalog so the footer gauge can resolve an active model that
+    // isn't in `model_options` (an un-baked, undeclared model only models.dev knows).
+    app.model_catalog = catalog;
     tokio::spawn(crate::llm::catalog::refresh_if_stale());
 
     // Render inline in the normal buffer: finalized blocks are pushed into the

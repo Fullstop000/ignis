@@ -266,20 +266,21 @@ impl ModelPicker {
         self.effort_idx = next_selection(self.effort_idx, levels, direction);
     }
 
-    /// Resolve the picker's selection into `(provider, model, effort, context_window)`
-    /// for the caller to apply. Effort is `None` when the model declares no
-    /// levels; context_window is `None` when the option doesn't declare one.
+    /// Resolve the picker's selection into `(provider, model, effort)` for the
+    /// caller to apply. Effort is `None` when the model declares no levels. The
+    /// caller retargets the context gauge from `model_options` separately, so
+    /// the window isn't surfaced here.
     pub(crate) fn resolve(
         &self,
         options: &[crate::llm::ModelOption],
-    ) -> Option<(String, String, Option<String>, Option<u64>)> {
+    ) -> Option<(String, String, Option<String>)> {
         let opt = options.get(self.selected)?;
         let effort = if opt.effort_levels.is_empty() {
             None
         } else {
             opt.effort_levels.get(self.effort_idx).cloned()
         };
-        Some((opt.provider.clone(), opt.model.clone(), effort, opt.context))
+        Some((opt.provider.clone(), opt.model.clone(), effort))
     }
 }
 
@@ -356,6 +357,11 @@ pub(crate) struct App {
     pub(crate) session_picker: Option<SessionPicker>,
     /// Choices for the `/model` picker, flattened from config.
     pub(crate) model_options: Vec<crate::llm::ModelOption>,
+    /// models.dev windows, keyed by model id — the fallback source for an active
+    /// model that isn't listed in `model_options` (e.g. a config `model` naming
+    /// a provider model ignis hasn't baked and the user hasn't declared). See
+    /// [`App::context_window`].
+    pub(crate) model_catalog: crate::llm::ModelCatalog,
     pub(crate) model_picker: Option<ModelPicker>,
     pub(crate) skill_picker: Option<SkillPicker>,
     pub(crate) mcp_picker: Option<McpPicker>,
@@ -409,11 +415,10 @@ pub(crate) struct App {
     pub(crate) error_flash: Option<(String, Instant)>,
     pub(crate) exit_pending: bool,
 
-    /// Token budget the context-usage % is measured against (the active model's
-    /// window, or the fallback below). Estimated, not exact.
-    pub(crate) context_window: usize,
-    /// Window to use when the active model's context is unknown (the compaction
-    /// threshold) — so the gauge never sticks to a previous model's window.
+    /// Window to use when the active model declares no context (the compaction
+    /// threshold). The active model's actual window is derived on demand from
+    /// `model_options` — see [`App::context_window`] — so it can't drift out of
+    /// sync with the selection.
     pub(crate) fallback_context_window: usize,
 
     /// Prompts typed while busy, waiting to fire after the current turn (FIFO).
@@ -486,6 +491,7 @@ impl App {
             slash_selection: 0,
             session_picker: None,
             model_options: Vec::new(),
+            model_catalog: crate::llm::ModelCatalog::default(),
             model_picker: None,
             skill_picker: None,
             mcp_picker: None,
@@ -504,7 +510,6 @@ impl App {
             should_quit: false,
             error_flash: None,
             exit_pending: false,
-            context_window: 120_000,
             fallback_context_window: 120_000,
             queue: Vec::new(),
             pending_injects: Vec::new(),
@@ -531,8 +536,24 @@ impl App {
         self.git_branch = super::git::branch(&self.cwd);
     }
 
-    pub(crate) fn set_context_window(&mut self, window: usize) {
-        self.context_window = window;
+    /// The active model's context window — the token budget the usage % is
+    /// measured against. Resolved on demand (config override → baked spec →
+    /// models.dev) so it can't drift out of sync with the selection the way a
+    /// cached copy each model switch had to refresh did:
+    /// - `model_options` covers every UI-switchable model (the picker/connect
+    ///   build it, folding config overrides, baked specs, and models.dev);
+    /// - the models.dev `model_catalog` covers an active model that isn't listed
+    ///   there — e.g. a config `model` naming an un-baked, undeclared provider
+    ///   model that only models.dev knows;
+    /// - the compaction threshold is the last-resort fallback.
+    fn context_window(&self) -> usize {
+        self.model_options
+            .iter()
+            .find(|o| o.provider == self.provider && o.model == self.model)
+            .and_then(|o| o.context)
+            .or_else(|| self.model_catalog.context_for(&self.model))
+            .map(|c| c as usize)
+            .unwrap_or(self.fallback_context_window)
     }
 
     /// Estimated tokens used by the whole transcript (chars/4). Estimate, not
@@ -563,7 +584,7 @@ impl App {
             _ => self.context_tokens() as u64,
         };
         let pct = (tokens as usize * 100)
-            .checked_div(self.context_window)
+            .checked_div(self.context_window())
             .map(|p| p.min(100))
             .unwrap_or(0) as u8;
         (tokens, pct)
@@ -1034,15 +1055,10 @@ impl App {
     /// close the picker, and return `(provider, model, effort)` to act on.
     pub(crate) fn apply_model_selection(&mut self) -> Option<(String, String, Option<String>)> {
         let picker = self.model_picker.take()?;
-        let (provider, model, effort, context) = picker.resolve(&self.model_options)?;
+        let (provider, model, effort) = picker.resolve(&self.model_options)?;
         self.provider = provider.clone();
         self.model = model.clone();
         self.effort = effort.clone();
-        // Retarget the footer's context gauge to the new model's window, falling
-        // back when it's unknown so the % isn't measured against the old model.
-        self.context_window = context
-            .map(|c| c as usize)
-            .unwrap_or(self.fallback_context_window);
         Some((provider, model, effort))
     }
 
@@ -1887,10 +1903,9 @@ mod tests {
     }
 
     #[test]
-    fn switching_models_retargets_context_window() {
+    fn context_window_tracks_active_model() {
         let mut app = test_app();
         app.fallback_context_window = 100_000;
-        app.context_window = 500_000; // pretend a prior known window
         app.set_model_options(
             vec![
                 crate::llm::ModelOption {
@@ -1914,15 +1929,58 @@ mod tests {
             effort_idx: 0,
         });
         app.apply_model_selection();
-        assert_eq!(app.context_window, 1_000_000);
-        // Switch to an unknown-context model → gauge resets to the fallback,
-        // not the previous model's window.
+        assert_eq!(app.context_window(), 1_000_000);
+        // Switch to an unknown-context model → gauge falls back, never sticking
+        // to the previous model's window.
         app.model_picker = Some(ModelPicker {
             selected: 1,
             effort_idx: 0,
         });
         app.apply_model_selection();
-        assert_eq!(app.context_window, 100_000);
+        assert_eq!(app.context_window(), 100_000);
+    }
+
+    #[test]
+    fn context_window_follows_connect_switch_without_explicit_refresh() {
+        // Regression: the footer's gauge must follow a `/connect` model switch
+        // (which sets `provider`/`model` + rebuilds the list but does NOT touch
+        // any cached window) the same as the `/model` picker. Previously a cached
+        // `context_window` left the % measured against the *prior* model's window
+        // — the 120k compaction fallback — so a freshly-connected 1M model showed
+        // `MiniMax-M3 · 107.5k tok (89%)` instead of ~11%. Deriving on demand
+        // means simply adopting the selection is enough.
+        let mut app = test_app();
+        app.fallback_context_window = 120_000;
+        app.set_model_options(
+            vec![crate::llm::ModelOption {
+                provider: "minimax-token-plan".to_string(),
+                model: "MiniMax-M3".to_string(),
+                effort_levels: vec![],
+                context: Some(1_000_000),
+            }],
+            None,
+        );
+        // Exactly what the `Switched` arm does: adopt the new selection.
+        app.provider = "minimax-token-plan".to_string();
+        app.model = "MiniMax-M3".to_string();
+        assert_eq!(app.context_window(), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_resolves_active_model_from_models_dev_when_unlisted() {
+        // An active model that isn't in `model_options` (un-baked, undeclared)
+        // but is known to models.dev must still use its real window, not the
+        // compaction fallback — preserving the old `active_context` behavior.
+        let mut app = test_app();
+        app.fallback_context_window = 120_000;
+        app.set_model_options(vec![], None);
+        app.model_catalog = crate::llm::ModelCatalog::from_entries([("ad-hoc-model", 512_000)]);
+        app.provider = "some-provider".to_string();
+        app.model = "ad-hoc-model".to_string();
+        assert_eq!(app.context_window(), 512_000);
+        // Unknown to both → compaction fallback.
+        app.model = "totally-unknown".to_string();
+        assert_eq!(app.context_window(), 120_000);
     }
 
     fn picker_app() -> App {

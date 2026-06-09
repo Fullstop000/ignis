@@ -85,14 +85,6 @@ impl ProviderConfig {
             .map(|m| m.reasoning().to_vec())
             .unwrap_or_default()
     }
-
-    /// Config-declared context window for `model` (the explicit override).
-    pub(crate) fn context(&self, model: &str) -> Option<u64> {
-        self.models
-            .iter()
-            .find(|m| m.name() == model)
-            .and_then(|m| m.context())
-    }
 }
 
 /// One selectable entry in the `/model` picker.

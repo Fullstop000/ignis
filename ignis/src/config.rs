@@ -400,26 +400,6 @@ impl Config {
         }
         out
     }
-
-    /// Context window of the active model: its config-declared override, else the
-    /// models.dev catalog value.
-    pub fn active_context(&self, catalog_dev: &ModelCatalog) -> Option<u64> {
-        let (provider, model) = self.active_selection()?;
-        if let Some(c) = self
-            .providers
-            .get(&provider)
-            .and_then(|p| p.context(&model))
-        {
-            return Some(c);
-        }
-        if let Some(c) = providers::lookup(&provider)
-            .and_then(|s| s.models.iter().find(|m| m.name == model))
-            .and_then(|m| m.context)
-        {
-            return Some(c);
-        }
-        catalog_dev.context_for(&model)
-    }
 }
 
 pub fn load_config() -> Result<Config, anyhow::Error> {
@@ -703,12 +683,12 @@ models = [{ name = "deepseek-v4-flash", context = 128000 }]
             .find(|o| o.model == "deepseek-v4-flash")
             .unwrap();
         assert_eq!(chat.context, Some(128000));
-        assert_eq!(cfg.active_context(&ModelCatalog::default()), Some(128000));
     }
 
     #[test]
     fn baked_context_is_used_when_no_override() {
-        // Kimi's window is baked into the catalog (models.dev doesn't know it).
+        // Kimi's window is baked into the catalog (models.dev doesn't know it),
+        // so it surfaces in the model list with no config `context` override.
         let cfg: Config = toml::from_str(
             r#"
 model = "kimi-code/kimi-for-coding"
@@ -717,7 +697,9 @@ api_key = "x"
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.active_context(&ModelCatalog::default()), Some(262144));
+        let opts = cfg.model_options(&ModelCatalog::default());
+        let kimi = opts.iter().find(|o| o.model == "kimi-for-coding").unwrap();
+        assert_eq!(kimi.context, Some(262144));
     }
 
     #[test]
