@@ -1,25 +1,38 @@
-//! Integration test for the Linux Landlock sandbox installed in
-//! `hooks::dispatch::run_hook`.
+//! Integration test for the filesystem sandbox installed in
+//! `hooks::dispatch::run_hook` — Linux Landlock and macOS Seatbelt.
 //!
-//! Skipped on non-Linux: Landlock is a Linux LSM. On Linux but a kernel
-//! without Landlock support, the sandbox degrades to NotEnforced and the
-//! "leak" hook can still write — we only verify the call doesn't panic in
-//! that case.
+//! Skipped on every other target (the sandbox primitive is OS-specific).
+//! On Linux with a kernel that lacks Landlock the sandbox degrades to
+//! `NotEnforced`; we detect that and downgrade the write-block assertion
+//! to a smoke test (no panic). macOS Seatbelt is available on every
+//! supported version (10.5+), so there is no equivalent escape hatch.
 //!
 //! The two tests assert opposite behaviours under the same hook script:
 //!
-//! - sandbox ON → write to $HOME blocked (file does not appear)
-//! - sandbox OFF → write to $HOME succeeds (file appears)
+//! - sandbox ON  → write to a non-allowlisted dir is blocked (file absent)
+//! - sandbox OFF → that write succeeds (file present)
 //!
 //! Together they pin the security contract: the default is the safe one;
 //! the opt-out is observable.
+//!
+//! ## Liveness signal (why the hook emits `updatedInput`)
+//!
+//! A naive "did the leak file appear?" test has a false-pass hole: if the
+//! sandbox profile is so tight the hook never *starts* (e.g. `/bin/sh`
+//! can't exec, or the stdout pipe can't be written), the leak file is also
+//! absent — for the wrong reason. So the hook emits
+//! `{"hookSpecificOutput":{"updatedInput":"HOOK_RAN"}}`, which surfaces as
+//! `PromptHookResult::Continue("HOOK_RAN")`. Asserting on that proves the
+//! hook executed *and* wrote to its stdout pipe under the sandbox — a
+//! necessary condition for any hook to function. Only then is "leak file
+//! absent" meaningful as "the forbidden write was denied".
 
-#![cfg(all(unix, target_os = "linux"))]
+#![cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use ignis::hooks::{HookContext, HookRegistry, HookSpec, HooksConfig};
+use ignis::hooks::{HookContext, HookRegistry, HookSpec, HooksConfig, PromptHookResult};
 use tokio::sync::mpsc;
 
 fn write_executable(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
@@ -31,14 +44,22 @@ fn write_executable(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// Tries to probe whether this kernel actually enforces Landlock. We don't
-/// fail the test when it doesn't — Landlock is a kernel feature, not an
-/// ignis bug. The integration test then becomes a smoke test: we verify
-/// the dispatcher doesn't crash, and skip the "did the write actually fail"
-/// assertion.
-fn landlock_available() -> bool {
-    // Raw syscall: `landlock_create_ruleset(NULL, 0, 1)` returns the supported
-    // ABI version on success, -1 (ENOSYS) on kernels without Landlock.
+/// Whether the kernel will actually enforce the sandbox on this host.
+///
+/// * **macOS** — Seatbelt (`sandbox_init`) is present on every supported
+///   version, so enforcement is unconditional.
+/// * **Linux** — probe Landlock with a raw
+///   `landlock_create_ruleset(NULL, 0, 1)`: returns the supported ABI
+///   version (>= 1) on success, -1 (ENOSYS) on kernels without Landlock.
+///   When absent the sandbox degrades to `NotEnforced` and we skip the
+///   write-block assertion rather than fail on a kernel gap.
+#[cfg(target_os = "macos")]
+fn sandbox_enforced() -> bool {
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_enforced() -> bool {
     const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
     let ret = unsafe {
         libc::syscall(
@@ -51,45 +72,48 @@ fn landlock_available() -> bool {
     ret >= 1
 }
 
-#[tokio::test]
-async fn sandboxed_hook_cannot_write_outside_tmpdir() {
-    // Layout:
-    //   /tmp/<home>/.ignis/leak.sh    — the hook script (in $TMPDIR is fine)
-    //   <leak_dir>/leak-from-hook.txt — the file the hook tries to create.
-    //                                   `leak_dir` is INTENTIONALLY built
-    //                                   under cargo's target/ so it's NOT
-    //                                   under /tmp (which IS in the write
-    //                                   allowlist). A real $HOME wouldn't
-    //                                   be under /tmp; the test mirrors that.
-    let home = tempfile::tempdir().unwrap();
-    let ignis_dir = home.path().join(".ignis");
-    std::fs::create_dir_all(&ignis_dir).unwrap();
+/// A hook that drains stdin, tries to write `leak_path`, then emits a
+/// liveness signal on stdout. The leak write is the security-relevant
+/// action; the `updatedInput` proves the hook ran regardless of whether
+/// that write succeeded.
+fn leak_hook_body(leak_path: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+cat >/dev/null
+echo "leaked" > "{leak_path}"
+printf '%s' '{{"hookSpecificOutput":{{"updatedInput":"HOOK_RAN"}}}}'
+"#
+    )
+}
+
+/// Build a leak path under cargo's per-test temp dir. That dir lives under
+/// the crate's `target/`, which on a normal checkout is NOT under `/tmp`
+/// or `/var/tmp` (the only write-allowlisted roots), so a sandboxed hook
+/// must be denied the write. (If you check the repo out *under* /tmp this
+/// assumption breaks — same caveat as any sandbox allowlist test.)
+fn fresh_leak_path(tag: &str) -> PathBuf {
     let leak_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
     std::fs::create_dir_all(leak_dir).unwrap();
-    let leak_path = leak_dir.join(format!(
-        "leak-from-hook-{}.txt",
+    let p = leak_dir.join(format!(
+        "{tag}-{}.txt",
         std::process::id() as u64 * 1000
             + std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .subsec_nanos() as u64
     ));
-    // Pre-cleanup in case a previous run crashed mid-test.
-    let _ = std::fs::remove_file(&leak_path);
-    let leak_str = leak_path.to_string_lossy();
+    let _ = std::fs::remove_file(&p);
+    p
+}
 
+async fn run_leak_hook(sandbox: bool, leak_path: &Path) -> PromptHookResult {
+    let home = tempfile::tempdir().unwrap();
+    let ignis_dir = home.path().join(".ignis");
+    std::fs::create_dir_all(&ignis_dir).unwrap();
     let hook = write_executable(
         &ignis_dir,
         "leak.sh",
-        &format!(
-            r#"#!/bin/sh
-cat >/dev/null
-# Sandboxed: this write must FAIL because $HOME is not in the write allowlist.
-# Sandbox off: this write succeeds, the test asserts the file exists.
-echo "leaked" > "{leak_str}"
-printf '{{}}'
-"#
-        ),
+        &leak_hook_body(&leak_path.to_string_lossy()),
     );
 
     let cfg = HooksConfig {
@@ -98,38 +122,48 @@ printf '{{}}'
             args: vec![],
             timeout_ms: 5_000,
             env: vec![],
-            sandbox: true,
+            sandbox,
         }],
         assistant_message_render: vec![],
     };
     let reg = HookRegistry::from_config(cfg);
     let (tx, _rx) = mpsc::channel(8);
-    let _ = reg
-        .run_user_prompt_submit(
-            "x",
-            HookContext {
-                session_id: "s",
-                cwd: "/tmp",
-            },
-            &tx,
-        )
-        .await;
+    reg.run_user_prompt_submit(
+        "x",
+        HookContext {
+            session_id: "s",
+            cwd: "/tmp",
+        },
+        &tx,
+    )
+    .await
+}
 
-    if landlock_available() {
-        // The kernel enforces Landlock — the hook's write to $HOME MUST have
-        // been denied. The script's `echo > file` failed silently; the file
-        // never got created.
+#[tokio::test]
+async fn sandboxed_hook_cannot_write_outside_tmpdir() {
+    let leak_path = fresh_leak_path("leak-from-hook");
+    let result = run_leak_hook(true, &leak_path).await;
+
+    // Liveness: the hook executed and wrote its JSON to the stdout pipe
+    // under the sandbox. If this fails the profile is too tight (the hook
+    // never started or couldn't talk back) — a different, louder failure
+    // than "the write was denied", and we want to see it distinctly.
+    assert_eq!(
+        result,
+        PromptHookResult::Continue("HOOK_RAN".to_string()),
+        "hook did not run/communicate under the sandbox — profile likely too tight"
+    );
+
+    if sandbox_enforced() {
         assert!(
             !leak_path.exists(),
-            "sandbox failed: {} was created by the hook despite Landlock",
+            "sandbox failed: {} was created by the hook despite the sandbox",
             leak_path.display()
         );
     } else {
-        // Landlock not in this kernel: just verify the dispatcher didn't
-        // panic. The write may or may not have succeeded.
         eprintln!(
-            "Landlock not available on this kernel; skipping write-block assertion. \
-             leak_path.exists() = {}",
+            "sandbox not enforced on this host (Linux without Landlock); \
+             skipping write-block assertion. leak_path.exists() = {}",
             leak_path.exists()
         );
     }
@@ -137,62 +171,17 @@ printf '{{}}'
 
 #[tokio::test]
 async fn unsandboxed_hook_can_write_outside_tmpdir() {
-    // Same fixture but `sandbox: false` — the hook's write to a non-/tmp
-    // path should succeed. Pins the opt-out as observable.
-    let home = tempfile::tempdir().unwrap();
-    let ignis_dir = home.path().join(".ignis");
-    std::fs::create_dir_all(&ignis_dir).unwrap();
-    let leak_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
-    std::fs::create_dir_all(leak_dir).unwrap();
-    let leak_path = leak_dir.join(format!(
-        "leak-no-sandbox-{}.txt",
-        std::process::id() as u64 * 1000
-            + std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos() as u64
-    ));
-    let _ = std::fs::remove_file(&leak_path);
-    let leak_str = leak_path.to_string_lossy();
+    // With `sandbox: false` the write must always succeed, on either OS.
+    // If this fails, env_clear stripped something critical (e.g. PATH so
+    // `/bin/sh` couldn't find `cat`) or the spawn failed outright.
+    let leak_path = fresh_leak_path("leak-no-sandbox");
+    let result = run_leak_hook(false, &leak_path).await;
 
-    let hook = write_executable(
-        &ignis_dir,
-        "leak.sh",
-        &format!(
-            r#"#!/bin/sh
-cat >/dev/null
-echo "leaked" > "{leak_str}"
-printf '{{}}'
-"#
-        ),
+    assert_eq!(
+        result,
+        PromptHookResult::Continue("HOOK_RAN".to_string()),
+        "unsandboxed hook did not run/communicate"
     );
-
-    let cfg = HooksConfig {
-        user_prompt_submit: vec![HookSpec {
-            program: hook,
-            args: vec![],
-            timeout_ms: 5_000,
-            env: vec![],
-            sandbox: false,
-        }],
-        assistant_message_render: vec![],
-    };
-    let reg = HookRegistry::from_config(cfg);
-    let (tx, _rx) = mpsc::channel(8);
-    let _ = reg
-        .run_user_prompt_submit(
-            "x",
-            HookContext {
-                session_id: "s",
-                cwd: "/tmp",
-            },
-            &tx,
-        )
-        .await;
-
-    // With sandbox off the write must always succeed, Landlock present or
-    // not. If this assertion fails, env_clear stripped something critical
-    // (e.g. PATH so /bin/sh couldn't find `cat`) or the spawn failed.
     assert!(
         leak_path.exists(),
         "expected hook to write {} when sandbox is disabled",
