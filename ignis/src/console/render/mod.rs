@@ -31,7 +31,8 @@ pub(crate) use blocks::{block_lines, welcome_lines};
 pub(crate) use layout::{band_height, viewport_height};
 use layout::{input_height, picker_open, MODEL_PICKER_MAX_OPTION_ROWS};
 pub(crate) use pickers::{
-    render_mcp_picker, render_model_picker, render_session_picker, render_skill_picker,
+    render_mcp_picker, render_model_picker, render_session_picker, render_settings_panel,
+    render_skill_picker,
 };
 pub(crate) use widgets::{
     draw_footer, draw_input, draw_loading, draw_queued, draw_slash_suggestions,
@@ -189,6 +190,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         let max_rows = (body_area.height as usize).saturating_sub(3).max(1);
         let mut lines: Vec<Line> = Vec::new();
         render_mcp_picker(&mut lines, picker, app.mcp.as_deref(), max_rows);
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().bg(BG))
+                .wrap(Wrap { trim: false }),
+            body_area,
+        );
+    } else if let Some(panel) = &app.settings_panel {
+        let mut lines: Vec<Line> = Vec::new();
+        render_settings_panel(&mut lines, panel, app);
         f.render_widget(
             Paragraph::new(Text::from(lines))
                 .style(Style::default().bg(BG))
@@ -464,9 +474,10 @@ mod queue_render_tests {
 mod tests {
     use super::*;
     use crate::console::app::{Mode, SessionPicker, ToolCallEntry, ToolStatus, UIBlock};
+    use crate::console::format_context;
     use crate::console::render::layout::model_picker_height;
     use crate::console::render::tool_block::compact_tool_args;
-    use crate::console::{format_context, DIFF_ADD_BG, DIFF_DEL_BG};
+    use crate::console::{DIFF_ADD_BG, DIFF_DEL_BG, PEACH, RED, YELLOW};
     use ratatui::{backend::TestBackend, Terminal};
     use std::path::PathBuf;
 
@@ -762,8 +773,6 @@ mod tests {
 
     #[test]
     fn render_reasoning_shows_header_and_dim_color() {
-        use crate::console::colors::TEXT_DIM;
-
         let mut app = App::new(
             "test".to_string(),
             "model".to_string(),
@@ -1140,7 +1149,6 @@ mod tests {
 
     #[test]
     fn render_footer_hands_free_badge_is_peach() {
-        use crate::console::colors::PEACH;
         use crate::permissions::{runtime::PermissionState, Mode as PermMode};
 
         let mut app = App::new(
@@ -1178,7 +1186,6 @@ mod tests {
 
     #[test]
     fn render_footer_fully_unattended_badge_is_red() {
-        use crate::console::colors::RED;
         use crate::permissions::{runtime::PermissionState, Mode as PermMode};
 
         let mut app = App::new(
@@ -1234,7 +1241,6 @@ mod tests {
     #[test]
     fn render_footer_shows_update_segment_when_notice_set() {
         use crate::cli::upgrade::UpdateNotice;
-        use crate::console::colors::YELLOW;
 
         let mut app = App::new(
             "openai".to_string(),

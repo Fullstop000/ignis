@@ -15,8 +15,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::console::app::{App, Mode};
 use crate::console::composer::PendingPaste;
 use crate::console::{
-    format_tokens, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, PEACH, RED, SUBTEXT,
-    SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
+    format_tokens, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, GREEN, PEACH, RED,
+    SUBTEXT, SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
 };
 
 /// Max queued rows shown before collapsing to a "+N more" row.
@@ -155,22 +155,34 @@ fn display_cwd(cwd: &std::path::Path) -> String {
 /// indicator that you're auto-approving tool calls — it pays for itself the
 /// first time it stops a user from thinking they're in default mode.
 pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    use crate::console::colors::{GREEN, PEACH};
     use crate::permissions::Mode as PermissionMode;
 
     let (ctx_tokens, ctx_pct) = app.context_usage();
-    let model_str = match &app.effort {
-        Some(e) => format!("{}/{} ({})", app.provider, app.model, e),
-        None => format!("{}/{}", app.provider, app.model),
+    // Right cluster: model + tokens, each independently toggleable via
+    // /settings → Statusline. `·`-joined; empty string when both are hidden.
+    let mut right_parts: Vec<String> = Vec::new();
+    if app.statusline_shows("model") {
+        right_parts.push(match &app.effort {
+            Some(e) => format!("{}/{} ({})", app.provider, app.model, e),
+            None => format!("{}/{}", app.provider, app.model),
+        });
+    }
+    if app.statusline_shows("tokens") {
+        right_parts.push(format!(
+            "{} tok ({}%)",
+            format_tokens(ctx_tokens as usize),
+            ctx_pct
+        ));
+    }
+    let right_str = if right_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}  ", right_parts.join("  ·  "))
     };
-    let right_str = format!(
-        " {}  ·  {} tok ({}%) ",
-        model_str,
-        format_tokens(ctx_tokens as usize),
-        ctx_pct
-    );
 
     // Mode badge: empty under Off (default), peach " HANDS-FREE ", red " AFK ".
+    // Always shown (not user-hideable) — it's the only signal you're
+    // auto-approving tool calls.
     let badge = match app.permissions.as_ref().map(|p| p.mode()) {
         Some(PermissionMode::HandsFree) => Some((" HANDS-FREE ", PEACH)),
         Some(PermissionMode::FullyUnattended) => Some((" AFK ", RED)),
@@ -184,21 +196,30 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Min(0), Constraint::Length(right_w)])
         .split(area);
 
-    // Left side: cwd, optionally followed by the update-notice segment in
-    // yellow. We append rather than replace cwd so the user keeps the
-    // always-on directory context; on a narrow terminal the notice gets
-    // truncated by ratatui's normal wrapping, which is the same fate any
-    // long cwd already faces.
-    let cwd_span = Span::styled(
-        format!("  {}", display_cwd(&app.cwd)),
-        Style::default().fg(TEXT_DIM),
-    );
-    let mut left_spans = vec![cwd_span];
+    // Left side: cwd · git branch · theme · turns, each toggleable, then the
+    // always-on update notice. All on the flexible `Min(0)` cell so the
+    // optional segments truncate before the fixed-width right cluster.
+    let mut left_spans: Vec<Span> = Vec::new();
+    if app.statusline_shows("cwd") {
+        left_spans.push(Span::styled(
+            format!("  {}", display_cwd(&app.cwd)),
+            Style::default().fg(TEXT_DIM),
+        ));
+    }
     // Git branch (oh-my-zsh `git:(branch)` style) when cwd is in a work tree.
-    if let Some(branch) = &app.git_branch {
-        left_spans.push(Span::styled("  git:(", Style::default().fg(TEXT_DIM)));
-        left_spans.push(Span::styled(branch.clone(), Style::default().fg(GREEN)));
-        left_spans.push(Span::styled(")", Style::default().fg(TEXT_DIM)));
+    if app.statusline_shows("git") {
+        if let Some(branch) = &app.git_branch {
+            left_spans.push(Span::styled("  git:(", Style::default().fg(TEXT_DIM)));
+            left_spans.push(Span::styled(branch.clone(), Style::default().fg(GREEN)));
+            left_spans.push(Span::styled(")", Style::default().fg(TEXT_DIM)));
+        }
+    }
+    // Live turn count.
+    if app.statusline_shows("turns") {
+        left_spans.push(Span::styled(
+            format!("   {} turns", app.turn_count()),
+            Style::default().fg(TEXT_DIM),
+        ));
     }
     if app.update_notice.is_some() {
         left_spans.push(Span::styled(

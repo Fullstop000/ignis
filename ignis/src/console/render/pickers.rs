@@ -7,9 +7,13 @@ use ratatui::{
 };
 
 use crate::cli::sessions::{format_timestamp_short, SessionDetail, TurnEvent};
-use crate::console::app::{McpPicker, ModelPicker, SessionPicker, SessionPickerMode, SkillPicker};
+use crate::console::app::{
+    App, McpPicker, ModelPicker, SessionPicker, SessionPickerMode, SettingsPanel, SettingsTab,
+    SkillPicker, STATUSLINE_SEGMENTS,
+};
 use crate::console::{
-    format_context, truncate, ACCENT, BG, GREEN, MAUVE, RED, SUBTEXT, TEXT, TEXT_DIM,
+    format_context, format_elapsed, format_tokens, truncate, ACCENT, BG, GREEN, MAUVE, RED,
+    SUBTEXT, TEXT, TEXT_DIM,
 };
 
 use super::widgets::picker_window;
@@ -795,6 +799,185 @@ pub(crate) fn render_model_picker(
         "  Up/Down model · ←/→ effort · Enter apply · Esc cancel",
         Style::default().fg(TEXT_DIM),
     )));
+}
+
+/// `/settings` control panel — a tab bar (Stats | Statusline) over the active
+/// tab's body. Reads `App` directly for the live Stats view.
+pub(crate) fn render_settings_panel(
+    lines: &mut Vec<Line<'static>>,
+    panel: &SettingsPanel,
+    app: &App,
+) {
+    lines.push(Line::from(""));
+    // Title + tab bar: active tab reverse-highlighted in the accent color.
+    let mut header = vec![Span::styled(
+        "  ⚙ Settings   ",
+        Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
+    )];
+    for (label, active) in [
+        ("Stats", panel.tab == SettingsTab::Stats),
+        ("Statusline", panel.tab == SettingsTab::Statusline),
+    ] {
+        let style = if active {
+            Style::default()
+                .fg(BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT_DIM)
+        };
+        header.push(Span::styled(format!(" {label} "), style));
+        header.push(Span::raw(" "));
+    }
+    lines.push(Line::from(header));
+    lines.push(Line::from(""));
+
+    match panel.tab {
+        SettingsTab::Stats => render_stats_tab(lines, app),
+        SettingsTab::Statusline => render_statusline_tab(lines, panel, app),
+    }
+
+    lines.push(Line::from(""));
+    let hint = match panel.tab {
+        SettingsTab::Stats => "  ←/→ tab · Esc close",
+        SettingsTab::Statusline => "  ←/→ tab · ↑/↓ move · Space toggle · Esc close",
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(TEXT_DIM),
+    )));
+}
+
+/// Footer-segment checklist — Space/Enter toggles each segment on/off. The
+/// mode badge is intentionally not listed (always shown for safety).
+fn render_statusline_tab(lines: &mut Vec<Line<'static>>, panel: &SettingsPanel, app: &App) {
+    for (i, (id, label)) in STATUSLINE_SEGMENTS.iter().enumerate() {
+        let selected = i == panel.statusline_idx;
+        let marker = if selected { ">" } else { " " };
+        let check = if app.statusline_shows(id) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let style = if selected {
+            Style::default()
+                .fg(BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {marker} {check} "),
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled((*label).to_string(), style),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        "      ( AFK / HANDS-FREE badge is always shown )",
+        Style::default().fg(TEXT_DIM),
+    )));
+}
+
+/// Live read-only stats for the current session.
+fn render_stats_tab(lines: &mut Vec<Line<'static>>, app: &App) {
+    let label = Style::default().fg(TEXT_DIM);
+    let val = Style::default().fg(TEXT);
+    let mut row = |k: &str, spans: Vec<Span<'static>>| {
+        let mut l = vec![Span::styled(format!("  {:<9}", k), label)];
+        l.extend(spans);
+        lines.push(Line::from(l));
+    };
+
+    // Context gauge (against the active model's window).
+    let (ctx_tokens, ctx_pct) = app.context_usage();
+    let bar_w = 14usize;
+    let filled = (ctx_pct as usize * bar_w / 100).min(bar_w);
+    let bar: String = "█".repeat(filled) + &"░".repeat(bar_w - filled);
+    row(
+        "context",
+        vec![
+            Span::styled(bar, Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("  {ctx_pct}%  ({} tok)", format_tokens(ctx_tokens as usize)),
+                val,
+            ),
+        ],
+    );
+
+    // Cumulative session tokens.
+    let u = &app.cumulative_usage;
+    row(
+        "tokens",
+        vec![Span::styled(
+            format!(
+                "\u{2191} {}   \u{2193} {}",
+                format_tokens(u.input_tokens as usize),
+                format_tokens(u.output_tokens as usize)
+            ),
+            val,
+        )],
+    );
+    if u.cache_read_tokens > 0 || u.cache_write_tokens > 0 {
+        row(
+            "cache",
+            vec![Span::styled(
+                format!(
+                    "read {}   write {}",
+                    format_tokens(u.cache_read_tokens as usize),
+                    format_tokens(u.cache_write_tokens as usize)
+                ),
+                val,
+            )],
+        );
+    }
+
+    // Turns / messages.
+    row(
+        "turns",
+        vec![Span::styled(
+            format!(
+                "{}   \u{00b7}   {} msgs",
+                app.turn_count(),
+                app.message_count()
+            ),
+            val,
+        )],
+    );
+
+    // Top tools.
+    let tally = app.tool_tally();
+    if tally.is_empty() {
+        row("tools", vec![Span::styled("\u{2014}".to_string(), label)]);
+    } else {
+        let shown: Vec<String> = tally
+            .iter()
+            .take(4)
+            .map(|(n, c)| format!("{n} {c}"))
+            .collect();
+        let mut s = shown.join(" \u{00b7} ");
+        let extra = tally.len().saturating_sub(4);
+        if extra > 0 {
+            s.push_str(&format!(" \u{00b7} +{extra}"));
+        }
+        row("tools", vec![Span::styled(s, val)]);
+    }
+
+    // Uptime + active model.
+    row(
+        "uptime",
+        vec![Span::styled(
+            format_elapsed(app.session_uptime().as_millis()),
+            val,
+        )],
+    );
+    let model = match &app.effort {
+        Some(e) => format!("{}/{} ({e})", app.provider, app.model),
+        None => format!("{}/{}", app.provider, app.model),
+    };
+    row("model", vec![Span::styled(model, val)]);
 }
 
 #[cfg(test)]

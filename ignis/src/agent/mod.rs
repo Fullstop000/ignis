@@ -143,11 +143,25 @@ fn get_git_diff() -> String {
         .unwrap_or_default();
     if output.trim().is_empty() {
         "No changes".to_string()
-    } else if output.len() > 2000 {
-        format!("{}... (truncated)", &output[..2000])
     } else {
-        output
+        truncate_diff_for_context(output)
     }
+}
+
+/// Cap a git diff to ~2000 bytes for the system-prompt context, truncating on
+/// a UTF-8 char boundary. A raw `&output[..2000]` panics when byte 2000 lands
+/// inside a multibyte char (e.g. a `↑`/`·` in a diff) — which crashed the whole
+/// TUI at startup whenever the working tree had such a diff.
+fn truncate_diff_for_context(output: String) -> String {
+    const MAX: usize = 2000;
+    if output.len() <= MAX {
+        return output;
+    }
+    let mut end = MAX;
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", &output[..end])
 }
 
 fn get_current_date() -> String {
@@ -1184,6 +1198,24 @@ mod tests {
     use super::*;
     use crate::skills::SkillRegistry;
     use std::collections::HashSet;
+
+    #[test]
+    fn truncate_diff_respects_char_boundaries() {
+        // 700 × '↑' (3 bytes each) = 2100 bytes; byte 2000 is mid-char, which
+        // a raw `&s[..2000]` would panic on.
+        let s = "↑".repeat(700);
+        assert!(s.len() > 2000);
+        let out = truncate_diff_for_context(s);
+        assert!(out.ends_with("... (truncated)"));
+        let body = out.trim_end_matches("... (truncated)");
+        assert!(body.len() <= 2000);
+        assert!(body.chars().all(|c| c == '↑'), "no partial char leaked");
+    }
+
+    #[test]
+    fn truncate_diff_passes_short_diffs_through() {
+        assert_eq!(truncate_diff_for_context("short".to_string()), "short");
+    }
 
     #[test]
     fn with_catalog_appends_when_skills_present() {

@@ -128,6 +128,9 @@ pub async fn run_console(
     hook_registry: crate::hooks::HookRegistry,
 ) -> Result<(), anyhow::Error> {
     let mut app = App::new(provider_name, model_name, session_id, cwd.clone());
+    // Apply the persisted `/settings` Statusline choices (hidden footer
+    // segments) before the first render.
+    app.statusline_hidden = crate::state::load_state().statusline_hidden;
     // Context windows: config override → cached models.dev → compaction threshold.
     // The cache loads instantly; refresh runs in the background for next launch.
     let catalog = crate::llm::catalog::load();

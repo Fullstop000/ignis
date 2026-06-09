@@ -57,6 +57,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
             "List registered hooks (`/hooks`) or reload ~/.ignis/hooks.json (`/hooks reload`)",
         ),
     },
+    SlashCommand {
+        name: Cow::Borrowed("/settings"),
+        description: Cow::Borrowed("Live session stats and status-bar segments"),
+    },
 ];
 
 pub(crate) fn slash_suggestions(
