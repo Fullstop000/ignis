@@ -506,11 +506,13 @@ pub(crate) async fn handle_key(
     // `r`/`R` hot-reloads the skill registry from disk while the picker stays
     // open, so newly added / edited / removed SKILL.md files appear without a
     // restart. Must run before `toggle_picker!`, which closes the picker on any
-    // char. The runner holds its own registry clone — signal it to rebuild too
-    // (mirrors `/connect` → ReloadConfig).
+    // char. Hand the runner the *same* rebuilt registry so both keep sharing one
+    // `Arc` — later toggles stay live, as they were before the reload.
     if app.skill_picker.is_some() && matches!(key.code, KeyCode::Char('r' | 'R')) {
         let count = app.reload_skills(dirs::home_dir().as_deref());
-        let _ = prompt_tx.send(AgentRequest::ReloadSkills).await;
+        if let Some(registry) = app.skills.clone() {
+            let _ = prompt_tx.send(AgentRequest::ReloadSkills(registry)).await;
+        }
         if count == 0 {
             // A 0-row picker with a live selection index is a bug; close it and
             // leave a breadcrumb in scrollback instead.
@@ -1237,6 +1239,66 @@ mod tests {
             "/connect must start the connect flow, not be blocked by the gate"
         );
         assert_ne!(last_notice(&app).as_deref(), Some(NO_PROVIDER_HINT));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn r_in_skill_picker_hands_runner_the_same_registry_arc() {
+        // Regression (codex review on #157): reload must not let the UI and the
+        // runner diverge onto separate registries. Pressing `r` rebuilds
+        // `App.skills` and sends the runner the SAME `Arc`, so a later toggle
+        // (interior mutability) stays visible to the next prompt — the shared-
+        // registry behavior that held before any reload.
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        let tmp = crate::util::unique_temp_dir("ignis-keys-skill-reload");
+        let dir = tmp.join(".ignis/skills/demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: demo\n---\nbody").unwrap();
+
+        let mut app = test_app();
+        app.cwd = tmp.clone();
+        app.skills = Some(Arc::new(crate::skills::SkillRegistry::load(
+            None,
+            &tmp,
+            HashSet::new(),
+        )));
+        app.show_skill_picker();
+
+        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (c_tx, _c_rx) = mpsc::channel::<()>(1);
+        let inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &p_tx,
+            &c_tx,
+            &inject,
+            std::path::Path::new("/tmp"),
+            &pk_tx,
+            &n_tx,
+        )
+        .await;
+
+        let ui_reg = app
+            .skills
+            .clone()
+            .expect("UI keeps a registry after reload");
+        match p_rx
+            .try_recv()
+            .expect("pressing r must send ReloadSkills to the runner")
+        {
+            AgentRequest::ReloadSkills(runner_reg) => assert!(
+                Arc::ptr_eq(&runner_reg, &ui_reg),
+                "runner must receive the SAME registry Arc the UI holds"
+            ),
+            other => panic!(
+                "expected ReloadSkills, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        assert!(app.skill_picker.is_some(), "picker stays open after reload");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

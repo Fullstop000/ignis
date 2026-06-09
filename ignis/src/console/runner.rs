@@ -245,21 +245,12 @@ pub async fn run_console(
                     }
                     continue;
                 }
-                AgentRequest::ReloadSkills => {
-                    // The user pressed `r` in the `/skills` picker; the UI
-                    // already rebuilt its own registry. Re-scan from disk here
-                    // too so the next prompt's session is built with the fresh
-                    // skill set — preserving disable choices from `state.json`.
-                    let disabled: std::collections::HashSet<String> = crate::state::load_state()
-                        .disabled_skills
-                        .into_iter()
-                        .collect();
-                    runner_skill_registry =
-                        std::sync::Arc::new(crate::skills::SkillRegistry::load(
-                            dirs::home_dir().as_deref(),
-                            &agent_cwd,
-                            disabled,
-                        ));
+                AgentRequest::ReloadSkills(registry) => {
+                    // The user pressed `r` in the `/skills` picker. Adopt the
+                    // *same* registry the UI just built, so both share one `Arc`
+                    // — a later enable/disable toggle (interior mutability) is
+                    // then visible to the next prompt without another reload.
+                    runner_skill_registry = registry;
                     continue;
                 }
             };
