@@ -255,6 +255,13 @@ pub(crate) async fn handle_key(
             app.request_exit();
             return;
         }
+        // Ctrl+O: collapse/expand reasoning. Global so it works mid-thought
+        // (re-renders the live preview) and at idle (re-renders past thoughts).
+        (m, KeyCode::Char('o')) if m.contains(KeyModifiers::CONTROL) => {
+            app.clear_exit_hint();
+            app.toggle_reasoning_expanded();
+            return;
+        }
         (m, KeyCode::Char('c'))
             if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
         {

@@ -5,7 +5,18 @@
 
 use crate::console::app::App;
 
+use super::blocks::REASONING_PREVIEW_LINES;
 use super::widgets::{queued_region_height, MAX_SLASH_ROWS};
+
+/// Rows reserved above the band for the live reasoning preview: the header +
+/// the rolling window. Zero unless a thought is streaming in collapsed mode.
+pub(crate) fn reasoning_preview_height(app: &App) -> u16 {
+    if app.live_reasoning().is_some() {
+        1 + REASONING_PREVIEW_LINES as u16
+    } else {
+        0
+    }
+}
 
 /// Height (rows) of the bottom band — status line + queued strip + slash
 /// suggestions + input box + footer. Independent of the transcript above it.
@@ -76,7 +87,9 @@ pub(crate) fn viewport_height(app: &App, term_cols: u16, term_rows: u16) -> u16 
     {
         return cap;
     }
-    band_height(app, term_rows).min(cap)
+    // No picker: the band fills the viewport, plus the reasoning preview region
+    // (if a thought is streaming collapsed) sits above it.
+    (band_height(app, term_rows) + reasoning_preview_height(app)).min(cap)
 }
 
 /// Natural height (rows) of the `/model` picker content. Used by
