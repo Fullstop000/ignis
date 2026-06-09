@@ -805,9 +805,28 @@ fn print_resume_hint(session_id: &str, band_bottom: u16) -> io::Result<()> {
             g: 0xa6,
             b: 0xf7,
         }),
-        Print(format!("  ignis --resume {session_id}\r\n")),
+        Print(format!(
+            "  ignis --resume {}\r\n",
+            quote_session_id(session_id)
+        )),
         ResetColor,
     )
+}
+
+/// Render a session id for the resume hint. Generated ids
+/// (`session-<ts>-<hex>`) print bare; but `--resume <id>` accepts an arbitrary
+/// user-supplied id verbatim, so one with spaces or shell metacharacters is
+/// single-quoted to stay copy-pasteable.
+fn quote_session_id(id: &str) -> String {
+    let safe = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'));
+    if safe {
+        id.to_string()
+    } else {
+        format!("'{}'", id.replace('\'', r"'\''"))
+    }
 }
 
 /// Prefix used to label the assistant block that carries an
@@ -959,6 +978,21 @@ mod tests {
     use crate::{AgentEvent, Message};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    #[test]
+    fn quote_session_id_keeps_generated_ids_bare_and_quotes_unsafe() {
+        // Generated ids (`session-<ts>-<hex>`) print bare, matching the example.
+        assert_eq!(
+            quote_session_id("session-1700000000-ab12cd34"),
+            "session-1700000000-ab12cd34"
+        );
+        // User-supplied `--resume <id>` reaches the hint verbatim; spaces and
+        // shell metacharacters get single-quoted so a paste stays one argument.
+        assert_eq!(quote_session_id("my work"), "'my work'");
+        assert_eq!(quote_session_id("a;rm -rf x"), "'a;rm -rf x'");
+        assert_eq!(quote_session_id("it's"), r"'it'\''s'");
+        assert_eq!(quote_session_id(""), "''");
+    }
 
     fn write_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
