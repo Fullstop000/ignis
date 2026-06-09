@@ -30,9 +30,11 @@
 //!   `/private/tmp` (same for `/var`). User-facing tools open the
 //!   pre-resolution path but Seatbelt matches the post-resolution
 //!   path. We emit both forms so a hook that writes `/tmp/foo` is
-//!   matched against the underlying `/private/tmp/foo`. This is
-//!   inferred from documented Seatbelt behaviour and **unverified**
-//!   on macOS hardware from this Linux host — see PR notes.
+//!   matched against the underlying `/private/tmp/foo`. The `/var`
+//!   rewrite is **verified on macOS 15.6 ARM64**: the sandboxed
+//!   integration test runs its hook script from a `/var/folders/…`
+//!   temp dir, which only becomes readable because of the
+//!   `/var`→`/private/var` mirror line.
 
 use std::ffi::{CStr, CString};
 use std::io;
