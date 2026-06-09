@@ -58,27 +58,7 @@ pub(crate) fn block_lines(
             }
         }
         UIBlock::Reasoning(text) => {
-            if text.is_empty() {
-                return lines;
-            }
-            lines.push(Line::from(""));
-            // Header row — the marker line that says "this block is the
-            // model's chain-of-thought, not the reply." Dim+italic so it's
-            // visually subordinate to the assistant blocks that follow.
-            lines.push(Line::from(Span::styled(
-                "✻ Thinking",
-                Style::default().fg(TEXT_DIM).add_modifier(Modifier::ITALIC),
-            )));
-            // Body — plain dim text, no markdown. Reasoning streams are
-            // prose-y and rarely contain code fences; rendering them as
-            // markdown would create heading/list noise from natural language.
-            for raw_line in text.lines() {
-                let line = Line::from(Span::styled(
-                    format!("  {}", sanitize(raw_line)),
-                    Style::default().fg(TEXT_DIM),
-                ));
-                lines.extend(wrap_line(&line, width, 2));
-            }
+            lines.extend(reasoning_full_lines(text, width));
         }
         UIBlock::Tool(entry) => {
             // The `ask_user` tool has its own purpose-built scrollback line
@@ -105,6 +85,111 @@ pub(crate) fn block_lines(
         }
     }
     lines
+}
+
+/// Live rolling-preview window: how many reasoning body rows show while a
+/// thought streams in collapsed mode. The region is this + 1 header row.
+pub(crate) const REASONING_PREVIEW_LINES: usize = 3;
+
+/// Below this line count a collapsed thought isn't worth truncating — it
+/// commits in full instead of a lead + "(N more lines)" hint.
+const REASONING_COLLAPSE_MIN: usize = 4;
+
+/// The full chain-of-thought block (expanded look, and the resume render):
+/// dim+italic `✻ Thinking` header over plain dim body lines (no markdown —
+/// reasoning is prose, markdown would invent heading/list noise).
+pub(crate) fn reasoning_full_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if text.is_empty() {
+        return lines;
+    }
+    lines.push(Line::from(""));
+    lines.push(reasoning_header(None));
+    for raw_line in text.lines() {
+        let line = Line::from(Span::styled(
+            format!("  {}", sanitize(raw_line)),
+            Style::default().fg(TEXT_DIM),
+        ));
+        lines.extend(wrap_line(&line, width, 2));
+    }
+    lines
+}
+
+/// The collapsed committed form (Claude-Code style): the lead line of the
+/// thought + a dim `… (N more lines, ctrl+o to expand)` hint. Short thoughts
+/// (≤ `REASONING_COLLAPSE_MIN` lines) commit in full — nothing to hide.
+pub(crate) fn reasoning_collapsed_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let all: Vec<&str> = text.lines().collect();
+    if all.len() <= REASONING_COLLAPSE_MIN {
+        return reasoning_full_lines(text, width);
+    }
+    let lead = all
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .copied()
+        .unwrap_or("");
+    let mut lines = vec![Line::from(""), reasoning_header(None)];
+    let lead_line = Line::from(Span::styled(
+        format!("  {}", sanitize(lead)),
+        Style::default().fg(TEXT_DIM),
+    ));
+    lines.extend(wrap_line(&lead_line, width, 2));
+    lines.push(Line::from(Span::styled(
+        format!("  … ({} more lines, ctrl+o to expand)", all.len() - 1),
+        Style::default().fg(TEXT_DIM).add_modifier(Modifier::ITALIC),
+    )));
+    lines
+}
+
+/// The transient live preview while a thought streams in collapsed mode: the
+/// `✻ Thinking` header with a spinner over a fixed `REASONING_PREVIEW_LINES`-row
+/// window of the *last* reasoning rows, rolling as more text arrives. Always
+/// returns exactly `1 + REASONING_PREVIEW_LINES` rows (front-padded with blanks)
+/// so the region's height never jitters mid-thought.
+pub(crate) fn reasoning_preview_lines(text: &str, spinner: &str, width: u16) -> Vec<Line<'static>> {
+    let mut out = vec![reasoning_header(Some(spinner))];
+    // Wrap a generous tail, then keep the last N visual rows.
+    let tail = tail_lines(text, REASONING_PREVIEW_LINES * 2);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for raw in tail.lines() {
+        let line = Line::from(Span::styled(
+            format!("  {}", sanitize(raw)),
+            Style::default().fg(TEXT_DIM),
+        ));
+        rows.extend(wrap_line(&line, width, 2));
+    }
+    let start = rows.len().saturating_sub(REASONING_PREVIEW_LINES);
+    let mut body = rows.split_off(start);
+    while body.len() < REASONING_PREVIEW_LINES {
+        body.insert(0, Line::from(""));
+    }
+    out.extend(body);
+    out
+}
+
+/// `✻ Thinking` marker, dim+italic, optionally trailed by a spinner frame.
+fn reasoning_header(spinner: Option<&str>) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        "✻ Thinking",
+        Style::default().fg(TEXT_DIM).add_modifier(Modifier::ITALIC),
+    )];
+    if let Some(s) = spinner {
+        spans.push(Span::styled(format!(" {s}"), Style::default().fg(ACCENT)));
+    }
+    Line::from(spans)
+}
+
+/// The last `n` newline-delimited lines of `text` (reverse scan, O(n)). Fewer
+/// than `n` lines → the whole text. Mirrors kimi's `_tail_lines`.
+fn tail_lines(text: &str, n: usize) -> &str {
+    let mut pos = text.len();
+    for _ in 0..n {
+        match text[..pos].rfind('\n') {
+            Some(i) => pos = i,
+            None => return text,
+        }
+    }
+    &text[pos + 1..]
 }
 
 /// Columns of leading spaces on a line (its natural indent).
@@ -496,5 +581,69 @@ mod tests {
         let joined = flatten(&lines);
         assert!(joined.contains('╰'), "still has a gutter line: {joined:?}");
         assert!(joined.contains("(no output)"), "{joined:?}");
+    }
+
+    #[test]
+    fn tail_lines_keeps_last_n() {
+        assert_eq!(tail_lines("a\nb\nc\nd", 2), "c\nd");
+        // Fewer than n lines → whole text.
+        assert_eq!(tail_lines("a\nb", 5), "a\nb");
+        // No trailing newline → the partial last line is included.
+        assert_eq!(tail_lines("one\ntwo\nthree", 1), "three");
+    }
+
+    #[test]
+    fn collapsed_reasoning_shows_lead_and_count() {
+        let text = (1..=125)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = flatten(&reasoning_collapsed_lines(&text, 80));
+        assert!(out.contains("✻ Thinking"), "{out:?}");
+        assert!(out.contains("line 1"), "lead line shown: {out:?}");
+        assert!(
+            !out.contains("line 2"),
+            "body hidden when collapsed: {out:?}"
+        );
+        assert!(
+            out.contains("… (124 more lines, ctrl+o to expand)"),
+            "hint with hidden count: {out:?}"
+        );
+    }
+
+    #[test]
+    fn short_reasoning_commits_in_full_not_collapsed() {
+        // ≤ REASONING_COLLAPSE_MIN lines: nothing to hide, render the whole thing.
+        let text = "first\nsecond\nthird";
+        let out = flatten(&reasoning_collapsed_lines(text, 80));
+        assert!(out.contains("first") && out.contains("third"), "{out:?}");
+        assert!(!out.contains("more lines"), "no truncation hint: {out:?}");
+    }
+
+    #[test]
+    fn reasoning_preview_is_fixed_height_with_rolling_tail() {
+        let text = "alpha\nbravo\ncharlie\ndelta\necho";
+        let out = reasoning_preview_lines(text, "⠹", 80);
+        // Exactly header + REASONING_PREVIEW_LINES rows, always.
+        assert_eq!(out.len(), 1 + REASONING_PREVIEW_LINES);
+        let joined = flatten(&out);
+        assert!(joined.contains("✻ Thinking"), "{joined:?}");
+        assert!(joined.contains('⠹'), "spinner present: {joined:?}");
+        // Rolling window = the last 3 lines; older ones scrolled off.
+        assert!(
+            joined.contains("echo") && joined.contains("charlie"),
+            "{joined:?}"
+        );
+        assert!(
+            !joined.contains("alpha"),
+            "oldest line rolled off: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_preview_pads_short_content_to_fixed_height() {
+        // One line of thought still reserves the full region (front-padded).
+        let out = reasoning_preview_lines("just started", "⠋", 80);
+        assert_eq!(out.len(), 1 + REASONING_PREVIEW_LINES);
     }
 }

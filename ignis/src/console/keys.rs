@@ -255,6 +255,18 @@ pub(crate) async fn handle_key(
             app.request_exit();
             return;
         }
+        // Ctrl+O: collapse/expand reasoning. Global so it works mid-thought
+        // (re-renders the live preview) and at idle (re-renders past thoughts).
+        // No-op while a picker owns the screen — toggling re-commits the whole
+        // transcript (a /resume-style wipe) which would scribble behind the
+        // open picker. Still consumed so it never types a literal 'o' into one.
+        (m, KeyCode::Char('o')) if m.contains(KeyModifiers::CONTROL) => {
+            if !crate::console::render::layout::picker_open(app) {
+                app.clear_exit_hint();
+                app.toggle_reasoning_expanded();
+            }
+            return;
+        }
         (m, KeyCode::Char('c'))
             if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
         {
@@ -1211,5 +1223,45 @@ mod tests {
         assert_ne!(last_notice(&app).as_deref(), Some(NO_PROVIDER_HINT));
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    async fn press_ctrl_o(app: &mut App) {
+        let (p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (c_tx, _c_rx) = mpsc::channel::<()>(1);
+        let inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
+        handle_key(
+            app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &p_tx,
+            &c_tx,
+            &inject,
+            std::path::Path::new("/tmp"),
+            &pk_tx,
+            &n_tx,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_toggles_reasoning_at_idle() {
+        let mut app = test_app();
+        assert!(!app.reasoning_expanded);
+        press_ctrl_o(&mut app).await;
+        assert!(app.reasoning_expanded, "ctrl+o expands");
+        press_ctrl_o(&mut app).await;
+        assert!(!app.reasoning_expanded, "ctrl+o collapses again");
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_is_noop_while_a_picker_is_open() {
+        // A slash picker owns the screen; toggling would re-commit the
+        // transcript behind it, so Ctrl+O must do nothing (but stay consumed).
+        let mut app = test_app();
+        app.show_settings_panel();
+        press_ctrl_o(&mut app).await;
+        assert!(
+            !app.reasoning_expanded,
+            "ctrl+o must not toggle behind an open picker"
+        );
     }
 }

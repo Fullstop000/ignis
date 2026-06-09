@@ -12,7 +12,7 @@ use std::io;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-use crate::console::app::App;
+use crate::console::app::{App, UIBlock};
 use crate::console::format::AgentRequest;
 use crate::console::inline_picker;
 use crate::console::keys::{handle_key, ActiveInject};
@@ -655,7 +655,16 @@ pub async fn run_console(
             let block = &app.blocks[app.committed];
             let done = app.block_done(app.committed);
             let rows = if done {
-                render::block_lines(block, app.tick, &app.cwd, width)
+                // A finished thought commits its collapsed breadcrumb (lead +
+                // "(N more lines, ctrl+o to expand)") unless expanded.
+                match block {
+                    UIBlock::Reasoning(t) if !app.reasoning_expanded => {
+                        render::reasoning_collapsed_lines(t, width)
+                    }
+                    _ => render::block_lines(block, app.tick, &app.cwd, width),
+                }
+            } else if matches!(block, UIBlock::Reasoning(_)) && !app.reasoning_expanded {
+                break; // collapsed thought still streaming: the live preview owns it
             } else if render::stream_commit::is_streamed(block) {
                 render::stream_commit::stable_rows(block, app.tick, &app.cwd, width)
             } else {

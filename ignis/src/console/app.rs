@@ -390,6 +390,14 @@ pub(crate) struct App {
     /// scroll-up history. Cleared by the runner once handled.
     pub(crate) pending_screen_clear: bool,
 
+    /// Reasoning verbosity, toggled live by Ctrl+O. `false` (default) collapses
+    /// chain-of-thought: while a thought streams it shows as a fixed 3-line
+    /// rolling preview (not committed), and finalizes to a one-line
+    /// `✻ Thinking … (N more lines, ctrl+o to expand)` breadcrumb. `true` streams
+    /// the full thought into scrollback. Session-only; resets to collapsed each
+    /// run. Flipping it re-commits the whole transcript in the new mode.
+    pub(crate) reasoning_expanded: bool,
+
     pub(crate) should_quit: bool,
     pub(crate) error_flash: Option<(String, Instant)>,
     pub(crate) exit_pending: bool,
@@ -485,6 +493,7 @@ impl App {
             committed: 0,
             committed_rows: 0,
             pending_screen_clear: false,
+            reasoning_expanded: false,
             should_quit: false,
             error_flash: None,
             exit_pending: false,
@@ -853,6 +862,31 @@ impl App {
     fn reset_transcript_view(&mut self) {
         self.committed_rows = 0;
         self.pending_screen_clear = true;
+    }
+
+    /// Flip collapsed↔expanded reasoning (Ctrl+O) and re-commit the whole
+    /// transcript in the new mode. Reuses the `/resume` re-anchor: rewind the
+    /// commit cursor to row 0 and ask the runner to wipe + repaint, so every
+    /// past thought re-renders collapsed or full — the "(ctrl+o to expand)" hint
+    /// is honest. `blocks` (with full reasoning text) is untouched.
+    pub(crate) fn toggle_reasoning_expanded(&mut self) {
+        self.reasoning_expanded = !self.reasoning_expanded;
+        self.committed = 0;
+        self.reset_transcript_view();
+    }
+
+    /// The in-progress reasoning text when a collapsed live preview should own
+    /// its display — a `Reasoning` block is streaming and we're not expanded.
+    /// `None` when expanded, or the current block isn't reasoning. Drives both
+    /// the preview region's height (`reasoning_preview_height`) and its content.
+    pub(crate) fn live_reasoning(&self) -> Option<&str> {
+        if self.reasoning_expanded {
+            return None;
+        }
+        match self.current_chunk_idx.and_then(|i| self.blocks.get(i)) {
+            Some(UIBlock::Reasoning(t)) => Some(t.as_str()),
+            _ => None,
+        }
     }
 
     pub(crate) fn show_session_picker(
@@ -2137,6 +2171,58 @@ mod tests {
         assert!(
             matches!(app.blocks.last(), Some(UIBlock::Reasoning(s)) if s == "hmm let me think")
         );
+    }
+
+    fn reasoning_msg() -> crate::Message {
+        crate::Message {
+            role: "assistant".to_string(),
+            content: None,
+            reasoning_content: Some(String::new()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn ctrl_o_toggles_reasoning_and_rewinds_commit() {
+        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        app.committed = 5;
+        assert!(!app.reasoning_expanded);
+        app.toggle_reasoning_expanded();
+        assert!(app.reasoning_expanded);
+        // Rewinds the commit cursor + asks the runner to wipe & repaint, so every
+        // past thought re-renders in the new mode (the /resume re-anchor).
+        assert_eq!(app.committed, 0);
+        assert!(app.pending_screen_clear);
+        app.toggle_reasoning_expanded();
+        assert!(!app.reasoning_expanded, "flips back");
+    }
+
+    #[test]
+    fn live_reasoning_tracks_streaming_collapsed_thought() {
+        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        assert_eq!(app.live_reasoning(), None, "no thought yet");
+
+        app.handle_event(AgentEvent::MessageStart {
+            message: reasoning_msg(),
+        });
+        app.handle_event(AgentEvent::MessageUpdate {
+            delta: "weighing options".to_string(),
+        });
+        assert_eq!(app.live_reasoning(), Some("weighing options"));
+
+        // Expanded mode suppresses the preview (the full thought streams instead).
+        app.reasoning_expanded = true;
+        assert_eq!(app.live_reasoning(), None);
+        app.reasoning_expanded = false;
+
+        // Once the thought finalizes there's no live preview to own.
+        app.handle_event(AgentEvent::MessageEnd {
+            message: reasoning_msg(),
+        });
+        assert_eq!(app.live_reasoning(), None);
     }
 
     #[test]
