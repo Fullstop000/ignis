@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUI — press `r` in the `/skills` picker to reload skills from disk, picking up newly added, edited, or removed skills without restarting. ([#157](https://github.com/Fullstop000/ignis/pull/157))
 - TUI — exiting with `Ctrl+D` prints a copy-pasteable `ignis --resume <id>` hint so you can pick the session back up. ([#158](https://github.com/Fullstop000/ignis/pull/158))
 
+### Changed
+- Internal — the inline TUI's re-anchor/commit state machine (screen-clear episodes, resize settle, commit row budget) is extracted from event-loop locals into a pure `render::anchor` module whose historical bugs (#138, #140, #154, #155) are now table-driven regression tests. No user-visible change.
+
 ### Fixed
 - TUI — on WSL2/conpty, the conversation no longer stays blank after you send a message while the agent keeps working; inline rendering recovers instead of only repainting on resume. ([#154](https://github.com/Fullstop000/ignis/pull/154))
 - TUI — `/sessions` no longer crashes when resuming a long transcript; the history is now committed to scrollback in bounded chunks instead of one oversized buffer that overflowed ratatui's cell limit. ([#155](https://github.com/Fullstop000/ignis/pull/155))

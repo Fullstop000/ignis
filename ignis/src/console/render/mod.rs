@@ -17,6 +17,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::console::app::App;
 use crate::console::{BG, BORDER, TEXT_DIM};
 
+pub(crate) mod anchor;
 pub(crate) mod blocks;
 pub(crate) mod layout;
 pub(crate) mod pickers;

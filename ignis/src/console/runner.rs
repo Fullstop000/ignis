@@ -16,6 +16,7 @@ use crate::console::app::{App, UIBlock};
 use crate::console::format::AgentRequest;
 use crate::console::inline_picker;
 use crate::console::keys::{handle_key, ActiveInject};
+use crate::console::render::anchor::{self, Anchor, ClearOutcome, Wipe};
 use crate::console::render::{self, draw};
 use crate::console::render_diag::RenderDiag;
 use crate::{AgentEvent, Message, Session};
@@ -151,7 +152,7 @@ pub async fn run_console(
     // mode on early-return or panic.
     let _term_guard = TerminalGuard::install()?;
     let init_size = crossterm::terminal::size()?;
-    let mut viewport_rows = render::viewport_height(&app, init_size.0, init_size.1);
+    let viewport_rows = render::viewport_height(&app, init_size.0, init_size.1);
     let mut terminal = make_terminal(viewport_rows)?;
 
     // Welcome banner: pushed into scrollback above the band, like any block.
@@ -389,33 +390,14 @@ pub async fn run_console(
     // The in-progress block's already-streamed row count lives on `app`
     // (`app.committed_rows`) so a session reset (`/clear`, `/resume`) resets it
     // in lockstep with `app.committed` — see reset_transcript_view.
-    // Last terminal size, to detect resizes (which ratatui 0.26 inline doesn't
-    // repaint cleanly — see the rebuild in the draw section).
-    let mut last_term_size = crossterm::terminal::size()?;
-    // Timestamp of the most recent `Event::Resize`. A beat after a resize
-    // settles we force one full clear + re-anchor (see the draw section): the
-    // terminal — notably conpty/Windows Terminal on a cross-DPI monitor drag —
-    // reflows and leaves duplicate band rows in the visible area that our
-    // band-only per-frame diff never scrubs (this is the "only ignis stacks"
-    // bug; vim/htop full-repaint after a resize, so they stay clean). A single
-    // settle repaint mirrors what the next message already does for free.
-    let mut last_resize: Option<std::time::Instant> = None;
-    // Re-anchor episode state for `pending_screen_clear`. A reset (`/clear`,
-    // `/resume`) wipes the screen and must re-anchor the inline viewport before
-    // any block can commit (the band never draws conversation content — it only
-    // flows into native scrollback via the commit loop below). Re-anchoring
-    // queries the cursor with a DSR (`ESC[6n`); on WSL2/conpty that can stall
-    // indefinitely. `clear_started` marks when the current episode began (None
-    // when not pending) so we wipe the screen ONCE per episode rather than every
-    // frame, and `reanchor_attempts` bounds how long we gate rendering on a DSR
-    // that isn't landing before falling back to a DSR-free re-anchor.
-    let mut clear_started: Option<std::time::Instant> = None;
-    let mut reanchor_attempts: u32 = 0;
-    // After this many consecutive failed re-anchors (each blocks ~the crossterm
-    // DSR timeout, ~2s), stop gating all rendering and re-anchor without a DSR.
-    // Bounds the blank window to a few seconds instead of forever — the "blank
-    // after input, full content on resume" wedge.
-    const MAX_REANCHOR_ATTEMPTS: u32 = 2;
+    //
+    // All anchoring state — screen-clear re-anchor episodes (#140/#154), the
+    // resize settle (#138), and the band's converged geometry — lives in the
+    // pure `Anchor` machine (see `render::anchor` for the invariants and their
+    // table tests). This loop only executes the wipes/rebuilds it asks for and
+    // reports the outcomes back. `epoch` is the monotonic clock it runs on.
+    let epoch = std::time::Instant::now();
+    let mut anchor = Anchor::new(viewport_rows, crossterm::terminal::size()?);
     // Opt-in render-loop health heartbeat (frames / commits / re-anchors) to
     // `~/.ignis/logs/ignis.log`, for diagnosing rendering issues in the field.
     let mut diag = RenderDiag::from_env();
@@ -521,8 +503,8 @@ pub async fn run_console(
                 }
                 Event::Paste(data) => crate::console::keys::handle_paste(&mut app, data),
                 // A resize (incl. same-grid-size DPI changes) must force a
-                // settle re-anchor — see `last_resize` and the draw section.
-                Event::Resize(_, _) => last_resize = Some(std::time::Instant::now()),
+                // settle re-anchor — see `Anchor::band_step`.
+                Event::Resize(_, _) => anchor.on_resize(epoch.elapsed()),
                 // No mouse capture in inline mode — wheel scroll and click-drag
                 // selection are handled natively by the terminal/scrollback.
                 _ => {}
@@ -546,63 +528,71 @@ pub async fn run_console(
         // and the draw-time rebuild check is a no-op.
         let term_size = crossterm::terminal::size()?;
         let want_rows = render::viewport_height(&app, term_size.0, term_size.1);
+        // Transfer a reset's wipe request (`/clear`, `/resume`) into the anchor
+        // machine; `anchor.can_commit()` stays false until the episode resolves.
         if app.pending_screen_clear {
-            // Wipe the visible screen AND scrollback exactly ONCE per episode.
-            // Repeating Clear(All) every frame floods the terminal and worsens
-            // the very DSR backpressure that keeps the re-anchor from landing.
-            if clear_started.is_none() {
+            app.pending_screen_clear = false;
+            anchor.request_reanchor();
+        }
+        let now = epoch.elapsed();
+        if let Some(step) = anchor.clear_step(now, want_rows) {
+            if step.wipe == Some(Wipe::All) {
+                // First frame of the episode: wipe visible screen + scrollback
+                // exactly once (re-wiping every frame floods the terminal and
+                // worsens the very DSR backpressure that keeps the re-anchor
+                // from landing).
                 execute!(
                     io::stdout(),
                     crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
                     crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
                     crossterm::cursor::MoveTo(0, 0)
                 )?;
-                clear_started = Some(std::time::Instant::now());
-                reanchor_attempts = 0;
                 log::info!(
                     "render: re-anchor started (blocks={}, committed={}, want_rows={})",
                     app.blocks.len(),
                     app.committed,
-                    want_rows
+                    step.want_rows
                 );
             }
-            if try_rebuild(&mut terminal, want_rows)? {
-                // Re-anchor landed: resume commits from the top of scrollback.
-                if reanchor_attempts > 0 {
-                    let waited = clear_started.map(|t| t.elapsed()).unwrap_or_default();
-                    log::info!(
-                        "render: re-anchor landed after {} retr{} ({}ms) — resuming commits",
-                        reanchor_attempts,
-                        if reanchor_attempts == 1 { "y" } else { "ies" },
-                        waited.as_millis()
+            let ok = try_rebuild(&mut terminal, step.want_rows)?;
+            let pending_blocks = app.blocks.len().saturating_sub(app.committed);
+            match anchor.clear_rebuilt(ok, now, step.want_rows, term_size) {
+                ClearOutcome::Landed { attempts, waited } => {
+                    // Re-anchor landed: resume commits from the top of scrollback.
+                    if attempts > 0 {
+                        log::info!(
+                            "render: re-anchor landed after {} retr{} ({}ms) — resuming commits",
+                            attempts,
+                            if attempts == 1 { "y" } else { "ies" },
+                            waited.as_millis()
+                        );
+                    }
+                    diag.on_reanchor_ok();
+                }
+                ClearOutcome::Held { attempts, waited } => {
+                    diag.on_reanchor_failed();
+                    log::warn!(
+                        "render: re-anchor DSR not landed (attempt {}/{}, {}ms) — \
+                         holding {} block(s); retrying",
+                        attempts,
+                        anchor::MAX_REANCHOR_ATTEMPTS,
+                        waited.as_millis(),
+                        pending_blocks
                     );
                 }
-                diag.on_reanchor_ok();
-                app.pending_screen_clear = false;
-                clear_started = None;
-                reanchor_attempts = 0;
-                viewport_rows = want_rows;
-                last_term_size = term_size;
-            } else {
-                diag.on_reanchor_failed();
-                reanchor_attempts += 1;
-                let waited = clear_started.map(|t| t.elapsed()).unwrap_or_default();
-                let pending_blocks = app.blocks.len().saturating_sub(app.committed);
-                if reanchor_attempts >= MAX_REANCHOR_ATTEMPTS {
+                ClearOutcome::ForcedFallback { attempts, waited } => {
                     // Backstop: the re-anchor DSR isn't answering (WSL2/conpty
                     // under backpressure). Gating all commits on it leaves the
                     // screen blank while the agent keeps working — the "blank
                     // after input, full content on resume" wedge. Re-anchor
                     // WITHOUT a DSR via `terminal.clear()` (resets the back
                     // buffer using the known viewport area) and resume commits.
-                    // Leave `viewport_rows` untouched so the draw-time resize
-                    // check still converges the band to `want_rows` on a later,
-                    // non-gating rebuild.
+                    diag.on_reanchor_failed();
                     log::warn!(
                         "render: re-anchor DSR unresponsive after {} attempts ({}ms) — \
                          forcing DSR-free re-anchor so {} block(s) can paint \
                          (blocks={}, committed={})",
-                        reanchor_attempts,
+                        attempts,
                         waited.as_millis(),
                         pending_blocks,
                         app.blocks.len(),
@@ -610,18 +600,6 @@ pub async fn run_console(
                     );
                     let _ = terminal.clear();
                     diag.on_forced_reanchor();
-                    app.pending_screen_clear = false;
-                    clear_started = None;
-                    reanchor_attempts = 0;
-                } else {
-                    log::warn!(
-                        "render: re-anchor DSR not landed (attempt {}/{}, {}ms) — \
-                         holding {} block(s); retrying",
-                        reanchor_attempts,
-                        MAX_REANCHOR_ATTEMPTS,
-                        waited.as_millis(),
-                        pending_blocks
-                    );
                 }
             }
         }
@@ -654,14 +632,11 @@ pub async fn run_console(
         // Committing before the re-anchor lands would advance `committed` into
         // blocks the next Clear(All) wipes — a resumed transcript paints once,
         // gets erased, and never repaints. So we hold off; once the re-anchor
-        // lands we commit the batch at once. Crucially, the re-anchor above is
-        // bounded (MAX_REANCHOR_ATTEMPTS): if its DSR never answers we force a
-        // DSR-free re-anchor and clear the flag, so this gate can't wedge
+        // lands we commit the batch at once. Crucially, the episode above is
+        // bounded (`anchor::MAX_REANCHOR_ATTEMPTS`): if its DSR never answers
+        // we force a DSR-free re-anchor and reopen the gate, so it can't wedge
         // rendering blank indefinitely (the "blank after input" bug).
-        while !app.pending_screen_clear
-            && app.committed < app.blocks.len()
-            && batch.len() < max_rows
-        {
+        while anchor.can_commit() && app.committed < app.blocks.len() && batch.len() < max_rows {
             let block = &app.blocks[app.committed];
             let done = app.block_done(app.committed);
             let rows = if done {
@@ -680,18 +655,16 @@ pub async fn run_console(
             } else {
                 break; // pending tool: nothing to commit until it finalizes
             };
-            let start = app.committed_rows.min(rows.len());
             // Take only what fits under this frame's row budget. A block taller
             // than the cap splits across frames: `committed` stays put until its
             // final row lands, with `committed_rows` marking the split point.
-            let take = (rows.len() - start).min(max_rows - batch.len());
-            batch.extend_from_slice(&rows[start..start + take]);
-            let drained = start + take == rows.len();
-            if done && drained {
+            let cut = anchor::commit_take(rows.len(), app.committed_rows, max_rows - batch.len());
+            batch.extend_from_slice(&rows[cut.start..cut.start + cut.take]);
+            if done && cut.drained {
                 app.committed += 1;
                 app.committed_rows = 0;
             } else {
-                app.committed_rows = start + take;
+                app.committed_rows = cut.start + cut.take;
                 break; // in-progress block, or a finalized block split by the cap
             }
         }
@@ -712,18 +685,15 @@ pub async fn run_console(
             // re-anchors cleanly.
             let term_size = crossterm::terminal::size()?;
             let want_rows = render::viewport_height(&app, term_size.0, term_size.1);
-            let size_changed = term_size != last_term_size;
-            // A beat after the last resize event, force one full clear +
-            // re-anchor to scrub the terminal's late reflow duplicates (the
-            // cross-DPI-drag stacking; the reported grid size can't see a
-            // same-size DPI change, and a band-only diff never wipes rows the
-            // terminal duplicated in the visible area). Fires once per settle.
-            // The delay lets a slow terminal (conpty/WT over WSL2) finish
-            // reflowing before we repaint; tune here if duplicates survive.
-            const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
-            let settled = last_resize.is_some_and(|t| t.elapsed() >= RESIZE_SETTLE);
-            if want_rows != viewport_rows || size_changed || settled {
-                if size_changed || settled {
+            // Band geometry: `Anchor::band_step` decides when to rebuild (height
+            // change, terminal resize, or a post-resize settle that scrubs
+            // conpty's late-reflow duplicates) and how much to wipe. A timed-out
+            // DSR keeps the old viewport and retries next frame; the resize
+            // marker is consumed only by a settle re-anchor that landed.
+            if let Some(step) = anchor.band_step(epoch.elapsed(), want_rows, term_size) {
+                if step.wipe == Some(Wipe::Band) {
+                    terminal.clear()?;
+                } else {
                     // ratatui's inline clear() only scrubs downward, so on a
                     // resize the old band (reflowed by the terminal above the
                     // new anchor) is left stranded (#77). Wipe the whole screen
@@ -733,22 +703,9 @@ pub async fn run_console(
                         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
                         crossterm::cursor::MoveTo(0, 0)
                     )?;
-                } else {
-                    terminal.clear()?;
                 }
-                // Commit the new band size only if the re-anchor succeeded; a
-                // timed-out DSR keeps the old viewport and retries next frame.
-                // Consume the resize marker only on a *settle* re-anchor that
-                // landed — so the live size-change rebuilds during a drag don't
-                // clear it early (the settle would never fire), and a timed-out
-                // settle (common on WSL2/conpty) is retried next frame.
-                if try_rebuild(&mut terminal, want_rows)? {
-                    viewport_rows = want_rows;
-                    last_term_size = term_size;
-                    if settled {
-                        last_resize = None;
-                    }
-                }
+                let ok = try_rebuild(&mut terminal, step.want_rows)?;
+                anchor.band_rebuilt(ok, step.want_rows, term_size);
             }
             draw_tolerant(&mut terminal, &mut app)?;
             last_draw = std::time::Instant::now();
