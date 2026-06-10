@@ -680,4 +680,34 @@ mod tests {
             .collect();
         assert!(joined.contains("foxtrot"), "content lost: {joined:?}");
     }
+
+    /// A double-width glyph (CJK/emoji) can't be split, so a squeezed column must
+    /// never be allocated less than 2 cols — else a 1-col cell would hold a 2-col
+    /// glyph and overflow the fitted border. Holds across narrow widths whether
+    /// the table renders as a box or falls back to plain rows (codex-caught).
+    #[test]
+    fn narrow_cjk_table_never_overflows_width() {
+        let md = "| 甲 | 乙 | 丙 | 丁 |\n\
+                  |--|--|--|--|\n\
+                  | 中文内容测试 | 例子 | 数据 | 值 |";
+        for width in [16u16, 20, 24, 30] {
+            let lines = block_lines(
+                &UIBlock::Assistant(md.to_string()),
+                0,
+                Path::new("/"),
+                width,
+            );
+            for line in &lines {
+                assert!(
+                    line_cols(line) <= width as usize,
+                    "width {width}: row exceeds it (w={}): {:?}",
+                    line_cols(line),
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>(),
+                );
+            }
+        }
+    }
 }

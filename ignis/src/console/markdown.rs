@@ -284,21 +284,23 @@ fn pad_cell(cell: &str, width: usize, align: Align) -> String {
 
 /// Shrink natural column widths so the whole box fits `width` columns, or return
 /// `None` when no box can: the overhead is `3 + 3*ncols` (the leading `  │` plus
-/// ` … │` per column), leaving a content budget of `width - overhead`. If that
-/// budget can't give every column even one column of content (`budget < ncols`),
-/// a box would have to overflow the terminal and garble — the caller falls back
+/// ` … │` per column), leaving a content budget of `width - overhead`. A cell can
+/// hold a double-width glyph (CJK/emoji) that can't be split, so a content column
+/// needs at least 2 columns; if the budget can't give every column that
+/// (`budget < 2*ncols`), a box would overflow and garble — the caller falls back
 /// to plain rows. Otherwise: if the natural widths already fit they're returned
 /// as-is, else we water-fill narrowest-first — each column takes the smaller of
 /// its natural width and an even share of the remaining budget, so slim columns
 /// keep their size and the surplus flows to wide ones (which then wrap, see
-/// [[wrap_cell]]). `budget >= ncols` guarantees no content column collapses to 0.
+/// [[wrap_cell]]). `budget >= 2*ncols` keeps every per-step share >= 2, so no
+/// content column is squeezed below the width of a single wide glyph.
 fn fit_column_widths(natural: &[usize], width: u16) -> Option<Vec<usize>> {
     let ncols = natural.len();
     if ncols == 0 {
         return Some(Vec::new());
     }
     let budget = (width as usize).saturating_sub(3 + 3 * ncols);
-    if budget < ncols {
+    if budget < 2 * ncols {
         return None;
     }
     if natural.iter().sum::<usize>() <= budget {
@@ -310,7 +312,7 @@ fn fit_column_widths(natural: &[usize], width: u16) -> Option<Vec<usize>> {
     let mut remaining = budget;
     let mut left = ncols;
     for &c in &order {
-        let share = remaining / left; // >= 1 here, since remaining >= left throughout
+        let share = remaining / left; // >= 2 here, since remaining >= 2*left throughout
         let w = natural[c].min(share);
         widths[c] = w;
         remaining -= w;
