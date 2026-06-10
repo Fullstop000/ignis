@@ -44,6 +44,7 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","updatedI
             program: hook,
             args: vec![],
             timeout_ms: 5_000,
+            ..HookSpec::default()
         }],
         assistant_message_render: vec![],
     };
@@ -87,6 +88,7 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"AssistantMessageRender","up
             program: hook,
             args: vec![],
             timeout_ms: 5_000,
+            ..HookSpec::default()
         }],
     };
     let reg = HookRegistry::from_config(cfg);
@@ -212,6 +214,7 @@ printf '{"hookSpecificOutput":{"updatedInput":"%s"}}' "$UPPER"
             program: upper,
             args: vec![],
             timeout_ms: 5_000,
+            ..HookSpec::default()
         }],
         assistant_message_render: vec![],
     };

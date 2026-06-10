@@ -11,12 +11,17 @@
 //! malformed JSON, missing binary) degrades to "use the original value +
 //! emit a Warning event to the UI".
 //!
-//! **Security:** v1 ships with no sandbox. Hooks run with ignis's full
-//! privileges. See `docs/usage/hooks.md` for the threat model.
+//! **Security:** hook subprocesses run with an env-var allowlist and (on
+//! Linux) a Landlock filesystem sandbox by default. Per-hook
+//! `sandbox: false` opts out; per-hook `env: [...]` extends the universal
+//! allowlist (`PATH HOME USER LANG LC_ALL TZ`). Network egress is NOT
+//! restricted — a hook with `env: ["ANTHROPIC_API_KEY"]` can still
+//! exfiltrate it. See `docs/usage/hooks.md` for the full threat model.
 
 pub mod config;
 pub mod dispatch;
 pub mod protocol;
+pub mod sandbox;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -29,6 +34,7 @@ use crate::AgentEvent;
 pub use config::{HookSpec, HooksConfig, DEFAULT_TIMEOUT_MS};
 pub use dispatch::{DispatchContext, HookOutcome};
 pub use protocol::{HookEvent, HookInput, HookOutput, HookSpecificOutput};
+pub use sandbox::SandboxStatus;
 
 /// Context the registry needs at every dispatch call. Borrowed strings so
 /// callers don't have to allocate per turn.
@@ -74,11 +80,17 @@ impl HookRegistry {
 
     /// Rebuild the registry from disk in place. Returns the new hook count
     /// for the `/hooks reload` confirmation line.
+    ///
+    /// Also clears the dispatcher's per-session "Landlock unavailable"
+    /// suppression set: a freshly-edited hook gets a fresh degradation
+    /// notice instead of being silently swallowed because an earlier
+    /// invocation of the same name already warned once.
     pub async fn reload(&self, home: &Path) -> anyhow::Result<usize> {
         let cfg = HooksConfig::from_home(home)?;
         let total = cfg.total_len();
         let mut guard = self.inner.write().await;
         *guard = cfg;
+        dispatch::reset_sandbox_warnings();
         Ok(total)
     }
 
@@ -168,11 +180,11 @@ impl HookRegistry {
 
         let mut current = initial.to_string();
         for spec in &specs {
-            let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx).await;
+            let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx, Some(tx)).await;
             match outcome {
-                HookOutcome::Mutated(next) => current = next,
-                HookOutcome::PassThrough => {}
-                HookOutcome::Blocked { stderr } => {
+                HookOutcome::Mutated { updated, .. } => current = updated,
+                HookOutcome::PassThrough { .. } => {}
+                HookOutcome::Blocked { stderr, .. } => {
                     // Honour the block. Spec: "Hook exits 2 → Block the
                     // turn (only event where blocking makes sense —
                     // UserPromptSubmit). Show stderr to user." Emit the
@@ -186,7 +198,7 @@ impl HookRegistry {
                     .await;
                     return PromptHookResult::Blocked { stderr: trimmed };
                 }
-                HookOutcome::SoftFailed { reason } => {
+                HookOutcome::SoftFailed { reason, .. } => {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
                     break;
                 }
@@ -220,11 +232,11 @@ impl HookRegistry {
 
         let mut current = initial.to_string();
         for spec in &specs {
-            let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx).await;
+            let outcome = dispatch::run_hook(spec, event, &current, &dispatch_ctx, Some(tx)).await;
             match outcome {
-                HookOutcome::Mutated(next) => current = next,
-                HookOutcome::PassThrough => {}
-                HookOutcome::Blocked { stderr } => {
+                HookOutcome::Mutated { updated, .. } => current = updated,
+                HookOutcome::PassThrough { .. } => {}
+                HookOutcome::Blocked { stderr, .. } => {
                     emit_warning(
                         tx,
                         event,
@@ -236,7 +248,7 @@ impl HookRegistry {
                     )
                     .await;
                 }
-                HookOutcome::SoftFailed { reason } => {
+                HookOutcome::SoftFailed { reason, .. } => {
                     emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
                     break;
                 }
@@ -407,11 +419,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: s1,
                     args: vec![],
                     timeout_ms: 5_000,
+                    ..HookSpec::default()
                 },
                 HookSpec {
                     program: s2,
                     args: vec![],
                     timeout_ms: 5_000,
+                    ..HookSpec::default()
                 },
             ],
             assistant_message_render: vec![],
@@ -445,11 +459,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: good,
                     args: vec![],
                     timeout_ms: 5_000,
+                    ..HookSpec::default()
                 },
                 HookSpec {
                     program: bad,
                     args: vec![],
                     timeout_ms: 5_000,
+                    ..HookSpec::default()
                 },
             ],
             assistant_message_render: vec![],
@@ -488,6 +504,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: blocker,
                 args: vec![],
                 timeout_ms: 5_000,
+                ..HookSpec::default()
             }],
             assistant_message_render: vec![],
         };
@@ -528,6 +545,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: blocker,
                 args: vec![],
                 timeout_ms: 5_000,
+                ..HookSpec::default()
             }],
         };
         let reg = HookRegistry::from_config(cfg);
@@ -594,6 +612,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/a/hook.sh"),
                 args: vec!["--flag".to_string()],
                 timeout_ms: 7_000,
+                ..HookSpec::default()
             }],
             assistant_message_render: vec![],
         };
@@ -620,6 +639,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/opt/translate/run.py"),
                 args: vec![],
                 timeout_ms: 10_000,
+                ..HookSpec::default()
             }],
             assistant_message_render: vec![],
         };
@@ -642,17 +662,20 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: PathBuf::from("/opt/translate/run.py"),
                     args: vec!["--source".to_string(), "en".to_string()],
                     timeout_ms: 30_000,
+                    ..HookSpec::default()
                 },
                 HookSpec {
                     program: PathBuf::from("/opt/redact.sh"),
                     args: vec![],
                     timeout_ms: 5_000,
+                    ..HookSpec::default()
                 },
             ],
             assistant_message_render: vec![HookSpec {
                 program: PathBuf::from("/opt/translate/run.py"),
                 args: vec![],
                 timeout_ms: 10_000,
+                ..HookSpec::default()
             }],
         };
         let out = format_list(&cfg);
@@ -677,6 +700,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/opt/render.sh"),
                 args: vec![],
                 timeout_ms: 1_000,
+                ..HookSpec::default()
             }],
         };
         let out = format_list(&cfg);
@@ -705,11 +729,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: PathBuf::from("/opt/translate-to-french-v2.py"),
                     args: vec![],
                     timeout_ms: 10_000,
+                    ..HookSpec::default()
                 },
                 HookSpec {
                     program: PathBuf::from("/opt/redact.sh"),
                     args: vec![],
                     timeout_ms: 10_000,
+                    ..HookSpec::default()
                 },
             ],
             assistant_message_render: vec![],
@@ -748,11 +774,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/a"),
                 args: vec![],
                 timeout_ms: 1_000,
+                ..HookSpec::default()
             }],
             assistant_message_render: vec![HookSpec {
                 program: PathBuf::from("/b"),
                 args: vec![],
                 timeout_ms: 1_000,
+                ..HookSpec::default()
             }],
         };
         let out = format_list(&cfg);

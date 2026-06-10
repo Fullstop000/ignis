@@ -1114,6 +1114,7 @@ printf '{"hookSpecificOutput":{"updatedOutput":"R:%s"}}' "$CONTENT"
                 program: script,
                 args: vec![],
                 timeout_ms: 5_000,
+                ..HookSpec::default()
             }],
         };
         let registry = HookRegistry::from_config(cfg);

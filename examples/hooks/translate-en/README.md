@@ -17,9 +17,12 @@ It's the worked example for the ignis hook protocol — the protocol is
 the feature; translation is the proof. Distill, copy, adapt for your
 own use case (PII scrub, prompt enhancement, telemetry sidecar, …).
 
-> **Warning — hooks run unsandboxed in v1.** Each hook command runs
-> with the full privileges of your `ignis` process. Audit the source
-> before installing.
+> **Hooks are sandboxed on Linux (v2).** Default Landlock confinement
+> blocks writes outside `$TMPDIR` and reads outside the hook's folder
+> + system lib paths. Env vars are scrubbed to the universal
+> allowlist; this hook declares the three it needs (`ANTHROPIC_API_KEY`,
+> `IGNIS_TRANSLATE_FROM`, `IGNIS_TRANSLATE_TO`) in `env: [...]`.
+> Sandboxing is a no-op on macOS / Windows / older Linux kernels.
 
 ## Install
 
@@ -32,16 +35,29 @@ chmod +x ~/.ignis/hooks/translate-en/run.py
 Python 3.10+. No third-party deps — the script uses the stdlib
 `urllib.request`. Set `ANTHROPIC_API_KEY` in your shell.
 
-Wire it in `~/.ignis/hooks.json`:
+Wire it in `~/.ignis/hooks.json`. `env` declares the variables this
+hook needs (everything else is scrubbed); `sandbox` is the default
+Landlock confinement (`true` on Linux, no-op elsewhere) — included
+here only so the example is self-documenting.
 
 ```json
 {
   "hooks": {
     "UserPromptSubmit": [
-      {"command": "~/.ignis/hooks/translate-en/run.py", "timeout_ms": 30000}
+      {
+        "command": "~/.ignis/hooks/translate-en/run.py",
+        "env": ["ANTHROPIC_API_KEY", "IGNIS_TRANSLATE_FROM", "IGNIS_TRANSLATE_TO"],
+        "sandbox": true,
+        "timeout_ms": 30000
+      }
     ],
     "AssistantMessageRender": [
-      {"command": "~/.ignis/hooks/translate-en/run.py", "timeout_ms": 30000}
+      {
+        "command": "~/.ignis/hooks/translate-en/run.py",
+        "env": ["ANTHROPIC_API_KEY", "IGNIS_TRANSLATE_FROM", "IGNIS_TRANSLATE_TO"],
+        "sandbox": true,
+        "timeout_ms": 30000
+      }
     ]
   }
 }

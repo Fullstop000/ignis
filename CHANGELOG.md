@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUI — the footer's context % now tracks the active model's context window after switching models via `/connect`, instead of measuring against the previously-selected model's window. ([#160](https://github.com/Fullstop000/ignis/pull/160))
 - TUI — wide markdown tables now wrap to fit the terminal instead of sprawling past the screen as a garbled box. ([#161](https://github.com/Fullstop000/ignis/pull/161))
 
+### Security
+- External hooks now run sandboxed by default: an env-var allowlist keeps secrets like `ANTHROPIC_API_KEY` out of hook subprocesses, and a filesystem sandbox (Linux Landlock / macOS Seatbelt) confines them to a small set of allowed paths. ([#109](https://github.com/Fullstop000/ignis/pull/109))
+
 ## [0.37.1] - 2026-06-09
 
 ### Added

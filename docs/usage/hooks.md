@@ -6,24 +6,56 @@ two events — `UserPromptSubmit` (mutates the prompt before model send)
 and `AssistantMessageRender` (mutates the assistant's text before TUI
 render).
 
-> ## ⚠ Hooks run unsandboxed in v1
+> ## Hook sandbox (v2)
 >
-> Each hook command runs with the full privileges of your `ignis`
-> process. A malicious or buggy hook can:
+> v2 confines each hook subprocess with four layers, defaults-on:
 >
-> - Read `~/.ssh`, `~/.aws/credentials`, `~/.config/gh/`, `.netrc`,
->   any project source.
-> - See and exfiltrate every env var ignis was started with —
->   including `ANTHROPIC_API_KEY`.
-> - Spawn child processes; write/delete arbitrary files; make
->   arbitrary network calls.
+> 1. **Env-var allowlist (all platforms).** The child sees only
+>    `PATH HOME USER LANG LC_ALL TZ` from ignis's own env, plus
+>    whatever extra names the hook declares in `env: [...]`. Default
+>    `env: []`. A hook that doesn't declare `ANTHROPIC_API_KEY` does
+>    not see `ANTHROPIC_API_KEY`.
+> 2. **Filesystem sandbox.** Per hook `sandbox: bool`, default `true`.
+>    The hook can **read** its own folder, `/etc/ssl/certs`,
+>    `/usr/lib`, `/lib`, `/lib64`, `/bin`, `/usr/bin`, `/sbin`,
+>    `/usr/sbin`, `/etc/resolv.conf`, `$TMPDIR`, `/dev/urandom`; it can
+>    **write** `$TMPDIR` and `/dev/null`. Net access is unrestricted —
+>    that's fine because the env-var allowlist already stops it learning
+>    a credential it could exfil. Set `sandbox: false` if your hook
+>    genuinely needs broader access (e.g. a project-indexer that reads
+>    the whole tree).
 >
-> **Treat `~/.ignis/hooks.json` like `crontab`** — anything in there
-> has root-equivalent power over your user account. Only install hooks
-> whose source you have personally audited.
+>    The mechanism is per-platform:
+>    * **Linux** uses Landlock (ABI V1, Linux 5.13+). On older kernels
+>      a one-time `[warn] hook.sandbox: <hook>: Landlock unavailable
+>      on this kernel; hook runs unconfined` notice fires per session.
+>    * **macOS** uses Apple's `sandbox_init(3)` ("Seatbelt") with a
+>      Scheme-syntax profile translated from the same default path
+>      list. `sandbox_init` is technically a private Apple API but has
+>      been ABI-stable since macOS 10.5 (2007) and is the same primitive
+>      Chromium and Firefox use for renderer confinement. The
+>      `/tmp → /private/tmp` and `/var → /private/var` symlink
+>      rewrites are emitted automatically so a hook that opens
+>      `/tmp/foo` is matched against the canonical `/private/tmp/foo`.
+>    * **Other platforms** (Windows, other BSDs) the flag is a no-op and
+>      the unconfined-warning fires.
+> 3. **SIGTERM → 1 s grace → SIGKILL on timeout.** A misbehaving hook
+>    gets one second of "please clean up" before it's force-killed.
+> 4. **1 MiB cap per stdout / stderr stream.** Bytes beyond the cap are
+>    discarded after a `[warn] hook.buffer: <hook>: <stream>
+>    truncated at 1 MiB` is committed to scrollback; the truncated
+>    bytes never accumulate in memory.
 >
-> v2 will add env-var scrubbing and a Linux filesystem sandbox; until
-> then, the protocol relies on you reading the script.
+> The defaults are tuned for the reference translator: a sandboxed
+> Python hook can read its own files, call the Anthropic / OpenAI
+> HTTPS API (TLS roots + DNS allowed), and write nothing outside
+> `/tmp`. Hooks that need more must declare it.
+>
+> **You should still audit `~/.ignis/hooks.json` like a crontab.** The
+> sandbox closes filesystem and credential exfil; it does not (yet)
+> filter network egress. A hook with `network = unrestricted` that
+> also declared `env: ["ANTHROPIC_API_KEY"]` can absolutely send the
+> key off-host.
 
 ## Events
 
@@ -83,9 +115,10 @@ hook" — but `continue: false` is also a block signal (see exit codes).
 | `2` | Block the chain. Honoured for `UserPromptSubmit` (turn does not send). Degraded to a soft failure for `AssistantMessageRender`. |
 | anything else | Soft failure: original text kept; a `[warn]` line is committed to scrollback. |
 
-A hook that runs longer than its `timeout_ms` is killed (SIGKILL,
-via `kill_on_drop`) and treated as a soft failure. v2 will add a
-SIGTERM grace window before the SIGKILL.
+A hook that runs longer than its `timeout_ms` is sent `SIGTERM`,
+given one second to exit cleanly, and then `SIGKILL`'d. Outcome is
+`SoftFailed { reason: "timed out after Nms" }` — the original prompt
+(or assistant text) passes through unchanged.
 
 ## Declaration — `~/.ignis/hooks.json`
 
@@ -95,12 +128,15 @@ SIGTERM grace window before the SIGKILL.
     "UserPromptSubmit": [
       {
         "command": "~/.ignis/hooks/translate-en/run.py",
+        "env": ["ANTHROPIC_API_KEY", "IGNIS_TRANSLATE_FROM", "IGNIS_TRANSLATE_TO"],
+        "sandbox": true,
         "timeout_ms": 30000
       }
     ],
     "AssistantMessageRender": [
       {
         "command": "~/.ignis/hooks/translate-en/run.py",
+        "env": ["ANTHROPIC_API_KEY"],
         "timeout_ms": 30000
       }
     ]
@@ -121,6 +157,16 @@ SIGTERM grace window before the SIGKILL.
   `argv[0]` is the program; subsequent entries are arguments. `~/` is
   expanded on `argv[0]`. `command` and `argv` are mutually exclusive.
 - `timeout_ms` defaults to `10000` (10 s).
+- `env` is an array of env-var **names** ignis passes through from its
+  own environment into the hook's. Defaults to `[]`. The universal
+  allowlist (`PATH HOME USER LANG LC_ALL TZ`) is always passed in
+  addition. A name listed but unset in ignis's env is silently
+  skipped.
+- `sandbox` toggles the filesystem confinement (Linux Landlock or
+  macOS Seatbelt). Defaults to `true`. Set `false` for hooks that
+  legitimately need broader filesystem access. On platforms with no
+  sandbox implementation the flag has no effect — the one-time
+  `[warn] hook.sandbox` notice is your hint.
 - Each event takes a JSON array — multiple hooks chain left-to-right,
   each receiving the previous hook's output.
 - The file is loaded at session start. An absent file means no hooks
@@ -159,7 +205,29 @@ last successful load or `/hooks reload` — not a live disk probe, so
 
 Type `/hooks reload` in the TUI after editing `hooks.json`. The parsed
 config is swapped into the running registry; the next prompt picks it
-up. The confirmation line includes the unsandboxed reminder.
+up. Reload also clears the per-session "Landlock unavailable" warning
+suppression set, so a freshly-edited hook gets its degradation notice
+again if the kernel doesn't support Landlock.
+
+## Verifying the sandbox
+
+The v2 sandbox is regression-tested by `ignis/tests/sandbox_e2e.rs`
+(25 tests across 8 layers: env-allowlist, filesystem, SIGTERM grace,
+buffer cap, lifecycle, composition, macOS Seatbelt quirks, status
+reporting) plus `ignis/tests/hook_sandbox.rs` (the original 2-test
+"hook cannot write outside `$TMPDIR`" smoke test). Run the whole
+suite:
+
+```sh
+cargo test --test sandbox_e2e
+cargo test --test hook_sandbox
+```
+
+The dispatcher also surfaces the confinement state on every hook
+invocation as the `sandbox_status` field on `HookOutcome`
+(`FullyEnforced` / `NotEnforced` / `PlatformUnsupported` / `Disabled`).
+The same value is recorded on the `ignis.hook` `tracing` span as
+`sandbox.status` for dashboards.
 
 ## Failure UI
 
