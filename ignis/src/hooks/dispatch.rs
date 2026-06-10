@@ -948,11 +948,25 @@ time.sleep(30)
     #[cfg(unix)]
     #[tokio::test]
     async fn sigterm_grace_with_cooperative_hook_exits_promptly() {
-        let tmp = crate::util::unique_temp_dir("ignis-hook-sigterm-coop");
-        // Python: install a SIGTERM handler that exits 0 immediately.
-        // This is exactly the production case — a hook that does some
-        // cleanup and shuts down on SIGTERM.
-        let body = b"\
+        // Skipped on macOS: the system / Homebrew Python stdlib (under
+        // /Library or /opt/homebrew) is NOT in the Seatbelt read
+        // allowlist, so a python hook can't start under the default
+        // sandbox — it fails before the cooperative SIGTERM handshake.
+        // The `sandbox_e2e.rs` copy skips for the same reason; macOS
+        // kernel confinement is covered by `hook_sandbox.rs`.
+        #[cfg(target_os = "macos")]
+        {
+            eprintln!(
+                "macOS Python not in Seatbelt read allowlist; skipping cooperative SIGTERM test"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let tmp = crate::util::unique_temp_dir("ignis-hook-sigterm-coop");
+            // Python: install a SIGTERM handler that exits 0 immediately.
+            // This is exactly the production case — a hook that does some
+            // cleanup and shuts down on SIGTERM.
+            let body = b"\
 #!/usr/bin/env python3
 import signal, sys, time
 def _term(_signum, _frame):
@@ -964,44 +978,45 @@ except Exception:
     pass
 time.sleep(30)
 ";
-        let script = write_script(&tmp, "cooperative.py", std::str::from_utf8(body).unwrap());
-        let spec = HookSpec {
-            program: script,
-            args: vec![],
-            timeout_ms: 100,
-            ..HookSpec::default()
-        };
-        let t0 = std::time::Instant::now();
-        let out = run_hook(&spec, HookEvent::UserPromptSubmit, "x", &ctx(), None).await;
-        let elapsed = t0.elapsed();
+            let script = write_script(&tmp, "cooperative.py", std::str::from_utf8(body).unwrap());
+            let spec = HookSpec {
+                program: script,
+                args: vec![],
+                timeout_ms: 100,
+                ..HookSpec::default()
+            };
+            let t0 = std::time::Instant::now();
+            let out = run_hook(&spec, HookEvent::UserPromptSubmit, "x", &ctx(), None).await;
+            let elapsed = t0.elapsed();
 
-        // The cooperative hook exits 0 after the SIGTERM, so from the
-        // dispatcher's view the call completed inside the grace window.
-        // We expect the *outer* timeout to still be reported — the
-        // dispatcher's outer timeout fires first and sends SIGTERM, then
-        // the child exits cleanly, then the dispatcher reports
-        // `timed out` because that's the *reason* the call returned at
-        // all (it never saw the child's exit before the timeout).
-        //
-        // On Linux: the dispatcher sends SIGTERM, the child exits 0,
-        // but the dispatcher's `child.wait()` resolves inside the
-        // 1s grace → return SoftFailed { reason: "timed out" }.
-        // Elapsed should be slightly more than the timeout (100ms) and
-        // well under 1.1s.
-        match out {
-            HookOutcome::SoftFailed { reason, .. } => assert!(reason.contains("timed out")),
-            other => panic!("expected SoftFailed, got {other:?}"),
+            // The cooperative hook exits 0 after the SIGTERM, so from the
+            // dispatcher's view the call completed inside the grace window.
+            // We expect the *outer* timeout to still be reported — the
+            // dispatcher's outer timeout fires first and sends SIGTERM, then
+            // the child exits cleanly, then the dispatcher reports
+            // `timed out` because that's the *reason* the call returned at
+            // all (it never saw the child's exit before the timeout).
+            //
+            // On Linux: the dispatcher sends SIGTERM, the child exits 0,
+            // but the dispatcher's `child.wait()` resolves inside the
+            // 1s grace → return SoftFailed { reason: "timed out" }.
+            // Elapsed should be slightly more than the timeout (100ms) and
+            // well under 1.1s.
+            match out {
+                HookOutcome::SoftFailed { reason, .. } => assert!(reason.contains("timed out")),
+                other => panic!("expected SoftFailed, got {other:?}"),
+            }
+            assert!(
+                elapsed >= Duration::from_millis(100),
+                "outer timeout did not fire: elapsed = {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "grace window was not honoured on cooperative exit: elapsed = {elapsed:?}"
+            );
+
+            std::fs::remove_dir_all(&tmp).ok();
         }
-        assert!(
-            elapsed >= Duration::from_millis(100),
-            "outer timeout did not fire: elapsed = {elapsed:?}"
-        );
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "grace window was not honoured on cooperative exit: elapsed = {elapsed:?}"
-        );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// Buffer cap: a hook that emits 2 MiB on stdout should be truncated at
