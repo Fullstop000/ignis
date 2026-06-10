@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUI — exiting with `Ctrl+D` prints a copy-pasteable `ignis --resume <id>` hint so you can pick the session back up. ([#158](https://github.com/Fullstop000/ignis/pull/158))
 
 ### Changed
-- Internal — the inline TUI render loop is restructured for testability: the re-anchor/commit state machine (screen-clear episodes, resize settle, commit row budget) moves into a pure `render::anchor` module whose historical bugs (#138, #140, #154, #155) are now table-driven regression tests, and the frame loop itself becomes a `ConsoleLoop` lifecycle skeleton mirroring `Agent::run`. No user-visible change.
+- Internal — the inline TUI render loop is restructured for testability: the re-anchor/commit state machine (screen-clear episodes, resize settle, commit row budget) moves into a pure `render::anchor` module whose historical bugs (#138, #140, #154, #155) are now table-driven regression tests, and the frame loop itself becomes a `ConsoleLoop` lifecycle skeleton mirroring `Agent::run`. No user-visible change. ([#163](https://github.com/Fullstop000/ignis/pull/163))
 
 ### Fixed
 - TUI — on WSL2/conpty, the conversation no longer stays blank after you send a message while the agent keeps working; inline rendering recovers instead of only repainting on resume. ([#154](https://github.com/Fullstop000/ignis/pull/154))
