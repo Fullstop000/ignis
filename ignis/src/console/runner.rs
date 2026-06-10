@@ -556,7 +556,10 @@ pub async fn run_console(
             }
             let ok = try_rebuild(&mut terminal, step.want_rows)?;
             let pending_blocks = app.blocks.len().saturating_sub(app.committed);
-            match anchor.clear_rebuilt(ok, now, step.want_rows, term_size) {
+            // Re-read the clock for the report: `waited` in the log lines must
+            // include the rebuild attempt itself (~2s when its DSR times out),
+            // or a stalled first attempt logs a misleading 0ms.
+            match anchor.clear_rebuilt(ok, epoch.elapsed(), step.want_rows, term_size) {
                 ClearOutcome::Landed { attempts, waited } => {
                     // Re-anchor landed: resume commits from the top of scrollback.
                     if attempts > 0 {
