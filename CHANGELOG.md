@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - extensions — user-facing rename from "hooks": config now at `~/.ignis/extensions.json`, slash command `/extensions`; the v1 `~/.ignis/hooks.json` file, `"hooks"` JSON key, and `/hooks` command keep working as deprecated fallbacks. ([#141](https://github.com/Fullstop000/ignis/pull/141))
+- Internal — the inline TUI render loop is restructured for testability: the re-anchor/commit state machine (screen-clear episodes, resize settle, commit row budget) moves into a pure `render::anchor` module whose historical bugs (#138, #140, #154, #155) are now table-driven regression tests, and the frame loop itself becomes a `ConsoleLoop` lifecycle skeleton mirroring `Agent::run`. No user-visible change. ([#163](https://github.com/Fullstop000/ignis/pull/163))
 
 ### Fixed
 - TUI — on WSL2/conpty, the conversation no longer stays blank after you send a message while the agent keeps working; inline rendering recovers instead of only repainting on resume. ([#154](https://github.com/Fullstop000/ignis/pull/154))
