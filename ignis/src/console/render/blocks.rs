@@ -52,7 +52,7 @@ pub(crate) fn block_lines(
                 return lines;
             }
             lines.push(Line::from(""));
-            for line in render_md_block(text, false) {
+            for line in render_md_block(text, false, width) {
                 let indent = leading_space_cols(&line);
                 lines.extend(wrap_line(&line, width, indent));
             }
@@ -645,5 +645,69 @@ mod tests {
         // One line of thought still reserves the full region (front-padded).
         let out = reasoning_preview_lines("just started", "⠋", 80);
         assert_eq!(out.len(), 1 + REASONING_PREVIEW_LINES);
+    }
+
+    /// A table with too many columns for the terminal can't draw a box without
+    /// overflowing — it must fall back to plain rows so the full pipeline never
+    /// emits an over-wide line for the terminal to garble (codex-caught).
+    #[test]
+    fn many_column_table_never_overflows_width() {
+        let width: u16 = 30;
+        let md = "| c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 |\n\
+                  |--|--|--|--|--|--|--|--|\n\
+                  | alpha | bravo | charlie | delta | echo | foxtrot | golf | hotel |";
+        let lines = block_lines(
+            &UIBlock::Assistant(md.to_string()),
+            0,
+            Path::new("/"),
+            width,
+        );
+        for line in &lines {
+            assert!(
+                line_cols(line) <= width as usize,
+                "row exceeds width {width} (w={}): {:?}",
+                line_cols(line),
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+            );
+        }
+        // Content survives the fallback (wrapped, not dropped).
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(joined.contains("foxtrot"), "content lost: {joined:?}");
+    }
+
+    /// A double-width glyph (CJK/emoji) can't be split, so a squeezed column must
+    /// never be allocated less than 2 cols — else a 1-col cell would hold a 2-col
+    /// glyph and overflow the fitted border. Holds across narrow widths whether
+    /// the table renders as a box or falls back to plain rows (codex-caught).
+    #[test]
+    fn narrow_cjk_table_never_overflows_width() {
+        let md = "| 甲 | 乙 | 丙 | 丁 |\n\
+                  |--|--|--|--|\n\
+                  | 中文内容测试 | 例子 | 数据 | 值 |";
+        for width in [16u16, 20, 24, 30] {
+            let lines = block_lines(
+                &UIBlock::Assistant(md.to_string()),
+                0,
+                Path::new("/"),
+                width,
+            );
+            for line in &lines {
+                assert!(
+                    line_cols(line) <= width as usize,
+                    "width {width}: row exceeds it (w={}): {:?}",
+                    line_cols(line),
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>(),
+                );
+            }
+        }
     }
 }

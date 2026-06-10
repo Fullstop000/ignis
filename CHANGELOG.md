@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - TUI — on WSL2/conpty, the conversation no longer stays blank after you send a message while the agent keeps working; inline rendering recovers instead of only repainting on resume. ([#154](https://github.com/Fullstop000/ignis/pull/154))
 - TUI — `/sessions` no longer crashes when resuming a long transcript; the history is now committed to scrollback in bounded chunks instead of one oversized buffer that overflowed ratatui's cell limit. ([#155](https://github.com/Fullstop000/ignis/pull/155))
+- TUI — wide markdown tables now wrap to fit the terminal instead of sprawling past the screen as a garbled box. ([#161](https://github.com/Fullstop000/ignis/pull/161))
 
 ## [0.37.1] - 2026-06-09
 
