@@ -282,21 +282,27 @@ fn pad_cell(cell: &str, width: usize, align: Align) -> String {
     }
 }
 
-/// Shrink natural column widths so the whole box fits `width` columns. The box
-/// overhead is `3 + 3*ncols` (the leading `  │` plus ` … │` per column), so the
-/// content budget is `width - overhead`. If the natural widths already fit, they
-/// are returned unchanged. Otherwise we water-fill narrowest-first: each column
-/// takes the smaller of its natural width and an even share of the remaining
-/// budget, so slim columns keep their size and the surplus flows to wide ones
-/// (which then wrap — see [[wrap_cell]]).
-fn fit_column_widths(natural: &[usize], width: u16) -> Vec<usize> {
+/// Shrink natural column widths so the whole box fits `width` columns, or return
+/// `None` when no box can: the overhead is `3 + 3*ncols` (the leading `  │` plus
+/// ` … │` per column), leaving a content budget of `width - overhead`. If that
+/// budget can't give every column even one column of content (`budget < ncols`),
+/// a box would have to overflow the terminal and garble — the caller falls back
+/// to plain rows. Otherwise: if the natural widths already fit they're returned
+/// as-is, else we water-fill narrowest-first — each column takes the smaller of
+/// its natural width and an even share of the remaining budget, so slim columns
+/// keep their size and the surplus flows to wide ones (which then wrap, see
+/// [[wrap_cell]]). `budget >= ncols` guarantees no content column collapses to 0.
+fn fit_column_widths(natural: &[usize], width: u16) -> Option<Vec<usize>> {
     let ncols = natural.len();
     if ncols == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let budget = (width as usize).saturating_sub(3 + 3 * ncols);
+    if budget < ncols {
+        return None;
+    }
     if natural.iter().sum::<usize>() <= budget {
-        return natural.to_vec();
+        return Some(natural.to_vec());
     }
     let mut order: Vec<usize> = (0..ncols).collect();
     order.sort_by_key(|&c| natural[c]);
@@ -304,13 +310,13 @@ fn fit_column_widths(natural: &[usize], width: u16) -> Vec<usize> {
     let mut remaining = budget;
     let mut left = ncols;
     for &c in &order {
-        let share = (remaining / left).max(1); // never collapse a column below 1
+        let share = remaining / left; // >= 1 here, since remaining >= left throughout
         let w = natural[c].min(share);
         widths[c] = w;
-        remaining = remaining.saturating_sub(w);
+        remaining -= w;
         left -= 1;
     }
-    widths
+    Some(widths)
 }
 
 /// Word-wrap a single cell to `width` display columns, breaking over-long runs
@@ -397,7 +403,19 @@ fn render_table(block: &[String], width: u16) -> (Vec<Line<'static>>, usize) {
         }
     }
     // Bound the box to the terminal; over-wide columns wrap instead of sprawling.
-    let widths = fit_column_widths(&natural, width);
+    // When too many columns leave no room for a box, fall back to plain rows so
+    // we never emit an over-wide border for the terminal to garble.
+    let Some(widths) = fit_column_widths(&natural, width) else {
+        let plain = |cells: &[String]| {
+            Line::from(Span::styled(
+                format!("  {}", cells.join(" | ")),
+                Style::default().fg(TEXT),
+            ))
+        };
+        let mut out = vec![plain(&header)];
+        out.extend(body.iter().map(|r| plain(r)));
+        return (out, consumed);
+    };
 
     let border = Style::default().fg(BORDER);
     let head_style = Style::default().fg(TEAL).add_modifier(Modifier::BOLD);

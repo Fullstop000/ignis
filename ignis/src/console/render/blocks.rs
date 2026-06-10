@@ -646,4 +646,38 @@ mod tests {
         let out = reasoning_preview_lines("just started", "⠋", 80);
         assert_eq!(out.len(), 1 + REASONING_PREVIEW_LINES);
     }
+
+    /// A table with too many columns for the terminal can't draw a box without
+    /// overflowing — it must fall back to plain rows so the full pipeline never
+    /// emits an over-wide line for the terminal to garble (codex-caught).
+    #[test]
+    fn many_column_table_never_overflows_width() {
+        let width: u16 = 30;
+        let md = "| c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 |\n\
+                  |--|--|--|--|--|--|--|--|\n\
+                  | alpha | bravo | charlie | delta | echo | foxtrot | golf | hotel |";
+        let lines = block_lines(
+            &UIBlock::Assistant(md.to_string()),
+            0,
+            Path::new("/"),
+            width,
+        );
+        for line in &lines {
+            assert!(
+                line_cols(line) <= width as usize,
+                "row exceeds width {width} (w={}): {:?}",
+                line_cols(line),
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+            );
+        }
+        // Content survives the fallback (wrapped, not dropped).
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(joined.contains("foxtrot"), "content lost: {joined:?}");
+    }
 }
