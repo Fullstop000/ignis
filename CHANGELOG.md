@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-06-10
+
 ### Added
 - TUI — the model's thinking now collapses to a rolling 3-line preview while it streams, finalizing to a one-line summary; press `Ctrl+O` to expand the full chain-of-thought. ([#156](https://github.com/Fullstop000/ignis/pull/156))
 - TUI — press `r` in the `/skills` picker to reload skills from disk, picking up newly added, edited, or removed skills without restarting. ([#157](https://github.com/Fullstop000/ignis/pull/157))
