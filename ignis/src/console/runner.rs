@@ -164,18 +164,18 @@ pub async fn run_console(
         }
     }
 
-    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
+    let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
     let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
     // Tool → console: the `ask_user` tool sends a PickerRequest when the model
     // wants to ask the user something mid-turn. Capacity 4 — pickers serialize
     // (one open at a time); the buffer just decouples send from console drain.
-    let (picker_tx, mut picker_rx) = mpsc::channel::<crate::console::picker::PickerRequest>(4);
+    let (picker_tx, picker_rx) = mpsc::channel::<crate::console::picker::PickerRequest>(4);
     let picker_tx_runner = picker_tx.clone();
     // Picker reply confirmation channel: handlers that run in `tokio::spawn`
     // (telemetry, AFK) can't reach `app.add_assistant_notice` directly, so
     // they send the confirm string here and the main loop drains it.
-    let (notice_tx, mut notice_rx) = mpsc::channel::<String>(8);
+    let (notice_tx, notice_rx) = mpsc::channel::<String>(8);
     // AssistantMessageRender hook chain runs on a single per-session
     // worker task that drains a bounded queue serially — so two
     // back-to-back MessageEnds with different hook latencies always
@@ -210,7 +210,7 @@ pub async fn run_console(
     // event loop polls the oneshot via try_recv and sets `app.update_notice`
     // when it lands. Skip gate (env opt-out, CI, stderr-not-TTY, debug build,
     // unsupported target) lives in cli::upgrade::should_check_for_update.
-    let mut update_check_rx = if crate::cli::upgrade::should_check_for_update() {
+    let update_check_rx = if crate::cli::upgrade::should_check_for_update() {
         Some(crate::cli::upgrade::spawn_update_check())
     } else {
         None
@@ -381,12 +381,6 @@ pub async fn run_console(
         }
     });
 
-    // Render at a capped frame rate. Agent events and keystrokes are coalesced
-    // between frames and the screen is redrawn at most once per frame, so a fast
-    // token stream never triggers a redraw per delta — which tears/flickers on
-    // slow terminals (e.g. Windows Terminal over WSL2).
-    let frame = std::time::Duration::from_millis(33); // ~30fps cap
-    let mut last_draw = std::time::Instant::now();
     // The in-progress block's already-streamed row count lives on `app`
     // (`app.committed_rows`) so a session reset (`/clear`, `/resume`) resets it
     // in lockstep with `app.committed` — see reset_transcript_view.
@@ -394,226 +388,359 @@ pub async fn run_console(
     // All anchoring state — screen-clear re-anchor episodes (#140/#154), the
     // resize settle (#138), and the band's converged geometry — lives in the
     // pure `Anchor` machine (see `render::anchor` for the invariants and their
-    // table tests). This loop only executes the wipes/rebuilds it asks for and
+    // table tests). The loop only executes the wipes/rebuilds it asks for and
     // reports the outcomes back. `epoch` is the monotonic clock it runs on.
-    let epoch = std::time::Instant::now();
-    let mut anchor = Anchor::new(viewport_rows, crossterm::terminal::size()?);
-    // Opt-in render-loop health heartbeat (frames / commits / re-anchors) to
-    // `~/.ignis/logs/ignis.log`, for diagnosing rendering issues in the field.
-    let mut diag = RenderDiag::from_env();
-    terminal.draw(|f| draw(f, &mut app))?;
+    let mut console = ConsoleLoop {
+        anchor: Anchor::new(viewport_rows, crossterm::terminal::size()?),
+        epoch: std::time::Instant::now(),
+        last_draw: std::time::Instant::now(),
+        // Opt-in render-loop health heartbeat (frames / commits / re-anchors)
+        // to `~/.ignis/logs/ignis.log`, for diagnosing rendering in the field.
+        diag: RenderDiag::from_env(),
+        app,
+        terminal,
+        agent_rx,
+        picker_rx,
+        notice_rx,
+        update_check_rx,
+        render_hook_queue,
+        prompt_tx,
+        cancel_tx,
+        picker_tx,
+        notice_tx,
+        active_inject,
+        ui_storage_dir,
+    };
+    console.run().await?;
 
-    loop {
-        // Wake on the next frame deadline, an agent event, or an `ask_user`
-        // picker request from a tool.
-        tokio::select! {
-            _ = tokio::time::sleep(frame) => {}
-            Some(ev) = agent_rx.recv() => {
-                enqueue_render_hook(
-                    &ev,
-                    &render_hook_queue,
-                    &app.session_id,
-                    &app.cwd,
-                );
-                app.handle_event(ev);
-            }
-            Some(req) = picker_rx.recv() => {
-                if app.inline_picker.is_some() {
-                    // One picker at a time — reject the second so the tool
-                    // returns an error instead of stalling.
-                    let _ = req.reply.send(crate::console::picker::PickerResponse::Cancelled);
-                } else {
-                    app.inline_picker = Some(inline_picker::InlinePickerState::new(req));
-                }
-            }
-        }
+    // Restore the cursor before the guard drops. The band stays in the normal
+    // buffer, so the conversation remains in scrollback after exit. `_term_guard`
+    // disables raw mode + bracketed paste on the way out (clean exit, `?`-bubbled
+    // Err returns, and panics).
+    console.terminal.show_cursor()?;
 
-        // Drain any other pending agent events and key input — state only, no draw.
-        while let Ok(ev) = agent_rx.try_recv() {
-            enqueue_render_hook(&ev, &render_hook_queue, &app.session_id, &app.cwd);
-            app.handle_event(ev);
+    // Leave a copy-pasteable resume hint below the band, like `claude --resume
+    // <id>`. We only reach this line on a clean Ctrl+D exit — every error path
+    // `?`-bubbles earlier — so it never fires on a crash. Skipped when the user
+    // sent nothing: an untouched session has nothing worth resuming. Uses
+    // `app.session_id`, which tracks the *current* session after any mid-run
+    // `/resume` or `/clear`, not the id we opened with.
+    if console.app.turn_count() > 0 {
+        let session_id = console.app.session_id.clone();
+        // Row just below the live band. The inline viewport anchors near the
+        // top after a short-history re-anchor and at the screen bottom in
+        // normal use; reading its area keeps the hint flush under the footer
+        // either way (vs. jumping to the screen bottom and leaving a gap).
+        let band_bottom = console.terminal.get_frame().size().bottom();
+        // Restore cooked mode first so `\n` and colors render normally.
+        drop(_term_guard);
+        let _ = print_resume_hint(&session_id, band_bottom);
+    }
+    Ok(())
+}
+
+/// Redraw cadence for the live band: agent events and keystrokes are coalesced
+/// between frames and the screen is redrawn at most once per interval, so a
+/// fast token stream never triggers a redraw per delta — which tears/flickers
+/// on slow terminals (e.g. Windows Terminal over WSL2). ~30fps.
+const FRAME: std::time::Duration = std::time::Duration::from_millis(33);
+
+/// What woke the frame loop (see [`ConsoleLoop::wake`]).
+enum Wake {
+    /// Frame deadline: nothing arrived, just tick/draw.
+    Tick,
+    /// An agent event from the background runner.
+    Event(AgentEvent),
+    /// An `ask_user`/permission picker request from a tool.
+    Picker(crate::console::picker::PickerRequest),
+}
+
+/// The live console: `App` (the UI model), the inline terminal, the `Anchor`
+/// machine, and every channel the frame loop drains. [`Self::run`] is the
+/// stable frame skeleton — mirroring [`crate::agent::Agent::run`]'s turn
+/// skeleton — and each lifecycle moment lives in its own method: waking
+/// ([`Self::wake`]), event intake ([`Self::drain_events`]), the queued-prompt
+/// pump ([`Self::pump_queued`]), terminal input ([`Self::poll_input`]),
+/// screen-clear re-anchoring ([`Self::resolve_reanchor`]), pushing rows into
+/// scrollback ([`Self::commit_scrollback`]), and the coalesced band redraw
+/// ([`Self::draw_frame`]).
+struct ConsoleLoop {
+    app: App,
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    anchor: Anchor,
+    /// Monotonic clock the `Anchor` machine runs on.
+    epoch: std::time::Instant,
+    diag: RenderDiag,
+    last_draw: std::time::Instant,
+    agent_rx: mpsc::Receiver<AgentEvent>,
+    picker_rx: mpsc::Receiver<crate::console::picker::PickerRequest>,
+    notice_rx: mpsc::Receiver<String>,
+    update_check_rx:
+        Option<tokio::sync::oneshot::Receiver<Option<crate::cli::upgrade::UpdateNotice>>>,
+    render_hook_queue: mpsc::Sender<RenderJob>,
+    prompt_tx: mpsc::Sender<AgentRequest>,
+    cancel_tx: mpsc::Sender<()>,
+    picker_tx: mpsc::Sender<crate::console::picker::PickerRequest>,
+    notice_tx: mpsc::Sender<String>,
+    active_inject: ActiveInject,
+    ui_storage_dir: PathBuf,
+}
+
+impl ConsoleLoop {
+    /// Drive the console until the user quits. The stable frame skeleton:
+    /// every iteration wakes, ingests state, then renders — state mutation
+    /// strictly precedes terminal output, so a frame never paints half-applied
+    /// events. Returns only on quit or a fatal terminal I/O error.
+    async fn run(&mut self) -> io::Result<()> {
+        let Self { terminal, app, .. } = &mut *self;
+        terminal.draw(|f| draw(f, app))?;
+
+        loop {
+            self.wake().await;
+            self.drain_events();
+            self.pump_queued().await;
+            self.poll_input().await?;
+            if self.app.should_quit {
+                break;
+            }
+            self.resolve_reanchor()?;
+            self.commit_scrollback()?;
+            self.draw_frame()?;
+            self.diag.heartbeat();
         }
-        // Drain picker-spawn notices into the transcript.
-        while let Ok(msg) = notice_rx.try_recv() {
-            app.add_assistant_notice(msg);
+        Ok(())
+    }
+
+    /// Park until there's work: the next frame deadline, an agent event, or an
+    /// `ask_user` picker request from a tool.
+    async fn wake(&mut self) {
+        let wake = tokio::select! {
+            _ = tokio::time::sleep(FRAME) => Wake::Tick,
+            Some(ev) = self.agent_rx.recv() => Wake::Event(ev),
+            Some(req) = self.picker_rx.recv() => Wake::Picker(req),
+        };
+        match wake {
+            Wake::Tick => {}
+            Wake::Event(ev) => self.on_agent_event(ev),
+            Wake::Picker(req) => self.open_picker(req),
+        }
+    }
+
+    /// Feed one agent event to the UI model (and the render-hook queue).
+    fn on_agent_event(&mut self, ev: AgentEvent) {
+        enqueue_render_hook(
+            &ev,
+            &self.render_hook_queue,
+            &self.app.session_id,
+            &self.app.cwd,
+        );
+        self.app.handle_event(ev);
+    }
+
+    /// Open a tool-initiated picker — one at a time; a second request is
+    /// rejected so the tool returns an error instead of stalling.
+    fn open_picker(&mut self, req: crate::console::picker::PickerRequest) {
+        if self.app.inline_picker.is_some() {
+            let _ = req
+                .reply
+                .send(crate::console::picker::PickerResponse::Cancelled);
+        } else {
+            self.app.inline_picker = Some(inline_picker::InlinePickerState::new(req));
+        }
+    }
+
+    /// Drain everything else pending — agent events, picker-spawn notices, the
+    /// auto-update oneshot, queued picker requests. State only, no draw.
+    fn drain_events(&mut self) {
+        while let Ok(ev) = self.agent_rx.try_recv() {
+            self.on_agent_event(ev);
+        }
+        while let Ok(msg) = self.notice_rx.try_recv() {
+            self.app.add_assistant_notice(msg);
         }
         // Poll the auto-update-check oneshot. Resolves once (Ok or Closed),
         // after which we drop the receiver so the branch goes dormant.
-        if let Some(rx) = &mut update_check_rx {
+        if let Some(rx) = &mut self.update_check_rx {
             match rx.try_recv() {
                 Ok(notice) => {
-                    app.update_notice = notice;
-                    update_check_rx = None;
+                    self.app.update_notice = notice;
+                    self.update_check_rx = None;
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    update_check_rx = None;
+                    self.update_check_rx = None;
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
         }
-        while let Ok(req) = picker_rx.try_recv() {
-            if app.inline_picker.is_some() {
-                let _ = req
-                    .reply
-                    .send(crate::console::picker::PickerResponse::Cancelled);
-            } else {
-                app.inline_picker = Some(inline_picker::InlinePickerState::new(req));
-            }
+        while let Ok(req) = self.picker_rx.try_recv() {
+            self.open_picker(req);
         }
+    }
 
-        // Edge-triggered: exactly one queued line per turn-end (TurnEnd).
-        // Route through the same dispatcher Enter uses so queued slash
-        // commands (`/compact`, `/model`, …) actually execute — sending the
-        // text as a raw `AgentRequest::Prompt` would deliver "/compact" to
-        // the LLM as a user message. The user block is rendered when
-        // `Session::prompt` emits `UserPromptCommitted` (post-hook), so we
-        // don't push it here.
-        if app.take_turn_just_ended() {
+    /// Edge-triggered: exactly one queued line per turn-end (TurnEnd).
+    /// Route through the same dispatcher Enter uses so queued slash
+    /// commands (`/compact`, `/model`, …) actually execute — sending the
+    /// text as a raw `AgentRequest::Prompt` would deliver "/compact" to
+    /// the LLM as a user message. The user block is rendered when
+    /// `Session::prompt` emits `UserPromptCommitted` (post-hook), so we
+    /// don't push it here.
+    async fn pump_queued(&mut self) {
+        if self.app.take_turn_just_ended() {
             // Control returned to the user — refresh the footer branch so a
             // `git checkout` the agent ran this turn is reflected (oh-my-zsh
             // recomputes per prompt; same idea).
-            app.refresh_git_branch();
-            if let Some(text) = app.take_queued_front() {
+            self.app.refresh_git_branch();
+            if let Some(text) = self.app.take_queued_front() {
                 crate::console::keys::submit_text(
-                    &mut app,
+                    &mut self.app,
                     text,
-                    &prompt_tx,
-                    &picker_tx,
-                    &notice_tx,
-                    &ui_storage_dir,
+                    &self.prompt_tx,
+                    &self.picker_tx,
+                    &self.notice_tx,
+                    &self.ui_storage_dir,
                 )
                 .await;
             }
         }
+    }
 
+    /// Poll terminal input — keys, paste, resize — without blocking.
+    async fn poll_input(&mut self) -> io::Result<()> {
         while event::poll(std::time::Duration::ZERO)? {
             match event::read()? {
                 Event::Key(key) => {
                     handle_key(
-                        &mut app,
+                        &mut self.app,
                         key,
-                        &prompt_tx,
-                        &cancel_tx,
-                        &active_inject,
-                        &ui_storage_dir,
-                        &picker_tx,
-                        &notice_tx,
+                        &self.prompt_tx,
+                        &self.cancel_tx,
+                        &self.active_inject,
+                        &self.ui_storage_dir,
+                        &self.picker_tx,
+                        &self.notice_tx,
                     )
                     .await;
                 }
-                Event::Paste(data) => crate::console::keys::handle_paste(&mut app, data),
+                Event::Paste(data) => crate::console::keys::handle_paste(&mut self.app, data),
                 // A resize (incl. same-grid-size DPI changes) must force a
                 // settle re-anchor — see `Anchor::band_step`.
-                Event::Resize(_, _) => anchor.on_resize(epoch.elapsed()),
+                Event::Resize(_, _) => self.anchor.on_resize(self.epoch.elapsed()),
                 // No mouse capture in inline mode — wheel scroll and click-drag
                 // selection are handled natively by the terminal/scrollback.
                 _ => {}
             }
         }
+        Ok(())
+    }
 
-        if app.should_quit {
-            break;
-        }
-
-        // Session reset (`/clear`, `/resume`): wipe the visible screen AND the
-        // scrollback history, then re-anchor a fresh viewport, so old output
-        // doesn't linger when scrolling up. `committed`/`committed_rows` were
-        // already reset in App, so the new session's blocks commit from the top.
-        //
+    /// Resolve a session reset (`/clear`, `/resume`): wipe the visible screen
+    /// AND the scrollback history, then re-anchor a fresh viewport, so old
+    /// output doesn't linger when scrolling up. `committed`/`committed_rows`
+    /// were already reset in App, so the new session's blocks commit from the
+    /// top. The episode policy (wipe once, bounded DSR attempts, DSR-free
+    /// fallback) lives in `Anchor`; this executes its instructions.
+    fn resolve_reanchor(&mut self) -> io::Result<()> {
         // Compute the target viewport height *before* the rebuild — the
         // pending viewport_rows is from the previous frame (e.g. 2 rows while
         // a picker was open), but the picker just closed, so the new size is
         // the band height. Building the post-clear terminal at the right size
-        // up front means the commit loop below runs in the correct viewport
-        // and the draw-time rebuild check is a no-op.
+        // up front means the commit loop runs in the correct viewport and the
+        // draw-time rebuild check is a no-op.
         let term_size = crossterm::terminal::size()?;
-        let want_rows = render::viewport_height(&app, term_size.0, term_size.1);
+        let want_rows = render::viewport_height(&self.app, term_size.0, term_size.1);
         // Transfer a reset's wipe request (`/clear`, `/resume`) into the anchor
         // machine; `anchor.can_commit()` stays false until the episode resolves.
-        if app.pending_screen_clear {
-            app.pending_screen_clear = false;
-            anchor.request_reanchor();
+        if self.app.pending_screen_clear {
+            self.app.pending_screen_clear = false;
+            self.anchor.request_reanchor();
         }
-        let now = epoch.elapsed();
-        if let Some(step) = anchor.clear_step(now, want_rows) {
-            if step.wipe == Some(Wipe::All) {
-                // First frame of the episode: wipe visible screen + scrollback
-                // exactly once (re-wiping every frame floods the terminal and
-                // worsens the very DSR backpressure that keeps the re-anchor
-                // from landing).
-                execute!(
-                    io::stdout(),
-                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                    crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
-                    crossterm::cursor::MoveTo(0, 0)
-                )?;
-                log::info!(
-                    "render: re-anchor started (blocks={}, committed={}, want_rows={})",
-                    app.blocks.len(),
-                    app.committed,
-                    step.want_rows
+        let now = self.epoch.elapsed();
+        let Some(step) = self.anchor.clear_step(now, want_rows) else {
+            return Ok(());
+        };
+        if step.wipe == Some(Wipe::All) {
+            // First frame of the episode: wipe visible screen + scrollback
+            // exactly once (re-wiping every frame floods the terminal and
+            // worsens the very DSR backpressure that keeps the re-anchor
+            // from landing).
+            execute!(
+                io::stdout(),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
+                crossterm::cursor::MoveTo(0, 0)
+            )?;
+            log::info!(
+                "render: re-anchor started (blocks={}, committed={}, want_rows={})",
+                self.app.blocks.len(),
+                self.app.committed,
+                step.want_rows
+            );
+        }
+        let ok = try_rebuild(&mut self.terminal, step.want_rows)?;
+        let pending_blocks = self.app.blocks.len().saturating_sub(self.app.committed);
+        // Re-read the clock for the report: `waited` in the log lines must
+        // include the rebuild attempt itself (~2s when its DSR times out),
+        // or a stalled first attempt logs a misleading 0ms.
+        match self
+            .anchor
+            .clear_rebuilt(ok, self.epoch.elapsed(), step.want_rows, term_size)
+        {
+            ClearOutcome::Landed { attempts, waited } => {
+                // Re-anchor landed: resume commits from the top of scrollback.
+                if attempts > 0 {
+                    log::info!(
+                        "render: re-anchor landed after {} retr{} ({}ms) — resuming commits",
+                        attempts,
+                        if attempts == 1 { "y" } else { "ies" },
+                        waited.as_millis()
+                    );
+                }
+                self.diag.on_reanchor_ok();
+            }
+            ClearOutcome::Held { attempts, waited } => {
+                self.diag.on_reanchor_failed();
+                log::warn!(
+                    "render: re-anchor DSR not landed (attempt {}/{}, {}ms) — \
+                     holding {} block(s); retrying",
+                    attempts,
+                    anchor::MAX_REANCHOR_ATTEMPTS,
+                    waited.as_millis(),
+                    pending_blocks
                 );
             }
-            let ok = try_rebuild(&mut terminal, step.want_rows)?;
-            let pending_blocks = app.blocks.len().saturating_sub(app.committed);
-            // Re-read the clock for the report: `waited` in the log lines must
-            // include the rebuild attempt itself (~2s when its DSR times out),
-            // or a stalled first attempt logs a misleading 0ms.
-            match anchor.clear_rebuilt(ok, epoch.elapsed(), step.want_rows, term_size) {
-                ClearOutcome::Landed { attempts, waited } => {
-                    // Re-anchor landed: resume commits from the top of scrollback.
-                    if attempts > 0 {
-                        log::info!(
-                            "render: re-anchor landed after {} retr{} ({}ms) — resuming commits",
-                            attempts,
-                            if attempts == 1 { "y" } else { "ies" },
-                            waited.as_millis()
-                        );
-                    }
-                    diag.on_reanchor_ok();
-                }
-                ClearOutcome::Held { attempts, waited } => {
-                    diag.on_reanchor_failed();
-                    log::warn!(
-                        "render: re-anchor DSR not landed (attempt {}/{}, {}ms) — \
-                         holding {} block(s); retrying",
-                        attempts,
-                        anchor::MAX_REANCHOR_ATTEMPTS,
-                        waited.as_millis(),
-                        pending_blocks
-                    );
-                }
-                ClearOutcome::ForcedFallback { attempts, waited } => {
-                    // Backstop: the re-anchor DSR isn't answering (WSL2/conpty
-                    // under backpressure). Gating all commits on it leaves the
-                    // screen blank while the agent keeps working — the "blank
-                    // after input, full content on resume" wedge. Re-anchor
-                    // WITHOUT a DSR via `terminal.clear()` (resets the back
-                    // buffer using the known viewport area) and resume commits.
-                    diag.on_reanchor_failed();
-                    log::warn!(
-                        "render: re-anchor DSR unresponsive after {} attempts ({}ms) — \
-                         forcing DSR-free re-anchor so {} block(s) can paint \
-                         (blocks={}, committed={})",
-                        attempts,
-                        waited.as_millis(),
-                        pending_blocks,
-                        app.blocks.len(),
-                        app.committed
-                    );
-                    let _ = terminal.clear();
-                    diag.on_forced_reanchor();
-                }
+            ClearOutcome::ForcedFallback { attempts, waited } => {
+                // Backstop: the re-anchor DSR isn't answering (WSL2/conpty
+                // under backpressure). Gating all commits on it leaves the
+                // screen blank while the agent keeps working — the "blank
+                // after input, full content on resume" wedge. Re-anchor
+                // WITHOUT a DSR via `terminal.clear()` (resets the back
+                // buffer using the known viewport area) and resume commits.
+                self.diag.on_reanchor_failed();
+                log::warn!(
+                    "render: re-anchor DSR unresponsive after {} attempts ({}ms) — \
+                     forcing DSR-free re-anchor so {} block(s) can paint \
+                     (blocks={}, committed={})",
+                    attempts,
+                    waited.as_millis(),
+                    pending_blocks,
+                    self.app.blocks.len(),
+                    self.app.committed
+                );
+                let _ = self.terminal.clear();
+                self.diag.on_forced_reanchor();
             }
         }
+        Ok(())
+    }
 
-        // Push settled rows into the terminal's native scrollback via
-        // insert_before — the terminal owns them from there (native scroll +
-        // copy + tmux-reattach persistence). Finalized blocks flush whole; the
-        // in-progress assistant/reasoning block streams its *stable* rows as
-        // they settle (stream_commit), so text flows smoothly into scrollback
-        // rather than appearing all at once. A pending tool block waits.
-        let width = terminal.size()?.width;
+    /// Push settled rows into the terminal's native scrollback via
+    /// insert_before — the terminal owns them from there (native scroll +
+    /// copy + tmux-reattach persistence). Finalized blocks flush whole; the
+    /// in-progress assistant/reasoning block streams its *stable* rows as
+    /// they settle (stream_commit), so text flows smoothly into scrollback
+    /// rather than appearing all at once. A pending tool block waits.
+    fn commit_scrollback(&mut self) -> io::Result<()> {
+        let width = self.terminal.size()?.width;
         // Collect the new rows for every block we're about to commit in this
         // frame, then hand them to insert_before as a single batch. Calling
         // insert_before multiple times in succession overwrites prior inserts
@@ -631,15 +758,17 @@ pub async fn run_console(
         // frame(s) via `committed`/`committed_rows`.
         let max_rows = render::max_commit_rows(width);
         let mut batch: Vec<Line<'static>> = Vec::new();
+        let app = &mut self.app;
         // Defer commits while a screen-clear re-anchor is still pending.
         // Committing before the re-anchor lands would advance `committed` into
         // blocks the next Clear(All) wipes — a resumed transcript paints once,
         // gets erased, and never repaints. So we hold off; once the re-anchor
-        // lands we commit the batch at once. Crucially, the episode above is
-        // bounded (`anchor::MAX_REANCHOR_ATTEMPTS`): if its DSR never answers
-        // we force a DSR-free re-anchor and reopen the gate, so it can't wedge
+        // lands we commit the batch at once. Crucially, the episode is bounded
+        // (`anchor::MAX_REANCHOR_ATTEMPTS`): if its DSR never answers we force
+        // a DSR-free re-anchor and reopen the gate, so it can't wedge
         // rendering blank indefinitely (the "blank after input" bug).
-        while anchor.can_commit() && app.committed < app.blocks.len() && batch.len() < max_rows {
+        while self.anchor.can_commit() && app.committed < app.blocks.len() && batch.len() < max_rows
+        {
             let block = &app.blocks[app.committed];
             let done = app.block_done(app.committed);
             let rows = if done {
@@ -673,74 +802,56 @@ pub async fn run_console(
         }
         if !batch.is_empty() {
             let h = batch.len() as u16;
-            terminal.insert_before(h, |buf| render::render_block_into(buf, &batch))?;
-            diag.on_commit(batch.len());
+            self.terminal
+                .insert_before(h, |buf| render::render_block_into(buf, &batch))?;
+            self.diag.on_commit(batch.len());
         }
+        Ok(())
+    }
 
-        // Coalesced redraw of the live band: at most once per frame interval.
-        if last_draw.elapsed() >= frame {
-            app.tick_update();
-            diag.on_frame();
-            // Rebuild the inline viewport when the band height changes (picker
-            // open/close, multi-line input) OR the terminal resized. ratatui
-            // 0.26's inline autoresize leaves the old band stranded in
-            // scrollback (#77); taking over with clear()+fresh viewport
-            // re-anchors cleanly.
-            let term_size = crossterm::terminal::size()?;
-            let want_rows = render::viewport_height(&app, term_size.0, term_size.1);
-            // Band geometry: `Anchor::band_step` decides when to rebuild (height
-            // change, terminal resize, or a post-resize settle that scrubs
-            // conpty's late-reflow duplicates) and how much to wipe. A timed-out
-            // DSR keeps the old viewport and retries next frame; the resize
-            // marker is consumed only by a settle re-anchor that landed.
-            if let Some(step) = anchor.band_step(epoch.elapsed(), want_rows, term_size) {
-                if step.wipe == Some(Wipe::Band) {
-                    terminal.clear()?;
-                } else {
-                    // ratatui's inline clear() only scrubs downward, so on a
-                    // resize the old band (reflowed by the terminal above the
-                    // new anchor) is left stranded (#77). Wipe the whole screen
-                    // and re-anchor fresh; committed scrollback stays in history.
-                    execute!(
-                        io::stdout(),
-                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                        crossterm::cursor::MoveTo(0, 0)
-                    )?;
-                }
-                let ok = try_rebuild(&mut terminal, step.want_rows)?;
-                anchor.band_rebuilt(ok, step.want_rows, term_size);
+    /// Coalesced redraw of the live band: at most once per [`FRAME`] interval.
+    fn draw_frame(&mut self) -> io::Result<()> {
+        if self.last_draw.elapsed() < FRAME {
+            return Ok(());
+        }
+        self.app.tick_update();
+        self.diag.on_frame();
+        // Rebuild the inline viewport when the band height changes (picker
+        // open/close, multi-line input) OR the terminal resized. ratatui
+        // 0.26's inline autoresize leaves the old band stranded in
+        // scrollback (#77); taking over with clear()+fresh viewport
+        // re-anchors cleanly.
+        let term_size = crossterm::terminal::size()?;
+        let want_rows = render::viewport_height(&self.app, term_size.0, term_size.1);
+        // Band geometry: `Anchor::band_step` decides when to rebuild (height
+        // change, terminal resize, or a post-resize settle that scrubs
+        // conpty's late-reflow duplicates) and how much to wipe. A timed-out
+        // DSR keeps the old viewport and retries next frame; the resize
+        // marker is consumed only by a settle re-anchor that landed.
+        if let Some(step) = self
+            .anchor
+            .band_step(self.epoch.elapsed(), want_rows, term_size)
+        {
+            if step.wipe == Some(Wipe::Band) {
+                self.terminal.clear()?;
+            } else {
+                // ratatui's inline clear() only scrubs downward, so on a
+                // resize the old band (reflowed by the terminal above the
+                // new anchor) is left stranded (#77). Wipe the whole screen
+                // and re-anchor fresh; committed scrollback stays in history.
+                execute!(
+                    io::stdout(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                    crossterm::cursor::MoveTo(0, 0)
+                )?;
             }
-            draw_tolerant(&mut terminal, &mut app)?;
-            last_draw = std::time::Instant::now();
+            let ok = try_rebuild(&mut self.terminal, step.want_rows)?;
+            self.anchor.band_rebuilt(ok, step.want_rows, term_size);
         }
-
-        diag.heartbeat();
+        draw_tolerant(&mut self.terminal, &mut self.app)?;
+        self.last_draw = std::time::Instant::now();
+        Ok(())
     }
-
-    // Restore the cursor before the guard drops. The band stays in the normal
-    // buffer, so the conversation remains in scrollback after exit. `_term_guard`
-    // disables raw mode + bracketed paste on the way out (clean exit, `?`-bubbled
-    // Err returns, and panics).
-    terminal.show_cursor()?;
-
-    // Leave a copy-pasteable resume hint below the band, like `claude --resume
-    // <id>`. We only reach this line on a clean Ctrl+D exit — every error path
-    // `?`-bubbles earlier — so it never fires on a crash. Skipped when the user
-    // sent nothing: an untouched session has nothing worth resuming. Uses
-    // `app.session_id`, which tracks the *current* session after any mid-run
-    // `/resume` or `/clear`, not the id we opened with.
-    if app.turn_count() > 0 {
-        let session_id = app.session_id.clone();
-        // Row just below the live band. The inline viewport anchors near the
-        // top after a short-history re-anchor and at the screen bottom in
-        // normal use; reading its area keeps the hint flush under the footer
-        // either way (vs. jumping to the screen bottom and leaving a gap).
-        let band_bottom = terminal.get_frame().size().bottom();
-        // Restore cooked mode first so `\n` and colors render normally.
-        drop(_term_guard);
-        let _ = print_resume_hint(&session_id, band_bottom);
-    }
-    Ok(())
 }
 
 /// Print a `ignis --resume <id>` hint below the live band, where the shell
