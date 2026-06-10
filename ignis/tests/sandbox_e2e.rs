@@ -444,35 +444,30 @@ async fn sandboxed_hook_can_read_system_libs() {
 }
 
 #[tokio::test]
-async fn sandboxed_hook_cannot_read_home() {
-    // $HOME must NOT be in the read allowlist — that's the whole point
-    // of the sandbox (a hook must not be able to read `~/.ssh/id_rsa`).
+async fn sandboxed_hook_cannot_read_outside_allowlist() {
+    // The sandbox's core guarantee: a hook may read ONLY allowlisted
+    // paths (system libs, /tmp, /var/tmp, its own folder). Everything
+    // else — `~/.ssh/id_rsa`, the user's project, anything — must be
+    // denied. We exercise that with the crate's target dir, which is
+    // outside the allowlist (the write-block test relies on the same
+    // fact). We deliberately do NOT read the process-global `$HOME`
+    // here: `env_allowlist_passes_universal_set` mutates it, so reading
+    // it would race under parallel `cargo test` (a flaky-test trap).
     //
-    // Two deliberate choices vs the naive version:
-    //   * Read the file's *contents* (`cat`), NOT `[ -r ]`: `-r` only needs
-    //     file-read-metadata, which the Seatbelt profile allows globally,
-    //     so it could report readable even when the data read is denied —
-    //     and `[ -r ]` on an absent file is false regardless of the
-    //     sandbox, which makes the assertion vacuous.
+    // Two further choices:
+    //   * Read the file's *contents* (`cat`), NOT `[ -r ]`: `-r` only
+    //     needs file-read-metadata (allowed globally on Seatbelt) and is
+    //     false on an absent file too, which would make the assertion
+    //     vacuous.
     //   * A real file + an unsandboxed control twin: proves the file is
     //     genuinely readable, so a BLOCKED result under the sandbox can
     //     only be the confinement, not a missing file.
     if !should_enforce_filesystem_assertions() {
-        eprintln!("kernel sandbox unavailable; skipping $HOME read-block assertion");
+        eprintln!("kernel sandbox unavailable; skipping outside-allowlist read-block assertion");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .expect("HOME set in test env");
-    let secret = home.join(format!(
-        "ignis-e2e-secret-{}-{}.txt",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    ));
+    let secret = fresh_target_path("read-secret");
     std::fs::write(&secret, "TOPSECRET").unwrap();
     let secret_str = secret.to_string_lossy().to_string();
     let probe = format!(
@@ -486,8 +481,8 @@ async fn sandboxed_hook_cannot_read_home() {
          fi\n"
     );
 
-    // Sandboxed: the content read of $HOME must be denied.
-    let s1 = write_script(tmp.path(), "read-home.sh", &probe);
+    // Sandboxed: the content read of a non-allowlisted path must be denied.
+    let s1 = write_script(tmp.path(), "read-secret.sh", &probe);
     let (out, _) = run_dispatch(spec_with(s1, true, vec![]), "x").await;
     let sandboxed = match out {
         HookOutcome::Mutated { ref updated, .. } => updated.clone(),
@@ -498,7 +493,7 @@ async fn sandboxed_hook_cannot_read_home() {
     };
 
     // Unsandboxed control: proves the file is genuinely readable.
-    let s2 = write_script(tmp.path(), "read-home-unsandboxed.sh", &probe);
+    let s2 = write_script(tmp.path(), "read-secret-unsandboxed.sh", &probe);
     let (out2, _) = run_dispatch(spec_with(s2, false, vec![]), "x").await;
     let unsandboxed = match out2 {
         HookOutcome::Mutated { ref updated, .. } => updated.clone(),
@@ -511,11 +506,11 @@ async fn sandboxed_hook_cannot_read_home() {
 
     assert_eq!(
         unsandboxed, "READABLE",
-        "control failed: hook could not read its own $HOME secret even unsandboxed"
+        "control failed: hook could not read the secret even unsandboxed"
     );
     assert_eq!(
         sandboxed, "BLOCKED",
-        "sandbox let the hook read a real file under $HOME"
+        "sandbox let the hook read a file outside the allowlist"
     );
 }
 
