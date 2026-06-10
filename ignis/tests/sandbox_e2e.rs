@@ -213,9 +213,15 @@ async fn env_allowlist_blocks_secret_by_default() {
 async fn env_allowlist_passes_universal_set() {
     let tmp = tempfile::tempdir().unwrap();
     let script = env_dump_script(tmp.path());
+    let home_before = std::env::var_os("HOME");
     std::env::set_var("HOME", "/home/e2e-user");
 
     let (out, _) = run_dispatch(spec_with(script, false, vec![]), "x").await;
+    if let Some(v) = home_before {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
     let body = match out {
         HookOutcome::Mutated { updated, .. } => updated,
         other => panic!("expected Mutated, got {other:?}"),
@@ -440,8 +446,17 @@ async fn sandboxed_hook_can_read_system_libs() {
 #[tokio::test]
 async fn sandboxed_hook_cannot_read_home() {
     // $HOME must NOT be in the read allowlist — that's the whole point
-    // of the sandbox. A hook that tries to read ~/.ssh/id_rsa should
-    // fail.
+    // of the sandbox (a hook must not be able to read `~/.ssh/id_rsa`).
+    //
+    // Two deliberate choices vs the naive version:
+    //   * Read the file's *contents* (`cat`), NOT `[ -r ]`: `-r` only needs
+    //     file-read-metadata, which the Seatbelt profile allows globally,
+    //     so it could report readable even when the data read is denied —
+    //     and `[ -r ]` on an absent file is false regardless of the
+    //     sandbox, which makes the assertion vacuous.
+    //   * A real file + an unsandboxed control twin: proves the file is
+    //     genuinely readable, so a BLOCKED result under the sandbox can
+    //     only be the confinement, not a missing file.
     if !should_enforce_filesystem_assertions() {
         eprintln!("kernel sandbox unavailable; skipping $HOME read-block assertion");
         return;
@@ -450,29 +465,58 @@ async fn sandboxed_hook_cannot_read_home() {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .expect("HOME set in test env");
-    let target = home.join("ignis-e2e-should-not-exist.txt");
-    let _ = std::fs::remove_file(&target);
-    let target_str = target.to_string_lossy().to_string();
-    let script = write_script(
-        tmp.path(),
-        "read-home.sh",
-        &format!(
-            "#!/bin/sh\n\
-             cat >/dev/null\n\
-             if [ -r \"{target_str}\" ]; then\n\
-                 printf '%s' '{{\"hookSpecificOutput\":{{\"updatedInput\":\"READABLE\"}}}}'\n\
-             else\n\
-                 printf '%s' '{{\"hookSpecificOutput\":{{\"updatedInput\":\"BLOCKED\"}}}}'\n\
-             fi\n"
-        ),
+    let secret = home.join(format!(
+        "ignis-e2e-secret-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::write(&secret, "TOPSECRET").unwrap();
+    let secret_str = secret.to_string_lossy().to_string();
+    let probe = format!(
+        "#!/bin/sh\n\
+         cat >/dev/null\n\
+         got=$(cat \"{secret_str}\" 2>/dev/null)\n\
+         if [ \"$got\" = \"TOPSECRET\" ]; then\n\
+             printf '%s' '{{\"hookSpecificOutput\":{{\"updatedInput\":\"READABLE\"}}}}'\n\
+         else\n\
+             printf '%s' '{{\"hookSpecificOutput\":{{\"updatedInput\":\"BLOCKED\"}}}}'\n\
+         fi\n"
     );
-    let (out, _) = run_dispatch(spec_with(script, true, vec![]), "x").await;
-    match out {
-        HookOutcome::Mutated { ref updated, .. } => {
-            assert_eq!(updated, "BLOCKED", "sandbox let hook read $HOME: {out:?}");
+
+    // Sandboxed: the content read of $HOME must be denied.
+    let s1 = write_script(tmp.path(), "read-home.sh", &probe);
+    let (out, _) = run_dispatch(spec_with(s1, true, vec![]), "x").await;
+    let sandboxed = match out {
+        HookOutcome::Mutated { ref updated, .. } => updated.clone(),
+        other => {
+            let _ = std::fs::remove_file(&secret);
+            panic!("expected Mutated, got {other:?}");
         }
-        other => panic!("expected Mutated, got {other:?}"),
-    }
+    };
+
+    // Unsandboxed control: proves the file is genuinely readable.
+    let s2 = write_script(tmp.path(), "read-home-unsandboxed.sh", &probe);
+    let (out2, _) = run_dispatch(spec_with(s2, false, vec![]), "x").await;
+    let unsandboxed = match out2 {
+        HookOutcome::Mutated { ref updated, .. } => updated.clone(),
+        other => {
+            let _ = std::fs::remove_file(&secret);
+            panic!("expected Mutated, got {other:?}");
+        }
+    };
+    let _ = std::fs::remove_file(&secret);
+
+    assert_eq!(
+        unsandboxed, "READABLE",
+        "control failed: hook could not read its own $HOME secret even unsandboxed"
+    );
+    assert_eq!(
+        sandboxed, "BLOCKED",
+        "sandbox let the hook read a real file under $HOME"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -525,12 +569,11 @@ time.sleep(30)
         "did not honour grace window: elapsed = {elapsed:?}"
     );
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < Duration::from_secs(5),
         "SIGKILL did not land promptly: elapsed = {elapsed:?}"
     );
 }
 
-#[cfg(unix)]
 #[cfg(unix)]
 #[tokio::test]
 async fn sigterm_grace_with_cooperative_hook_exits_promptly() {

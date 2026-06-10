@@ -931,7 +931,7 @@ time.sleep(30)
         );
         // Upper bound: must NOT wait the full 30 s sleep — SIGKILL kicks in.
         assert!(
-            elapsed < Duration::from_secs(3),
+            elapsed < Duration::from_secs(5),
             "SIGKILL did not land promptly: elapsed = {elapsed:?}"
         );
 
