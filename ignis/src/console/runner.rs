@@ -762,7 +762,71 @@ pub async fn run_console(
     // disables raw mode + bracketed paste on the way out (clean exit, `?`-bubbled
     // Err returns, and panics).
     terminal.show_cursor()?;
+
+    // Leave a copy-pasteable resume hint below the band, like `claude --resume
+    // <id>`. We only reach this line on a clean Ctrl+D exit — every error path
+    // `?`-bubbles earlier — so it never fires on a crash. Skipped when the user
+    // sent nothing: an untouched session has nothing worth resuming. Uses
+    // `app.session_id`, which tracks the *current* session after any mid-run
+    // `/resume` or `/clear`, not the id we opened with.
+    if app.turn_count() > 0 {
+        let session_id = app.session_id.clone();
+        // Row just below the live band. The inline viewport anchors near the
+        // top after a short-history re-anchor and at the screen bottom in
+        // normal use; reading its area keeps the hint flush under the footer
+        // either way (vs. jumping to the screen bottom and leaving a gap).
+        let band_bottom = terminal.get_frame().size().bottom();
+        // Restore cooked mode first so `\n` and colors render normally.
+        drop(_term_guard);
+        let _ = print_resume_hint(&session_id, band_bottom);
+    }
     Ok(())
+}
+
+/// Print a `ignis --resume <id>` hint below the live band, where the shell
+/// prompt returns after exit. Best-effort: terminal I/O errors are swallowed —
+/// the session already ended cleanly and a missing hint is harmless.
+fn print_resume_hint(session_id: &str, band_bottom: u16) -> io::Result<()> {
+    use crossterm::{
+        cursor::MoveTo,
+        style::{Color, Print, ResetColor, SetForegroundColor},
+    };
+    execute!(
+        io::stdout(),
+        // Land just under the band (clamped to the screen, scrolls if needed),
+        // then a blank separator line before the hint.
+        MoveTo(0, band_bottom),
+        Print("\r\n"),
+        SetForegroundColor(Color::DarkGrey),
+        Print("Resume this session with:\r\n"),
+        ResetColor,
+        SetForegroundColor(Color::Rgb {
+            r: 0xcb,
+            g: 0xa6,
+            b: 0xf7,
+        }),
+        Print(format!(
+            "  ignis --resume {}\r\n",
+            quote_session_id(session_id)
+        )),
+        ResetColor,
+    )
+}
+
+/// Render a session id for the resume hint. Generated ids
+/// (`session-<ts>-<hex>`) print bare; but `--resume <id>` accepts an arbitrary
+/// user-supplied id verbatim, so one with spaces or shell metacharacters is
+/// single-quoted to stay copy-pasteable.
+fn quote_session_id(id: &str) -> String {
+    let safe = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'));
+    if safe {
+        id.to_string()
+    } else {
+        format!("'{}'", id.replace('\'', r"'\''"))
+    }
 }
 
 /// Prefix used to label the assistant block that carries an
@@ -914,6 +978,21 @@ mod tests {
     use crate::{AgentEvent, Message};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    #[test]
+    fn quote_session_id_keeps_generated_ids_bare_and_quotes_unsafe() {
+        // Generated ids (`session-<ts>-<hex>`) print bare, matching the example.
+        assert_eq!(
+            quote_session_id("session-1700000000-ab12cd34"),
+            "session-1700000000-ab12cd34"
+        );
+        // User-supplied `--resume <id>` reaches the hint verbatim; spaces and
+        // shell metacharacters get single-quoted so a paste stays one argument.
+        assert_eq!(quote_session_id("my work"), "'my work'");
+        assert_eq!(quote_session_id("a;rm -rf x"), "'a;rm -rf x'");
+        assert_eq!(quote_session_id("it's"), r"'it'\''s'");
+        assert_eq!(quote_session_id(""), "''");
+    }
 
     fn write_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
