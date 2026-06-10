@@ -46,6 +46,18 @@ impl ModelCatalog {
     pub fn context_for(&self, model: &str) -> Option<u64> {
         self.by_model.get(model).copied()
     }
+
+    /// Build a catalog from explicit `(model id, window)` pairs — test-only, so
+    /// resolution can be exercised without a `~/.ignis/models.json` cache.
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: impl IntoIterator<Item = (&'static str, u64)>) -> Self {
+        Self {
+            by_model: entries
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        }
+    }
 }
 
 fn cache_path() -> Option<PathBuf> {

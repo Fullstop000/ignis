@@ -7,25 +7,48 @@ the next turn. (Formerly "hooks" — v1 configs at `~/.ignis/hooks.json`
 still load as a back-compat fallback, and the slash command `/hooks` is
 kept as a deprecated alias.)
 
-> ## ⚠ Extensions run unsandboxed
+> ## Extension sandbox
 >
-> Each extension command runs with the full privileges of your `ignis`
-> process. A malicious or buggy hook can:
+> Each extension subprocess is confined with four layers, defaults-on:
 >
-> - Read `~/.ssh`, `~/.aws/credentials`, `~/.config/gh/`, `.netrc`,
->   any project source.
-> - See and exfiltrate every env var ignis was started with —
->   including `ANTHROPIC_API_KEY`.
-> - Spawn child processes; write/delete arbitrary files; make
->   arbitrary network calls.
+> 1. **Env-var allowlist (all platforms).** The child sees only
+>    `PATH HOME USER LANG LC_ALL TZ` from ignis's own env, plus whatever
+>    extra names the extension declares in `env: [...]`. Default
+>    `env: []`. An extension that doesn't declare `ANTHROPIC_API_KEY`
+>    does not see `ANTHROPIC_API_KEY`.
+> 2. **Filesystem sandbox.** Per extension `sandbox: bool`, default
+>    `true`. The extension can **read** its own folder, `/etc/ssl/certs`,
+>    `/usr/lib`, `/lib`, `/lib64`, `/bin`, `/usr/bin`, `/sbin`,
+>    `/usr/sbin`, `/etc/resolv.conf`, `/tmp`, `/var/tmp`, `/dev/urandom`,
+>    `/dev/zero`; it can **write** `/tmp`, `/var/tmp`, `/dev/null`. Net
+>    access is unrestricted — that's fine because the env-var allowlist
+>    already stops it learning a credential it could exfil. Set
+>    `sandbox: false` if your extension genuinely needs broader access
+>    (e.g. a project-indexer that reads the whole tree).
 >
-> **Treat `~/.ignis/extensions.json` like `crontab`** — anything in there
-> has root-equivalent power over your user account. Only install hooks
-> whose source you have personally audited.
+>    The mechanism is per-platform:
+>    * **Linux** uses Landlock (ABI V1, Linux 5.13+). On older kernels a
+>      one-time `[warn] extension.sandbox: <name>: kernel sandbox
+>      unavailable on this kernel; extension runs unconfined` notice
+>      fires per session.
+>    * **macOS** uses Apple's `sandbox_init(3)` ("Seatbelt") with a
+>      Scheme-syntax profile translated from the same default path list.
+>      The `/tmp → /private/tmp` and `/var → /private/var` symlink
+>      rewrites are emitted automatically so an extension that opens
+>      `/tmp/foo` is matched against the canonical `/private/tmp/foo`.
+>    * **Other platforms** (Windows, other BSDs) the flag is a no-op and
+>      the unconfined-warning fires.
+> 3. **SIGTERM → 1 s grace → SIGKILL on timeout.** A misbehaving
+>    extension gets one second of "please clean up" before it's
+>    force-killed.
+> 4. **1 MiB cap per stdout / stderr stream.** Bytes beyond the cap are
+>    discarded after a `[warn] extension.buffer: <name>: <stream>
+>    truncated at 1 MiB` is committed to scrollback.
 >
-> A separate PR adds env-var scrubbing and a Linux Landlock / macOS
-> Seatbelt sandbox; until it merges, the protocol relies on you reading
-> the script.
+> **You should still audit `~/.ignis/extensions.json` like a crontab.**
+> The sandbox closes filesystem and credential exfil; it does not (yet)
+> filter network egress. An extension that declared
+> `env: ["ANTHROPIC_API_KEY"]` can still send the key off-host.
 
 ## Events
 
@@ -183,8 +206,9 @@ summary.
 | `2` | Block the chain. Per-event semantics (see Block column above). |
 | anything else | Soft failure: original payload kept; `[warn]` in scrollback. |
 
-A hook that runs longer than its `timeout_ms` is killed (SIGKILL via
-`kill_on_drop`) and treated as a soft failure.
+An extension that runs longer than its `timeout_ms` gets SIGTERM, a
+1 s grace window to exit cleanly, then SIGKILL — and is treated as a
+soft failure.
 
 ## Declaration — `~/.ignis/extensions.json`
 
@@ -194,6 +218,8 @@ A hook that runs longer than its `timeout_ms` is killed (SIGKILL via
     "UserPromptSubmit": [
       {
         "command": "~/.ignis/extensions/translate-en/run.py",
+        "env": ["ANTHROPIC_API_KEY"],
+        "sandbox": true,
         "timeout_ms": 30000
       }
     ],
@@ -232,8 +258,17 @@ A hook that runs longer than its `timeout_ms` is killed (SIGKILL via
 - `timeout_ms` defaults to `10000` (10 s).
 - `matcher` is a regex on `tool_name`. Meaningful only for
   `PreToolUse` / `PostToolUse`; on other events it's logged at load.
-- Each event takes a JSON array — multiple hooks chain left-to-right,
-  each receiving the previous hook's output.
+- `env` is an array of env-var **names** ignis passes through from its
+  own environment, on top of the universal allowlist
+  (`PATH HOME USER LANG LC_ALL TZ`). Defaults to `[]`. An extension
+  that needs `ANTHROPIC_API_KEY` must list it here, or it won't see it.
+- `sandbox` toggles the filesystem confinement (Linux Landlock / macOS
+  Seatbelt). Defaults to `true`. Set `false` for extensions that
+  legitimately need broad filesystem access. On a platform without a
+  sandbox implementation the flag has no effect — the one-time
+  `[warn] extension.sandbox` notice is your hint.
+- Each event takes a JSON array — multiple extensions chain
+  left-to-right, each receiving the previous one's output.
 - The file is loaded at session start. Absent file = no hooks, no log
   noise. Malformed file = startup error.
 
@@ -247,7 +282,7 @@ edits required. The `matcher` field is optional; absent matcher means
 ### Inspecting the active chains — `/extensions` (or `/extensions list`)
 
 ```
-[info] 4 hooks registered · /extensions reload to re-read · run unsandboxed; audit before installing:
+[info] 4 extensions registered · /extensions reload to re-read:
   UserPromptSubmit (1):
     · translate-en  ~/.ignis/extensions/translate-en/run.py  (timeout 30000ms)
   SystemPromptCompose (1):
@@ -273,12 +308,30 @@ Every soft failure commits a `[warn] <event>: <reason> (<hook-name>)`
 line below the affected block. No rate-limiting — transparency over
 visual cleanliness.
 
+## Verifying the sandbox
+
+The sandbox is regression-tested by `ignis/tests/sandbox_e2e.rs`
+(across 8 layers: env-allowlist, filesystem, SIGTERM grace, buffer cap,
+lifecycle, composition, macOS Seatbelt quirks, status reporting) plus
+`ignis/tests/hook_sandbox.rs` (the 2-test "extension cannot write
+outside `/tmp`" smoke test). Run the whole suite:
+
+```sh
+cargo test --test sandbox_e2e
+cargo test --test hook_sandbox
+```
+
+The dispatcher also surfaces the confinement state on every invocation
+as the `SandboxStatus` returned alongside the outcome (`FullyEnforced`
+/ `NotEnforced` / `PlatformUnsupported` / `Disabled`) and records it on
+the `ignis.extension` `tracing` span as `sandbox.status` for dashboards.
+
 ## Observability
 
-Each hook invocation emits a `tracing` span named `ignis.hook` with
-attributes `event`, `command`, `duration_ms`, `outcome`
-(`mutated` / `mutated_json` / `inject_context` / `pass_through` /
-`blocked` / `keep_looping` / `failed`). Enable
+Each extension invocation emits a `tracing` span named `ignis.extension`
+with attributes `event`, `command`, `duration_ms`, `sandbox.status`,
+`outcome` (`mutated` / `mutated_json` / `inject_context` / `pass_through`
+/ `blocked` / `keep_looping` / `failed`). Enable
 `IGNIS_ENABLE_TELEMETRY=1` to export via OpenTelemetry.
 
 ## Worked examples

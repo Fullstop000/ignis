@@ -141,16 +141,23 @@ impl SessionPicker {
 #[derive(Debug, Clone)]
 pub(crate) struct SkillPicker {
     pub(crate) selected: usize,
+    /// Transient one-line confirmation shown in the footer after `r` reloads
+    /// the registry (e.g. `↻ reloaded — 7 skills`). Cleared on navigation.
+    pub(crate) status: Option<String>,
 }
 
 impl SkillPicker {
     /// Open over a non-empty registry; returns `None` (so the caller can show
     /// a notice) when no skills are configured.
     pub(crate) fn open(registry: &crate::skills::SkillRegistry) -> Option<Self> {
-        (!registry.is_empty()).then_some(Self { selected: 0 })
+        (!registry.is_empty()).then_some(Self {
+            selected: 0,
+            status: None,
+        })
     }
 
     pub(crate) fn select(&mut self, direction: SelectionDirection, total: usize) {
+        self.status = None;
         self.selected = next_selection(self.selected, total, direction);
     }
 
@@ -259,20 +266,21 @@ impl ModelPicker {
         self.effort_idx = next_selection(self.effort_idx, levels, direction);
     }
 
-    /// Resolve the picker's selection into `(provider, model, effort, context_window)`
-    /// for the caller to apply. Effort is `None` when the model declares no
-    /// levels; context_window is `None` when the option doesn't declare one.
+    /// Resolve the picker's selection into `(provider, model, effort)` for the
+    /// caller to apply. Effort is `None` when the model declares no levels. The
+    /// caller retargets the context gauge from `model_options` separately, so
+    /// the window isn't surfaced here.
     pub(crate) fn resolve(
         &self,
         options: &[crate::llm::ModelOption],
-    ) -> Option<(String, String, Option<String>, Option<u64>)> {
+    ) -> Option<(String, String, Option<String>)> {
         let opt = options.get(self.selected)?;
         let effort = if opt.effort_levels.is_empty() {
             None
         } else {
             opt.effort_levels.get(self.effort_idx).cloned()
         };
-        Some((opt.provider.clone(), opt.model.clone(), effort, opt.context))
+        Some((opt.provider.clone(), opt.model.clone(), effort))
     }
 }
 
@@ -349,6 +357,11 @@ pub(crate) struct App {
     pub(crate) session_picker: Option<SessionPicker>,
     /// Choices for the `/model` picker, flattened from config.
     pub(crate) model_options: Vec<crate::llm::ModelOption>,
+    /// models.dev windows, keyed by model id — the fallback source for an active
+    /// model that isn't listed in `model_options` (e.g. a config `model` naming
+    /// a provider model ignis hasn't baked and the user hasn't declared). See
+    /// [`App::context_window`].
+    pub(crate) model_catalog: crate::llm::ModelCatalog,
     pub(crate) model_picker: Option<ModelPicker>,
     pub(crate) skill_picker: Option<SkillPicker>,
     pub(crate) mcp_picker: Option<McpPicker>,
@@ -390,15 +403,22 @@ pub(crate) struct App {
     /// scroll-up history. Cleared by the runner once handled.
     pub(crate) pending_screen_clear: bool,
 
+    /// Reasoning verbosity, toggled live by Ctrl+O. `false` (default) collapses
+    /// chain-of-thought: while a thought streams it shows as a fixed 3-line
+    /// rolling preview (not committed), and finalizes to a one-line
+    /// `✻ Thinking … (N more lines, ctrl+o to expand)` breadcrumb. `true` streams
+    /// the full thought into scrollback. Session-only; resets to collapsed each
+    /// run. Flipping it re-commits the whole transcript in the new mode.
+    pub(crate) reasoning_expanded: bool,
+
     pub(crate) should_quit: bool,
     pub(crate) error_flash: Option<(String, Instant)>,
     pub(crate) exit_pending: bool,
 
-    /// Token budget the context-usage % is measured against (the active model's
-    /// window, or the fallback below). Estimated, not exact.
-    pub(crate) context_window: usize,
-    /// Window to use when the active model's context is unknown (the compaction
-    /// threshold) — so the gauge never sticks to a previous model's window.
+    /// Window to use when the active model declares no context (the compaction
+    /// threshold). The active model's actual window is derived on demand from
+    /// `model_options` — see [`App::context_window`] — so it can't drift out of
+    /// sync with the selection.
     pub(crate) fallback_context_window: usize,
 
     /// Prompts typed while busy, waiting to fire after the current turn (FIFO).
@@ -471,6 +491,7 @@ impl App {
             slash_selection: 0,
             session_picker: None,
             model_options: Vec::new(),
+            model_catalog: crate::llm::ModelCatalog::default(),
             model_picker: None,
             skill_picker: None,
             mcp_picker: None,
@@ -485,10 +506,10 @@ impl App {
             committed: 0,
             committed_rows: 0,
             pending_screen_clear: false,
+            reasoning_expanded: false,
             should_quit: false,
             error_flash: None,
             exit_pending: false,
-            context_window: 120_000,
             fallback_context_window: 120_000,
             queue: Vec::new(),
             pending_injects: Vec::new(),
@@ -515,8 +536,24 @@ impl App {
         self.git_branch = super::git::branch(&self.cwd);
     }
 
-    pub(crate) fn set_context_window(&mut self, window: usize) {
-        self.context_window = window;
+    /// The active model's context window — the token budget the usage % is
+    /// measured against. Resolved on demand (config override → baked spec →
+    /// models.dev) so it can't drift out of sync with the selection the way a
+    /// cached copy each model switch had to refresh did:
+    /// - `model_options` covers every UI-switchable model (the picker/connect
+    ///   build it, folding config overrides, baked specs, and models.dev);
+    /// - the models.dev `model_catalog` covers an active model that isn't listed
+    ///   there — e.g. a config `model` naming an un-baked, undeclared provider
+    ///   model that only models.dev knows;
+    /// - the compaction threshold is the last-resort fallback.
+    fn context_window(&self) -> usize {
+        self.model_options
+            .iter()
+            .find(|o| o.provider == self.provider && o.model == self.model)
+            .and_then(|o| o.context)
+            .or_else(|| self.model_catalog.context_for(&self.model))
+            .map(|c| c as usize)
+            .unwrap_or(self.fallback_context_window)
     }
 
     /// Estimated tokens used by the whole transcript (chars/4). Estimate, not
@@ -547,7 +584,7 @@ impl App {
             _ => self.context_tokens() as u64,
         };
         let pct = (tokens as usize * 100)
-            .checked_div(self.context_window)
+            .checked_div(self.context_window())
             .map(|p| p.min(100))
             .unwrap_or(0) as u8;
         (tokens, pct)
@@ -855,6 +892,31 @@ impl App {
         self.pending_screen_clear = true;
     }
 
+    /// Flip collapsed↔expanded reasoning (Ctrl+O) and re-commit the whole
+    /// transcript in the new mode. Reuses the `/resume` re-anchor: rewind the
+    /// commit cursor to row 0 and ask the runner to wipe + repaint, so every
+    /// past thought re-renders collapsed or full — the "(ctrl+o to expand)" hint
+    /// is honest. `blocks` (with full reasoning text) is untouched.
+    pub(crate) fn toggle_reasoning_expanded(&mut self) {
+        self.reasoning_expanded = !self.reasoning_expanded;
+        self.committed = 0;
+        self.reset_transcript_view();
+    }
+
+    /// The in-progress reasoning text when a collapsed live preview should own
+    /// its display — a `Reasoning` block is streaming and we're not expanded.
+    /// `None` when expanded, or the current block isn't reasoning. Drives both
+    /// the preview region's height (`reasoning_preview_height`) and its content.
+    pub(crate) fn live_reasoning(&self) -> Option<&str> {
+        if self.reasoning_expanded {
+            return None;
+        }
+        match self.current_chunk_idx.and_then(|i| self.blocks.get(i)) {
+            Some(UIBlock::Reasoning(t)) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn show_session_picker(
         &mut self,
         sessions: Vec<crate::cli::sessions::SessionRecord>,
@@ -993,15 +1055,10 @@ impl App {
     /// close the picker, and return `(provider, model, effort)` to act on.
     pub(crate) fn apply_model_selection(&mut self) -> Option<(String, String, Option<String>)> {
         let picker = self.model_picker.take()?;
-        let (provider, model, effort, context) = picker.resolve(&self.model_options)?;
+        let (provider, model, effort) = picker.resolve(&self.model_options)?;
         self.provider = provider.clone();
         self.model = model.clone();
         self.effort = effort.clone();
-        // Retarget the footer's context gauge to the new model's window, falling
-        // back when it's unknown so the % isn't measured against the old model.
-        self.context_window = context
-            .map(|c| c as usize)
-            .unwrap_or(self.fallback_context_window);
         Some((provider, model, effort))
     }
 
@@ -1013,6 +1070,28 @@ impl App {
                 "No skills found. Add one at ~/.ignis/skills/<name>/SKILL.md".to_string(),
             ),
         }
+    }
+
+    /// Re-scan the skill roots from disk and swap in a fresh registry,
+    /// preserving the user's enable/disable choices (re-read from `state.json`).
+    /// Returns the new skill count. If the picker is open, clamps its selection
+    /// to the new list and sets a one-line "reloaded" status. `home` is threaded
+    /// in (rather than read here) so tests can point at a temp dir; the UI side
+    /// updated here is paired with an `AgentRequest::ReloadSkills` to the runner
+    /// — its registry clone is otherwise left stale.
+    pub(crate) fn reload_skills(&mut self, home: Option<&std::path::Path>) -> usize {
+        let disabled: std::collections::HashSet<String> = crate::state::load_state()
+            .disabled_skills
+            .into_iter()
+            .collect();
+        let registry = crate::skills::SkillRegistry::load(home, &self.cwd, disabled);
+        let count = registry.all().len();
+        self.skills = Some(std::sync::Arc::new(registry));
+        if let Some(p) = &mut self.skill_picker {
+            p.selected = p.selected.min(count.saturating_sub(1));
+            p.status = Some(format!("↻ reloaded — {count} skills"));
+        }
+        count
     }
 
     pub(crate) fn select_skill_picker(&mut self, direction: SelectionDirection) {
@@ -1371,6 +1450,76 @@ mod copy_tests {
             matches!(last, UIBlock::Assistant(text) if text == "Copied to clipboard."),
             "Expected success notice, got {:?}",
             last
+        );
+    }
+
+    fn write_skill(skills_root: &std::path::Path, name: &str) {
+        let dir = skills_root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill {name}\n---\nbody"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reload_skills_picks_up_new_skill_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join(".ignis/skills");
+        write_skill(&skills_root, "alpha");
+
+        let mut app = test_app();
+        app.cwd = tmp.path().to_path_buf();
+        app.skills = Some(std::sync::Arc::new(crate::skills::SkillRegistry::load(
+            None,
+            &app.cwd,
+            std::collections::HashSet::new(),
+        )));
+        app.show_skill_picker();
+        assert_eq!(app.skills.as_deref().unwrap().all().len(), 1);
+
+        // A new skill lands on disk after the picker is already open.
+        write_skill(&skills_root, "beta");
+
+        let count = app.reload_skills(None);
+
+        assert_eq!(count, 2, "reload should re-scan disk and see the new skill");
+        assert_eq!(app.skills.as_deref().unwrap().all().len(), 2);
+        assert_eq!(
+            app.skill_picker.as_ref().unwrap().status.as_deref(),
+            Some("↻ reloaded — 2 skills"),
+        );
+    }
+
+    #[test]
+    fn reload_skills_clamps_selection_when_skills_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join(".ignis/skills");
+        for name in ["alpha", "beta", "gamma"] {
+            write_skill(&skills_root, name);
+        }
+
+        let mut app = test_app();
+        app.cwd = tmp.path().to_path_buf();
+        app.skills = Some(std::sync::Arc::new(crate::skills::SkillRegistry::load(
+            None,
+            &app.cwd,
+            std::collections::HashSet::new(),
+        )));
+        app.show_skill_picker();
+        app.skill_picker.as_mut().unwrap().selected = 2; // last row
+
+        std::fs::remove_dir_all(skills_root.join("beta")).unwrap();
+        std::fs::remove_dir_all(skills_root.join("gamma")).unwrap();
+
+        let count = app.reload_skills(None);
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            app.skill_picker.as_ref().unwrap().selected,
+            0,
+            "selection clamps to the new last row",
         );
     }
 
@@ -1755,10 +1904,9 @@ mod tests {
     }
 
     #[test]
-    fn switching_models_retargets_context_window() {
+    fn context_window_tracks_active_model() {
         let mut app = test_app();
         app.fallback_context_window = 100_000;
-        app.context_window = 500_000; // pretend a prior known window
         app.set_model_options(
             vec![
                 crate::llm::ModelOption {
@@ -1782,15 +1930,58 @@ mod tests {
             effort_idx: 0,
         });
         app.apply_model_selection();
-        assert_eq!(app.context_window, 1_000_000);
-        // Switch to an unknown-context model → gauge resets to the fallback,
-        // not the previous model's window.
+        assert_eq!(app.context_window(), 1_000_000);
+        // Switch to an unknown-context model → gauge falls back, never sticking
+        // to the previous model's window.
         app.model_picker = Some(ModelPicker {
             selected: 1,
             effort_idx: 0,
         });
         app.apply_model_selection();
-        assert_eq!(app.context_window, 100_000);
+        assert_eq!(app.context_window(), 100_000);
+    }
+
+    #[test]
+    fn context_window_follows_connect_switch_without_explicit_refresh() {
+        // Regression: the footer's gauge must follow a `/connect` model switch
+        // (which sets `provider`/`model` + rebuilds the list but does NOT touch
+        // any cached window) the same as the `/model` picker. Previously a cached
+        // `context_window` left the % measured against the *prior* model's window
+        // — the 120k compaction fallback — so a freshly-connected 1M model showed
+        // `MiniMax-M3 · 107.5k tok (89%)` instead of ~11%. Deriving on demand
+        // means simply adopting the selection is enough.
+        let mut app = test_app();
+        app.fallback_context_window = 120_000;
+        app.set_model_options(
+            vec![crate::llm::ModelOption {
+                provider: "minimax-token-plan".to_string(),
+                model: "MiniMax-M3".to_string(),
+                effort_levels: vec![],
+                context: Some(1_000_000),
+            }],
+            None,
+        );
+        // Exactly what the `Switched` arm does: adopt the new selection.
+        app.provider = "minimax-token-plan".to_string();
+        app.model = "MiniMax-M3".to_string();
+        assert_eq!(app.context_window(), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_resolves_active_model_from_models_dev_when_unlisted() {
+        // An active model that isn't in `model_options` (un-baked, undeclared)
+        // but is known to models.dev must still use its real window, not the
+        // compaction fallback — preserving the old `active_context` behavior.
+        let mut app = test_app();
+        app.fallback_context_window = 120_000;
+        app.set_model_options(vec![], None);
+        app.model_catalog = crate::llm::ModelCatalog::from_entries([("ad-hoc-model", 512_000)]);
+        app.provider = "some-provider".to_string();
+        app.model = "ad-hoc-model".to_string();
+        assert_eq!(app.context_window(), 512_000);
+        // Unknown to both → compaction fallback.
+        app.model = "totally-unknown".to_string();
+        assert_eq!(app.context_window(), 120_000);
     }
 
     fn picker_app() -> App {
@@ -2138,6 +2329,58 @@ mod tests {
         assert!(
             matches!(app.blocks.last(), Some(UIBlock::Reasoning(s)) if s == "hmm let me think")
         );
+    }
+
+    fn reasoning_msg() -> crate::Message {
+        crate::Message {
+            role: "assistant".to_string(),
+            content: None,
+            reasoning_content: Some(String::new()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn ctrl_o_toggles_reasoning_and_rewinds_commit() {
+        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        app.committed = 5;
+        assert!(!app.reasoning_expanded);
+        app.toggle_reasoning_expanded();
+        assert!(app.reasoning_expanded);
+        // Rewinds the commit cursor + asks the runner to wipe & repaint, so every
+        // past thought re-renders in the new mode (the /resume re-anchor).
+        assert_eq!(app.committed, 0);
+        assert!(app.pending_screen_clear);
+        app.toggle_reasoning_expanded();
+        assert!(!app.reasoning_expanded, "flips back");
+    }
+
+    #[test]
+    fn live_reasoning_tracks_streaming_collapsed_thought() {
+        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        assert_eq!(app.live_reasoning(), None, "no thought yet");
+
+        app.handle_event(AgentEvent::MessageStart {
+            message: reasoning_msg(),
+        });
+        app.handle_event(AgentEvent::MessageUpdate {
+            delta: "weighing options".to_string(),
+        });
+        assert_eq!(app.live_reasoning(), Some("weighing options"));
+
+        // Expanded mode suppresses the preview (the full thought streams instead).
+        app.reasoning_expanded = true;
+        assert_eq!(app.live_reasoning(), None);
+        app.reasoning_expanded = false;
+
+        // Once the thought finalizes there's no live preview to own.
+        app.handle_event(AgentEvent::MessageEnd {
+            message: reasoning_msg(),
+        });
+        assert_eq!(app.live_reasoning(), None);
     }
 
     #[test]

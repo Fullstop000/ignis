@@ -27,8 +27,18 @@ use super::protocol::ExtensionEvent;
 /// larger budget explicitly.
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
-/// One declared hook: how to spawn it, how long to wait, and (optionally)
+/// One declared extension: how to spawn it, how long to wait, and (optionally)
 /// which tool names it applies to.
+///
+/// `Default::default()` exists so test fixtures and call sites that only care
+/// about a subset of fields can use `..ExtensionSpec::default()` without
+/// re-listing every knob.
+///
+/// IMPORTANT: `sandbox` defaults to `true` so tests written with
+/// `..ExtensionSpec::default()` exercise the sandboxed code path; an
+/// accidentally-derived default would leave production extensions unconfined.
+/// Extensions that need to spawn outside the sandbox must opt out explicitly
+/// (`sandbox: false`).
 #[derive(Debug, Clone)]
 pub struct ExtensionSpec {
     /// Executable path (post-`~` expansion).
@@ -37,10 +47,34 @@ pub struct ExtensionSpec {
     /// interpolation).
     pub args: Vec<String>,
     pub timeout_ms: u64,
+    /// Extra env var names ignis passes through into the extension process on
+    /// top of the universal allowlist (`PATH HOME USER LANG LC_ALL TZ`).
+    /// Default empty — extensions see no credentials unless they declare them
+    /// here.
+    pub env: Vec<String>,
+    /// Apply the filesystem sandbox (Linux Landlock / macOS Seatbelt) to this
+    /// extension. Default `true`; set `false` per-extension to opt out (e.g. a
+    /// project-indexer that legitimately needs broad read access). On
+    /// unsupported platforms the flag has no effect — see [`crate::sandbox`].
+    pub sandbox: bool,
     /// Tool-name filter. Compiled at parse so a malformed pattern is a
     /// startup error rather than a per-call surprise. Meaningful only for
     /// `PreToolUse` / `PostToolUse` (see [`ExtensionEvent::uses_tool_matcher`]).
     pub matcher: Option<ExtensionMatcher>,
+}
+
+impl Default for ExtensionSpec {
+    fn default() -> Self {
+        Self {
+            program: PathBuf::new(),
+            args: Vec::new(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            env: Vec::new(),
+            // Secure-by-default — see the type-level doc-comment.
+            sandbox: true,
+            matcher: None,
+        }
+    }
 }
 
 /// Tool-name regex paired with the source pattern. The pattern is kept
@@ -68,6 +102,8 @@ impl PartialEq for ExtensionSpec {
         self.program == other.program
             && self.args == other.args
             && self.timeout_ms == other.timeout_ms
+            && self.env == other.env
+            && self.sandbox == other.sandbox
             && self.matcher.as_ref().map(|m| &m.raw) == other.matcher.as_ref().map(|m| &m.raw)
     }
 }
@@ -243,6 +279,11 @@ fn parse_event_name(s: &str) -> Option<ExtensionEvent> {
 
 fn parse_entry(entry: ExtensionJsonEntry, home: &Path) -> Result<ExtensionSpec> {
     let timeout_ms = entry.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    // v2 additions: `env` carries extra allowlisted env var names; `sandbox`
+    // is the per-extension filesystem-sandbox opt-out. Both default to
+    // "secure" (no extra env, sandbox on).
+    let env = entry.env.unwrap_or_default();
+    let sandbox = entry.sandbox.unwrap_or(true);
     // Compile matcher at parse so a malformed regex is a startup error,
     // not a per-call surprise.
     let matcher = entry
@@ -296,6 +337,8 @@ fn parse_entry(entry: ExtensionJsonEntry, home: &Path) -> Result<ExtensionSpec> 
         program,
         args,
         timeout_ms,
+        env,
+        sandbox,
         matcher,
     })
 }
@@ -336,6 +379,17 @@ struct ExtensionJsonEntry {
     argv: Option<Vec<String>>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// v2: extra env var names allowlisted into the extension process. Each
+    /// listed name is looked up in ignis's own env and, if present, set in the
+    /// child. Defaults to `[]` — the universal allowlist
+    /// (`PATH HOME USER LANG LC_ALL TZ`) is unconditional.
+    #[serde(default)]
+    env: Option<Vec<String>>,
+    /// v2: per-extension filesystem-sandbox toggle. Default `true`. `false`
+    /// disables sandboxing for this extension on supported platforms; others
+    /// ignore it.
+    #[serde(default)]
+    sandbox: Option<bool>,
     /// v2: regex on the tool name. Meaningful only for `PreToolUse` and
     /// `PostToolUse`; declaring it elsewhere triggers a `[warn]` at load.
     #[serde(default)]
@@ -412,9 +466,8 @@ mod tests {
     fn applies_to_tool_default_when_no_matcher() {
         let spec = ExtensionSpec {
             program: PathBuf::from("/bin/true"),
-            args: vec![],
             timeout_ms: 1000,
-            matcher: None,
+            ..ExtensionSpec::default()
         };
         // No matcher = applies to every tool.
         assert!(spec.applies_to_tool("Bash"));
@@ -578,10 +631,48 @@ mod tests {
     fn display_name_strips_directory_and_extension() {
         let spec = ExtensionSpec {
             program: PathBuf::from("/home/me/.ignis/hooks/translate-en/run.py"),
-            args: vec![],
-            timeout_ms: 1,
-            matcher: None,
+            ..ExtensionSpec::default()
         };
         assert_eq!(spec.display_name(), "run");
+    }
+
+    #[test]
+    fn defaults_env_empty_and_sandbox_on() {
+        // Spec invariant: omitting `env` and `sandbox` means "no extra env
+        // pass-through, sandbox engaged". Without this, the security default
+        // would silently flip back to v1 behaviour for any old config.
+        let home = PathBuf::from("/h");
+        let raw = r#"{"extensions": {"UserPromptSubmit": [{"command": "/bin/true"}]}}"#;
+        let cfg = ExtensionsConfig::from_str(raw, &home).unwrap();
+        let spec = &cfg.user_prompt_submit[0];
+        assert!(spec.env.is_empty());
+        assert!(spec.sandbox);
+    }
+
+    #[test]
+    fn env_list_is_preserved_in_declared_order() {
+        let home = PathBuf::from("/h");
+        let raw = r#"{"extensions": {"UserPromptSubmit": [
+            {"command": "/bin/true", "env": ["ANTHROPIC_API_KEY", "IGNIS_TRANSLATE_TO"]}
+        ]}}"#;
+        let cfg = ExtensionsConfig::from_str(raw, &home).unwrap();
+        let spec = &cfg.user_prompt_submit[0];
+        assert_eq!(
+            spec.env,
+            vec![
+                "ANTHROPIC_API_KEY".to_string(),
+                "IGNIS_TRANSLATE_TO".to_string()
+            ]
+        );
+        assert!(spec.sandbox);
+    }
+
+    #[test]
+    fn sandbox_false_is_an_explicit_opt_out() {
+        let home = PathBuf::from("/h");
+        let raw =
+            r#"{"extensions": {"UserPromptSubmit": [{"command": "/bin/true", "sandbox": false}]}}"#;
+        let cfg = ExtensionsConfig::from_str(raw, &home).unwrap();
+        assert!(!cfg.user_prompt_submit[0].sandbox);
     }
 }

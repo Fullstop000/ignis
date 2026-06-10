@@ -6,6 +6,7 @@ pub mod llm;
 pub mod logger;
 pub mod mcp;
 pub mod permissions;
+pub mod sandbox;
 pub mod session;
 pub mod skills;
 pub mod state;

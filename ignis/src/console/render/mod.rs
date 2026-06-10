@@ -26,10 +26,10 @@ pub(crate) mod widgets;
 
 // Re-export per-frame primitives callers still reference by their old
 // `console::render::*` path so this split is a pure file move from outside.
-pub(crate) use blocks::{block_lines, welcome_lines};
+pub(crate) use blocks::{block_lines, reasoning_collapsed_lines, welcome_lines};
 // Runner reaches these by the old `render::*` path; `draw` (below) uses the rest.
 pub(crate) use layout::{band_height, viewport_height};
-use layout::{input_height, picker_open, MODEL_PICKER_MAX_OPTION_ROWS};
+use layout::{input_height, picker_open, reasoning_preview_height, MODEL_PICKER_MAX_OPTION_ROWS};
 pub(crate) use pickers::{
     render_mcp_picker, render_model_picker, render_session_picker, render_settings_panel,
     render_skill_picker,
@@ -38,6 +38,21 @@ pub(crate) use widgets::{
     draw_footer, draw_input, draw_loading, draw_queued, draw_slash_suggestions,
     queued_region_height, MAX_SLASH_ROWS,
 };
+
+/// Max rows a single `insert_before` may carry at `width` columns.
+///
+/// `insert_before` builds a `width * height` cell scratch buffer, but
+/// `Rect::area()` saturates at `u16::MAX` (65535) and `insert_before` skips
+/// `Rect::new`'s aspect-clamp (it builds the area with a struct literal). So a
+/// call whose `width * height >= 65536` under-allocates the cell Vec while the
+/// buffer area still reports the full height — and `render_block_into`'s
+/// `set_style` then runs off the end ("index out of bounds: the len is 65535
+/// but the index is 65535"). Splitting a commit so each frame stays at or below
+/// this many rows keeps every buffer within the limit. Bites `/resume` of a
+/// long transcript, which commits every block in one batch.
+pub(crate) fn max_commit_rows(width: u16) -> usize {
+    (u16::MAX as usize / (width.max(1) as usize)).max(1)
+}
 
 /// Blit pre-wrapped `lines` (one `Line` per visual row — `block_lines` already
 /// wraps to width) into the `insert_before` scratch buffer, one row each. This
@@ -90,13 +105,19 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Block::default().style(Style::default().bg(BG)), size);
 
     // Inline layout: `size` IS the viewport. With no picker the band fills it
-    // entirely (the conversation is in native scrollback above). With a picker
+    // entirely (the conversation is in native scrollback above), minus a
+    // reasoning preview region when a thought streams collapsed. With a picker
     // open the viewport is grown by `viewport_height`, and the picker takes the
     // top while the band stays pinned at the bottom.
+    let preview_h = if picker_open(app) {
+        0
+    } else {
+        reasoning_preview_height(app)
+    };
     let band_h = if picker_open(app) {
         band_height(app, size.height)
     } else {
-        size.height
+        size.height.saturating_sub(preview_h)
     };
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -206,8 +227,19 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
             body_area,
         );
     }
-    // No picker → `body_area` is zero-height; the band fills the viewport and
-    // the conversation is in native scrollback above it.
+    // No picker → `body_area` is zero-height, unless a thought is streaming in
+    // collapsed mode: then it's the `preview_h`-row reasoning preview region,
+    // anchored just above the band. The rolling window redraws each frame and is
+    // never committed to scrollback (only the one-line breadcrumb is, on finish).
+    if preview_h > 0 {
+        if let Some(text) = app.live_reasoning() {
+            let lines = blocks::reasoning_preview_lines(text, app.spinner(), body_area.width);
+            f.render_widget(
+                Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
+                body_area,
+            );
+        }
+    }
 
     // Band: status … footer. While a picker is open the band is just status +
     // footer (no input box / slash / queued) — the picker above is the input.
@@ -311,6 +343,7 @@ fn render_inline_picker_split(
     let right_lines = super::inline_picker::preview_pane_lines(picker);
     let preview_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(BORDER))
         .title(Span::styled(
             " Preview ",
@@ -403,6 +436,40 @@ mod queue_render_tests {
         );
         assert_eq!(buf.get(2, 0).symbol(), " ");
         assert_eq!(buf.get(3, 0).symbol(), "x");
+    }
+
+    #[test]
+    fn max_commit_rows_keeps_insert_before_buffer_in_bounds() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::text::Line;
+        // Regression for the `/resume` panic on a long transcript: committing
+        // the whole history in one `insert_before(h, ..)` built a
+        // `width * h >= 65536` scratch buffer, whose backing Vec saturates at
+        // 65535 cells while the area still reports the full size — so
+        // `render_block_into`'s `set_style` ran off the end (panic
+        // "index out of bounds: the len is 65535 but the index is 65535").
+        // The runner now caps each frame at `max_commit_rows(width)`; a
+        // full-cap batch must render without panicking.
+        for width in [1u16, 64, 80, 120, 200, 256, 1000] {
+            let rows = super::max_commit_rows(width);
+            assert!(
+                rows * width as usize <= u16::MAX as usize,
+                "cap overflows at width {width}: {rows} rows"
+            );
+            assert!(rows >= 1);
+            // The runner builds insert_before's area with a struct literal (no
+            // `Rect::new` aspect-clamp) — mirror that exactly.
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: rows as u16,
+            };
+            let mut buf = Buffer::empty(area);
+            let lines: Vec<Line> = (0..rows).map(|_| Line::from("x")).collect();
+            super::render_block_into(&mut buf, &lines); // must not panic
+        }
     }
 
     #[test]
@@ -745,8 +812,8 @@ mod tests {
         let content = buffer_content(&term);
         assert!(content.contains("Hello"), "should show user text");
         assert!(
-            content.contains('👤'),
-            "user turn should carry the emoji prefix"
+            content.contains('▌'),
+            "user turn should carry the mauve left-rail"
         );
     }
 

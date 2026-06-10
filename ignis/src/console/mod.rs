@@ -19,6 +19,7 @@ pub(crate) mod keys;
 pub mod markdown;
 pub(crate) mod picker;
 pub mod render;
+pub(crate) mod render_diag;
 pub(crate) mod runner;
 pub(crate) mod slash;
 

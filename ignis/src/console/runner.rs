@@ -12,11 +12,12 @@ use std::io;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-use crate::console::app::App;
+use crate::console::app::{App, UIBlock};
 use crate::console::format::AgentRequest;
 use crate::console::inline_picker;
 use crate::console::keys::{handle_key, ActiveInject};
 use crate::console::render::{self, draw};
+use crate::console::render_diag::RenderDiag;
 use crate::{AgentEvent, Message, Session};
 
 /// Create an inline-viewport terminal over stdout: a fixed `viewport_rows`-tall
@@ -131,17 +132,17 @@ pub async fn run_console(
     // Apply the persisted `/settings` Statusline choices (hidden footer
     // segments) before the first render.
     app.statusline_hidden = crate::state::load_state().statusline_hidden;
-    // Context windows: config override → cached models.dev → compaction threshold.
-    // The cache loads instantly; refresh runs in the background for next launch.
+    // Model windows: config override → cached models.dev → compaction threshold.
+    // Each model's resolved window is baked into `model_options`; the footer
+    // gauge derives the active one from there on demand (see `App::context_window`),
+    // with the compaction threshold as the fallback. The cache loads instantly;
+    // refresh runs in the background for next launch.
     let catalog = crate::llm::catalog::load();
     app.fallback_context_window = config.compaction.threshold_tokens;
-    app.set_context_window(
-        config
-            .active_context(&catalog)
-            .map(|c| c as usize)
-            .unwrap_or(config.compaction.threshold_tokens),
-    );
     app.set_model_options(config.model_options(&catalog), config.active_effort());
+    // Keep the catalog so the footer gauge can resolve an active model that
+    // isn't in `model_options` (an un-baked, undeclared model only models.dev knows).
+    app.model_catalog = catalog;
     tokio::spawn(crate::llm::catalog::refresh_if_stale());
 
     // Render inline in the normal buffer: finalized blocks are pushed into the
@@ -193,7 +194,9 @@ pub async fn run_console(
     app.hooks = Some(hook_registry);
 
     let ui_skill_registry = skill_registry.clone();
-    let runner_skill_registry = skill_registry.clone();
+    // `mut` so an `AgentRequest::ReloadSkills` can swap in a freshly-scanned
+    // registry; the UI rebuilds its own `App.skills` clone in parallel.
+    let mut runner_skill_registry = skill_registry.clone();
     app.skills = Some(ui_skill_registry);
 
     let runner_mcp_registry = mcp_registry.clone();
@@ -240,6 +243,14 @@ pub async fn run_console(
                         Ok(reloaded) => agent_config = reloaded,
                         Err(e) => log::error!("ReloadConfig: failed to re-read config.toml: {e}"),
                     }
+                    continue;
+                }
+                AgentRequest::ReloadSkills(registry) => {
+                    // The user pressed `r` in the `/skills` picker. Adopt the
+                    // *same* registry the UI just built, so both share one `Arc`
+                    // — a later enable/disable toggle (interior mutability) is
+                    // then visible to the next prompt without another reload.
+                    runner_skill_registry = registry;
                     continue;
                 }
             };
@@ -389,6 +400,25 @@ pub async fn run_console(
     // bug; vim/htop full-repaint after a resize, so they stay clean). A single
     // settle repaint mirrors what the next message already does for free.
     let mut last_resize: Option<std::time::Instant> = None;
+    // Re-anchor episode state for `pending_screen_clear`. A reset (`/clear`,
+    // `/resume`) wipes the screen and must re-anchor the inline viewport before
+    // any block can commit (the band never draws conversation content — it only
+    // flows into native scrollback via the commit loop below). Re-anchoring
+    // queries the cursor with a DSR (`ESC[6n`); on WSL2/conpty that can stall
+    // indefinitely. `clear_started` marks when the current episode began (None
+    // when not pending) so we wipe the screen ONCE per episode rather than every
+    // frame, and `reanchor_attempts` bounds how long we gate rendering on a DSR
+    // that isn't landing before falling back to a DSR-free re-anchor.
+    let mut clear_started: Option<std::time::Instant> = None;
+    let mut reanchor_attempts: u32 = 0;
+    // After this many consecutive failed re-anchors (each blocks ~the crossterm
+    // DSR timeout, ~2s), stop gating all rendering and re-anchor without a DSR.
+    // Bounds the blank window to a few seconds instead of forever — the "blank
+    // after input, full content on resume" wedge.
+    const MAX_REANCHOR_ATTEMPTS: u32 = 2;
+    // Opt-in render-loop health heartbeat (frames / commits / re-anchors) to
+    // `~/.ignis/logs/ignis.log`, for diagnosing rendering issues in the field.
+    let mut diag = RenderDiag::from_env();
     terminal.draw(|f| draw(f, &mut app))?;
 
     loop {
@@ -517,18 +547,82 @@ pub async fn run_console(
         let term_size = crossterm::terminal::size()?;
         let want_rows = render::viewport_height(&app, term_size.0, term_size.1);
         if app.pending_screen_clear {
-            execute!(
-                io::stdout(),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
-                crossterm::cursor::MoveTo(0, 0)
-            )?;
-            // Leave `pending_screen_clear` set if the rebuild's DSR times out,
-            // so the re-anchor is retried next frame instead of crashing.
+            // Wipe the visible screen AND scrollback exactly ONCE per episode.
+            // Repeating Clear(All) every frame floods the terminal and worsens
+            // the very DSR backpressure that keeps the re-anchor from landing.
+            if clear_started.is_none() {
+                execute!(
+                    io::stdout(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
+                    crossterm::cursor::MoveTo(0, 0)
+                )?;
+                clear_started = Some(std::time::Instant::now());
+                reanchor_attempts = 0;
+                log::info!(
+                    "render: re-anchor started (blocks={}, committed={}, want_rows={})",
+                    app.blocks.len(),
+                    app.committed,
+                    want_rows
+                );
+            }
             if try_rebuild(&mut terminal, want_rows)? {
+                // Re-anchor landed: resume commits from the top of scrollback.
+                if reanchor_attempts > 0 {
+                    let waited = clear_started.map(|t| t.elapsed()).unwrap_or_default();
+                    log::info!(
+                        "render: re-anchor landed after {} retr{} ({}ms) — resuming commits",
+                        reanchor_attempts,
+                        if reanchor_attempts == 1 { "y" } else { "ies" },
+                        waited.as_millis()
+                    );
+                }
+                diag.on_reanchor_ok();
                 app.pending_screen_clear = false;
+                clear_started = None;
+                reanchor_attempts = 0;
                 viewport_rows = want_rows;
                 last_term_size = term_size;
+            } else {
+                diag.on_reanchor_failed();
+                reanchor_attempts += 1;
+                let waited = clear_started.map(|t| t.elapsed()).unwrap_or_default();
+                let pending_blocks = app.blocks.len().saturating_sub(app.committed);
+                if reanchor_attempts >= MAX_REANCHOR_ATTEMPTS {
+                    // Backstop: the re-anchor DSR isn't answering (WSL2/conpty
+                    // under backpressure). Gating all commits on it leaves the
+                    // screen blank while the agent keeps working — the "blank
+                    // after input, full content on resume" wedge. Re-anchor
+                    // WITHOUT a DSR via `terminal.clear()` (resets the back
+                    // buffer using the known viewport area) and resume commits.
+                    // Leave `viewport_rows` untouched so the draw-time resize
+                    // check still converges the band to `want_rows` on a later,
+                    // non-gating rebuild.
+                    log::warn!(
+                        "render: re-anchor DSR unresponsive after {} attempts ({}ms) — \
+                         forcing DSR-free re-anchor so {} block(s) can paint \
+                         (blocks={}, committed={})",
+                        reanchor_attempts,
+                        waited.as_millis(),
+                        pending_blocks,
+                        app.blocks.len(),
+                        app.committed
+                    );
+                    let _ = terminal.clear();
+                    diag.on_forced_reanchor();
+                    app.pending_screen_clear = false;
+                    clear_started = None;
+                    reanchor_attempts = 0;
+                } else {
+                    log::warn!(
+                        "render: re-anchor DSR not landed (attempt {}/{}, {}ms) — \
+                         holding {} block(s); retrying",
+                        reanchor_attempts,
+                        MAX_REANCHOR_ATTEMPTS,
+                        waited.as_millis(),
+                        pending_blocks
+                    );
+                }
             }
         }
 
@@ -549,43 +643,68 @@ pub async fn run_console(
         // commits N blocks back-to-back after a screen clear). For the
         // streaming case, the loop breaks after the first in-progress block,
         // so the batch is always exactly the new rows of that one block.
+        // Cap rows per frame so the single `insert_before` buffer (width * rows
+        // cells) stays within ratatui's u16 limit — see `max_commit_rows`. A
+        // long `/resume` transcript would otherwise commit every block in one
+        // oversized batch and panic; the remainder now streams on the next
+        // frame(s) via `committed`/`committed_rows`.
+        let max_rows = render::max_commit_rows(width);
         let mut batch: Vec<Line<'static>> = Vec::new();
-        // Defer commits while a screen-clear re-anchor is still pending. A
-        // timed-out `try_rebuild` (DSR cursor-read backpressure on WSL2/tmux)
-        // leaves `pending_screen_clear` set, and the next frame `Clear(All)`s
-        // again. Committing now would advance `committed` into blocks the
-        // re-clear then wipes — a resumed transcript paints once, gets erased,
-        // and never repaints (committed == blocks.len(), so nothing is left to
-        // push). Hold off; once the re-anchor lands we commit the batch at once.
-        while !app.pending_screen_clear && app.committed < app.blocks.len() {
+        // Defer commits while a screen-clear re-anchor is still pending.
+        // Committing before the re-anchor lands would advance `committed` into
+        // blocks the next Clear(All) wipes — a resumed transcript paints once,
+        // gets erased, and never repaints. So we hold off; once the re-anchor
+        // lands we commit the batch at once. Crucially, the re-anchor above is
+        // bounded (MAX_REANCHOR_ATTEMPTS): if its DSR never answers we force a
+        // DSR-free re-anchor and clear the flag, so this gate can't wedge
+        // rendering blank indefinitely (the "blank after input" bug).
+        while !app.pending_screen_clear
+            && app.committed < app.blocks.len()
+            && batch.len() < max_rows
+        {
             let block = &app.blocks[app.committed];
             let done = app.block_done(app.committed);
             let rows = if done {
-                render::block_lines(block, app.tick, &app.cwd, width)
+                // A finished thought commits its collapsed breadcrumb (lead +
+                // "(N more lines, ctrl+o to expand)") unless expanded.
+                match block {
+                    UIBlock::Reasoning(t) if !app.reasoning_expanded => {
+                        render::reasoning_collapsed_lines(t, width)
+                    }
+                    _ => render::block_lines(block, app.tick, &app.cwd, width),
+                }
+            } else if matches!(block, UIBlock::Reasoning(_)) && !app.reasoning_expanded {
+                break; // collapsed thought still streaming: the live preview owns it
             } else if render::stream_commit::is_streamed(block) {
                 render::stream_commit::stable_rows(block, app.tick, &app.cwd, width)
             } else {
                 break; // pending tool: nothing to commit until it finalizes
             };
             let start = app.committed_rows.min(rows.len());
-            let new = &rows[start..];
-            batch.extend_from_slice(new);
-            if done {
+            // Take only what fits under this frame's row budget. A block taller
+            // than the cap splits across frames: `committed` stays put until its
+            // final row lands, with `committed_rows` marking the split point.
+            let take = (rows.len() - start).min(max_rows - batch.len());
+            batch.extend_from_slice(&rows[start..start + take]);
+            let drained = start + take == rows.len();
+            if done && drained {
                 app.committed += 1;
                 app.committed_rows = 0;
             } else {
-                app.committed_rows += new.len();
-                break; // in-progress block is last; nothing after it yet
+                app.committed_rows = start + take;
+                break; // in-progress block, or a finalized block split by the cap
             }
         }
         if !batch.is_empty() {
             let h = batch.len() as u16;
             terminal.insert_before(h, |buf| render::render_block_into(buf, &batch))?;
+            diag.on_commit(batch.len());
         }
 
         // Coalesced redraw of the live band: at most once per frame interval.
         if last_draw.elapsed() >= frame {
             app.tick_update();
+            diag.on_frame();
             // Rebuild the inline viewport when the band height changes (picker
             // open/close, multi-line input) OR the terminal resized. ratatui
             // 0.26's inline autoresize leaves the old band stranded in
@@ -634,6 +753,8 @@ pub async fn run_console(
             draw_tolerant(&mut terminal, &mut app)?;
             last_draw = std::time::Instant::now();
         }
+
+        diag.heartbeat();
     }
 
     // Restore the cursor before the guard drops. The band stays in the normal
@@ -641,7 +762,71 @@ pub async fn run_console(
     // disables raw mode + bracketed paste on the way out (clean exit, `?`-bubbled
     // Err returns, and panics).
     terminal.show_cursor()?;
+
+    // Leave a copy-pasteable resume hint below the band, like `claude --resume
+    // <id>`. We only reach this line on a clean Ctrl+D exit — every error path
+    // `?`-bubbles earlier — so it never fires on a crash. Skipped when the user
+    // sent nothing: an untouched session has nothing worth resuming. Uses
+    // `app.session_id`, which tracks the *current* session after any mid-run
+    // `/resume` or `/clear`, not the id we opened with.
+    if app.turn_count() > 0 {
+        let session_id = app.session_id.clone();
+        // Row just below the live band. The inline viewport anchors near the
+        // top after a short-history re-anchor and at the screen bottom in
+        // normal use; reading its area keeps the hint flush under the footer
+        // either way (vs. jumping to the screen bottom and leaving a gap).
+        let band_bottom = terminal.get_frame().size().bottom();
+        // Restore cooked mode first so `\n` and colors render normally.
+        drop(_term_guard);
+        let _ = print_resume_hint(&session_id, band_bottom);
+    }
     Ok(())
+}
+
+/// Print a `ignis --resume <id>` hint below the live band, where the shell
+/// prompt returns after exit. Best-effort: terminal I/O errors are swallowed —
+/// the session already ended cleanly and a missing hint is harmless.
+fn print_resume_hint(session_id: &str, band_bottom: u16) -> io::Result<()> {
+    use crossterm::{
+        cursor::MoveTo,
+        style::{Color, Print, ResetColor, SetForegroundColor},
+    };
+    execute!(
+        io::stdout(),
+        // Land just under the band (clamped to the screen, scrolls if needed),
+        // then a blank separator line before the hint.
+        MoveTo(0, band_bottom),
+        Print("\r\n"),
+        SetForegroundColor(Color::DarkGrey),
+        Print("Resume this session with:\r\n"),
+        ResetColor,
+        SetForegroundColor(Color::Rgb {
+            r: 0xcb,
+            g: 0xa6,
+            b: 0xf7,
+        }),
+        Print(format!(
+            "  ignis --resume {}\r\n",
+            quote_session_id(session_id)
+        )),
+        ResetColor,
+    )
+}
+
+/// Render a session id for the resume hint. Generated ids
+/// (`session-<ts>-<hex>`) print bare; but `--resume <id>` accepts an arbitrary
+/// user-supplied id verbatim, so one with spaces or shell metacharacters is
+/// single-quoted to stay copy-pasteable.
+fn quote_session_id(id: &str) -> String {
+    let safe = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'));
+    if safe {
+        id.to_string()
+    } else {
+        format!("'{}'", id.replace('\'', r"'\''"))
+    }
 }
 
 /// Prefix used to label the assistant block that carries an
@@ -794,6 +979,21 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
+    #[test]
+    fn quote_session_id_keeps_generated_ids_bare_and_quotes_unsafe() {
+        // Generated ids (`session-<ts>-<hex>`) print bare, matching the example.
+        assert_eq!(
+            quote_session_id("session-1700000000-ab12cd34"),
+            "session-1700000000-ab12cd34"
+        );
+        // User-supplied `--resume <id>` reaches the hint verbatim; spaces and
+        // shell metacharacters get single-quoted so a paste stays one argument.
+        assert_eq!(quote_session_id("my work"), "'my work'");
+        assert_eq!(quote_session_id("a;rm -rf x"), "'a;rm -rf x'");
+        assert_eq!(quote_session_id("it's"), r"'it'\''s'");
+        assert_eq!(quote_session_id(""), "''");
+    }
+
     fn write_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let p = dir.join(name);
@@ -914,7 +1114,7 @@ printf '{"hookSpecificOutput":{"updatedOutput":"R:%s"}}' "$CONTENT"
                 program: script,
                 args: vec![],
                 timeout_ms: 5_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };

@@ -255,6 +255,18 @@ pub(crate) async fn handle_key(
             app.request_exit();
             return;
         }
+        // Ctrl+O: collapse/expand reasoning. Global so it works mid-thought
+        // (re-renders the live preview) and at idle (re-renders past thoughts).
+        // No-op while a picker owns the screen — toggling re-commits the whole
+        // transcript (a /resume-style wipe) which would scribble behind the
+        // open picker. Still consumed so it never types a literal 'o' into one.
+        (m, KeyCode::Char('o')) if m.contains(KeyModifiers::CONTROL) => {
+            if !crate::console::render::layout::picker_open(app) {
+                app.clear_exit_hint();
+                app.toggle_reasoning_expanded();
+            }
+            return;
+        }
         (m, KeyCode::Char('c'))
             if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
         {
@@ -491,6 +503,24 @@ pub(crate) async fn handle_key(
         }
     }
 
+    // `r`/`R` hot-reloads the skill registry from disk while the picker stays
+    // open, so newly added / edited / removed SKILL.md files appear without a
+    // restart. Must run before `toggle_picker!`, which closes the picker on any
+    // char. Hand the runner the *same* rebuilt registry so both keep sharing one
+    // `Arc` — later toggles stay live, as they were before the reload.
+    if app.skill_picker.is_some() && matches!(key.code, KeyCode::Char('r' | 'R')) {
+        let count = app.reload_skills(dirs::home_dir().as_deref());
+        if let Some(registry) = app.skills.clone() {
+            let _ = prompt_tx.send(AgentRequest::ReloadSkills(registry)).await;
+        }
+        if count == 0 {
+            // A 0-row picker with a live selection index is a bug; close it and
+            // leave a breadcrumb in scrollback instead.
+            app.skill_picker = None;
+            app.add_assistant_notice("No skills found after reload.".to_string());
+        }
+        return;
+    }
     toggle_picker!(
         app,
         key,
@@ -720,7 +750,7 @@ async fn reload_extensions(app: &mut App) {
     };
     match reg.reload(&home).await {
         Ok(count) => app.add_assistant_notice(format!(
-            "[info] reloaded {count} extension{plural} \u{00b7} run unsandboxed; audit before installing",
+            "[info] reloaded {count} extension{plural}",
             plural = if count == 1 { "" } else { "s" }
         )),
         Err(e) => app.add_assistant_notice(format!("[err] /hooks reload: {e}")),
@@ -1216,5 +1246,105 @@ mod tests {
         assert_ne!(last_notice(&app).as_deref(), Some(NO_PROVIDER_HINT));
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn r_in_skill_picker_hands_runner_the_same_registry_arc() {
+        // Regression (codex review on #157): reload must not let the UI and the
+        // runner diverge onto separate registries. Pressing `r` rebuilds
+        // `App.skills` and sends the runner the SAME `Arc`, so a later toggle
+        // (interior mutability) stays visible to the next prompt — the shared-
+        // registry behavior that held before any reload.
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        let tmp = crate::util::unique_temp_dir("ignis-keys-skill-reload");
+        let dir = tmp.join(".ignis/skills/demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: demo\n---\nbody").unwrap();
+
+        let mut app = test_app();
+        app.cwd = tmp.clone();
+        app.skills = Some(Arc::new(crate::skills::SkillRegistry::load(
+            None,
+            &tmp,
+            HashSet::new(),
+        )));
+        app.show_skill_picker();
+
+        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (c_tx, _c_rx) = mpsc::channel::<()>(1);
+        let inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &p_tx,
+            &c_tx,
+            &inject,
+            std::path::Path::new("/tmp"),
+            &pk_tx,
+            &n_tx,
+        )
+        .await;
+
+        let ui_reg = app
+            .skills
+            .clone()
+            .expect("UI keeps a registry after reload");
+        match p_rx
+            .try_recv()
+            .expect("pressing r must send ReloadSkills to the runner")
+        {
+            AgentRequest::ReloadSkills(runner_reg) => assert!(
+                Arc::ptr_eq(&runner_reg, &ui_reg),
+                "runner must receive the SAME registry Arc the UI holds"
+            ),
+            other => panic!(
+                "expected ReloadSkills, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        assert!(app.skill_picker.is_some(), "picker stays open after reload");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    async fn press_ctrl_o(app: &mut App) {
+        let (p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (c_tx, _c_rx) = mpsc::channel::<()>(1);
+        let inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
+        handle_key(
+            app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &p_tx,
+            &c_tx,
+            &inject,
+            std::path::Path::new("/tmp"),
+            &pk_tx,
+            &n_tx,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_toggles_reasoning_at_idle() {
+        let mut app = test_app();
+        assert!(!app.reasoning_expanded);
+        press_ctrl_o(&mut app).await;
+        assert!(app.reasoning_expanded, "ctrl+o expands");
+        press_ctrl_o(&mut app).await;
+        assert!(!app.reasoning_expanded, "ctrl+o collapses again");
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_is_noop_while_a_picker_is_open() {
+        // A slash picker owns the screen; toggling would re-commit the
+        // transcript behind it, so Ctrl+O must do nothing (but stay consumed).
+        let mut app = test_app();
+        app.show_settings_panel();
+        press_ctrl_o(&mut app).await;
+        assert!(
+            !app.reasoning_expanded,
+            "ctrl+o must not toggle behind an open picker"
+        );
     }
 }

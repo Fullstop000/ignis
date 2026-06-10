@@ -144,5 +144,5 @@ happened" patterns without modifying the actual tool result.
 
 See `auto-test/` and `system-prompt-trim/` for working examples.
 
-See [`docs/usage/hooks.md`](../../docs/usage/hooks.md) for the full
-user-facing reference.
+See [`docs/usage/extensions.md`](../../docs/usage/extensions.md) for the
+full user-facing reference.

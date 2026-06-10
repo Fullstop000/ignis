@@ -8,16 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- extensions: ignis's agent-loop extension protocol (formerly "hooks"). Surface grows from 2 events to 9 — `SessionStart`, `SystemPromptCompose`, `PreToolUse`, `PostToolUse`, `PreCompact`, `PostCompact`, and `Stop` join `UserPromptSubmit` + `AssistantMessageRender`. Each event gets typed per-event envelope fields (`tool_name`, `tool_input`, `tool_response`, `system_prompt`, `model`, `trigger`, `summary`, `source`, `transcript_path`, `triggered_at`). Extensions can rewrite (`updatedInput` / `updatedOutput` / `updatedSystemPrompt`), block (`decision: "block"` + `reason`), or inject context for the next LLM call (`additionalContext`, surfaced as a labelled `<system-reminder>`).
-- extensions: `matcher` field on `PreToolUse` / `PostToolUse` entries — regex on `tool_name`, compiled at parse so a malformed pattern is a startup error. Non-matching tools skip the spawn entirely. Declaring `matcher` on a non-tool event logs a `[warn]` at load.
-- extensions: `Stop` event honours the Claude Code inversion — a `decision: "block"` on `Stop` keeps the loop alive and surfaces the reason as a `<system-reminder>` framed `"stopped continuation: <reason>"`. Lets users wire "don't stop until tests pass" guardrails without a new event.
-- extensions: `SystemPromptCompose` fires once per LLM call (not per session) — extensions can prune or rewrite the assembled system prompt (which includes git status/diff, AGENTS.md, the skills catalog, and MCP instructions) to A/B test prompt density for token-efficiency research.
-- extensions: three new example extensions — `examples/extensions/bash-deny-rm-rf/` (PreToolUse block), `examples/extensions/auto-test/` (PostToolUse `additionalContext`), `examples/extensions/system-prompt-trim/` (SystemPromptCompose rewrite).
+- extensions — the agent-loop extension protocol (formerly "hooks") grows from 2 events to 9; `SessionStart`, `SystemPromptCompose`, `PreToolUse`, `PostToolUse`, `PreCompact`, `PostCompact`, and `Stop` join `UserPromptSubmit` and `AssistantMessageRender`, each able to rewrite, block, or inject `<system-reminder>` context. ([#141](https://github.com/Fullstop000/ignis/pull/141))
+- extensions — `matcher` (a regex on `tool_name`, compiled at load) scopes `PreToolUse`/`PostToolUse` extensions to specific tools. ([#141](https://github.com/Fullstop000/ignis/pull/141))
+- extensions — `SystemPromptCompose` fires per LLM call so an extension can rewrite the assembled system prompt, enabling prompt-density A/B tests for token-efficiency research. ([#141](https://github.com/Fullstop000/ignis/pull/141))
+- extensions — `Stop` honours the Claude Code inversion: `decision: "block"` keeps the loop running and re-queues the reason, so you can wire "don't stop until tests pass" guardrails. ([#141](https://github.com/Fullstop000/ignis/pull/141))
+- extensions — three example extensions: `bash-deny-rm-rf` (PreToolUse block), `auto-test` (PostToolUse `additionalContext`), and `system-prompt-trim` (SystemPromptCompose rewrite). ([#141](https://github.com/Fullstop000/ignis/pull/141))
+- TUI — the model's thinking now collapses to a rolling 3-line preview while it streams, finalizing to a one-line summary; press `Ctrl+O` to expand the full chain-of-thought. ([#156](https://github.com/Fullstop000/ignis/pull/156))
+- TUI — press `r` in the `/skills` picker to reload skills from disk, picking up newly added, edited, or removed skills without restarting. ([#157](https://github.com/Fullstop000/ignis/pull/157))
+- TUI — exiting with `Ctrl+D` prints a copy-pasteable `ignis --resume <id>` hint so you can pick the session back up. ([#158](https://github.com/Fullstop000/ignis/pull/158))
+
+### Changed
+- extensions — user-facing rename from "hooks": config now at `~/.ignis/extensions.json`, slash command `/extensions`; the v1 `~/.ignis/hooks.json` file, `"hooks"` JSON key, and `/hooks` command keep working as deprecated fallbacks. ([#141](https://github.com/Fullstop000/ignis/pull/141))
+
+### Fixed
+- TUI — on WSL2/conpty, the conversation no longer stays blank after you send a message while the agent keeps working; inline rendering recovers instead of only repainting on resume. ([#154](https://github.com/Fullstop000/ignis/pull/154))
+- TUI — `/sessions` no longer crashes when resuming a long transcript; the history is now committed to scrollback in bounded chunks instead of one oversized buffer that overflowed ratatui's cell limit. ([#155](https://github.com/Fullstop000/ignis/pull/155))
+- TUI — the footer's context % now tracks the active model's context window after switching models via `/connect`, instead of measuring against the previously-selected model's window. ([#160](https://github.com/Fullstop000/ignis/pull/160))
+- TUI — wide markdown tables now wrap to fit the terminal instead of sprawling past the screen as a garbled box. ([#161](https://github.com/Fullstop000/ignis/pull/161))
+
+### Security
+- External hooks now run sandboxed by default: an env-var allowlist keeps secrets like `ANTHROPIC_API_KEY` out of hook subprocesses, and a filesystem sandbox (Linux Landlock / macOS Seatbelt) confines them to a small set of allowed paths. ([#109](https://github.com/Fullstop000/ignis/pull/109))
+
+## [0.37.1] - 2026-06-09
+
+### Added
 - Providers — Ark Coding Plan (`ark-coding`) — Volcengine's flat-fee subscription aggregating 10 models (`doubao-seed-*`, `minimax-m{2.7,3}`, `glm-5.1`, `deepseek-v4-{flash,pro}`, `kimi-k2.6`). Set `ARK_CODING_PLAN_TOKEN` and pick `ark-coding/<model>` via `/model`. ([#149](https://github.com/Fullstop000/ignis/pull/149))
 - TUI — `/settings` opens a control panel: a live **Stats** tab (context %, tokens, turns, tools, uptime) and a **Statusline** tab to show/hide individual status-bar segments. ([#151](https://github.com/Fullstop000/ignis/pull/151))
 
 ### Changed
-- extensions: rename of the user-facing surface. Config lives at `~/.ignis/extensions.json` and the slash command is `/extensions` (with `/extensions list` and `/extensions reload`). v1 hook configs at `~/.ignis/hooks.json` continue to be read as a back-compat fallback, and `/hooks` remains as a deprecated alias for `/extensions`. JSON top-level key accepts either `"extensions"` (preferred) or `"hooks"` (legacy).
+- TUI — tool calls, your messages, and boxes restyled toward Claude Code's look: gutter-style tool blocks (a status-colored `●` bullet + `╰` result), a mauve rail down your turns, and rounded composer/code-fence corners. ([#153](https://github.com/Fullstop000/ignis/pull/153))
 
 ### Fixed
 - TUI — no longer crashes at startup in a git repository whose working diff contains a multibyte character near the truncation point. ([#151](https://github.com/Fullstop000/ignis/pull/151))

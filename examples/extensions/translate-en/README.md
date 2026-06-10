@@ -17,14 +17,18 @@ It's the worked example for the ignis hook protocol — the protocol is
 the feature; translation is the proof. Distill, copy, adapt for your
 own use case (PII scrub, prompt enhancement, telemetry sidecar, …).
 
-> **Warning — hooks run unsandboxed in v1.** Each extension command runs
-> with the full privileges of your `ignis` process. Audit the source
-> before installing.
+> **Extensions are sandboxed by default.** A filesystem sandbox (Linux
+> Landlock / macOS Seatbelt) blocks writes outside `/tmp` and reads
+> outside the extension's folder + system lib paths. Env vars are
+> scrubbed to the universal allowlist; this extension declares the three
+> it needs (`ANTHROPIC_API_KEY`, `IGNIS_TRANSLATE_FROM`,
+> `IGNIS_TRANSLATE_TO`) in `env: [...]`. Sandboxing is a no-op on Windows
+> and older Linux kernels.
 
 ## Install
 
 ```sh
-mkdir -p ~/.ignis/hooks
+mkdir -p ~/.ignis/extensions
 cp -R examples/extensions/translate-en ~/.ignis/extensions/translate-en
 chmod +x ~/.ignis/extensions/translate-en/run.py
 ```
@@ -32,16 +36,29 @@ chmod +x ~/.ignis/extensions/translate-en/run.py
 Python 3.10+. No third-party deps — the script uses the stdlib
 `urllib.request`. Set `ANTHROPIC_API_KEY` in your shell.
 
-Wire it in `~/.ignis/extensions.json`:
+Wire it in `~/.ignis/extensions.json`. `env` declares the variables this
+extension needs (everything else is scrubbed); `sandbox` is the default
+filesystem confinement (Linux Landlock / macOS Seatbelt) — included here
+only so the example is self-documenting.
 
 ```json
 {
   "extensions": {
     "UserPromptSubmit": [
-      {"command": "~/.ignis/extensions/translate-en/run.py", "timeout_ms": 30000}
+      {
+        "command": "~/.ignis/extensions/translate-en/run.py",
+        "env": ["ANTHROPIC_API_KEY", "IGNIS_TRANSLATE_FROM", "IGNIS_TRANSLATE_TO"],
+        "sandbox": true,
+        "timeout_ms": 30000
+      }
     ],
     "AssistantMessageRender": [
-      {"command": "~/.ignis/extensions/translate-en/run.py", "timeout_ms": 30000}
+      {
+        "command": "~/.ignis/extensions/translate-en/run.py",
+        "env": ["ANTHROPIC_API_KEY", "IGNIS_TRANSLATE_FROM", "IGNIS_TRANSLATE_TO"],
+        "sandbox": true,
+        "timeout_ms": 30000
+      }
     ]
   }
 }

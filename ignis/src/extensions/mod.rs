@@ -7,16 +7,21 @@
 //! before history.push) and `AssistantMessageRender` (mutates the
 //! assistant's text before TUI render).
 //!
-//! Hooks **never** kill a turn: every failure mode (timeout, crash,
+//! Extensions **never** kill a turn: every failure mode (timeout, crash,
 //! malformed JSON, missing binary) degrades to "use the original value +
 //! emit a Warning event to the UI".
 //!
-//! **Security:** v1 ships with no sandbox. Hooks run with ignis's full
-//! privileges. See `docs/usage/hooks.md` for the threat model.
+//! **Security:** extension subprocesses run with an env-var allowlist and a
+//! filesystem sandbox (Linux Landlock / macOS Seatbelt) by default. Per-
+//! extension `sandbox: false` opts out; per-extension `env: [...]` extends
+//! the universal allowlist (`PATH HOME USER LANG LC_ALL TZ`). Network egress
+//! is NOT restricted — an extension with `env: ["ANTHROPIC_API_KEY"]` can
+//! still exfiltrate it. See `docs/usage/extensions.md` for the threat model.
 
 pub mod config;
 pub mod dispatch;
 pub mod protocol;
+pub mod sandbox;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,6 +36,7 @@ use crate::AgentEvent;
 pub use config::{ExtensionSpec, ExtensionsConfig, DEFAULT_TIMEOUT_MS};
 pub use dispatch::{DispatchContext, ExtensionOutcome};
 pub use protocol::{ExtensionEvent, ExtensionInput, ExtensionOutput, ExtensionSpecificOutput};
+pub use sandbox::SandboxStatus;
 
 /// Context the registry needs at every dispatch call. Borrowed strings so
 /// callers don't have to allocate per turn.
@@ -184,13 +190,18 @@ impl ExtensionRegistry {
         )
     }
 
-    /// Rebuild the registry from disk in place. Returns the new hook count
-    /// for the `/hooks reload` confirmation line.
+    /// Rebuild the registry from disk in place. Returns the new extension
+    /// count for the `/extensions reload` confirmation line.
+    ///
+    /// Also clears the dispatcher's per-session "sandbox unavailable"
+    /// suppression set so a freshly-edited extension gets a fresh degradation
+    /// notice instead of being silently swallowed.
     pub async fn reload(&self, home: &Path) -> anyhow::Result<usize> {
         let cfg = ExtensionsConfig::from_home(home)?;
         let total = cfg.total_len();
         let mut guard = self.inner.write().await;
         *guard = cfg;
+        dispatch::reset_sandbox_warnings();
         Ok(total)
     }
 
@@ -251,7 +262,8 @@ impl ExtensionRegistry {
                 system_prompt: &current,
                 model,
             };
-            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            let (outcome, _sandbox_status) =
+                dispatch::run_hook(spec, payload, &dispatch_ctx, Some(tx)).await;
             match outcome {
                 ExtensionOutcome::PassThrough => {}
                 ExtensionOutcome::Mutated(text) => current = text,
@@ -343,7 +355,8 @@ impl ExtensionRegistry {
                 trigger,
                 transcript_path,
             };
-            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            let (outcome, _sandbox_status) =
+                dispatch::run_hook(spec, payload, &dispatch_ctx, Some(tx)).await;
             match outcome {
                 ExtensionOutcome::PassThrough => {}
                 ExtensionOutcome::InjectContext(text) => {
@@ -431,7 +444,8 @@ impl ExtensionRegistry {
         let mut keep_looping = false;
         for spec in &specs {
             let payload = dispatch::ExtensionPayload::Stop { transcript_path };
-            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            let (outcome, _sandbox_status) =
+                dispatch::run_hook(spec, payload, &dispatch_ctx, Some(tx)).await;
             match outcome {
                 ExtensionOutcome::PassThrough => {}
                 ExtensionOutcome::InjectContext(text) => {
@@ -517,7 +531,8 @@ impl ExtensionRegistry {
         };
         for spec in &specs {
             let pwl = build_payload(spec);
-            let outcome = dispatch::run_hook(spec, pwl.payload, &dispatch_ctx).await;
+            let (outcome, _sandbox_status) =
+                dispatch::run_hook(spec, pwl.payload, &dispatch_ctx, Some(tx)).await;
             match outcome {
                 ExtensionOutcome::PassThrough => {}
                 ExtensionOutcome::InjectContext(text) => {
@@ -618,7 +633,8 @@ impl ExtensionRegistry {
         let mut current = initial.to_string();
         for spec in &specs {
             let payload = dispatch::ExtensionPayload::UserPromptSubmit { prompt: &current };
-            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            let (outcome, _sandbox_status) =
+                dispatch::run_hook(spec, payload, &dispatch_ctx, Some(tx)).await;
             match outcome {
                 ExtensionOutcome::Mutated(next) => current = next,
                 ExtensionOutcome::PassThrough => {}
@@ -679,7 +695,8 @@ impl ExtensionRegistry {
         let mut current = initial.to_string();
         for spec in &specs {
             let payload = dispatch::ExtensionPayload::AssistantMessageRender { content: &current };
-            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            let (outcome, _sandbox_status) =
+                dispatch::run_hook(spec, payload, &dispatch_ctx, Some(tx)).await;
             match outcome {
                 ExtensionOutcome::Mutated(next) => current = next,
                 ExtensionOutcome::PassThrough => {}
@@ -873,7 +890,10 @@ impl ToolExtensions for ExtensionRegistry {
                 tool_name,
                 tool_input: &current,
             };
-            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            // `ToolExtensions` carries no event channel, so sandbox/buffer
+            // warnings for tool events are logged via tracing only (None).
+            let (outcome, _sandbox_status) =
+                dispatch::run_hook(spec, payload, &dispatch_ctx, None).await;
             match outcome {
                 ExtensionOutcome::PassThrough => {}
                 ExtensionOutcome::MutatedJson(v) => current = v,
@@ -947,7 +967,8 @@ impl ToolExtensions for ExtensionRegistry {
                 tool_input: args,
                 tool_response: &tool_response,
             };
-            let outcome = dispatch::run_hook(spec, payload, &dispatch_ctx).await;
+            let (outcome, _sandbox_status) =
+                dispatch::run_hook(spec, payload, &dispatch_ctx, None).await;
             match outcome {
                 ExtensionOutcome::PassThrough => {}
                 ExtensionOutcome::InjectContext(text) => {
@@ -1150,13 +1171,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: s1,
                     args: vec![],
                     timeout_ms: 5_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
                 ExtensionSpec {
                     program: s2,
                     args: vec![],
                     timeout_ms: 5_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
             ],
             assistant_message_render: vec![],
@@ -1191,13 +1212,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: good,
                     args: vec![],
                     timeout_ms: 5_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
                 ExtensionSpec {
                     program: bad,
                     args: vec![],
                     timeout_ms: 5_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
             ],
             assistant_message_render: vec![],
@@ -1237,7 +1258,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: blocker,
                 args: vec![],
                 timeout_ms: 5_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             assistant_message_render: vec![],
             ..ExtensionsConfig::default()
@@ -1279,7 +1300,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: blocker,
                 args: vec![],
                 timeout_ms: 5_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };
@@ -1347,7 +1368,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/a/hook.sh"),
                 args: vec!["--flag".to_string()],
                 timeout_ms: 7_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             assistant_message_render: vec![],
             ..ExtensionsConfig::default()
@@ -1375,7 +1396,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/opt/translate/run.py"),
                 args: vec![],
                 timeout_ms: 10_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             assistant_message_render: vec![],
             ..ExtensionsConfig::default()
@@ -1399,20 +1420,20 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: PathBuf::from("/opt/translate/run.py"),
                     args: vec!["--source".to_string(), "en".to_string()],
                     timeout_ms: 30_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
                 ExtensionSpec {
                     program: PathBuf::from("/opt/redact.sh"),
                     args: vec![],
                     timeout_ms: 5_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
             ],
             assistant_message_render: vec![ExtensionSpec {
                 program: PathBuf::from("/opt/translate/run.py"),
                 args: vec![],
                 timeout_ms: 10_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };
@@ -1438,7 +1459,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/opt/render.sh"),
                 args: vec![],
                 timeout_ms: 1_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };
@@ -1468,13 +1489,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: PathBuf::from("/opt/translate-to-french-v2.py"),
                     args: vec![],
                     timeout_ms: 10_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
                 ExtensionSpec {
                     program: PathBuf::from("/opt/redact.sh"),
                     args: vec![],
                     timeout_ms: 10_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
             ],
             assistant_message_render: vec![],
@@ -1514,13 +1535,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: PathBuf::from("/a"),
                 args: vec![],
                 timeout_ms: 1_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             assistant_message_render: vec![ExtensionSpec {
                 program: PathBuf::from("/b"),
                 args: vec![],
                 timeout_ms: 1_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };
@@ -1553,7 +1574,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };
@@ -1578,7 +1599,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };
@@ -1645,7 +1666,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };
@@ -1694,13 +1715,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: s1,
                     args: vec![],
                     timeout_ms: 5_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
                 ExtensionSpec {
                     program: s2,
                     args: vec![],
                     timeout_ms: 5_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
             ],
             ..ExtensionsConfig::default()
@@ -1753,7 +1774,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };
@@ -1793,7 +1814,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };
@@ -1834,7 +1855,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };
@@ -1860,7 +1881,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };
@@ -1903,13 +1924,13 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                     program: s1,
                     args: vec![],
                     timeout_ms: 5_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
                 ExtensionSpec {
                     program: s2,
                     args: vec![],
                     timeout_ms: 5_000,
-                    matcher: None,
+                    ..ExtensionSpec::default()
                 },
             ],
             ..ExtensionsConfig::default()
@@ -2049,7 +2070,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 program: s,
                 args: vec![],
                 timeout_ms: 5_000,
-                matcher: None,
+                ..ExtensionSpec::default()
             }],
             ..ExtensionsConfig::default()
         };

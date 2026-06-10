@@ -1,6 +1,6 @@
 [package]
 name = "ignis"
-version = "0.37.0"
+version = "0.37.1"
 edition = "2021"
 description = "A single-binary, multi-provider AI coding agent for your terminal."
 license = "Apache-2.0"
@@ -47,6 +47,11 @@ opentelemetry = { version = "0.32", optional = true }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto", "tls-roots", "trace", "metrics"], optional = true }
 opentelemetry-semantic-conventions = { version = "0.32", optional = true }
+
+# Linux-only filesystem sandbox for hook subprocesses. On other platforms the
+# sandbox module compiles to a no-op stub; see `ignis/src/hooks/sandbox.rs`.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
 
 [features]
 default = ["telemetry"]

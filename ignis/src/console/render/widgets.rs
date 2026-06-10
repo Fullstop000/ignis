@@ -347,6 +347,7 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 
     let mut block = Block::default()
         .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(SURFACE_2));
     if !app.queue.is_empty() {
