@@ -27,6 +27,12 @@ pub(crate) enum AgentRequest {
     /// `Config`. Used after `/connect` writes a fresh provider so the next
     /// prompt picks up the new `api_key` without a restart.
     ReloadConfig,
+    /// Adopt a freshly-scanned `SkillRegistry` as the runner's own. Sent when
+    /// the user presses `r` in the `/skills` picker: the UI rebuilds `App.skills`
+    /// and hands the runner the *same* `Arc` so both share one registry — live
+    /// enable/disable toggles keep propagating to the next prompt, exactly as
+    /// they did before a reload.
+    ReloadSkills(std::sync::Arc<crate::skills::SkillRegistry>),
 }
 
 pub(crate) fn format_duration(ms: u128) -> String {

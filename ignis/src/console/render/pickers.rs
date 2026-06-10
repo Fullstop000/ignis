@@ -574,8 +574,14 @@ pub(crate) fn render_skill_picker(
         )));
     }
 
+    if let Some(status) = &picker.status {
+        lines.push(Line::from(Span::styled(
+            format!("  {status}"),
+            Style::default().fg(GREEN),
+        )));
+    }
     lines.push(Line::from(Span::styled(
-        "  Up/Down to move, Space/Enter to toggle, Esc to close.",
+        "  Up/Down move · Space/Enter toggle · r reload · Esc close",
         Style::default().fg(TEXT_DIM),
     )));
 }

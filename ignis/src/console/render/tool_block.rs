@@ -105,6 +105,20 @@ pub(crate) fn ask_user_resume_trace(entry: &ToolCallEntry) -> Vec<Line<'static>>
     out
 }
 
+/// First body line under the header carries the `╰` connector; any extra /
+/// wrapped rows get a 4-space indent so content stays aligned under it. This is
+/// the Claude-Code gutter: `● tool(args)` header, `  ╰ result` beneath — no box.
+/// `●` / `╰` are used over CC's `⏺` / `⎿` because the latter tofu on common
+/// monospace fonts (DejaVu Sans Mono); `●` already ships in the footer notice
+/// and `╰` is plain box-drawing, so both render everywhere.
+fn gutter(first: bool) -> Span<'static> {
+    if first {
+        Span::styled("  ╰ ", Style::default().fg(TEXT_DIM))
+    } else {
+        Span::raw("    ")
+    }
+}
+
 pub(crate) fn render_tool_block(
     lines: &mut Vec<Line<'static>>,
     entry: &ToolCallEntry,
@@ -112,43 +126,29 @@ pub(crate) fn render_tool_block(
     cwd: &Path,
     width: u16,
 ) {
-    let (icon, color, status_line, elapsed) = match &entry.status {
-        ToolStatus::Pending => {
-            let spinner = SPINNERS[(tick as usize / 10) % SPINNERS.len()];
-            let ms = entry.started_at.elapsed().as_millis();
-            (
-                spinner,
-                YELLOW,
-                format!("running… {}", format_duration(ms)),
-                String::new(),
-            )
-        }
-        ToolStatus::Success(out) => {
-            let elapsed = format_duration(entry.elapsed_ms);
-            let preview = truncate(out.trim(), 300);
-            ("+", GREEN, preview, elapsed)
-        }
-        ToolStatus::Error(err) => {
-            let elapsed = format_duration(entry.elapsed_ms);
-            let preview = truncate(&sanitize(err.trim()), 300);
-            ("x", RED, preview, elapsed)
-        }
+    // The state-colored bullet carries the whole status; the tool name stays
+    // neutral (bold) and args dim, so the eye lands on the verb, not the noise.
+    let color = match &entry.status {
+        ToolStatus::Pending => YELLOW,
+        ToolStatus::Success(_) => GREEN,
+        ToolStatus::Error(_) => RED,
     };
-
-    // Parse tool arguments for a compact display
+    let elapsed = match &entry.status {
+        ToolStatus::Pending => String::new(),
+        _ => format_duration(entry.elapsed_ms),
+    };
     let args_compact = sanitize(&compact_tool_args(&entry.name, &entry.arguments, cwd));
 
     lines.push(Line::from(""));
-    // Header line: ┌─ ⚙ tool_name(args) [1.2s]
+    // Header line: ● tool_name(args) [1.2s]
     let mut header = vec![
-        Span::styled("  ┌ ", Style::default().fg(color)),
         Span::styled(
-            format!("{} ", icon),
+            "● ",
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             entry.name.clone(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
     ];
     if !args_compact.is_empty() {
@@ -165,12 +165,18 @@ pub(crate) fn render_tool_block(
     }
     lines.push(Line::from(header));
 
-    // Status / output lines (collapsed for success, expanded for errors)
+    // Body — rendered under the `╰` gutter, shape depends on status.
     match &entry.status {
         ToolStatus::Pending => {
+            let spinner = SPINNERS[(tick as usize / 10) % SPINNERS.len()];
+            let ms = entry.started_at.elapsed().as_millis();
             lines.push(Line::from(vec![
-                Span::styled("  │ ", Style::default().fg(color)),
-                Span::styled(status_line, Style::default().fg(TEXT_DIM)),
+                gutter(true),
+                Span::styled(format!("{spinner} "), Style::default().fg(YELLOW)),
+                Span::styled(
+                    format!("running… {}", format_duration(ms)),
+                    Style::default().fg(TEXT_DIM),
+                ),
             ]));
         }
         ToolStatus::Success(_) if entry.name == SkillTool::NAME => {
@@ -179,25 +185,38 @@ pub(crate) fn render_tool_block(
             // the model's to read, not the user's. Show one dim confirmation
             // line (CC/Codex render the compact invocation, not the loaded text).
             lines.push(Line::from(vec![
-                Span::styled("  │ ", Style::default().fg(color)),
+                gutter(true),
                 Span::styled("loaded skill instructions", Style::default().fg(TEXT_DIM)),
             ]));
         }
         ToolStatus::Success(out) => {
-            // edit_file returns a git-style diff: render the hunk with solid
-            // red/green backgrounds and syntax-highlighted code. Other tools get
-            // a compact 3-line preview.
+            // edit_file returns a git-style diff: lead with a `+adds -dels`
+            // summary, then render the hunk with solid red/green backgrounds and
+            // syntax-highlighted code. Other tools get a compact 3-line preview.
             let is_diff = entry.name == EditFileTool::NAME;
             let max = if is_diff { 30 } else { 3 };
             if is_diff {
+                let (adds, dels) = count_diff(out);
+                lines.push(Line::from(vec![
+                    gutter(true),
+                    Span::styled(format!("+{adds}"), Style::default().fg(GREEN)),
+                    Span::styled(format!(" -{dels}"), Style::default().fg(RED)),
+                ]));
                 let ext = diff_file_ext(&entry.arguments);
                 for sl in out.lines().take(max) {
-                    push_diff_line(lines, sl, &ext, color, width);
+                    push_diff_line(lines, sl, &ext, width);
                 }
+            } else if out.trim().is_empty() {
+                // A tool that succeeds with no output still gets one gutter line
+                // so the block reads as complete, not a bare dangling header.
+                lines.push(Line::from(vec![
+                    gutter(true),
+                    Span::styled("(no output)", Style::default().fg(TEXT_DIM)),
+                ]));
             } else {
-                for sl in out.lines().take(max) {
+                for (i, sl) in out.lines().take(max).enumerate() {
                     lines.push(Line::from(vec![
-                        Span::styled("  │ ", Style::default().fg(color)),
+                        gutter(i == 0),
                         Span::styled(truncate(&sanitize(sl), 200), Style::default().fg(TEXT_DIM)),
                     ]));
                 }
@@ -205,7 +224,7 @@ pub(crate) fn render_tool_block(
             let total_lines = out.lines().count();
             if total_lines > max {
                 lines.push(Line::from(vec![
-                    Span::styled("  │ ", Style::default().fg(color)),
+                    gutter(false),
                     Span::styled(
                         format!("… {} more lines", total_lines - max),
                         Style::default().fg(TEXT_DIM),
@@ -213,17 +232,31 @@ pub(crate) fn render_tool_block(
                 ]));
             }
         }
-        ToolStatus::Error(_) => {
-            for sl in status_line.lines().take(5) {
+        ToolStatus::Error(err) => {
+            let preview = truncate(&sanitize(err.trim()), 300);
+            for (i, sl) in preview.lines().take(5).enumerate() {
                 lines.push(Line::from(vec![
-                    Span::styled("  │ ", Style::default().fg(color)),
+                    gutter(i == 0),
                     Span::styled(sl.to_string(), Style::default().fg(RED)),
                 ]));
             }
         }
     }
+}
 
-    lines.push(Line::from(Span::styled("  └", Style::default().fg(color))));
+/// Count added / removed lines in an edit_file diff hunk (first byte `+` / `-`),
+/// matching `push_diff_line`'s own sign detection. The hunk carries no
+/// `+++`/`---` file headers, so a plain first-byte check is exact.
+fn count_diff(diff: &str) -> (usize, usize) {
+    let (mut adds, mut dels) = (0usize, 0usize);
+    for l in diff.lines() {
+        match l.as_bytes().first() {
+            Some(b'+') => adds += 1,
+            Some(b'-') => dels += 1,
+            _ => {}
+        }
+    }
+    (adds, dels)
 }
 
 /// The active file's extension (for syntax highlighting), from the tool args.
@@ -243,17 +276,12 @@ fn diff_file_ext(args_json: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Render one diff line. Added (`+`) and removed (`-`) lines get a solid
-/// background filling the row and syntax-highlighted code; other lines render
-/// plain. `width` is the messages-area width (for the full-row background).
-fn push_diff_line(
-    lines: &mut Vec<Line<'static>>,
-    raw: &str,
-    ext: &str,
-    border: ratatui::style::Color,
-    width: u16,
-) {
-    let prefix = Span::styled("  │ ", Style::default().fg(border));
+/// Render one diff line under the tool gutter. Added (`+`) and removed (`-`)
+/// lines get a solid background filling the row and syntax-highlighted code;
+/// other lines render plain. `width` is the messages-area width (for the
+/// full-row background). The 4-space prefix aligns the hunk under the `╰`.
+fn push_diff_line(lines: &mut Vec<Line<'static>>, raw: &str, ext: &str, width: u16) {
+    let prefix = Span::raw("    ");
     let (sign, bg, sign_fg) = match raw.as_bytes().first() {
         Some(b'+') => ('+', DIFF_ADD_BG, GREEN),
         Some(b'-') => ('-', DIFF_DEL_BG, RED),
@@ -266,7 +294,7 @@ fn push_diff_line(
         }
     };
 
-    // Content area = width − "  │ " (4) − "± " (2); fill it so the bg spans the row.
+    // Content area = width − 4-space prefix − "± " (2); fill it so bg spans the row.
     let content_w = (width as usize).saturating_sub(6).max(8);
     // `truncate` appends `…` past its limit, so cap at content_w − 1: a truncated
     // line is then exactly content_w cells and never wraps off the bg bar.

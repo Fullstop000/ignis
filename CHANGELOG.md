@@ -11,12 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - hooks: env-var allowlist + filesystem sandbox (Linux Landlock, macOS Seatbelt) for hook subprocesses, defaults-on; SIGTERM-then-SIGKILL grace on timeout; stdout/stderr capped at 1 MiB per stream. ([#109](https://github.com/Fullstop000/ignis/pull/109))
 - hooks: `HookOutcome` now carries the per-call `sandbox_status` (`FullyEnforced` / `NotEnforced` / `PlatformUnsupported` / `Disabled`); new `sandbox::is_kernel_sandbox_available()` helper exposes the kernel-side check. `ignis/tests/sandbox_e2e.rs` adds 25 regression tests across 8 layers (env-allowlist, filesystem, SIGTERM grace, buffer cap, lifecycle, composition, macOS Seatbelt quirks, status reporting) and exercises both Landlock and Seatbelt end-to-end.
 - hooks: dispatcher now sets the child's CWD to the hook's script folder, fixing the macOS Seatbelt `shell-init` / `job-working-directory` EPERM noise that previously leaked into every hook's stderr.
+- TUI — the model's thinking now collapses to a rolling 3-line preview while it streams, finalizing to a one-line summary; press `Ctrl+O` to expand the full chain-of-thought. ([#156](https://github.com/Fullstop000/ignis/pull/156))
+- TUI — press `r` in the `/skills` picker to reload skills from disk, picking up newly added, edited, or removed skills without restarting. ([#157](https://github.com/Fullstop000/ignis/pull/157))
+- TUI — exiting with `Ctrl+D` prints a copy-pasteable `ignis --resume <id>` hint so you can pick the session back up. ([#158](https://github.com/Fullstop000/ignis/pull/158))
+
+### Fixed
+- TUI — on WSL2/conpty, the conversation no longer stays blank after you send a message while the agent keeps working; inline rendering recovers instead of only repainting on resume. ([#154](https://github.com/Fullstop000/ignis/pull/154))
+- TUI — `/sessions` no longer crashes when resuming a long transcript; the history is now committed to scrollback in bounded chunks instead of one oversized buffer that overflowed ratatui's cell limit. ([#155](https://github.com/Fullstop000/ignis/pull/155))
+- TUI — wide markdown tables now wrap to fit the terminal instead of sprawling past the screen as a garbled box. ([#161](https://github.com/Fullstop000/ignis/pull/161))
 
 ## [0.37.1] - 2026-06-09
 
 ### Added
 - Providers — Ark Coding Plan (`ark-coding`) — Volcengine's flat-fee subscription aggregating 10 models (`doubao-seed-*`, `minimax-m{2.7,3}`, `glm-5.1`, `deepseek-v4-{flash,pro}`, `kimi-k2.6`). Set `ARK_CODING_PLAN_TOKEN` and pick `ark-coding/<model>` via `/model`. ([#149](https://github.com/Fullstop000/ignis/pull/149))
 - TUI — `/settings` opens a control panel: a live **Stats** tab (context %, tokens, turns, tools, uptime) and a **Statusline** tab to show/hide individual status-bar segments. ([#151](https://github.com/Fullstop000/ignis/pull/151))
+
+### Changed
+- TUI — tool calls, your messages, and boxes restyled toward Claude Code's look: gutter-style tool blocks (a status-colored `●` bullet + `╰` result), a mauve rail down your turns, and rounded composer/code-fence corners. ([#153](https://github.com/Fullstop000/ignis/pull/153))
 
 ### Fixed
 - TUI — no longer crashes at startup in a git repository whose working diff contains a multibyte character near the truncation point. ([#151](https://github.com/Fullstop000/ignis/pull/151))
