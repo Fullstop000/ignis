@@ -11,7 +11,7 @@ reminder — the model sees a tool error and adapts (or asks the user).
 ## Install
 
 ```sh
-mkdir -p ~/.ignis/hooks
+mkdir -p ~/.ignis/extensions
 cp -R examples/extensions/bash-deny-rm-rf ~/.ignis/extensions/bash-deny-rm-rf
 chmod +x ~/.ignis/extensions/bash-deny-rm-rf/run.sh
 ```

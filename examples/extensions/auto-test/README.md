@@ -8,7 +8,7 @@ injection.
 ## Install
 
 ```sh
-mkdir -p ~/.ignis/hooks
+mkdir -p ~/.ignis/extensions
 cp -R examples/extensions/auto-test ~/.ignis/extensions/auto-test
 chmod +x ~/.ignis/extensions/auto-test/run.sh
 ```
@@ -24,6 +24,7 @@ Requires `jq` on `PATH`.
       {
         "command": "~/.ignis/extensions/auto-test/run.sh",
         "matcher": "Write|Edit",
+        "sandbox": false,
         "timeout_ms": 120000
       }
     ]
@@ -31,9 +32,16 @@ Requires `jq` on `PATH`.
 }
 ```
 
-The `matcher` `Write|Edit` confines the hook to file-modifying tools —
-it doesn't run after `Read`, `Grep`, or `Bash`. `timeout_ms` is 2
-minutes because `cargo test --workspace` can take a while on cold
+`"sandbox": false` is **required** here: extensions are sandboxed by
+default (reads confined to system libs + `/tmp`, writes to `/tmp`),
+but `cargo test --workspace` must read your whole project tree and
+write `target/`. The default sandbox would block it. This is the
+intended escape hatch for extensions that legitimately need broad
+filesystem access — see `docs/usage/extensions.md`.
+
+The `matcher` `Write|Edit` confines the extension to file-modifying
+tools — it doesn't run after `Read`, `Grep`, or `Bash`. `timeout_ms`
+is 2 minutes because `cargo test --workspace` can take a while on cold
 incremental builds.
 
 Reload without restarting: type `/extensions reload`.

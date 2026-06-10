@@ -12,7 +12,7 @@ motivated v2.
 ## Install
 
 ```sh
-mkdir -p ~/.ignis/hooks
+mkdir -p ~/.ignis/extensions
 cp -R examples/extensions/system-prompt-trim ~/.ignis/extensions/system-prompt-trim
 chmod +x ~/.ignis/extensions/system-prompt-trim/run.sh
 ```
