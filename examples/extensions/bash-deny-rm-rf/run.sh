@@ -1,5 +1,5 @@
 #!/bin/sh
-# PreToolUse hook — deny `rm -rf` style commands on `Bash`.
+# PreToolUse extension — deny `rm -rf` style commands on the `bash` tool.
 #
 # Reads the envelope on stdin, extracts `tool_input.command`, and refuses
 # any command matching a destructive-rm pattern. Returns
@@ -12,7 +12,7 @@
 #
 # Wire in ~/.ignis/extensions.json:
 #   { "extensions": { "PreToolUse": [
-#       { "command": "~/.ignis/extensions/bash-deny-rm-rf/run.sh", "matcher": "Bash" }
+#       { "command": "~/.ignis/extensions/bash-deny-rm-rf/run.sh", "matcher": "bash" }
 #   ]}}
 
 set -eu

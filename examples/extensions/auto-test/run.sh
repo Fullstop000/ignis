@@ -1,7 +1,7 @@
 #!/bin/sh
-# PostToolUse hook — auto-run `cargo test --workspace -q` after every
-# Write/Edit and inject the pass/fail result as additionalContext for
-# the next LLM call.
+# PostToolUse extension — auto-run `cargo test --workspace -q` after every
+# create_file/edit_file and inject the pass/fail result as additionalContext
+# for the next LLM call.
 #
 # Demonstrates the v2 `PostToolUse` event + `additionalContext`
 # injection: the agent's next turn sees a system reminder framing what
@@ -15,13 +15,13 @@
 # Wire in ~/.ignis/extensions.json:
 #   { "extensions": { "PostToolUse": [
 #       { "command": "~/.ignis/extensions/auto-test/run.sh",
-#         "matcher": "Write|Edit", "timeout_ms": 120000 }
+#         "matcher": "create_file|edit_file", "sandbox": false, "timeout_ms": 120000 }
 #   ]}}
 
 set -eu
 
 # Drain stdin — we don't read the envelope for this simple example; the
-# matcher already guarantees we fire on Write/Edit only.
+# matcher already guarantees we fire on create_file/edit_file only.
 cat >/dev/null
 
 cd "${IGNIS_HOOK_CWD:-$PWD}"

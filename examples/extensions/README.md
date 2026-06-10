@@ -11,8 +11,8 @@ collects working extension scripts you can copy, install in
 | Hook | Event(s) | What it does |
 |---|---|---|
 | [`translate-en/`](./translate-en/) | `UserPromptSubmit` + `AssistantMessageRender` | Bilingual prompt + reply translator (Anthropic Haiku). The original ignis use case. |
-| [`bash-deny-rm-rf/`](./bash-deny-rm-rf/) | `PreToolUse` (`matcher: "Bash"`) | Refuses `rm -rf` (and variants) before the bash tool runs. Demonstrates `decision: "block"`. |
-| [`auto-test/`](./auto-test/) | `PostToolUse` (`matcher: "Write\|Edit"`) | Runs `cargo test --workspace -q` after every Write/Edit and injects PASS/FAIL into the next turn via `additionalContext`. |
+| [`bash-deny-rm-rf/`](./bash-deny-rm-rf/) | `PreToolUse` (`matcher: "bash"`) | Refuses `rm -rf` (and variants) before the bash tool runs. Demonstrates `decision: "block"`. |
+| [`auto-test/`](./auto-test/) | `PostToolUse` (`matcher: "create_file\|edit_file"`) | Runs `cargo test --workspace -q` after every create_file/edit_file and injects PASS/FAIL into the next turn via `additionalContext`. |
 | [`system-prompt-trim/`](./system-prompt-trim/) | `SystemPromptCompose` | Strips the `Git Diff:` block from the assembled system prompt per LLM call. The token-efficiency research substrate; A/B test prompt density on your project. |
 
 ## Events available (v2)
@@ -101,7 +101,7 @@ calls don't pay the spawn cost:
 ```json
 {
   "command": "~/.ignis/extensions/bash-deny/run.sh",
-  "matcher": "Bash"
+  "matcher": "bash"
 }
 ```
 
@@ -120,7 +120,7 @@ the field is ignored.
       {"command": "~/.ignis/extensions/your-hook/run.py"}
     ],
     "PreToolUse": [
-      {"command": "~/.ignis/extensions/bash-judge/run.sh", "matcher": "Bash"}
+      {"command": "~/.ignis/extensions/bash-judge/run.sh", "matcher": "bash"}
     ]
   }
 }

@@ -171,10 +171,15 @@ debug log.
 Tool events accept a `matcher` regex on `tool_name`:
 
 ```json
-{ "command": "~/.ignis/extensions/bash-deny/run.sh", "matcher": "Bash" }
+{ "command": "~/.ignis/extensions/bash-deny/run.sh", "matcher": "bash" }
 ```
 
-Hooks with a matcher only fire when the running tool's name matches —
+ignis tool names are lowercase snake_case — `bash`, `read_file`,
+`create_file`, `edit_file`, `grep`, `glob`, `list_dir`, `web_search`,
+`web_fetch`, `agent`, `skill` (**not** Claude Code's `Bash` / `Write` /
+`Edit`). A `matcher` that matches none of them silently never fires.
+
+Extensions with a matcher only fire when the running tool's name matches —
 unrelated calls don't pay the spawn cost. `matcher` is compiled at
 parse, so a malformed regex is a startup error. Declaring `matcher`
 on a non-tool event logs a `[warn]` at load and is otherwise ignored.
@@ -226,14 +231,14 @@ soft failure.
     "PreToolUse": [
       {
         "command": "~/.ignis/extensions/bash-deny-rm-rf/run.sh",
-        "matcher": "Bash",
+        "matcher": "bash",
         "timeout_ms": 2000
       }
     ],
     "PostToolUse": [
       {
         "command": "~/.ignis/extensions/auto-test/run.sh",
-        "matcher": "Write|Edit",
+        "matcher": "create_file|edit_file",
         "timeout_ms": 120000
       }
     ],
@@ -340,10 +345,10 @@ with attributes `event`, `command`, `duration_ms`, `sandbox.status`,
   — bilingual translator (the original ignis use case). Demonstrates
   `UserPromptSubmit` + `AssistantMessageRender`.
 - [`examples/extensions/bash-deny-rm-rf/`](../../examples/extensions/bash-deny-rm-rf/)
-  — `PreToolUse` with `matcher: "Bash"`, blocks `rm -rf`. Demonstrates
+  — `PreToolUse` with `matcher: "bash"`, blocks `rm -rf`. Demonstrates
   `decision: "block"`.
 - [`examples/extensions/auto-test/`](../../examples/extensions/auto-test/) —
-  `PostToolUse` with `matcher: "Write|Edit"`, runs the test suite and
+  `PostToolUse` with `matcher: "create_file|edit_file"`, runs the test suite and
   injects PASS/FAIL via `additionalContext`.
 - [`examples/extensions/system-prompt-trim/`](../../examples/extensions/system-prompt-trim/)
   — `SystemPromptCompose`, strips the `Git Diff:` block for

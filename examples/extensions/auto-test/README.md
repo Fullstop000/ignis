@@ -1,7 +1,8 @@
 # auto-test — PostToolUse test-after-edit hook
 
-Runs `cargo test --workspace -q` after every `Write` or `Edit` and
-injects PASS / FAIL into the model's next turn as a system reminder.
+Runs `cargo test --workspace -q` after every `create_file` or
+`edit_file` and injects PASS / FAIL into the model's next turn as a
+system reminder.
 Demonstrates the v2 `PostToolUse` event + `additionalContext`
 injection.
 
@@ -23,7 +24,7 @@ Requires `jq` on `PATH`.
     "PostToolUse": [
       {
         "command": "~/.ignis/extensions/auto-test/run.sh",
-        "matcher": "Write|Edit",
+        "matcher": "create_file|edit_file",
         "sandbox": false,
         "timeout_ms": 120000
       }
@@ -39,8 +40,9 @@ write `target/`. The default sandbox would block it. This is the
 intended escape hatch for extensions that legitimately need broad
 filesystem access — see `docs/usage/extensions.md`.
 
-The `matcher` `Write|Edit` confines the extension to file-modifying
-tools — it doesn't run after `Read`, `Grep`, or `Bash`. `timeout_ms`
+The `matcher` `create_file|edit_file` confines the extension to
+file-modifying tools — it doesn't run after `read_file`, `grep`, or
+`bash` (ignis tool names are lowercase snake_case). `timeout_ms`
 is 2 minutes because `cargo test --workspace` can take a while on cold
 incremental builds.
 
@@ -48,7 +50,7 @@ Reload without restarting: type `/extensions reload`.
 
 ## How it shows up to the model
 
-After every Write/Edit, the model's next turn sees:
+After every create_file/edit_file, the model's next turn sees:
 
 ```
 <system-reminder>
@@ -65,5 +67,5 @@ proposing a fix without the user asking.
 The script tails the last 20 lines. For larger output bump that or
 filter further (e.g., `grep -E "test result|FAILED|error\[E"`). On a
 slow test suite, set `timeout_ms` generously — a timeout causes a
-soft failure (the original Write/Edit still completes; no test
+soft failure (the original create_file/edit_file still completes; no test
 feedback is injected).

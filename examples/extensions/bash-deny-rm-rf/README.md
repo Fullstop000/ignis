@@ -26,7 +26,7 @@ Requires `jq` on `PATH`.
     "PreToolUse": [
       {
         "command": "~/.ignis/extensions/bash-deny-rm-rf/run.sh",
-        "matcher": "Bash",
+        "matcher": "bash",
         "timeout_ms": 2000
       }
     ]
@@ -34,9 +34,10 @@ Requires `jq` on `PATH`.
 }
 ```
 
-The `matcher` field is a regex on the tool name — `"Bash"` means the
-hook only fires for bash calls; PreToolUse on `Edit` or `Read` skips
-this hook without paying a spawn cost.
+The `matcher` field is a regex on the tool name — `"bash"` means the
+extension only fires for bash calls; PreToolUse on `edit_file` or
+`read_file` skips it without paying a spawn cost. (ignis tool names are
+lowercase snake_case, not Claude Code's `Bash` / `Edit` / `Read`.)
 
 Reload without restarting: type `/extensions reload`.
 
