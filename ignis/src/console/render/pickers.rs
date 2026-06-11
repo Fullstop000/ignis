@@ -809,11 +809,60 @@ pub(crate) fn render_model_picker(
 
 /// `/settings` control panel — a tab bar (Stats | Statusline) over the active
 /// tab's body. Reads `App` directly for the live Stats view.
+/// App-derived data the `/settings` tabs render from, resolved once per frame
+/// so the tab renderers are pure (data → lines) and unit-testable without an
+/// `App`. The only place the settings panel touches the `App` god-object.
+pub(crate) struct SettingsData {
+    pub ctx_tokens: u64,
+    pub ctx_pct: u8,
+    pub in_tokens: u64,
+    pub out_tokens: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub turns: usize,
+    pub msgs: usize,
+    pub tools: Vec<(String, usize)>,
+    pub uptime_ms: u128,
+    pub provider: String,
+    pub model: String,
+    pub effort: Option<String>,
+    /// Which footer segments are on, aligned to `STATUSLINE_SEGMENTS`.
+    pub segment_shown: [bool; STATUSLINE_SEGMENTS.len()],
+}
+
+impl From<&App> for SettingsData {
+    fn from(app: &App) -> Self {
+        let (ctx_tokens, ctx_pct) = app.context_usage();
+        let u = &app.cumulative_usage;
+        let mut segment_shown = [false; STATUSLINE_SEGMENTS.len()];
+        for (i, (id, _)) in STATUSLINE_SEGMENTS.iter().enumerate() {
+            segment_shown[i] = app.statusline_shows(id);
+        }
+        SettingsData {
+            ctx_tokens,
+            ctx_pct,
+            in_tokens: u.input_tokens,
+            out_tokens: u.output_tokens,
+            cache_read: u.cache_read_tokens,
+            cache_write: u.cache_write_tokens,
+            turns: app.turn_count(),
+            msgs: app.message_count(),
+            tools: app.tool_tally(),
+            uptime_ms: app.session_uptime().as_millis(),
+            provider: app.provider.clone(),
+            model: app.model.clone(),
+            effort: app.effort.clone(),
+            segment_shown,
+        }
+    }
+}
+
 pub(crate) fn render_settings_panel(
     lines: &mut Vec<Line<'static>>,
     panel: &SettingsPanel,
     app: &App,
 ) {
+    let data = SettingsData::from(app);
     lines.push(Line::from(""));
     // Title + tab bar: active tab reverse-highlighted in the accent color.
     let mut header = vec![Span::styled(
@@ -839,8 +888,8 @@ pub(crate) fn render_settings_panel(
     lines.push(Line::from(""));
 
     match panel.tab {
-        SettingsTab::Stats => render_stats_tab(lines, app),
-        SettingsTab::Statusline => render_statusline_tab(lines, panel, app),
+        SettingsTab::Stats => render_stats_tab(lines, &data),
+        SettingsTab::Statusline => render_statusline_tab(lines, panel, &data),
     }
 
     lines.push(Line::from(""));
@@ -856,15 +905,15 @@ pub(crate) fn render_settings_panel(
 
 /// Footer-segment checklist — Space/Enter toggles each segment on/off. The
 /// mode badge is intentionally not listed (always shown for safety).
-fn render_statusline_tab(lines: &mut Vec<Line<'static>>, panel: &SettingsPanel, app: &App) {
-    for (i, (id, label)) in STATUSLINE_SEGMENTS.iter().enumerate() {
+fn render_statusline_tab(
+    lines: &mut Vec<Line<'static>>,
+    panel: &SettingsPanel,
+    data: &SettingsData,
+) {
+    for (i, (_id, label)) in STATUSLINE_SEGMENTS.iter().enumerate() {
         let selected = i == panel.statusline_idx;
         let marker = if selected { ">" } else { " " };
-        let check = if app.statusline_shows(id) {
-            "[x]"
-        } else {
-            "[ ]"
-        };
+        let check = if data.segment_shown[i] { "[x]" } else { "[ ]" };
         let style = if selected {
             Style::default()
                 .fg(BG)
@@ -888,7 +937,7 @@ fn render_statusline_tab(lines: &mut Vec<Line<'static>>, panel: &SettingsPanel, 
 }
 
 /// Live read-only stats for the current session.
-fn render_stats_tab(lines: &mut Vec<Line<'static>>, app: &App) {
+fn render_stats_tab(lines: &mut Vec<Line<'static>>, data: &SettingsData) {
     let label = Style::default().fg(TEXT_DIM);
     let val = Style::default().fg(TEXT);
     let mut row = |k: &str, spans: Vec<Span<'static>>| {
@@ -898,42 +947,44 @@ fn render_stats_tab(lines: &mut Vec<Line<'static>>, app: &App) {
     };
 
     // Context gauge (against the active model's window).
-    let (ctx_tokens, ctx_pct) = app.context_usage();
     let bar_w = 14usize;
-    let filled = (ctx_pct as usize * bar_w / 100).min(bar_w);
+    let filled = (data.ctx_pct as usize * bar_w / 100).min(bar_w);
     let bar: String = "█".repeat(filled) + &"░".repeat(bar_w - filled);
     row(
         "context",
         vec![
             Span::styled(bar, Style::default().fg(ACCENT)),
             Span::styled(
-                format!("  {ctx_pct}%  ({} tok)", format_tokens(ctx_tokens as usize)),
+                format!(
+                    "  {}%  ({} tok)",
+                    data.ctx_pct,
+                    format_tokens(data.ctx_tokens as usize)
+                ),
                 val,
             ),
         ],
     );
 
     // Cumulative session tokens.
-    let u = &app.cumulative_usage;
     row(
         "tokens",
         vec![Span::styled(
             format!(
                 "\u{2191} {}   \u{2193} {}",
-                format_tokens(u.input_tokens as usize),
-                format_tokens(u.output_tokens as usize)
+                format_tokens(data.in_tokens as usize),
+                format_tokens(data.out_tokens as usize)
             ),
             val,
         )],
     );
-    if u.cache_read_tokens > 0 || u.cache_write_tokens > 0 {
+    if data.cache_read > 0 || data.cache_write > 0 {
         row(
             "cache",
             vec![Span::styled(
                 format!(
                     "read {}   write {}",
-                    format_tokens(u.cache_read_tokens as usize),
-                    format_tokens(u.cache_write_tokens as usize)
+                    format_tokens(data.cache_read as usize),
+                    format_tokens(data.cache_write as usize)
                 ),
                 val,
             )],
@@ -944,27 +995,23 @@ fn render_stats_tab(lines: &mut Vec<Line<'static>>, app: &App) {
     row(
         "turns",
         vec![Span::styled(
-            format!(
-                "{}   \u{00b7}   {} msgs",
-                app.turn_count(),
-                app.message_count()
-            ),
+            format!("{}   \u{00b7}   {} msgs", data.turns, data.msgs),
             val,
         )],
     );
 
     // Top tools.
-    let tally = app.tool_tally();
-    if tally.is_empty() {
+    if data.tools.is_empty() {
         row("tools", vec![Span::styled("\u{2014}".to_string(), label)]);
     } else {
-        let shown: Vec<String> = tally
+        let shown: Vec<String> = data
+            .tools
             .iter()
             .take(4)
             .map(|(n, c)| format!("{n} {c}"))
             .collect();
         let mut s = shown.join(" \u{00b7} ");
-        let extra = tally.len().saturating_sub(4);
+        let extra = data.tools.len().saturating_sub(4);
         if extra > 0 {
             s.push_str(&format!(" \u{00b7} +{extra}"));
         }
@@ -974,14 +1021,11 @@ fn render_stats_tab(lines: &mut Vec<Line<'static>>, app: &App) {
     // Uptime + active model.
     row(
         "uptime",
-        vec![Span::styled(
-            format_elapsed(app.session_uptime().as_millis()),
-            val,
-        )],
+        vec![Span::styled(format_elapsed(data.uptime_ms), val)],
     );
-    let model = match &app.effort {
-        Some(e) => format!("{}/{} ({e})", app.provider, app.model),
-        None => format!("{}/{}", app.provider, app.model),
+    let model = match &data.effort {
+        Some(e) => format!("{}/{} ({e})", data.provider, data.model),
+        None => format!("{}/{}", data.provider, data.model),
     };
     row("model", vec![Span::styled(model, val)]);
 }
@@ -1010,5 +1054,119 @@ mod tests {
         let out = fit_title("添加会话标题", 7);
         assert!(out.ends_with('…'));
         assert_eq!(UnicodeWidthStr::width(out.as_str()), 7);
+    }
+
+    // --- /settings tabs, rendered straight from SettingsData (no App) ---
+
+    fn stats(tools: Vec<(String, usize)>) -> SettingsData {
+        SettingsData {
+            ctx_tokens: 1500,
+            ctx_pct: 50,
+            in_tokens: 12000,
+            out_tokens: 3400,
+            cache_read: 0,
+            cache_write: 0,
+            turns: 3,
+            msgs: 7,
+            tools,
+            uptime_ms: 65_000,
+            provider: "minimax".to_string(),
+            model: "MiniMax-M3".to_string(),
+            effort: None,
+            segment_shown: [true; STATUSLINE_SEGMENTS.len()],
+        }
+    }
+
+    fn render_to_string(data: &SettingsData) -> String {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        render_stats_tab(&mut lines, data);
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn stats_tab_shows_context_gauge_tokens_turns_and_model() {
+        let out = render_to_string(&stats(vec![]));
+        assert!(out.contains("50%  (1.5k tok)"), "context: {out}");
+        assert!(out.contains("↑ 12.0k   ↓ 3.4k"), "tokens: {out}");
+        assert!(out.contains("3   ·   7 msgs"), "turns: {out}");
+        assert!(out.contains("minimax/MiniMax-M3"), "model: {out}");
+    }
+
+    #[test]
+    fn stats_tab_omits_cache_row_when_zero() {
+        let out = render_to_string(&stats(vec![]));
+        assert!(!out.contains("cache"), "cache row should be hidden: {out}");
+    }
+
+    #[test]
+    fn stats_tab_shows_cache_row_when_present() {
+        let mut d = stats(vec![]);
+        d.cache_read = 800;
+        d.cache_write = 200;
+        let out = render_to_string(&d);
+        assert!(out.contains("read 800   write 200"), "cache: {out}");
+    }
+
+    #[test]
+    fn stats_tab_empty_tools_shows_dash() {
+        let out = render_to_string(&stats(vec![]));
+        assert!(
+            out.contains("tools") && out.contains('—'),
+            "expected dash: {out}"
+        );
+    }
+
+    #[test]
+    fn stats_tab_tools_collapse_overflow_past_four() {
+        let tools = vec![
+            ("read".to_string(), 5),
+            ("edit".to_string(), 4),
+            ("bash".to_string(), 3),
+            ("grep".to_string(), 2),
+            ("glob".to_string(), 1),
+            ("web".to_string(), 1),
+        ];
+        let out = render_to_string(&stats(tools));
+        assert!(out.contains("read 5"), "top tool: {out}");
+        assert!(out.contains("+2"), "overflow marker for the 2 extra: {out}");
+    }
+
+    #[test]
+    fn statusline_tab_reflects_segment_shown_flags() {
+        let mut d = stats(vec![]);
+        d.segment_shown = [true, false, true, false, true];
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let panel = SettingsPanel {
+            tab: SettingsTab::Statusline,
+            statusline_idx: 0,
+        };
+        render_statusline_tab(&mut lines, &panel, &d);
+        let checks: Vec<bool> = lines
+            .iter()
+            .filter_map(|l| {
+                let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                if s.contains("[x]") {
+                    Some(true)
+                } else if s.contains("[ ]") {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            checks,
+            vec![true, false, true, false, true],
+            "got: {checks:?}"
+        );
     }
 }
