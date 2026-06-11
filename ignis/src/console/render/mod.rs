@@ -19,6 +19,7 @@ use crate::console::{BG, BORDER, TEXT_DIM};
 
 pub(crate) mod anchor;
 pub(crate) mod blocks;
+pub(crate) mod footer;
 pub(crate) mod layout;
 pub(crate) mod pickers;
 pub(crate) mod stream_commit;
@@ -28,6 +29,7 @@ pub(crate) mod widgets;
 // Re-export per-frame primitives callers still reference by their old
 // `console::render::*` path so this split is a pure file move from outside.
 pub(crate) use blocks::{block_lines, reasoning_collapsed_lines, welcome_lines};
+pub(crate) use footer::draw_footer;
 // Runner reaches these by the old `render::*` path; `draw` (below) uses the rest.
 pub(crate) use layout::{band_height, viewport_height};
 use layout::{input_height, picker_open, reasoning_preview_height, MODEL_PICKER_MAX_OPTION_ROWS};
@@ -36,8 +38,8 @@ pub(crate) use pickers::{
     render_skill_picker,
 };
 pub(crate) use widgets::{
-    draw_footer, draw_input, draw_loading, draw_queued, draw_slash_suggestions,
-    queued_region_height, MAX_SLASH_ROWS,
+    draw_input, draw_loading, draw_queued, draw_slash_suggestions, queued_region_height,
+    MAX_SLASH_ROWS,
 };
 
 /// Max rows a single `insert_before` may carry at `width` columns.

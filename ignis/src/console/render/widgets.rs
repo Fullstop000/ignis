@@ -4,7 +4,7 @@
 //! The `queued_*` helpers compute the rows the queue strip needs so
 //! `band_height` can size the band.
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
@@ -15,8 +15,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::console::app::{App, Mode};
 use crate::console::composer::PendingPaste;
 use crate::console::{
-    format_tokens, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, GREEN, PEACH, RED,
-    SUBTEXT, SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
+    format_tokens, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, PEACH, RED, SUBTEXT,
+    SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
 };
 
 /// Max queued rows shown before collapsing to a "+N more" row.
@@ -132,125 +132,6 @@ pub(crate) fn draw_queued(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
         area,
-    );
-}
-
-/// Abbreviate `$HOME` to `~` for the footer (shell convention) so the path
-/// leaves room for the git branch and right-side status on one line.
-fn display_cwd(cwd: &std::path::Path) -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        if let Ok(rel) = cwd.strip_prefix(&home) {
-            return if rel.as_os_str().is_empty() {
-                "~".to_string()
-            } else {
-                format!("~/{}", rel.display())
-            };
-        }
-    }
-    cwd.display().to_string()
-}
-
-/// Status footer under the input: working dir (left) and mode badge (when in
-/// any AFK level) + model + token usage (right). The badge is the only visual
-/// indicator that you're auto-approving tool calls — it pays for itself the
-/// first time it stops a user from thinking they're in default mode.
-pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    use crate::permissions::Mode as PermissionMode;
-
-    let (ctx_tokens, ctx_pct) = app.context_usage();
-    // Right cluster: model + tokens, each independently toggleable via
-    // /settings → Statusline. `·`-joined; empty string when both are hidden.
-    let mut right_parts: Vec<String> = Vec::new();
-    if app.statusline_shows("model") {
-        right_parts.push(match &app.effort {
-            Some(e) => format!("{}/{} ({})", app.provider, app.model, e),
-            None => format!("{}/{}", app.provider, app.model),
-        });
-    }
-    if app.statusline_shows("tokens") {
-        right_parts.push(format!(
-            "{} tok ({}%)",
-            format_tokens(ctx_tokens as usize),
-            ctx_pct
-        ));
-    }
-    let right_str = if right_parts.is_empty() {
-        String::new()
-    } else {
-        format!(" {}  ", right_parts.join("  ·  "))
-    };
-
-    // Mode badge: empty under Off (default), peach " HANDS-FREE ", red " AFK ".
-    // Always shown (not user-hideable) — it's the only signal you're
-    // auto-approving tool calls.
-    let badge = match app.permissions.as_ref().map(|p| p.mode()) {
-        Some(PermissionMode::HandsFree) => Some((" HANDS-FREE ", PEACH)),
-        Some(PermissionMode::FullyUnattended) => Some((" AFK ", RED)),
-        _ => None,
-    };
-
-    let badge_w = badge.map(|(s, _)| s.chars().count() as u16).unwrap_or(0);
-    let right_w = right_str.chars().count() as u16 + badge_w;
-    let split = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(right_w)])
-        .split(area);
-
-    // Left side: cwd · git branch · theme · turns, each toggleable, then the
-    // always-on update notice. All on the flexible `Min(0)` cell so the
-    // optional segments truncate before the fixed-width right cluster.
-    let mut left_spans: Vec<Span> = Vec::new();
-    if app.statusline_shows("cwd") {
-        left_spans.push(Span::styled(
-            format!("  {}", display_cwd(&app.cwd)),
-            Style::default().fg(TEXT_DIM),
-        ));
-    }
-    // Git branch (oh-my-zsh `git:(branch)` style) when cwd is in a work tree.
-    if app.statusline_shows("git") {
-        if let Some(branch) = &app.git_branch {
-            left_spans.push(Span::styled("  git:(", Style::default().fg(TEXT_DIM)));
-            left_spans.push(Span::styled(branch.clone(), Style::default().fg(GREEN)));
-            left_spans.push(Span::styled(")", Style::default().fg(TEXT_DIM)));
-        }
-    }
-    // Live turn count.
-    if app.statusline_shows("turns") {
-        left_spans.push(Span::styled(
-            format!("   {} turns", app.turn_count()),
-            Style::default().fg(TEXT_DIM),
-        ));
-    }
-    if app.update_notice.is_some() {
-        left_spans.push(Span::styled(
-            "   ● new version available — run `ignis upgrade`",
-            Style::default().fg(YELLOW),
-        ));
-    }
-    let left = Line::from(left_spans);
-    let right = if let Some((label, color)) = badge {
-        Line::from(vec![
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(color)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-            Span::styled(right_str, Style::default().fg(SUBTEXT)),
-        ])
-    } else {
-        Line::from(Span::styled(right_str, Style::default().fg(SUBTEXT)))
-    };
-
-    f.render_widget(
-        Paragraph::new(left).style(Style::default().bg(SURFACE)),
-        split[0],
-    );
-    f.render_widget(
-        Paragraph::new(right)
-            .style(Style::default().bg(SURFACE))
-            .alignment(ratatui::layout::Alignment::Right),
-        split[1],
     );
 }
 
@@ -434,53 +315,4 @@ pub(crate) fn draw_slash_suggestions(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(lines).style(Style::default().bg(SURFACE)),
         area,
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::{backend::TestBackend, Terminal};
-    use std::path::PathBuf;
-
-    fn footer_text(app: &App, w: u16) -> String {
-        let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
-        term.draw(|f| draw_footer(f, f.size(), app)).unwrap();
-        term.backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect()
-    }
-
-    #[test]
-    fn footer_shows_git_branch_when_present() {
-        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
-        app.git_branch = Some("feature/login".into());
-        let out = footer_text(&app, 120);
-        assert!(out.contains("git:("), "expected git segment, got: {out}");
-        assert!(out.contains("feature/login"), "expected branch, got: {out}");
-    }
-
-    #[test]
-    fn display_cwd_abbreviates_home() {
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            assert_eq!(display_cwd(&home), "~");
-            assert_eq!(display_cwd(&home.join("proj/src")), "~/proj/src");
-        }
-        // A path outside $HOME is left absolute.
-        assert_eq!(display_cwd(&PathBuf::from("/etc/x")), "/etc/x");
-    }
-
-    #[test]
-    fn footer_omits_git_segment_outside_repo() {
-        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
-        app.git_branch = None;
-        let out = footer_text(&app, 120);
-        assert!(
-            !out.contains("git:("),
-            "expected no git segment, got: {out}"
-        );
-    }
 }
