@@ -15,6 +15,10 @@ struct TuiProcess {
 
 impl TuiProcess {
     fn spawn(home: &Path, project: &Path) -> Self {
+        Self::spawn_with_args(home, project, &[])
+    }
+
+    fn spawn_with_args(home: &Path, project: &Path, args: &[&str]) -> Self {
         let ignis_home = home.join(".ignis");
         std::fs::create_dir_all(&ignis_home).unwrap();
         std::fs::write(
@@ -38,6 +42,9 @@ impl TuiProcess {
         // consistent with seed_session.
         let project = std::fs::canonicalize(project).unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_ignis"));
+        for arg in args {
+            command.arg(arg);
+        }
         // No `--tui` arg — the no-prompt invocation already launches the TUI.
         command.cwd(project.as_os_str());
         command.env("HOME", home.as_os_str());
@@ -230,6 +237,34 @@ fn sessions_command_lists_sessions_and_enter_resumes_selection() {
     tui.wait_for("alpha user prompt");
     tui.wait_for("alpha assistant answer");
     tui.wait_for("Resumed session");
+}
+
+#[test]
+fn startup_resume_renders_prior_transcript() {
+    // `ignis --resume <id>` must paint the resumed transcript into scrollback,
+    // not just feed it to the agent. Regression for the launch path that set
+    // the right session id but never called render_session_history, so the
+    // chat history showed blank after resuming.
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    seed_session(
+        project.path(),
+        home.path(),
+        "delta",
+        "delta user prompt",
+        "delta assistant answer",
+    );
+
+    let mut tui = TuiProcess::spawn_with_args(home.path(), project.path(), &["--resume", "delta"]);
+
+    // The prior conversation paints on launch (above the live band).
+    tui.wait_for("delta user prompt");
+    tui.wait_for("delta assistant answer");
+    tui.wait_for("Resumed session");
+
+    // A new prompt still echoes below the restored history.
+    tui.send("brand-new-followup\r");
+    tui.wait_for("brand-new-followup");
 }
 
 #[test]
