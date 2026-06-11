@@ -22,7 +22,10 @@ pub(crate) mod blocks;
 pub(crate) mod composer;
 pub(crate) mod footer;
 pub(crate) mod layout;
+pub(crate) mod loading;
 pub(crate) mod pickers;
+pub(crate) mod queued;
+pub(crate) mod slash;
 pub(crate) mod stream_commit;
 pub(crate) mod tool_block;
 pub(crate) mod widgets;
@@ -32,6 +35,9 @@ pub(crate) mod widgets;
 pub(crate) use blocks::{block_lines, reasoning_collapsed_lines, welcome_lines};
 pub(crate) use composer::draw_input;
 pub(crate) use footer::draw_footer;
+pub(crate) use loading::draw_loading;
+pub(crate) use queued::draw_queued;
+pub(crate) use slash::draw_slash_suggestions;
 // Runner reaches these by the old `render::*` path; `draw` (below) uses the rest.
 pub(crate) use layout::{band_height, viewport_height};
 use layout::{input_height, picker_open, reasoning_preview_height, MODEL_PICKER_MAX_OPTION_ROWS};
@@ -39,9 +45,7 @@ pub(crate) use pickers::{
     render_mcp_picker, render_model_picker, render_session_picker, render_settings_panel,
     render_skill_picker,
 };
-pub(crate) use widgets::{
-    draw_loading, draw_queued, draw_slash_suggestions, queued_region_height, MAX_SLASH_ROWS,
-};
+pub(crate) use widgets::{queued_region_height, MAX_SLASH_ROWS};
 
 /// Max rows a single `insert_before` may carry at `width` columns.
 ///

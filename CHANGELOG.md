@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Internal — the status footer and the composer input box are extracted into self-contained `FooterProps`/`ComposerProps` view components (props struct + ratatui `Widget` + one `From<&App>`), making each panel's rendering unit-testable in isolation. No user-visible change. ([#166](https://github.com/Fullstop000/ignis/pull/166))
+- Internal — the loading line, queued-prompts strip, and slash-suggestion list are extracted into `LoadingProps`/`QueuedProps`/`SlashProps` view components, completing the bottom-band decomposition. No user-visible change. ([#167](https://github.com/Fullstop000/ignis/pull/167))
 
 ### Fixed
 - TUI — `ignis --resume <id>` now paints your prior conversation on launch instead of leaving the chat history blank. ([#165](https://github.com/Fullstop000/ignis/pull/165))
