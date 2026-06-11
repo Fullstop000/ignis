@@ -19,6 +19,7 @@ use crate::console::keys::{handle_key, ActiveInject};
 use crate::console::render::anchor::{self, Anchor, ClearOutcome, Wipe};
 use crate::console::render::{self, draw};
 use crate::console::render_diag::RenderDiag;
+use crate::storage::{FileStorage, SessionStorage};
 use crate::{AgentEvent, Message, Session};
 
 /// Create an inline-viewport terminal over stdout: a fixed `viewport_rows`-tall
@@ -162,6 +163,29 @@ pub async fn run_console(
         if h > 0 {
             terminal.insert_before(h, |buf| render::render_block_into(buf, &welcome))?;
         }
+    }
+
+    // Startup resume (`ignis --resume <id>`, or `auto_resume_last_session`): if
+    // this session id already has a persisted transcript, paint it into
+    // scrollback so the user sees their prior conversation — not just new
+    // turns. The agent already continues the right session (the runner's
+    // `Session::open` reads the same JSONL), but the launch path never put it on
+    // screen — the in-session `/sessions` path is the only place that called
+    // `render_session_history`. A fresh session's id has no file, so this is a
+    // no-op (and a quick miss) on a normal launch.
+    let resumed_history = FileStorage::new(storage_dir.clone())
+        .load_session(&app.session_id)
+        .await
+        .unwrap_or_default();
+    if !resumed_history.is_empty() {
+        let id = app.session_id.clone();
+        app.render_session_history(id, resumed_history);
+        // `render_session_history` requests a screen-clear re-anchor so the
+        // in-session `/sessions` path can wipe the *current* transcript before
+        // repainting. At launch there's nothing committed yet — the blocks just
+        // stream into scrollback below the welcome banner — and the wipe would
+        // also purge the user's pre-launch terminal scrollback. So drop it.
+        app.pending_screen_clear = false;
     }
 
     let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(256);

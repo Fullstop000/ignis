@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- TUI — `ignis --resume <id>` now paints your prior conversation on launch instead of leaving the chat history blank. ([#165](https://github.com/Fullstop000/ignis/pull/165))
+
 ## [0.38.0] - 2026-06-10
 
 ### Added
