@@ -7,16 +7,13 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
 
 use crate::console::app::{App, Mode};
-use crate::console::composer::PendingPaste;
 use crate::console::{
-    format_tokens, sanitize, truncate, ACCENT, BG, BORDER, BORDER_ACTIVE, PEACH, RED, SUBTEXT,
-    SURFACE, SURFACE_2, TEXT, TEXT_DIM, YELLOW,
+    format_tokens, sanitize, truncate, ACCENT, BG, RED, SUBTEXT, SURFACE, TEXT, TEXT_DIM, YELLOW,
 };
 
 /// Max queued rows shown before collapsing to a "+N more" row.
@@ -133,124 +130,6 @@ pub(crate) fn draw_queued(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
         area,
     );
-}
-
-/// Render one composer line, painting any paste-chip placeholder in PEACH so it
-/// reads as a token instead of literal brackets. Placeholders never contain a
-/// newline, so each chip lives within a single rendered line.
-fn input_line(line: &str, pastes: &[PendingPaste]) -> Line<'static> {
-    if pastes.is_empty() || !line.contains('[') {
-        return Line::from(Span::styled(line.to_string(), Style::default().fg(TEXT)));
-    }
-    // Locate each chip on this line; placeholders are unique so each matches at
-    // most once. Sort by start to walk left-to-right.
-    let mut ranges: Vec<(usize, usize)> = pastes
-        .iter()
-        .filter_map(|p| {
-            line.find(&p.placeholder)
-                .map(|s| (s, s + p.placeholder.len()))
-        })
-        .collect();
-    if ranges.is_empty() {
-        return Line::from(Span::styled(line.to_string(), Style::default().fg(TEXT)));
-    }
-    ranges.sort_by_key(|r| r.0);
-    let mut spans: Vec<Span> = Vec::new();
-    let mut pos = 0;
-    for (start, end) in ranges {
-        if start < pos {
-            continue; // overlap guard — shouldn't happen with unique chips
-        }
-        if start > pos {
-            spans.push(Span::styled(
-                line[pos..start].to_string(),
-                Style::default().fg(TEXT),
-            ));
-        }
-        spans.push(Span::styled(
-            line[start..end].to_string(),
-            Style::default().fg(PEACH),
-        ));
-        pos = end;
-    }
-    if pos < line.len() {
-        spans.push(Span::styled(
-            line[pos..].to_string(),
-            Style::default().fg(TEXT),
-        ));
-    }
-    Line::from(spans)
-}
-
-/// Leftmost prompt glyph that prefixes the first input line (Claude-Code style);
-/// continuation lines are indented `PROMPT_W` columns so wrapped text aligns.
-const PROMPT: &str = "❯ ";
-const PROMPT_W: u16 = 2;
-
-pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &App) {
-    let idle = app.mode == Mode::Idle;
-    let border_color = if idle { BORDER_ACTIVE } else { BORDER };
-    let prompt = Span::styled(
-        PROMPT,
-        Style::default().fg(if idle { ACCENT } else { TEXT_DIM }),
-    );
-
-    let content = if app.composer.input.is_empty() {
-        let placeholder = if idle {
-            "Type a message…"
-        } else {
-            "Type your next message…"
-        };
-        Text::from(Line::from(vec![
-            prompt,
-            Span::styled(placeholder, Style::default().fg(TEXT_DIM)),
-        ]))
-    } else {
-        Text::from(
-            app.composer
-                .input
-                .split('\n')
-                .enumerate()
-                .map(|(i, l)| {
-                    let mut line = input_line(l, &app.composer.pending_pastes);
-                    // Prompt glyph on the first line; align continuation lines.
-                    let lead = if i == 0 {
-                        prompt.clone()
-                    } else {
-                        Span::raw("  ")
-                    };
-                    line.spans.insert(0, lead);
-                    line
-                })
-                .collect::<Vec<_>>(),
-        )
-    };
-
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .style(Style::default().bg(SURFACE_2));
-    if !app.queue.is_empty() {
-        block = block.title(
-            ratatui::widgets::block::Title::from(Span::styled(
-                format!(" · {} queued ", app.queue.len()),
-                Style::default().fg(SUBTEXT),
-            ))
-            .alignment(ratatui::layout::Alignment::Right),
-        );
-    }
-
-    let p = Paragraph::new(content).block(block);
-    f.render_widget(p, area);
-
-    // Cursor is shown whenever the input has focus — idle or busy (you can type
-    // while the agent works to queue / steer). It sits just past the prompt glyph.
-    let before = &app.composer.input[..app.composer.cursor];
-    let row = before.matches('\n').count() as u16;
-    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let col = UnicodeWidthStr::width(&app.composer.input[line_start..app.composer.cursor]) as u16;
-    f.set_cursor(area.x + 1 + PROMPT_W + col, area.y + 1 + row);
 }
 
 /// Render the slash-command suggestions into `area` (the band reserved above the
