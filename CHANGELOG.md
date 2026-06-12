@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- TUI — resizing or splitting a terminal pane no longer leaves stale copies of the input bar in native scrollback; Ignis coalesces each resize burst into one settled purge, then replays its welcome, resumed/mid-session conversation, and active stream rows at the new width.
+
 ## [0.38.1] - 2026-06-12
 
 ### Changed

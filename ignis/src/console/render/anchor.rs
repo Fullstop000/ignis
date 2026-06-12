@@ -43,15 +43,11 @@ pub(crate) const RESIZE_SETTLE: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wipe {
     /// Visible screen + scrollback (`Clear(All)` + `Clear(Purge)` + home).
-    /// Used once per screen-clear episode so stale history can't linger when
-    /// scrolling up after `/clear` or `/resume`.
+    /// Used by screen-clear episodes and resize recovery so stale history or
+    /// inline-band rows can't linger when scrolling up.
     All,
-    /// Visible screen only (`Clear(All)` + home). Used by resize/settle
-    /// re-anchors: committed scrollback stays in history, but the band rows
-    /// the terminal duplicated in the visible area get scrubbed.
-    Visible,
-    /// ratatui `Terminal::clear()` — band-only. Used when just the band
-    /// height changes (picker open/close, multi-line input).
+    /// ratatui `Terminal::clear()` — non-destructive band cleanup. Used while
+    /// resize geometry is still moving and when only band height changes.
     Band,
 }
 
@@ -198,9 +194,10 @@ impl Anchor {
 
     /// The draw-section band geometry decision, run once per frame interval.
     /// Fires when the band height needs to change, the terminal size changed,
-    /// or a resize settled. The wipe escalates to `Visible` for size/settle
-    /// re-anchors (stranded-band scrub) and stays `Band` for height-only
-    /// changes.
+    /// or a resize settled. Live size changes use a non-destructive `Band`
+    /// rebuild so a drag does not repeatedly purge/replay history. The one
+    /// post-burst settle rebuild escalates to `All` to remove any band rows the
+    /// terminal reflowed into scrollback.
     pub(crate) fn band_step(
         &mut self,
         now: Duration,
@@ -208,6 +205,12 @@ impl Anchor {
         term_size: (u16, u16),
     ) -> Option<Reanchor> {
         let size_changed = term_size != self.term_size;
+        // Some terminals can expose the new grid size before (or without)
+        // delivering Event::Resize. Treat the observed geometry change as a
+        // resize episode so it still gets one settle cleanup.
+        if size_changed {
+            self.last_resize = Some(now);
+        }
         let settled = self
             .last_resize
             .is_some_and(|t| now.saturating_sub(t) >= RESIZE_SETTLE);
@@ -215,11 +218,7 @@ impl Anchor {
             return None;
         }
         self.settle_in_flight = settled;
-        let wipe = if size_changed || settled {
-            Wipe::Visible
-        } else {
-            Wipe::Band
-        };
+        let wipe = if settled { Wipe::All } else { Wipe::Band };
         Some(Reanchor {
             wipe: Some(wipe),
             want_rows,
@@ -428,13 +427,13 @@ mod tests {
     }
 
     #[test]
-    fn size_change_rebuilds_with_visible_wipe() {
+    fn size_change_rebuilds_without_purging_scrollback() {
         let mut a = Anchor::new(8, SIZE);
         let step = a.band_step(ms(0), 8, (120, 40)).unwrap();
         assert_eq!(
             step.wipe,
-            Some(Wipe::Visible),
-            "a resize must scrub the stranded old band from the visible area"
+            Some(Wipe::Band),
+            "drag-time geometry changes must not purge and replay scrollback"
         );
     }
 
@@ -450,7 +449,11 @@ mod tests {
             "before the quiet period nothing fires"
         );
         let step = a.band_step(ms(250), 8, SIZE).expect("settle fires");
-        assert_eq!(step.wipe, Some(Wipe::Visible));
+        assert_eq!(
+            step.wipe,
+            Some(Wipe::All),
+            "the settle pass must purge late-reflow duplicates from scrollback"
+        );
         a.band_rebuilt(true, 8, SIZE);
         assert_eq!(
             a.band_step(ms(300), 8, SIZE),
@@ -477,14 +480,65 @@ mod tests {
         a.on_resize(ms(0));
         // Live size-change rebuild during the drag, before the quiet period.
         let step = a.band_step(ms(50), 8, (120, 40)).unwrap();
-        assert_eq!(step.wipe, Some(Wipe::Visible));
+        assert_eq!(step.wipe, Some(Wipe::Band));
         a.band_rebuilt(true, 8, (120, 40));
         // The settle must STILL fire after the quiet period — consuming the
         // marker on a drag rebuild would mean it never does (#138).
         let step = a
-            .band_step(ms(250), 8, (120, 40))
+            .band_step(ms(300), 8, (120, 40))
             .expect("settle still fires");
-        assert_eq!(step.wipe, Some(Wipe::Visible));
+        assert_eq!(step.wipe, Some(Wipe::All));
+    }
+
+    #[test]
+    fn resize_burst_has_one_destructive_settle_rebuild() {
+        let mut a = Anchor::new(8, SIZE);
+
+        a.on_resize(ms(0));
+        let first = a.band_step(ms(10), 8, (100, 30)).unwrap();
+        assert_eq!(first.wipe, Some(Wipe::Band));
+        a.band_rebuilt(true, 8, (100, 30));
+
+        a.on_resize(ms(100));
+        let second = a.band_step(ms(110), 8, (120, 35)).unwrap();
+        assert_eq!(second.wipe, Some(Wipe::Band));
+        a.band_rebuilt(true, 8, (120, 35));
+
+        assert_eq!(
+            a.band_step(ms(300), 8, (120, 35)),
+            None,
+            "the final resize event restarts the quiet period"
+        );
+        let settle = a.band_step(ms(360), 8, (120, 35)).unwrap();
+        assert_eq!(settle.wipe, Some(Wipe::All));
+        a.band_rebuilt(true, 8, (120, 35));
+
+        assert_eq!(
+            a.band_step(ms(400), 8, (120, 35)),
+            None,
+            "a landed settle cleanup runs only once per burst"
+        );
+    }
+
+    #[test]
+    fn observed_size_changes_restart_settle_without_resize_events() {
+        let mut a = Anchor::new(8, SIZE);
+
+        let first = a.band_step(ms(0), 8, (100, 30)).unwrap();
+        assert_eq!(first.wipe, Some(Wipe::Band));
+        a.band_rebuilt(true, 8, (100, 30));
+
+        let second = a.band_step(ms(200), 8, (120, 35)).unwrap();
+        assert_eq!(second.wipe, Some(Wipe::Band));
+        a.band_rebuilt(true, 8, (120, 35));
+
+        assert_eq!(
+            a.band_step(ms(250), 8, (120, 35)),
+            None,
+            "a later observed size must restart the quiet period"
+        );
+        let settle = a.band_step(ms(450), 8, (120, 35)).unwrap();
+        assert_eq!(settle.wipe, Some(Wipe::All));
     }
 
     #[test]

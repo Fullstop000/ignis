@@ -6,8 +6,11 @@
 //! land late; the timeout used to `?`-bubble out of `run_console` and tear down
 //! the whole TUI mid-session. This test withholds the DSR reply across a resize
 //! and asserts the TUI rides it out instead of exiting.
+use ignis::session::project_sessions_dir;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use serde_json::json;
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,13 +27,23 @@ struct Tui {
 
 impl Tui {
     fn spawn(home: &Path, project: &Path) -> Self {
-        let ignis_home = home.join(".ignis");
-        std::fs::create_dir_all(&ignis_home).unwrap();
-        std::fs::write(
-            ignis_home.join("config.toml"),
+        Self::spawn_with_args_and_config(
+            home,
+            project,
+            &[],
             "active_provider = \"ollama\"\n\n[providers.ollama]\napi_url = \"http://127.0.0.1:11434\"\nmodel = \"test-model\"\n",
         )
-        .unwrap();
+    }
+
+    fn spawn_with_args_and_config(
+        home: &Path,
+        project: &Path,
+        args: &[&str],
+        config: &str,
+    ) -> Self {
+        let ignis_home = home.join(".ignis");
+        std::fs::create_dir_all(&ignis_home).unwrap();
+        std::fs::write(ignis_home.join("config.toml"), config).unwrap();
 
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -43,6 +56,9 @@ impl Tui {
 
         let project = std::fs::canonicalize(project).unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_ignis"));
+        for arg in args {
+            command.arg(arg);
+        }
         command.cwd(project.as_os_str());
         command.env("HOME", home.as_os_str());
         command.env("TERM", "xterm-256color");
@@ -115,6 +131,53 @@ impl Tui {
         panic!("timed out waiting for `{needle}`\n{}", self.snapshot());
     }
 
+    fn wait_for_count(&mut self, needle: &str, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if self.output.lock().unwrap().matches(needle).count() >= count {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "TUI exited before rendering `{needle}` {count} times with status {status:?}\n{}",
+                    self.snapshot()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "timed out waiting for `{needle}` {count} times\n{}",
+            self.snapshot()
+        );
+    }
+
+    fn wait_for_after_last_purge(&mut self, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let found = {
+                let output = self.output.lock().unwrap();
+                output
+                    .rsplit_once("\x1b[3J")
+                    .is_some_and(|(_, tail)| tail.contains(needle))
+            };
+            if found {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "TUI exited before replaying `{needle}` after the last purge with status \
+                     {status:?}\n{}",
+                    self.snapshot()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "timed out waiting for `{needle}` after the last purge\n{}",
+            self.snapshot()
+        );
+    }
+
     fn snapshot(&self) -> String {
         let o = self.output.lock().unwrap();
         o[o.len().saturating_sub(4000)..].to_string()
@@ -128,6 +191,180 @@ impl Drop for Tui {
             let _ = self.child.wait();
         }
     }
+}
+
+fn seed_session(project: &Path, home: &Path, id: &str, user: &str, assistant: &str) {
+    let project = std::fs::canonicalize(project).unwrap();
+    let storage_dir = project_sessions_dir(&home.join(".ignis"), &project);
+    std::fs::create_dir_all(&storage_dir).unwrap();
+    let records = [
+        json!({
+            "type": "session_meta",
+            "timestamp": 1,
+            "payload": { "id": id }
+        }),
+        json!({
+            "type": "message",
+            "timestamp": 2,
+            "payload": { "role": "user", "content": user }
+        }),
+        json!({
+            "type": "message",
+            "timestamp": 3,
+            "payload": { "role": "assistant", "content": assistant }
+        }),
+    ];
+    let content = records
+        .into_iter()
+        .map(|record| serde_json::to_string(&record).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(storage_dir.join(format!("{id}.jsonl")), content).unwrap();
+}
+
+fn spawn_streaming_ollama() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 65536];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                  Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+
+        let write_chunk = |stream: &mut std::net::TcpStream, body: &str| {
+            write!(stream, "{:x}\r\n{}\r\n", body.len(), body).unwrap();
+            stream.flush().unwrap();
+        };
+        write_chunk(
+            &mut stream,
+            "{\"message\":{\"content\":\"stream-before-resize\\n\"}}\n",
+        );
+        std::thread::sleep(Duration::from_secs(2));
+        write_chunk(
+            &mut stream,
+            "{\"message\":{\"content\":\"stream-after-resize\\n\"}}\n",
+        );
+        stream.write_all(b"0\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn inline_resize_purges_stale_bands_and_replays_owned_scrollback() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+
+    let mut tui = Tui::spawn(home.path(), project.path());
+    tui.wait_for("Your AI coding agent");
+    tui.send("/hooks nope\r");
+    tui.wait_for("Usage: /hooks");
+
+    tui.master
+        .resize(PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(75));
+    tui.master
+        .resize(PtySize {
+            rows: 18,
+            cols: 90,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(75));
+    tui.master
+        .resize(PtySize {
+            rows: 15,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    tui.wait_for_count("Your AI coding agent", 2);
+    tui.wait_for_count("Usage: /hooks", 2);
+    let purge_count = tui.output.lock().unwrap().matches("\x1b[3J").count();
+    assert_eq!(
+        purge_count,
+        1,
+        "one resize burst must produce exactly one scrollback purge/replay\n{}",
+        tui.snapshot(),
+    );
+}
+
+#[test]
+fn inline_resize_replays_resumed_history_after_the_final_purge() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    seed_session(
+        project.path(),
+        home.path(),
+        "resume-resize",
+        "resumed-user-before-resize",
+        "resumed-assistant-before-resize",
+    );
+
+    let mut tui = Tui::spawn_with_args_and_config(
+        home.path(),
+        project.path(),
+        &["--resume", "resume-resize"],
+        "active_provider = \"ollama\"\n\n[providers.ollama]\napi_url = \"http://127.0.0.1:11434\"\nmodel = \"test-model\"\n",
+    );
+    tui.wait_for("resumed-assistant-before-resize");
+
+    tui.master
+        .resize(PtySize {
+            rows: 15,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    tui.wait_for_after_last_purge("resumed-user-before-resize");
+    tui.wait_for_after_last_purge("resumed-assistant-before-resize");
+    tui.wait_for_after_last_purge("Resumed session");
+}
+
+#[test]
+fn inline_resize_replays_stable_rows_from_an_active_stream() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let api_url = spawn_streaming_ollama();
+    let config = format!(
+        "active_provider = \"ollama\"\n\n[providers.ollama]\napi_url = \"{api_url}\"\n\
+         model = \"test-model\"\n"
+    );
+    let mut tui =
+        Tui::spawn_with_args_and_config(home.path(), project.path(), &[], config.as_str());
+    tui.wait_for("Your AI coding agent");
+    tui.send("start streaming\r");
+    tui.wait_for("stream-before-resize");
+
+    tui.master
+        .resize(PtySize {
+            rows: 15,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    tui.wait_for_after_last_purge("start streaming");
+    tui.wait_for_after_last_purge("stream-before-resize");
+    tui.wait_for_after_last_purge("stream-after-resize");
 }
 
 #[test]

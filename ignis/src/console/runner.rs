@@ -421,6 +421,7 @@ pub async fn run_console(
         // Opt-in render-loop health heartbeat (frames / commits / re-anchors)
         // to `~/.ignis/logs/ignis.log`, for diagnosing rendering in the field.
         diag: RenderDiag::from_env(),
+        scrollback_replay: None,
         app,
         terminal,
         agent_rx,
@@ -495,6 +496,11 @@ struct ConsoleLoop {
     /// Monotonic clock the `Anchor` machine runs on.
     epoch: std::time::Instant,
     diag: RenderDiag,
+    /// Welcome-row cursor for a resize replay. Starting a replay also rewinds
+    /// `app.committed`/`committed_rows`, so after these rows drain the normal
+    /// commit loop replays every finalized transcript block plus stable rows
+    /// from an active stream at the new width.
+    scrollback_replay: Option<usize>,
     last_draw: std::time::Instant,
     agent_rx: mpsc::Receiver<AgentEvent>,
     picker_rx: mpsc::Receiver<crate::console::picker::PickerRequest>,
@@ -511,6 +517,12 @@ struct ConsoleLoop {
 }
 
 impl ConsoleLoop {
+    fn begin_scrollback_replay(&mut self) {
+        self.scrollback_replay = Some(0);
+        self.app.committed = 0;
+        self.app.committed_rows = 0;
+    }
+
     /// Drive the console until the user quits. The stable frame skeleton:
     /// every iteration wakes, ingests state, then renders — state mutation
     /// strictly precedes terminal output, so a frame never paints half-applied
@@ -782,6 +794,16 @@ impl ConsoleLoop {
         // frame(s) via `committed`/`committed_rows`.
         let max_rows = render::max_commit_rows(width);
         let mut batch: Vec<Line<'static>> = Vec::new();
+        if let Some(start) = self.scrollback_replay {
+            let welcome = render::welcome_lines(&self.app);
+            let cut = anchor::commit_take(welcome.len(), start, max_rows);
+            batch.extend_from_slice(&welcome[cut.start..cut.start + cut.take]);
+            self.scrollback_replay = if cut.drained {
+                None
+            } else {
+                Some(cut.start + cut.take)
+            };
+        }
         let app = &mut self.app;
         // Defer commits while a screen-clear re-anchor is still pending.
         // Committing before the re-anchor lands would advance `committed` into
@@ -791,7 +813,10 @@ impl ConsoleLoop {
         // (`anchor::MAX_REANCHOR_ATTEMPTS`): if its DSR never answers we force
         // a DSR-free re-anchor and reopen the gate, so it can't wedge
         // rendering blank indefinitely (the "blank after input" bug).
-        while self.anchor.can_commit() && app.committed < app.blocks.len() && batch.len() < max_rows
+        while self.scrollback_replay.is_none()
+            && self.anchor.can_commit()
+            && app.committed < app.blocks.len()
+            && batch.len() < max_rows
         {
             let block = &app.blocks[app.committed];
             let done = app.block_done(app.committed);
@@ -856,21 +881,27 @@ impl ConsoleLoop {
             .anchor
             .band_step(self.epoch.elapsed(), want_rows, term_size)
         {
-            if step.wipe == Some(Wipe::Band) {
-                self.terminal.clear()?;
-            } else {
-                // ratatui's inline clear() only scrubs downward, so on a
-                // resize the old band (reflowed by the terminal above the
-                // new anchor) is left stranded (#77). Wipe the whole screen
-                // and re-anchor fresh; committed scrollback stays in history.
-                execute!(
-                    io::stdout(),
-                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                    crossterm::cursor::MoveTo(0, 0)
-                )?;
+            match step.wipe {
+                Some(Wipe::Band) => self.terminal.clear()?,
+                Some(Wipe::All) => {
+                    // A terminal resize can reflow the old inline band into
+                    // scrollback before Ignis receives Event::Resize. There is
+                    // no selective scrollback delete, so purge it and replay
+                    // the welcome + App-owned transcript at the new width.
+                    execute!(
+                        io::stdout(),
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
+                        crossterm::cursor::MoveTo(0, 0)
+                    )?;
+                }
+                None => {}
             }
             let ok = try_rebuild(&mut self.terminal, step.want_rows)?;
             self.anchor.band_rebuilt(ok, step.want_rows, term_size);
+            if ok && step.wipe == Some(Wipe::All) {
+                self.begin_scrollback_replay();
+            }
         }
         draw_tolerant(&mut self.terminal, &mut self.app)?;
         self.last_draw = std::time::Instant::now();
