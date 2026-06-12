@@ -126,6 +126,13 @@ _SECRET_PATTERNS = [
     (re.compile(r"BSA[A-Za-z0-9]{20,}"), "BSA_REDACTED"),
     (re.compile(r"hf_[A-Za-z0-9_-]{20,}"), "hf_REDACTED"),
     (re.compile(r"tvly-[A-Za-z0-9_-]{20,}"), "tvly-REDACTED"),
+    # Value-agnostic credential shapes: an agent that `cat`s ~/.ignis/config.toml
+    # (or whose error echoes the request) surfaces a key whose *value* has no
+    # recognizable prefix (e.g. a bare-UUID provider token). Redact by the
+    # surrounding indicator instead — the config `api_key = "…"` line and any
+    # `Authorization: Bearer …` header.
+    (re.compile(r'api_key\s*=\s*"[^"]*"'), 'api_key = "REDACTED"'),
+    (re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{20,}"), "Bearer REDACTED"),
 ]
 
 

@@ -61,6 +61,13 @@ _SECRET_PATTERNS = [
     (re.compile(rb"dtn_[A-Za-z0-9]{20,}"), b"dtn_REDACTED"),
     (re.compile(rb"sk-cp-[A-Za-z0-9_-]{20,}"), b"sk-cp-REDACTED"),
     (re.compile(rb"sk-kimi-[A-Za-z0-9-]{20,}"), b"sk-kimi-REDACTED"),
+    # Value-agnostic credential shapes: an agent that `cat`s ~/.ignis/config.toml
+    # (or whose error echoes the request) surfaces a key whose *value* has no
+    # recognizable prefix (e.g. a bare-UUID provider token). Redact by the
+    # surrounding indicator instead — the config `api_key = "…"` line and any
+    # `Authorization: Bearer …` header.
+    (re.compile(rb'api_key\s*=\s*"[^"]*"'), b'api_key = "REDACTED"'),
+    (re.compile(rb"(?i)bearer\s+[A-Za-z0-9._-]{20,}"), b"Bearer REDACTED"),
 ]
 
 
@@ -190,8 +197,10 @@ Every text file is streamed through these regex replacements before bundling:
 | `dtn_[A-Za-z0-9]{{20,}}` | `dtn_REDACTED` |
 | `sk-cp-[A-Za-z0-9_-]{{20,}}` | `sk-cp-REDACTED` |
 | `sk-kimi-[A-Za-z0-9-]{{20,}}` | `sk-kimi-REDACTED` |
+| `api_key\\s*=\\s*"[^"]*"` | `api_key = "REDACTED"` |
+| `(?i)bearer\\s+[A-Za-z0-9._-]{{20,}}` | `Bearer REDACTED` |
 
-These are the same patterns the `/ship` pre-push secret scan uses. The list is conservative — it may catch task-planted "secret" strings used by tasks like `vulnerable-secret`. That's intentional defense-in-depth for a private archive.
+The last two are value-agnostic: they catch a config-dumped key whose value has no recognizable prefix (e.g. a bare-UUID provider token an agent surfaces by `cat`-ing `~/.ignis/config.toml` mid-task). These are mostly the same patterns the `/ship` pre-push secret scan uses. The list is conservative — it may catch task-planted "secret" strings used by tasks like `vulnerable-secret`. That's intentional defense-in-depth for a private archive.
 
 The original `job.log` (echoes the full in-sandbox `~/.ignis/config.toml`, including the provider api_key) and `agent/setup/` (install logs that echo the same config write) are dropped entirely, not redacted.
 
