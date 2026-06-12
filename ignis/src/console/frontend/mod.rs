@@ -11,14 +11,18 @@
 //!     [`Acceptor`] that guarantees exactly one live frontend.
 //!   * [`command`] — maps wire [`ClientCommand`]s onto the console's existing
 //!     internal signals, making the responsibility boundary explicit.
+//!   * [`in_process`] — the first concrete [`FrontendPort`]: a non-serializing
+//!     channel bridge for the bundled ratatui TUI.
 
 pub mod broker;
 pub mod command;
+pub mod in_process;
 pub mod port;
 pub mod protocol;
 
 pub use broker::RequestBroker;
 pub use command::{control_signal, ControlSignal};
+pub use in_process::{in_process, FrontendChannels, InProcessTuiPort};
 pub use port::{Acceptor, FrontendPort, PortError};
 pub use protocol::{ClientCommand, ClientRequest, Outbound, ReplyAnswer, RequestId, Snapshot};
 
