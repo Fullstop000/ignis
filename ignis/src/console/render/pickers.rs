@@ -938,21 +938,23 @@ fn render_statusline_tab(
 
 /// Live read-only stats for the current session.
 fn render_stats_tab(lines: &mut Vec<Line<'static>>, data: &SettingsData) {
+    use super::stack::{self, Cell};
+
     let label = Style::default().fg(TEXT_DIM);
     let val = Style::default().fg(TEXT);
-    let mut row = |k: &str, spans: Vec<Span<'static>>| {
-        let mut l = vec![Span::styled(format!("  {:<9}", k), label)];
-        l.extend(spans);
-        lines.push(Line::from(l));
-    };
+
+    // Each stat is `(key, value-cell)` data. The key column content-sizes to
+    // its widest entry below (replacing the old hardcoded `{:<9}`), so adding
+    // a longer-named stat keeps every value aligned automatically.
+    let mut rows: Vec<(&str, Cell)> = Vec::new();
 
     // Context gauge (against the active model's window).
     let bar_w = 14usize;
     let filled = (data.ctx_pct as usize * bar_w / 100).min(bar_w);
     let bar: String = "█".repeat(filled) + &"░".repeat(bar_w - filled);
-    row(
+    rows.push((
         "context",
-        vec![
+        stack::spans(vec![
             Span::styled(bar, Style::default().fg(ACCENT)),
             Span::styled(
                 format!(
@@ -962,47 +964,47 @@ fn render_stats_tab(lines: &mut Vec<Line<'static>>, data: &SettingsData) {
                 ),
                 val,
             ),
-        ],
-    );
+        ]),
+    ));
 
     // Cumulative session tokens.
-    row(
+    rows.push((
         "tokens",
-        vec![Span::styled(
+        stack::text(
             format!(
                 "\u{2191} {}   \u{2193} {}",
                 format_tokens(data.in_tokens as usize),
                 format_tokens(data.out_tokens as usize)
             ),
             val,
-        )],
-    );
+        ),
+    ));
     if data.cache_read > 0 || data.cache_write > 0 {
-        row(
+        rows.push((
             "cache",
-            vec![Span::styled(
+            stack::text(
                 format!(
                     "read {}   write {}",
                     format_tokens(data.cache_read as usize),
                     format_tokens(data.cache_write as usize)
                 ),
                 val,
-            )],
-        );
+            ),
+        ));
     }
 
     // Turns / messages.
-    row(
+    rows.push((
         "turns",
-        vec![Span::styled(
+        stack::text(
             format!("{}   \u{00b7}   {} msgs", data.turns, data.msgs),
             val,
-        )],
-    );
+        ),
+    ));
 
     // Top tools.
     if data.tools.is_empty() {
-        row("tools", vec![Span::styled("\u{2014}".to_string(), label)]);
+        rows.push(("tools", stack::text("\u{2014}", label)));
     } else {
         let shown: Vec<String> = data
             .tools
@@ -1015,19 +1017,29 @@ fn render_stats_tab(lines: &mut Vec<Line<'static>>, data: &SettingsData) {
         if extra > 0 {
             s.push_str(&format!(" \u{00b7} +{extra}"));
         }
-        row("tools", vec![Span::styled(s, val)]);
+        rows.push(("tools", stack::text(s, val)));
     }
 
     // Uptime + active model.
-    row(
-        "uptime",
-        vec![Span::styled(format_elapsed(data.uptime_ms), val)],
-    );
+    rows.push(("uptime", stack::text(format_elapsed(data.uptime_ms), val)));
     let model = match &data.effort {
         Some(e) => format!("{}/{} ({e})", data.provider, data.model),
         None => format!("{}/{}", data.provider, data.model),
     };
-    row("model", vec![Span::styled(model, val)]);
+    rows.push(("model", stack::text(model, val)));
+
+    // Lay out: a 2-space indent + the content-sized key column + the value.
+    // `LABEL_GUTTER` is the gap between the key and value columns — a named
+    // spacing, where the old `{:<9}` baked width + gap into one opaque literal.
+    const LABEL_GUTTER: usize = 2;
+    let keys: Vec<Cell> = rows
+        .iter()
+        .map(|(k, _)| stack::text(format!("  {k}"), label))
+        .collect();
+    let key_w = stack::column_width(&keys, LABEL_GUTTER);
+    for ((_, value), key) in rows.into_iter().zip(keys) {
+        lines.push(stack::row([stack::pad_right(key, key_w), value]));
+    }
 }
 
 #[cfg(test)]

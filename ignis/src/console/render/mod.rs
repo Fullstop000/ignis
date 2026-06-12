@@ -26,6 +26,7 @@ pub(crate) mod loading;
 pub(crate) mod pickers;
 pub(crate) mod queued;
 pub(crate) mod slash;
+pub(crate) mod stack;
 pub(crate) mod stream_commit;
 pub(crate) mod tool_block;
 pub(crate) mod widgets;
