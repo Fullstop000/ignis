@@ -91,6 +91,9 @@ pub(crate) struct Anchor {
     /// Set by `band_step` when the pending rebuild is a settle re-anchor, so
     /// `band_rebuilt` knows whether success consumes the resize marker.
     settle_in_flight: bool,
+    /// The resize settle may retry its DSR rebuild, but scrollback must be
+    /// purged only once per burst or each timeout erases the replay again.
+    settle_wiped: bool,
     /// Height of the inline viewport the terminal is currently built at.
     pub(crate) viewport_rows: u16,
     /// Last adopted terminal size, to detect resizes (ratatui 0.26 inline
@@ -106,6 +109,7 @@ impl Anchor {
             attempts: 0,
             last_resize: None,
             settle_in_flight: false,
+            settle_wiped: false,
             viewport_rows,
             term_size,
         }
@@ -127,6 +131,7 @@ impl Anchor {
     /// which only the event — not the reported size — can see).
     pub(crate) fn on_resize(&mut self, now: Duration) {
         self.last_resize = Some(now);
+        self.settle_wiped = false;
     }
 
     /// Whether blocks may flow into scrollback this frame. False while a
@@ -210,6 +215,7 @@ impl Anchor {
         // resize episode so it still gets one settle cleanup.
         if size_changed {
             self.last_resize = Some(now);
+            self.settle_wiped = false;
         }
         let settled = self
             .last_resize
@@ -218,11 +224,15 @@ impl Anchor {
             return None;
         }
         self.settle_in_flight = settled;
-        let wipe = if settled { Wipe::All } else { Wipe::Band };
-        Some(Reanchor {
-            wipe: Some(wipe),
-            want_rows,
-        })
+        let wipe = if settled && !self.settle_wiped {
+            self.settle_wiped = true;
+            Some(Wipe::All)
+        } else if settled {
+            None
+        } else {
+            Some(Wipe::Band)
+        };
+        Some(Reanchor { wipe, want_rows })
     }
 
     /// Report the rebuild attempt for a [`Self::band_step`]. Success adopts
@@ -235,6 +245,7 @@ impl Anchor {
             self.term_size = term_size;
             if self.settle_in_flight {
                 self.last_resize = None;
+                self.settle_wiped = false;
             }
         }
         self.settle_in_flight = false;
@@ -539,6 +550,24 @@ mod tests {
         );
         let settle = a.band_step(ms(450), 8, (120, 35)).unwrap();
         assert_eq!(settle.wipe, Some(Wipe::All));
+    }
+
+    #[test]
+    fn timed_out_settle_retries_without_purging_again() {
+        let mut a = Anchor::new(8, SIZE);
+
+        a.on_resize(ms(0));
+        let settle = a.band_step(ms(250), 8, SIZE).unwrap();
+        assert_eq!(settle.wipe, Some(Wipe::All));
+        a.band_rebuilt(false, 8, SIZE);
+
+        let retry = a.band_step(ms(300), 8, SIZE).unwrap();
+        assert_eq!(
+            retry.wipe, None,
+            "a DSR retry must preserve the replay from the first settle purge"
+        );
+        a.band_rebuilt(true, 8, SIZE);
+        assert_eq!(a.band_step(ms(350), 8, SIZE), None);
     }
 
     #[test]

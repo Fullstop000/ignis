@@ -12,7 +12,7 @@ use serde_json::json;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -23,6 +23,7 @@ struct Tui {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     output: Arc<Mutex<String>>,
     answer_dsr: Arc<AtomicBool>,
+    dsr_answers: Arc<AtomicUsize>,
 }
 
 impl Tui {
@@ -70,10 +71,12 @@ impl Tui {
             Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
         let output = Arc::new(Mutex::new(String::new()));
         let answer_dsr = Arc::new(AtomicBool::new(true));
+        let dsr_answers = Arc::new(AtomicUsize::new(0));
 
         let output_t = Arc::clone(&output);
         let writer_t = Arc::clone(&writer);
         let answer_t = Arc::clone(&answer_dsr);
+        let dsr_answers_t = Arc::clone(&dsr_answers);
         // Reader thread: answer DSR queries with a fixed cursor report — but
         // only while `answer_dsr` is set. Flipping it off simulates a terminal
         // that has stopped replying (the WSL2/tmux backpressure case).
@@ -91,6 +94,7 @@ impl Tui {
                                 let _ = w.write_all(b"\x1b[1;1R");
                             }
                             let _ = w.flush();
+                            dsr_answers_t.fetch_add(dsr, Ordering::SeqCst);
                         }
                         output_t.lock().unwrap().push_str(&text);
                     }
@@ -105,6 +109,7 @@ impl Tui {
             writer,
             output,
             answer_dsr,
+            dsr_answers,
         }
     }
 
@@ -178,9 +183,34 @@ impl Tui {
         );
     }
 
+    fn wait_for_dsr_answers(&mut self, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if self.dsr_answers.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "TUI exited before sending DSR answer {count} with status {status:?}\n{}",
+                    self.snapshot()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "timed out waiting for DSR answer {count}; saw {}\n{}",
+            self.dsr_answers.load(Ordering::SeqCst),
+            self.snapshot()
+        );
+    }
+
     fn snapshot(&self) -> String {
         let o = self.output.lock().unwrap();
-        o[o.len().saturating_sub(4000)..].to_string()
+        let mut start = o.len().saturating_sub(4000);
+        while !o.is_char_boundary(start) {
+            start += 1;
+        }
+        o[start..].to_string()
     }
 }
 
@@ -365,6 +395,33 @@ fn inline_resize_replays_stable_rows_from_an_active_stream() {
     tui.wait_for_after_last_purge("start streaming");
     tui.wait_for_after_last_purge("stream-before-resize");
     tui.wait_for_after_last_purge("stream-after-resize");
+}
+
+#[test]
+fn inline_resize_replays_scrollback_when_settle_dsr_times_out() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+
+    let mut tui = Tui::spawn(home.path(), project.path());
+    tui.wait_for("Your AI coding agent");
+    tui.send("/hooks nope\r");
+    tui.wait_for("Usage: /hooks");
+
+    let startup_answers = tui.dsr_answers.load(Ordering::SeqCst);
+    tui.master
+        .resize(PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    tui.wait_for_dsr_answers(startup_answers + 1);
+    tui.answer_dsr.store(false, Ordering::SeqCst);
+
+    tui.wait_for_count("\x1b[3J", 1);
+    tui.wait_for_after_last_purge("Your AI coding agent");
+    tui.wait_for_after_last_purge("Usage: /hooks");
 }
 
 #[test]

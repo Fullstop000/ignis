@@ -894,14 +894,15 @@ impl ConsoleLoop {
                         crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
                         crossterm::cursor::MoveTo(0, 0)
                     )?;
+                    // The purge already happened even if the following DSR
+                    // rebuild times out. Arm replay now so a tolerated timeout
+                    // cannot leave App-owned history erased.
+                    self.begin_scrollback_replay();
                 }
                 None => {}
             }
             let ok = try_rebuild(&mut self.terminal, step.want_rows)?;
             self.anchor.band_rebuilt(ok, step.want_rows, term_size);
-            if ok && step.wipe == Some(Wipe::All) {
-                self.begin_scrollback_replay();
-            }
         }
         draw_tolerant(&mut self.terminal, &mut self.app)?;
         self.last_draw = std::time::Instant::now();
