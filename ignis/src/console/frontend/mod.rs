@@ -9,12 +9,16 @@
 //!     the frontend boundary via correlation ids.
 //!   * [`port`] — the [`FrontendPort`] trait and the single-slot FIFO
 //!     [`Acceptor`] that guarantees exactly one live frontend.
+//!   * [`command`] — maps wire [`ClientCommand`]s onto the console's existing
+//!     internal signals, making the responsibility boundary explicit.
 
 pub mod broker;
+pub mod command;
 pub mod port;
 pub mod protocol;
 
 pub use broker::RequestBroker;
+pub use command::{control_signal, ControlSignal};
 pub use port::{Acceptor, FrontendPort, PortError};
 pub use protocol::{ClientCommand, ClientRequest, Outbound, ReplyAnswer, RequestId, Snapshot};
 
