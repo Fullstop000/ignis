@@ -1114,6 +1114,26 @@ mod tests {
     }
 
     #[test]
+    fn stats_tab_value_column_is_content_aligned() {
+        // Pin the value-column offset. The widest key `context` (7) sets the
+        // column; every shorter key pads to the same width so all values start
+        // at the same place. The `contains` tests above wouldn't catch an
+        // off-by-one in the gutter — this one does, keeping the content-sized
+        // column a tested invariant rather than an incidental match.
+        let out = render_to_string(&stats(vec![]));
+        let prefix = |key: &str| {
+            out.lines()
+                .find(|l| l.contains(key))
+                .unwrap_or_else(|| panic!("missing {key} row"))[..11]
+                .to_string()
+        };
+        // 2-space indent + key + gutter, all landing on column 11.
+        assert_eq!(prefix("context"), "  context  "); // 2 + 7 + 2
+        assert_eq!(prefix("tokens"), "  tokens   "); // 2 + 6 + 3
+        assert_eq!(prefix("uptime"), "  uptime   "); // 2 + 6 + 3
+    }
+
+    #[test]
     fn stats_tab_omits_cache_row_when_zero() {
         let out = render_to_string(&stats(vec![]));
         assert!(!out.contains("cache"), "cache row should be hidden: {out}");
