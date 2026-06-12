@@ -7,13 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.1] - 2026-06-12
+
 ### Changed
 - Internal — the status footer and the composer input box are extracted into self-contained `FooterProps`/`ComposerProps` view components (props struct + ratatui `Widget` + one `From<&App>`), making each panel's rendering unit-testable in isolation. No user-visible change. ([#166](https://github.com/Fullstop000/ignis/pull/166))
 - Internal — the loading line, queued-prompts strip, and slash-suggestion list are extracted into `LoadingProps`/`QueuedProps`/`SlashProps` view components, completing the bottom-band decomposition. No user-visible change. ([#167](https://github.com/Fullstop000/ignis/pull/167))
 - Internal — the `/settings` panel's live stats are decoupled from the `App` struct into a `SettingsData` view model, making the Stats and Statusline tabs unit-testable in isolation. No user-visible change. ([#168](https://github.com/Fullstop000/ignis/pull/168))
+- Docs — the TB 2.1 leaderboard now lists the `deepseek-v4-pro@max` (Ark) row and clarifies the cache column. ([#169](https://github.com/Fullstop000/ignis/pull/169))
 
 ### Fixed
 - TUI — `ignis --resume <id>` now paints your prior conversation on launch instead of leaving the chat history blank. ([#165](https://github.com/Fullstop000/ignis/pull/165))
+- Benchmarks — `bundle_traces.py` and `generate_report.py` now redact any value behind `api_key = "…"` and any `Authorization: Bearer …` header in dumped configs and agent logs, closing the leak that exposed an unprefixed Ark API token during the `deepseek-v4-pro@max` run. ([#170](https://github.com/Fullstop000/ignis/pull/170))
 
 ## [0.38.0] - 2026-06-10
 
