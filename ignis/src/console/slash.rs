@@ -52,10 +52,14 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: Cow::Borrowed("Show or toggle OpenTelemetry export status (on/off)"),
     },
     SlashCommand {
-        name: Cow::Borrowed("/hooks"),
+        name: Cow::Borrowed("/extensions"),
         description: Cow::Borrowed(
-            "List registered hooks (`/hooks`) or reload ~/.ignis/hooks.json (`/hooks reload`)",
+            "List registered extensions (`/extensions`) or reload ~/.ignis/extensions.json (`/extensions reload`). `/hooks` is a deprecated alias.",
         ),
+    },
+    SlashCommand {
+        name: Cow::Borrowed("/hooks"),
+        description: Cow::Borrowed("Deprecated alias for `/extensions`."),
     },
     SlashCommand {
         name: Cow::Borrowed("/settings"),

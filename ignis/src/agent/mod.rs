@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::llm::{
     now_ms, LlmProvider, LlmResponseDelta, Message, ToolCall, ToolCallFunction, Usage,
 };
-use crate::tools::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
+use crate::tools::tool::{AgentTool, ExecutionMode, ToolExtensions, ToolResult};
 
 pub mod agents_md;
 
@@ -184,8 +184,8 @@ async fn before_llm_call(
     inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     history: &mut Vec<Message>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-    prompt_hooks: Option<&crate::hooks::HookRegistry>,
-    hook_ctx: Option<crate::hooks::HookContext<'_>>,
+    prompt_hooks: Option<&crate::extensions::ExtensionRegistry>,
+    hook_ctx: Option<crate::extensions::ExtensionContext<'_>>,
 ) -> usize {
     let mut n = 0;
     if let Some(rx) = inject_rx {
@@ -193,11 +193,11 @@ async fn before_llm_call(
             let effective = match (prompt_hooks, hook_ctx) {
                 (Some(reg), Some(ctx)) => {
                     match reg.run_user_prompt_submit(&text, ctx, tx).await {
-                        crate::hooks::PromptHookResult::Continue(t) => Some(t),
+                        crate::extensions::PromptExtensionResult::Continue(t) => Some(t),
                         // Block: warning already emitted on `tx`; drop
                         // the inject entirely — same posture as
                         // Session::prompt's short-circuit.
-                        crate::hooks::PromptHookResult::Blocked { .. } => None,
+                        crate::extensions::PromptExtensionResult::Blocked { .. } => None,
                     }
                 }
                 _ => Some(text),
@@ -223,7 +223,17 @@ async fn before_llm_call(
 /// Append a tool-result message to `history`, running the `after_tool_call` hook
 /// first if one is set (the hook may transform the result content/error). The
 /// stored content is re-serialized as the `{result, is_error}` JSON envelope.
-async fn push_with_hook(history: &mut Vec<Message>, hooks: Option<&dyn ToolHooks>, msg: Message) {
+///
+/// `args` is the JSON the tool actually ran with — `PostToolUse` subprocess
+/// hooks pull `tool_input` from it. Orphan / unmatched result paths pass
+/// `Value::Null` (no way to recover original args after the fact); hooks that
+/// inspect `tool_input` should treat null as "unavailable".
+async fn push_with_hook(
+    history: &mut Vec<Message>,
+    hooks: Option<&dyn ToolExtensions>,
+    args: &serde_json::Value,
+    msg: Message,
+) {
     if let Some(h) = hooks {
         let content_str = msg.content.clone().unwrap_or_default();
         let parsed: serde_json::Value = serde_json::from_str(&content_str).unwrap_or_default();
@@ -235,7 +245,7 @@ async fn push_with_hook(history: &mut Vec<Message>, hooks: Option<&dyn ToolHooks
             is_error: parsed["is_error"].as_bool().unwrap_or(false),
         };
         let transformed = h
-            .after_tool_call(msg.name.as_deref().unwrap_or(""), original_result)
+            .after_tool_call(msg.name.as_deref().unwrap_or(""), args, original_result)
             .await;
         let result_json = serde_json::json!({
             "result": transformed.content,
@@ -336,34 +346,68 @@ fn tool_result_message(name: &str, call_id: &str, result: &ToolResult) -> Messag
     }
 }
 
-/// Run the `before_tool_call` hook for `tc`. When a hook blocks the call, emit
-/// the `ToolExecutionStart`/`End` event pair (so a blocked call renders like
-/// any other) and return the `role:"tool"` message carrying the block reason.
-/// `None` means the call is allowed to proceed.
+/// Outcome of the `before_tool_call` gate for a single tool call.
+enum ExtensionGateOutcome {
+    /// Hook chain (or no hooks) returned `Ok(None)`. Run the tool with
+    /// the original arguments.
+    Proceed,
+    /// A hook returned `Ok(Some(rewritten))` — the tool runs with
+    /// `rewritten` substituted for the original `tool_input` (the
+    /// `PreToolUse` `updatedInput` path). The caller must update the
+    /// `ToolCall.function.arguments` string before dispatch so the
+    /// tool, the `ToolExecutionStart` event, and any `PostToolUse`
+    /// envelope all see the same args.
+    Rewrite(serde_json::Value),
+    /// A hook returned `Err(reason)`. The blocked `role:"tool"`
+    /// message is ready to push to history; the
+    /// `ToolExecutionStart`/`End` event pair has been emitted so the
+    /// blocked call renders like any other.
+    Block(Message),
+}
+
+/// Run the `before_tool_call` hook for `tc`. Emits the
+/// `ToolExecutionStart`/`End` event pair on block so a blocked call
+/// renders like any other.
 async fn before_tool_call_block(
     tc: &ToolCall,
-    hooks: Option<&dyn ToolHooks>,
+    hooks: Option<&dyn ToolExtensions>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-) -> Option<Message> {
-    let h = hooks?;
+) -> ExtensionGateOutcome {
+    let Some(h) = hooks else {
+        return ExtensionGateOutcome::Proceed;
+    };
     let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-    let reason = h.before_tool_call(&tc.function.name, &args).await.err()?;
+    match h.before_tool_call(&tc.function.name, &args).await {
+        Ok(None) => ExtensionGateOutcome::Proceed,
+        Ok(Some(rewritten)) => ExtensionGateOutcome::Rewrite(rewritten),
+        Err(reason) => {
+            let blocked = ToolResult::error(format!("Blocked by hook: {}", reason));
+            let _ = tx
+                .send(AgentEvent::ToolExecutionStart {
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: tc.id.clone(),
+                    result: blocked.clone(),
+                })
+                .await;
+            ExtensionGateOutcome::Block(tool_result_message(&tc.function.name, &tc.id, &blocked))
+        }
+    }
+}
 
-    let blocked = ToolResult::error(format!("Blocked by hook: {}", reason));
-    let _ = tx
-        .send(AgentEvent::ToolExecutionStart {
-            tool_call_id: tc.id.clone(),
-            tool_name: tc.function.name.clone(),
-            arguments: tc.function.arguments.clone(),
-        })
-        .await;
-    let _ = tx
-        .send(AgentEvent::ToolExecutionEnd {
-            tool_call_id: tc.id.clone(),
-            result: blocked.clone(),
-        })
-        .await;
-    Some(tool_result_message(&tc.function.name, &tc.id, &blocked))
+/// Apply a `PreToolUse` rewrite to `tc.function.arguments` in place. The
+/// rewritten JSON re-serialises canonically so the `ToolExecutionStart`
+/// event, the tool dispatch, and any downstream `PostToolUse` hook all
+/// agree on what ran.
+fn apply_rewrite(tc: &mut ToolCall, rewritten: serde_json::Value) {
+    if let Ok(s) = serde_json::to_string(&rewritten) {
+        tc.function.arguments = s;
+    }
 }
 
 /// The accumulated result of consuming one streamed LLM run.
@@ -651,7 +695,7 @@ pub struct Agent {
     system_prompt: String,
     provider: Box<dyn LlmProvider>,
     tools: Vec<Arc<dyn AgentTool>>,
-    hooks: Option<Box<dyn ToolHooks>>,
+    hooks: Option<Box<dyn ToolExtensions>>,
     skills: Option<Arc<SkillRegistry>>,
     mcp: Option<Arc<McpRegistry>>,
     /// Project instructions (from `AGENTS.md`) prepended to each request as a
@@ -687,7 +731,7 @@ impl Agent {
         self.tools.push(tool);
     }
 
-    pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
+    pub fn set_hooks(&mut self, hooks: Box<dyn ToolExtensions>) {
         self.hooks = Some(hooks);
     }
 
@@ -1020,8 +1064,8 @@ impl Agent {
         history: &mut Vec<Message>,
         tx: tokio::sync::mpsc::Sender<AgentEvent>,
         mut inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
-        prompt_hooks: Option<&crate::hooks::HookRegistry>,
-        hook_ctx: Option<crate::hooks::HookContext<'_>>,
+        prompt_hooks: Option<&crate::extensions::ExtensionRegistry>,
+        hook_ctx: Option<crate::extensions::ExtensionContext<'_>>,
     ) -> Result<Usage, anyhow::Error> {
         let _ = tx.send(AgentEvent::TurnStart).await;
         let effective_prompt = with_catalog(
@@ -1043,8 +1087,26 @@ impl Agent {
             .await;
             let _ = tx.send(AgentEvent::RunStart).await;
 
+            // SystemPromptCompose: hooks may rewrite the system prompt
+            // per LLM call (e.g. trim git diff for token-efficiency
+            // research). Hooks may also inject `additionalContext`,
+            // queued for the same flush path PostToolUse uses. No
+            // hook chain → zero overhead.
+            let call_prompt: std::borrow::Cow<'_, str> = match (prompt_hooks, hook_ctx) {
+                (Some(reg), Some(ctx)) => std::borrow::Cow::Owned(
+                    reg.run_system_prompt_compose(
+                        &effective_prompt,
+                        self.provider.model_id(),
+                        ctx,
+                        &tx,
+                    )
+                    .await,
+                ),
+                _ => std::borrow::Cow::Borrowed(effective_prompt.as_str()),
+            };
+
             let run = match self
-                .call_llm(&effective_prompt, history, &tool_schemas, &tx)
+                .call_llm(&call_prompt, history, &tool_schemas, &tx)
                 .await
             {
                 Ok(run) => run,
@@ -1077,6 +1139,47 @@ impl Agent {
                 .await;
                 let _ = tx.send(AgentEvent::RunEnd).await;
                 if injected == 0 {
+                    // Stop hook chain — fires on the clean-exit branch
+                    // (NOT on `emit_fatal`). CC inversion: a hook
+                    // returning `decision: "block"` (mapped to
+                    // `KeepLooping` in dispatch) tells the loop to
+                    // continue instead of stopping. Any
+                    // `additional_context` is queued for the next-LLM-
+                    // call drain — but if we ARE keep-looping, the next
+                    // LLM call will drain it; if we're stopping, the
+                    // queue is naturally GC'd with the session.
+                    let keep_looping = match (prompt_hooks, hook_ctx) {
+                        (Some(reg), Some(ctx)) => {
+                            // No transcript path is plumbed yet — empty
+                            // string is the documented placeholder
+                            // until persistence wires it through.
+                            reg.run_stop("", ctx, &tx).await
+                        }
+                        _ => false,
+                    };
+                    if keep_looping {
+                        // Drain the just-queued KeepLooping reminder so
+                        // the next LLM call sees it. The same drain path
+                        // execute_tool_calls uses, applied here too.
+                        if let Some(reg) = prompt_hooks {
+                            for inj in reg.drain_injections().await {
+                                history.push(Message {
+                                    role: "user".to_string(),
+                                    content: Some(
+                                        crate::extensions::render_injection_as_system_reminder(
+                                            &inj,
+                                        ),
+                                    ),
+                                    reasoning_content: None,
+                                    name: None,
+                                    tool_call_id: None,
+                                    tool_calls: None,
+                                    created_at_ms: Some(now_ms()),
+                                });
+                            }
+                        }
+                        continue;
+                    }
                     break;
                 }
             }
@@ -1119,10 +1222,16 @@ impl Agent {
         let results = if force_sequential {
             // Sequential execution
             let mut results = Vec::new();
-            for tc in tool_calls_owned {
+            for mut tc in tool_calls_owned {
                 match before_tool_call_block(&tc, hooks.as_deref(), &tx_clone).await {
-                    Some(blocked) => results.push(blocked),
-                    None => {
+                    ExtensionGateOutcome::Block(blocked) => results.push(blocked),
+                    ExtensionGateOutcome::Rewrite(args) => {
+                        apply_rewrite(&mut tc, args);
+                        results.push(
+                            execute_single_tool(tc, tools_map.clone(), tx_clone.clone()).await,
+                        );
+                    }
+                    ExtensionGateOutcome::Proceed => {
                         results.push(
                             execute_single_tool(tc, tools_map.clone(), tx_clone.clone()).await,
                         );
@@ -1132,14 +1241,19 @@ impl Agent {
             results
         } else {
             // Parallel execution — run before_tool_call hooks first
-            // sequentially, then fan out the allowed calls.
+            // sequentially, then fan out the allowed (post-rewrite) calls.
             let mut allowed_calls = Vec::new();
             let mut blocked_results: Vec<Message> = Vec::new();
 
             for tc in &tool_calls_owned {
-                match before_tool_call_block(tc, hooks.as_deref(), &tx_clone).await {
-                    Some(blocked) => blocked_results.push(blocked),
-                    None => allowed_calls.push(tc.clone()),
+                let mut tc = tc.clone();
+                match before_tool_call_block(&tc, hooks.as_deref(), &tx_clone).await {
+                    ExtensionGateOutcome::Block(blocked) => blocked_results.push(blocked),
+                    ExtensionGateOutcome::Rewrite(args) => {
+                        apply_rewrite(&mut tc, args);
+                        allowed_calls.push(tc);
+                    }
+                    ExtensionGateOutcome::Proceed => allowed_calls.push(tc),
                 }
             }
 
@@ -1175,20 +1289,48 @@ impl Agent {
 
         for tc in tool_calls {
             if let Some(msg) = results_by_id.remove(&tc.id) {
-                push_with_hook(history, hooks.as_deref(), msg).await;
+                // Parse args from the original tool call. Fallback to Null on
+                // malformed JSON — the tool's already run, we don't fail the
+                // history push over a bad PostToolUse envelope.
+                let args =
+                    serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
+                push_with_hook(history, hooks.as_deref(), &args, msg).await;
             }
         }
 
         // Drain any remaining orphan results (unmatched IDs or missing IDs) so we
         // never silently lose a tool result. Sort by tool_call_id so the appended
         // order is deterministic across runs (HashMap drain order is not).
+        // Orphans have no recoverable args — PostToolUse hooks get Value::Null.
+        let null_args = serde_json::Value::Null;
         let mut leftover: Vec<(String, Message)> = results_by_id.drain().collect();
         leftover.sort_by(|a, b| a.0.cmp(&b.0));
         for (_, msg) in leftover {
-            push_with_hook(history, hooks.as_deref(), msg).await;
+            push_with_hook(history, hooks.as_deref(), &null_args, msg).await;
         }
         for msg in orphans.drain(..) {
-            push_with_hook(history, hooks.as_deref(), msg).await;
+            push_with_hook(history, hooks.as_deref(), &null_args, msg).await;
+        }
+
+        // Flush any `additionalContext` queued by PostToolUse hooks
+        // (and, eventually, the other inject-context events). Each
+        // pending injection becomes a synthetic `role:"user"` message
+        // wrapping a `<system-reminder>` block — the next LLM call
+        // reads it like any other reminder. Rendered via the single
+        // helper in `hooks::render_injection_as_system_reminder` so
+        // wire format stays consistent with tests and dashboards.
+        if let Some(h) = hooks.as_deref() {
+            for inj in h.drain_pending_context().await {
+                history.push(Message {
+                    role: "user".to_string(),
+                    content: Some(crate::extensions::render_injection_as_system_reminder(&inj)),
+                    reasoning_content: None,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                    created_at_ms: Some(now_ms()),
+                });
+            }
         }
     }
 }

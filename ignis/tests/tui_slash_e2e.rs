@@ -362,9 +362,9 @@ fn hooks_command_lists_registered_chains() {
     let mut tui = TuiProcess::spawn(home.path(), project.path());
     tui.wait_for("Your AI coding agent");
 
-    // Bare `/hooks` lists.
+    // Bare `/hooks` lists (deprecated alias for `/extensions`).
     tui.send("/hooks\r");
-    tui.wait_for("[info] 2 hooks registered");
+    tui.wait_for("[info] 2 extensions registered");
     tui.wait_for("UserPromptSubmit (1):");
     tui.wait_for("AssistantMessageRender (1):");
     tui.wait_for("prompt-hook");
@@ -374,7 +374,7 @@ fn hooks_command_lists_registered_chains() {
 
     // `/hooks list` is an alias — produces the same listing.
     tui.send("/hooks list\r");
-    tui.wait_for("[info] 2 hooks registered");
+    tui.wait_for("[info] 2 extensions registered");
 
     // Edit the file (drop one hook, add a longer one) and `/hooks reload`.
     // `sync_all` flushes the write to disk so the child process is
@@ -396,11 +396,11 @@ fn hooks_command_lists_registered_chains() {
         f.sync_all().unwrap();
     }
     tui.send("/hooks reload\r");
-    tui.wait_for("[info] reloaded 1 hook");
+    tui.wait_for("[info] reloaded 1 extension");
 
     // Reloaded list reflects the new state.
     tui.send("/hooks\r");
-    tui.wait_for("[info] 1 hook registered");
+    tui.wait_for("[info] 1 extension registered");
     tui.wait_for("UserPromptSubmit (1):");
     tui.wait_for("timeout 9999ms");
     // The render hook is gone from the new listing. The full output buffer
@@ -412,5 +412,5 @@ fn hooks_command_lists_registered_chains() {
     // Unknown subcommand falls through to the usage line. Pins that the
     // new dispatcher doesn't silently accept arbitrary tokens.
     tui.send("/hooks bogus\r");
-    tui.wait_for("Usage: /hooks [list] | /hooks reload");
+    tui.wait_for("Usage: /extensions [list] | /extensions reload");
 }

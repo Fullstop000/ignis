@@ -1,12 +1,12 @@
 //! `PermissionChecker` — wires the pure `check()` decision into the existing
-//! `ToolHooks::before_tool_call` integration point. When the decision is
+//! `ToolExtensions::before_tool_call` integration point. When the decision is
 //! `Ask`, opens a permission picker over the shared `PickerRequest` channel
 //! (same channel `ask_user` uses) with three fixed options:
 //! `Approve once`, `Approve session`, `Deny`. No "Other" free-text row —
 //! `PickerQuestion::allow_other` is `false` for permission prompts.
 //!
 //! Behavior matrix:
-//! - Allow → return Ok(())  (tool runs)
+//! - Allow → return Ok(None)  (tool runs)
 //! - Deny  → return Err(reason)  (agent loop wraps as "Blocked by hook: …")
 //! - Ask + session-allow-set has the tool name → Allow
 //! - Ask + console picker present → open picker, wait for response
@@ -21,7 +21,7 @@ use super::{check, default_policy_for_tool, rule, Decision};
 use crate::console::picker::{
     PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse,
 };
-use crate::tools::tool::ToolHooks;
+use crate::tools::tool::ToolExtensions;
 
 const APPROVE_ONCE: &str = "Approve once";
 const APPROVE_SESSION: &str = "Approve session";
@@ -144,12 +144,12 @@ impl PermissionChecker {
 }
 
 #[async_trait]
-impl ToolHooks for PermissionChecker {
+impl ToolExtensions for PermissionChecker {
     async fn before_tool_call(
         &self,
         tool_name: &str,
         args: &serde_json::Value,
-    ) -> Result<(), String> {
+    ) -> Result<Option<serde_json::Value>, String> {
         // Session-level "Approve session" is honored inside `check()` AFTER
         // the safety floor (circuit breakers, protected paths) has had its
         // say. The floor is non-negotiable — even an explicit prior
@@ -166,7 +166,7 @@ impl ToolHooks for PermissionChecker {
         );
 
         match decision {
-            Decision::Allow => Ok(()),
+            Decision::Allow => Ok(None),
             Decision::Deny { reason } => Err(reason),
             Decision::Ask { reason } => {
                 let Some(tx) = &self.picker_tx else {
@@ -211,14 +211,14 @@ impl ToolHooks for PermissionChecker {
                             }
                         };
                         match label {
-                            APPROVE_ONCE => Ok(()),
+                            APPROVE_ONCE => Ok(None),
                             APPROVE_SESSION => {
                                 self.state.add_session_allow(tool_name);
-                                Ok(())
+                                Ok(None)
                             }
                             ALWAYS_ALLOW => {
                                 self.persist_always_allow(tool_name, args);
-                                Ok(())
+                                Ok(None)
                             }
                             DENY => Err(format!(
                                 "user denied the permission prompt for `{tool_name}`"
@@ -334,7 +334,10 @@ mod tests {
         tool: &str,
         args: serde_json::Value,
         reply: PickerResponse,
-    ) -> (Result<(), String>, Option<PickerQuestion>) {
+    ) -> (
+        Result<Option<serde_json::Value>, String>,
+        Option<PickerQuestion>,
+    ) {
         let (tx, mut rx) = mpsc::channel::<PickerRequest>(1);
         let checker = PermissionChecker::new(state).with_picker(tx);
         // Spawn a fake console: pop the picker request, capture it, reply.

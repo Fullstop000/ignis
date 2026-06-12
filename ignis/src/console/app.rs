@@ -455,7 +455,7 @@ pub(crate) struct App {
     pub(crate) git_branch: Option<String>,
     /// Shared external-subprocess hook registry — used by `/hooks reload`
     /// and (clone-handed) by the assistant-render seam in `runner.rs`.
-    pub(crate) hooks: Option<crate::hooks::HookRegistry>,
+    pub(crate) hooks: Option<crate::extensions::ExtensionRegistry>,
     /// Compact text to render for the next committed user prompt, in place of
     /// the prompt actually sent to the model. Set when a `/skill-name` command
     /// expands its full body into the prompt — the transcript shows the typed
@@ -1864,6 +1864,7 @@ mod tests {
                 "/mcp",
                 "/afk",
                 "/telemetry",
+                "/extensions",
                 "/hooks",
                 "/settings",
             ]

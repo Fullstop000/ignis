@@ -22,11 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.38.0] - 2026-06-10
 
 ### Added
+- extensions — the agent-loop extension protocol (formerly "hooks") grows from 2 events to 9; `SessionStart`, `SystemPromptCompose`, `PreToolUse`, `PostToolUse`, `PreCompact`, `PostCompact`, and `Stop` join `UserPromptSubmit` and `AssistantMessageRender`, each able to rewrite, block, or inject `<system-reminder>` context. ([#141](https://github.com/Fullstop000/ignis/pull/141))
+- extensions — `matcher` (a regex on `tool_name`, compiled at load) scopes `PreToolUse`/`PostToolUse` extensions to specific tools. ([#141](https://github.com/Fullstop000/ignis/pull/141))
+- extensions — `SystemPromptCompose` fires per LLM call so an extension can rewrite the assembled system prompt, enabling prompt-density A/B tests for token-efficiency research. ([#141](https://github.com/Fullstop000/ignis/pull/141))
+- extensions — `Stop` honours the Claude Code inversion: `decision: "block"` keeps the loop running and re-queues the reason, so you can wire "don't stop until tests pass" guardrails. ([#141](https://github.com/Fullstop000/ignis/pull/141))
+- extensions — three example extensions: `bash-deny-rm-rf` (PreToolUse block), `auto-test` (PostToolUse `additionalContext`), and `system-prompt-trim` (SystemPromptCompose rewrite). ([#141](https://github.com/Fullstop000/ignis/pull/141))
 - TUI — the model's thinking now collapses to a rolling 3-line preview while it streams, finalizing to a one-line summary; press `Ctrl+O` to expand the full chain-of-thought. ([#156](https://github.com/Fullstop000/ignis/pull/156))
 - TUI — press `r` in the `/skills` picker to reload skills from disk, picking up newly added, edited, or removed skills without restarting. ([#157](https://github.com/Fullstop000/ignis/pull/157))
 - TUI — exiting with `Ctrl+D` prints a copy-pasteable `ignis --resume <id>` hint so you can pick the session back up. ([#158](https://github.com/Fullstop000/ignis/pull/158))
 
 ### Changed
+- extensions — user-facing rename from "hooks": config now at `~/.ignis/extensions.json`, slash command `/extensions`; the v1 `~/.ignis/hooks.json` file, `"hooks"` JSON key, and `/hooks` command keep working as deprecated fallbacks. ([#141](https://github.com/Fullstop000/ignis/pull/141))
 - Internal — the inline TUI render loop is restructured for testability: the re-anchor/commit state machine (screen-clear episodes, resize settle, commit row budget) moves into a pure `render::anchor` module whose historical bugs (#138, #140, #154, #155) are now table-driven regression tests, and the frame loop itself becomes a `ConsoleLoop` lifecycle skeleton mirroring `Agent::run`. No user-visible change. ([#163](https://github.com/Fullstop000/ignis/pull/163))
 
 ### Fixed
@@ -135,7 +141,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.32.0] - 2026-06-01
 
 ### Added
-- hooks: external subprocess hooks for `UserPromptSubmit` and `AssistantMessageRender` with first-class prompt mutation; declare in `~/.ignis/hooks.json`. ([#102](https://github.com/Fullstop000/ignis/pull/102))
+- hooks: external subprocess hooks for `UserPromptSubmit` and `AssistantMessageRender` with first-class prompt mutation; declare in `~/.ignis/extensions.json`. ([#102](https://github.com/Fullstop000/ignis/pull/102))
 - MiniMax Token Plan: `MiniMax-M3` model now in the catalog (Anthropic-first, same dual-endpoint shape as M2.7). ([#94](https://github.com/Fullstop000/ignis/pull/94))
 - MCP HTTP transport (Streamable HTTP). `[mcp.servers.X] url = "https://…"` or `ignis mcp add X --url … [--bearer-token-env-var ENV] [--header "K: V"]`; `/mcp` picker shows transport tag and per-server tool list. ([#86](https://github.com/Fullstop000/ignis/pull/86))
 

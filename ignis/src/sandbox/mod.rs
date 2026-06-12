@@ -5,8 +5,8 @@
 //! API applied inside a `Command::pre_exec` closure between fork and
 //! execve. It is deliberately **policy-free** — the caller passes
 //! pre-built `reads` and `writes` slices and chooses what to allow.
-//! Hook-specific paths (its own folder, TLS roots, scratch dirs) live in
-//! [`crate::hooks::sandbox`]; future bash-tool paths (cwd, system
+//! Extension-specific paths (its own folder, TLS roots, scratch dirs) live in
+//! [`crate::extensions::sandbox`]; future bash-tool paths (cwd, system
 //! binaries, project root with `$HOME` excluded) will live alongside
 //! the bash tool.
 //!

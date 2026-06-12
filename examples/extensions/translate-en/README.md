@@ -17,35 +17,36 @@ It's the worked example for the ignis hook protocol — the protocol is
 the feature; translation is the proof. Distill, copy, adapt for your
 own use case (PII scrub, prompt enhancement, telemetry sidecar, …).
 
-> **Hooks are sandboxed on Linux (v2).** Default Landlock confinement
-> blocks writes outside `$TMPDIR` and reads outside the hook's folder
-> + system lib paths. Env vars are scrubbed to the universal
-> allowlist; this hook declares the three it needs (`ANTHROPIC_API_KEY`,
-> `IGNIS_TRANSLATE_FROM`, `IGNIS_TRANSLATE_TO`) in `env: [...]`.
-> Sandboxing is a no-op on macOS / Windows / older Linux kernels.
+> **Extensions are sandboxed by default.** A filesystem sandbox (Linux
+> Landlock / macOS Seatbelt) blocks writes outside `/tmp` and reads
+> outside the extension's folder + system lib paths. Env vars are
+> scrubbed to the universal allowlist; this extension declares the three
+> it needs (`ANTHROPIC_API_KEY`, `IGNIS_TRANSLATE_FROM`,
+> `IGNIS_TRANSLATE_TO`) in `env: [...]`. Sandboxing is a no-op on Windows
+> and older Linux kernels.
 
 ## Install
 
 ```sh
-mkdir -p ~/.ignis/hooks
-cp -R examples/hooks/translate-en ~/.ignis/hooks/translate-en
-chmod +x ~/.ignis/hooks/translate-en/run.py
+mkdir -p ~/.ignis/extensions
+cp -R examples/extensions/translate-en ~/.ignis/extensions/translate-en
+chmod +x ~/.ignis/extensions/translate-en/run.py
 ```
 
 Python 3.10+. No third-party deps — the script uses the stdlib
 `urllib.request`. Set `ANTHROPIC_API_KEY` in your shell.
 
-Wire it in `~/.ignis/hooks.json`. `env` declares the variables this
-hook needs (everything else is scrubbed); `sandbox` is the default
-Landlock confinement (`true` on Linux, no-op elsewhere) — included
-here only so the example is self-documenting.
+Wire it in `~/.ignis/extensions.json`. `env` declares the variables this
+extension needs (everything else is scrubbed); `sandbox` is the default
+filesystem confinement (Linux Landlock / macOS Seatbelt) — included here
+only so the example is self-documenting.
 
 ```json
 {
-  "hooks": {
+  "extensions": {
     "UserPromptSubmit": [
       {
-        "command": "~/.ignis/hooks/translate-en/run.py",
+        "command": "~/.ignis/extensions/translate-en/run.py",
         "env": ["ANTHROPIC_API_KEY", "IGNIS_TRANSLATE_FROM", "IGNIS_TRANSLATE_TO"],
         "sandbox": true,
         "timeout_ms": 30000
@@ -53,7 +54,7 @@ here only so the example is self-documenting.
     ],
     "AssistantMessageRender": [
       {
-        "command": "~/.ignis/hooks/translate-en/run.py",
+        "command": "~/.ignis/extensions/translate-en/run.py",
         "env": ["ANTHROPIC_API_KEY", "IGNIS_TRANSLATE_FROM", "IGNIS_TRANSLATE_TO"],
         "sandbox": true,
         "timeout_ms": 30000
@@ -63,7 +64,7 @@ here only so the example is self-documenting.
 }
 ```
 
-Reload without restarting ignis: type `/hooks reload`.
+Reload without restarting ignis: type `/extensions reload`.
 
 ## Configure
 
@@ -89,7 +90,7 @@ sentinels.
 
 ```sh
 pip install pytest
-pytest examples/hooks/translate-en/
+pytest examples/extensions/translate-en/
 ```
 
 The tests are **not** part of `cargo test --workspace`. They mock

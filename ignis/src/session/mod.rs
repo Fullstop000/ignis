@@ -1,9 +1,11 @@
 use crate::agent::Agent;
 use crate::config::CompactionConfig;
-use crate::hooks::{HookContext, HookRegistry, PromptHookResult};
+use crate::extensions::{
+    ChainedToolExtensions, ExtensionContext, ExtensionRegistry, PromptExtensionResult,
+};
 use crate::llm::LlmProvider;
 use crate::storage::SessionStorage;
-use crate::tools::tool::{AgentTool, ToolHooks};
+use crate::tools::tool::{AgentTool, ToolExtensions};
 use crate::{AgentEvent, Message};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -38,7 +40,7 @@ pub struct Session {
     /// drive the `AssistantMessageRender` chain over the same registry, and
     /// so `/hooks reload` can swap the live config without rebuilding the
     /// session.
-    hooks: HookRegistry,
+    hooks: ExtensionRegistry,
 }
 
 impl Session {
@@ -70,9 +72,38 @@ impl Session {
         // `/hooks reload` swaps the parsed config in place via the
         // RwLock-backed registry. Absent file = no-op, fast path.
         let hooks = match dirs::home_dir() {
-            Some(home) => HookRegistry::from_config_dir(&home)?,
-            None => HookRegistry::empty(),
+            Some(home) => ExtensionRegistry::from_config_dir(&home)?,
+            None => ExtensionRegistry::empty(),
         };
+        // Seed the registry's envelope context so PreToolUse / PostToolUse
+        // (and the lifecycle events landing in commit 6) carry the real
+        // session id + cwd in their JSON envelopes. Set before any hook
+        // can fire — the registry is then used by both the prompt-hook
+        // path (UserPromptSubmit / AssistantMessageRender) and, once
+        // `set_hooks` is called, the chained ToolExtensions path.
+        hooks
+            .set_envelope_context(id.clone(), PathBuf::from(&start_dir))
+            .await;
+        // SessionStart fires before any user turn is processed so its
+        // `additionalContext` reaches the very first LLM call via the
+        // pending-injection queue. Empty registry → zero overhead. The
+        // tx channel is created here only because run_session_start
+        // takes one for emitting [warn] lines on soft failures —
+        // there's no live event consumer at this moment, so the channel
+        // dies with this scope; warnings are silently dropped, which
+        // matches "session-start is best-effort".
+        let (tmp_tx, _tmp_rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+        let source = if history.is_empty() { "new" } else { "resume" };
+        hooks
+            .run_session_start(
+                source,
+                ExtensionContext {
+                    session_id: &id,
+                    cwd: &start_dir,
+                },
+                &tmp_tx,
+            )
+            .await;
         // The registry is plumbed into each `agent.run` call in
         // `Session::prompt` rather than stored on the Agent; that keeps a
         // single source of truth (the Session's `hooks` field) and makes
@@ -109,8 +140,15 @@ impl Session {
         self.agent.register_tool(tool);
     }
 
-    pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
-        self.agent.set_hooks(hooks);
+    /// Install the in-tree policy gate. The session always wraps it
+    /// with the subprocess `ExtensionRegistry` so user-authored
+    /// `PreToolUse` / `PostToolUse` hooks fire on the same path — see
+    /// [`ChainedToolExtensions`]. The policy gate runs first; only allowed
+    /// calls reach user hooks. A second call replaces the previous
+    /// policy gate but keeps the registry wired.
+    pub fn set_hooks(&mut self, policy: Box<dyn ToolExtensions>) {
+        let chained = ChainedToolExtensions::wrap(policy, self.hooks.clone());
+        self.agent.set_hooks(chained);
     }
 
     /// Apply the shared skill registry to this session's agent (enables the
@@ -136,14 +174,14 @@ impl Session {
     /// The shared hook registry. The console's render path takes a clone of
     /// this handle so it can run the `AssistantMessageRender` chain over
     /// the same parsed config the session uses for `UserPromptSubmit`.
-    pub fn hooks(&self) -> &HookRegistry {
+    pub fn hooks(&self) -> &ExtensionRegistry {
         &self.hooks
     }
 
     /// Replace the hook registry — used by the console runner so
     /// `/hooks reload` reaches the live registry instance, and by tests
     /// so they don't have to touch the real `~/.ignis/hooks.json`.
-    pub fn set_hook_registry(&mut self, registry: HookRegistry) {
+    pub fn set_hook_registry(&mut self, registry: ExtensionRegistry) {
         self.hooks = registry;
     }
 
@@ -183,7 +221,7 @@ impl Session {
         // Best-effort: a compaction failure must not block the user's prompt.
         if self.compaction.auto && estimate_tokens(&self.history) > self.compaction.threshold_tokens
         {
-            let _ = self.compact().await;
+            let _ = self.compact_with_trigger("auto").await;
         }
 
         // Run UserPromptSubmit hooks. Soft failures fall back to the
@@ -196,7 +234,7 @@ impl Session {
             .hooks
             .run_user_prompt_submit(
                 text,
-                HookContext {
+                ExtensionContext {
                     session_id: &self.id,
                     cwd: &self.start_dir,
                 },
@@ -204,8 +242,8 @@ impl Session {
             )
             .await
         {
-            PromptHookResult::Continue(t) => t,
-            PromptHookResult::Blocked { .. } => {
+            PromptExtensionResult::Continue(t) => t,
+            PromptExtensionResult::Blocked { .. } => {
                 // The hook chain already emitted a Warning event carrying
                 // the stderr reason. Do NOT push to history, do NOT call
                 // the agent. The console handler renders Warning lines
@@ -264,7 +302,7 @@ impl Session {
                 tx,
                 self.inject_rx.as_mut(),
                 Some(&self.hooks),
-                Some(HookContext {
+                Some(ExtensionContext {
                     session_id: &self.id,
                     cwd: &self.start_dir,
                 }),
@@ -286,9 +324,44 @@ impl Session {
     /// Summarize older history into a single message, keeping the most recent
     /// turns (by token budget) verbatim. Returns the number of messages
     /// replaced by the summary (0 if nothing was compacted).
+    /// Manual compaction — called by `/compact`. Equivalent to
+    /// `compact_with_trigger("manual")`. The hook chain sees
+    /// `trigger: "manual"` in its envelope so PreCompact / PostCompact
+    /// users can distinguish user-initiated from threshold-triggered
+    /// compactions.
     pub async fn compact(&mut self) -> Result<usize, anyhow::Error> {
+        self.compact_with_trigger("manual").await
+    }
+
+    /// Internal: compact with an explicit trigger label
+    /// (`"auto"` or `"manual"`). Fires `PreCompact` (which may abort)
+    /// and `PostCompact` (which sees the summary) hooks around the
+    /// existing summarisation logic.
+    pub async fn compact_with_trigger(&mut self, trigger: &str) -> Result<usize, anyhow::Error> {
         let n = self.history.len();
         if n == 0 {
+            return Ok(0);
+        }
+
+        // PreCompact: a hook may abort the compact entirely. The
+        // transcript path is the empty string for now — disk-persistence
+        // plumbing is a follow-up. The temporary tx channel mirrors the
+        // SessionStart wiring: warnings emitted by hooks die with this
+        // scope, which is "best-effort during a slash command".
+        let (hook_tx, _hook_rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+        let abort = self
+            .hooks
+            .run_pre_compact(
+                trigger,
+                "",
+                ExtensionContext {
+                    session_id: &self.id,
+                    cwd: &self.start_dir,
+                },
+                &hook_tx,
+            )
+            .await;
+        if abort {
             return Ok(0);
         }
         // Keep the most recent messages up to the token budget (walking from the
@@ -342,6 +415,24 @@ impl Session {
         compacted.extend_from_slice(&self.history[cut..]);
         self.history = compacted;
         self.persist().await?;
+
+        // PostCompact: hooks see the summary text and can inject
+        // `additionalContext` for the next LLM call (queued in the
+        // pending-injection path the agent loop drains). Best-effort
+        // (warnings drop with this scope), same posture as
+        // PreCompact above.
+        self.hooks
+            .run_post_compact(
+                trigger,
+                &summary,
+                ExtensionContext {
+                    session_id: &self.id,
+                    cwd: &self.start_dir,
+                },
+                &hook_tx,
+            )
+            .await;
+
         Ok(cut)
     }
 

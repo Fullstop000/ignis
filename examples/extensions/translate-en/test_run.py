@@ -1,6 +1,6 @@
 """pytest for the reference translator hook.
 
-Not part of cargo test — run with `pytest examples/hooks/translate-en/`.
+Not part of cargo test — run with `pytest examples/extensions/translate-en/`.
 Mocks `urllib.request.urlopen` so the test never touches the real API.
 """
 
