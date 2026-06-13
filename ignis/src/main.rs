@@ -148,6 +148,31 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {
+        // Frontend selection (PR #174, topology ii). Ratatui in-process is the
+        // default + always-available fallback; the Ink frontend is opt-in via
+        // IGNIS_FRONTEND=ink + IGNIS_TUI_ENTRY=<path to ignis-tui/src/cli.js>.
+        // When selected, the Ink host owns the terminal and spawns THIS binary
+        // as `--engine` (IGNIS_ENGINE_BIN below). Any failure — Node missing,
+        // entry unset, spawn error — falls through to the built-in TUI.
+        //
+        // PACKAGING (deferred, needs sign-off): a real install must decide how
+        // `ignis-tui` + a Node runtime ship — bundle Node, require system Node,
+        // or vendor the JS — and only then can the entry be auto-located instead
+        // of passed via IGNIS_TUI_ENTRY. Not finalized here; release.yml unchanged.
+        if let ignis::cli::Frontend::Ink { entry } = ignis::cli::resolve_frontend(
+            std::env::var("IGNIS_FRONTEND").ok().as_deref(),
+            std::env::var("IGNIS_TUI_ENTRY").ok().as_deref(),
+        ) {
+            match launch_ink_frontend(&entry).await {
+                Ok(code) => {
+                    mcp_registry.shutdown().await;
+                    std::process::exit(code);
+                }
+                Err(e) => {
+                    eprintln!("ignis: Ink frontend unavailable ({e}); using the built-in TUI.");
+                }
+            }
+        }
         let res = ignis::console::run_console(
             active_provider,
             active_model,
@@ -273,4 +298,21 @@ async fn main() -> Result<(), anyhow::Error> {
     prompt_task.await?;
     mcp_registry.shutdown().await;
     Ok(())
+}
+
+/// Launch the out-of-process Ink frontend: run `node <entry>` with our terminal
+/// inherited (so Ink owns the TTY) and `IGNIS_ENGINE_BIN` set to this
+/// executable, so the Ink host spawns us back as `ignis --engine` and speaks
+/// the NDJSON protocol over that child's pipes. Returns the child's exit code;
+/// any error (e.g. `node` not on PATH) bubbles up so the caller falls back to
+/// the built-in ratatui TUI.
+async fn launch_ink_frontend(entry: &str) -> std::io::Result<i32> {
+    let exe = std::env::current_exe()?;
+    // `status()` inherits stdin/stdout/stderr — Ink renders to the real terminal.
+    let status = tokio::process::Command::new("node")
+        .arg(entry)
+        .env("IGNIS_ENGINE_BIN", exe)
+        .status()
+        .await?;
+    Ok(status.code().unwrap_or(0))
 }
