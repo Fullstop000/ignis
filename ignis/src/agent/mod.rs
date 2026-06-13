@@ -627,6 +627,9 @@ fn is_retryable_error(err: &anyhow::Error) -> bool {
                 || req_err.is_connect()
                 || req_err.status().is_none_or(|s| s.is_server_error());
         }
+        if let Some(http_err) = cause.downcast_ref::<crate::llm::protocols::LlmHttpError>() {
+            return http_err.status.is_server_error();
+        }
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
             return matches!(
                 io_err.kind(),
@@ -1377,7 +1380,16 @@ mod tests {
         )));
         let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
         assert!(is_retryable_error(&anyhow::anyhow!(io_err)));
-        assert!(!is_retryable_error(&anyhow::anyhow!("invalid api key")));
+        let http_5xx = crate::llm::protocols::LlmHttpError {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "overloaded".to_string(),
+        };
+        assert!(is_retryable_error(&anyhow::anyhow!(http_5xx)));
+        let http_4xx = crate::llm::protocols::LlmHttpError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: "bad key".to_string(),
+        };
+        assert!(!is_retryable_error(&anyhow::anyhow!(http_4xx)));
         assert!(!is_retryable_error(&anyhow::anyhow!("model not found")));
     }
 

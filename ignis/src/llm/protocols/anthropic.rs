@@ -3,7 +3,6 @@ use super::{
     Resolved,
 };
 use crate::Message;
-use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -200,12 +199,17 @@ impl LlmProvider for AnthropicCompatible {
         };
         let res = super::send_with_timeout(req.json(&req_body)).await?;
 
-        if !res.status().is_success() {
+        let status = res.status();
+        if !status.is_success() {
             let error_text = res
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(anyhow!("Anthropic API returned error: {}", error_text));
+            return Err(super::LlmHttpError {
+                status,
+                body: error_text,
+            }
+            .into());
         }
 
         let byte_stream = res.bytes_stream();

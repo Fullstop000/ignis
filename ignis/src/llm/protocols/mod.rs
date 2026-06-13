@@ -92,6 +92,22 @@ pub struct Resolved {
     pub reasoning_effort: Option<String>,
 }
 
+/// Carries a non-2xx provider response back to callers so retry logic can
+/// distinguish transient 5xx failures from fatal 4xx/audit errors.
+#[derive(Debug)]
+pub(crate) struct LlmHttpError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl std::fmt::Display for LlmHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LLM API returned error {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for LlmHttpError {}
+
 /// Time-to-first-byte timeout for LLM chat requests. Covers connection
 /// establishment + response headers; the returned stream is not bounded by this.
 const LLM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -493,12 +509,17 @@ pub(crate) async fn openai_compatible_chat_stream(
     }
     let res = send_with_timeout(req).await?;
 
-    if !res.status().is_success() {
+    let status = res.status();
+    if !status.is_success() {
         let error_text = res
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(anyhow::anyhow!("LLM API returned error: {}", error_text));
+        return Err(LlmHttpError {
+            status,
+            body: error_text,
+        }
+        .into());
     }
 
     let line_stream = bytes_to_lines(res.bytes_stream());
