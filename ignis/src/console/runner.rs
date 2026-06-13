@@ -120,6 +120,189 @@ impl Drop for TerminalGuard {
         let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
 }
+/// The frontend-agnostic agent loop: dispatch `AgentRequest`s into `Session`
+/// runs, streaming `AgentEvent`s out on `agent_tx`. Shared by the ratatui
+/// runner and the headless `--engine` mode — it has no idea which frontend
+/// (if any) is on the other end of `agent_tx`.
+#[allow(clippy::too_many_arguments)]
+async fn agent_loop(
+    mut prompt_rx: mpsc::Receiver<AgentRequest>,
+    mut cancel_rx: mpsc::Receiver<()>,
+    agent_tx: mpsc::Sender<AgentEvent>,
+    picker_tx_runner: mpsc::Sender<crate::console::picker::PickerRequest>,
+    active_inject_runner: ActiveInject,
+    mut agent_config: crate::config::Config,
+    agent_system_prompt: String,
+    agent_storage_dir: PathBuf,
+    agent_cwd: PathBuf,
+    runner_hook_registry: crate::hooks::HookRegistry,
+    mut runner_skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
+    runner_mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
+    runner_permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
+) {
+    while let Some(request) = prompt_rx.recv().await {
+        let (session_id, prompt) = match request {
+            AgentRequest::Prompt { session_id, prompt } => (session_id, Some(prompt)),
+            AgentRequest::Compact { session_id } => (session_id, None),
+            AgentRequest::SetModel {
+                provider,
+                model,
+                effort,
+            } => {
+                // Apply to the config the runner rebuilds the provider from;
+                // the next prompt picks it up. No session work needed.
+                agent_config.model = Some(format!("{provider}/{model}"));
+                agent_config.reasoning_effort = effort;
+                continue;
+            }
+            AgentRequest::ReloadConfig => {
+                // /connect just wrote a fresh `[providers.X] api_key = …`
+                // to disk; re-read it so the next prompt resolves with the
+                // new key. A read failure leaves the in-memory config as
+                // it was — but log loudly: the user will hit a stale-config
+                // error on their next prompt and the log is the only
+                // breadcrumb explaining why.
+                match crate::config::load_config() {
+                    Ok(reloaded) => agent_config = reloaded,
+                    Err(e) => log::error!("ReloadConfig: failed to re-read config.toml: {e}"),
+                }
+                continue;
+            }
+            AgentRequest::ReloadSkills(registry) => {
+                // The user pressed `r` in the `/skills` picker. Adopt the
+                // *same* registry the UI just built, so both share one `Arc`
+                // — a later enable/disable toggle (interior mutability) is
+                // then visible to the next prompt without another reload.
+                runner_skill_registry = registry;
+                continue;
+            }
+        };
+        let provider = match crate::config::build_provider(&agent_config) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = agent_tx.send(AgentEvent::TurnEnd).await;
+                log::error!("Provider error: {}", e);
+                continue;
+            }
+        };
+        let storage = crate::storage::FileStorage::new(agent_storage_dir.clone());
+        let mut session = match Session::open(
+            session_id,
+            agent_system_prompt.clone(),
+            provider,
+            Box::new(storage),
+            agent_cwd.to_string_lossy().to_string(),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = agent_tx.send(AgentEvent::TurnEnd).await;
+                log::error!("Session open error: {}", e);
+                continue;
+            }
+        };
+        session.set_compaction(agent_config.compaction.clone());
+        // Share the runner's HookRegistry handle so `/hooks reload`
+        // immediately affects the next prompt — Session::open loaded
+        // its own copy from disk, but the runner owns the live one.
+        session.set_hook_registry(runner_hook_registry.clone());
+
+        let mcp_for_subagent = if !runner_mcp_registry.is_empty() {
+            Some(runner_mcp_registry.clone())
+        } else {
+            None
+        };
+        crate::tools::register_native_tools_with_mcp(
+            &mut session,
+            &agent_cwd,
+            &agent_config,
+            mcp_for_subagent,
+            Some(picker_tx_runner.clone()),
+            Some(runner_permissions.clone()),
+        );
+        if !runner_skill_registry.is_empty() {
+            session.set_skills(runner_skill_registry.clone());
+            session.register_tool(std::sync::Arc::new(crate::tools::SkillTool::new(
+                runner_skill_registry.clone(),
+            )));
+        }
+        if !runner_mcp_registry.is_empty() {
+            session.set_mcp(runner_mcp_registry.clone());
+            crate::tools::register_mcp_tools(&mut session, &runner_mcp_registry);
+        }
+
+        // Permission gate. The TUI's picker channel is wired in so an
+        // `Ask` decision opens the 3-option permission picker (Approve
+        // once / Approve session / Deny) over the same plumbing
+        // `ask_user` uses; on `Approve session` the checker writes back
+        // into the shared `PermissionState`.
+        session.set_hooks(Box::new(
+            crate::permissions::checker::PermissionChecker::new(runner_permissions.clone())
+                .with_picker(picker_tx_runner.clone()),
+        ));
+
+        let notice_msg = |content: &str| Message {
+            role: "assistant".to_string(),
+            content: Some(content.to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        };
+        let tx = agent_tx.clone();
+        match prompt {
+            Some(prompt) => {
+                // Discard any cancel that arrived after the previous turn
+                // already ended (its end-of-turn window) — it must not cancel
+                // this fresh prompt.
+                while cancel_rx.try_recv().is_ok() {}
+                let (inj_tx, inj_rx) = mpsc::channel::<String>(8);
+                *active_inject_runner.lock().unwrap() = Some(inj_tx);
+                session.set_inject_source(inj_rx);
+                tokio::select! {
+                    result = session.prompt(&prompt, tx) => {
+                        if let Err(e) = result {
+                            let _ = agent_tx.send(AgentEvent::TurnEnd).await;
+                            log::error!("Agent error: {}", e);
+                        }
+                    }
+                    _ = cancel_rx.recv() => {
+                        let _ = agent_tx.send(AgentEvent::TurnEnd).await;
+                    }
+                }
+                *active_inject_runner.lock().unwrap() = None;
+            }
+            None => {
+                // /compact: summarize earlier history and report a notice.
+                let _ = agent_tx.send(AgentEvent::TurnStart).await;
+                let notice = match session.compact().await {
+                    Ok(0) => "Nothing to compact yet.".to_string(),
+                    Ok(n) => format!("Compacted {n} earlier messages into a summary."),
+                    Err(e) => format!("Compact failed: {e}"),
+                };
+                let _ = agent_tx
+                    .send(AgentEvent::MessageStart {
+                        message: notice_msg(""),
+                    })
+                    .await;
+                let _ = agent_tx
+                    .send(AgentEvent::MessageUpdate {
+                        delta: notice.clone(),
+                    })
+                    .await;
+                let _ = agent_tx
+                    .send(AgentEvent::MessageEnd {
+                        message: notice_msg(&notice),
+                    })
+                    .await;
+                let _ = agent_tx.send(AgentEvent::TurnEnd).await;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_console(
     provider_name: String,
@@ -193,8 +376,8 @@ pub async fn run_console(
     }
 
     let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(256);
-    let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
-    let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
+    let (prompt_tx, prompt_rx) = mpsc::channel::<AgentRequest>(8);
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(8);
     // Two picker channels, split by origin (capacity 4 — pickers serialize, one
     // open at a time; the buffer just decouples send from drain):
     //   * `tool_picker_*` — the `ask_user` tool and the permission gate
@@ -227,14 +410,14 @@ pub async fn run_console(
     let agent_storage_dir = storage_dir.clone();
     let ui_storage_dir = storage_dir;
     let agent_cwd = cwd;
-    let mut agent_config = config;
+    let agent_config = config;
     let runner_hook_registry = hook_registry.clone();
     app.hooks = Some(hook_registry);
 
     let ui_skill_registry = skill_registry.clone();
-    // `mut` so an `AgentRequest::ReloadSkills` can swap in a freshly-scanned
-    // registry; the UI rebuilds its own `App.skills` clone in parallel.
-    let mut runner_skill_registry = skill_registry.clone();
+    // The UI keeps its own `App.skills` clone; `agent_loop` owns the runner's
+    // copy (and takes it `mut` so `ReloadSkills` can swap in a fresh scan).
+    let runner_skill_registry = skill_registry.clone();
     app.skills = Some(ui_skill_registry);
 
     let runner_mcp_registry = mcp_registry.clone();
@@ -253,170 +436,23 @@ pub async fn run_console(
         None
     };
 
-    // Background agent runner
-    tokio::spawn(async move {
-        while let Some(request) = prompt_rx.recv().await {
-            let (session_id, prompt) = match request {
-                AgentRequest::Prompt { session_id, prompt } => (session_id, Some(prompt)),
-                AgentRequest::Compact { session_id } => (session_id, None),
-                AgentRequest::SetModel {
-                    provider,
-                    model,
-                    effort,
-                } => {
-                    // Apply to the config the runner rebuilds the provider from;
-                    // the next prompt picks it up. No session work needed.
-                    agent_config.model = Some(format!("{provider}/{model}"));
-                    agent_config.reasoning_effort = effort;
-                    continue;
-                }
-                AgentRequest::ReloadConfig => {
-                    // /connect just wrote a fresh `[providers.X] api_key = …`
-                    // to disk; re-read it so the next prompt resolves with the
-                    // new key. A read failure leaves the in-memory config as
-                    // it was — but log loudly: the user will hit a stale-config
-                    // error on their next prompt and the log is the only
-                    // breadcrumb explaining why.
-                    match crate::config::load_config() {
-                        Ok(reloaded) => agent_config = reloaded,
-                        Err(e) => log::error!("ReloadConfig: failed to re-read config.toml: {e}"),
-                    }
-                    continue;
-                }
-                AgentRequest::ReloadSkills(registry) => {
-                    // The user pressed `r` in the `/skills` picker. Adopt the
-                    // *same* registry the UI just built, so both share one `Arc`
-                    // — a later enable/disable toggle (interior mutability) is
-                    // then visible to the next prompt without another reload.
-                    runner_skill_registry = registry;
-                    continue;
-                }
-            };
-            let provider = match crate::config::build_provider(&agent_config) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = agent_tx.send(AgentEvent::TurnEnd).await;
-                    log::error!("Provider error: {}", e);
-                    continue;
-                }
-            };
-            let storage = crate::storage::FileStorage::new(agent_storage_dir.clone());
-            let mut session = match Session::open(
-                session_id,
-                agent_system_prompt.clone(),
-                provider,
-                Box::new(storage),
-                agent_cwd.to_string_lossy().to_string(),
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = agent_tx.send(AgentEvent::TurnEnd).await;
-                    log::error!("Session open error: {}", e);
-                    continue;
-                }
-            };
-            session.set_compaction(agent_config.compaction.clone());
-            // Share the runner's HookRegistry handle so `/hooks reload`
-            // immediately affects the next prompt — Session::open loaded
-            // its own copy from disk, but the runner owns the live one.
-            session.set_hook_registry(runner_hook_registry.clone());
-
-            let mcp_for_subagent = if !runner_mcp_registry.is_empty() {
-                Some(runner_mcp_registry.clone())
-            } else {
-                None
-            };
-            crate::tools::register_native_tools_with_mcp(
-                &mut session,
-                &agent_cwd,
-                &agent_config,
-                mcp_for_subagent,
-                Some(picker_tx_runner.clone()),
-                Some(runner_permissions.clone()),
-            );
-            if !runner_skill_registry.is_empty() {
-                session.set_skills(runner_skill_registry.clone());
-                session.register_tool(std::sync::Arc::new(crate::tools::SkillTool::new(
-                    runner_skill_registry.clone(),
-                )));
-            }
-            if !runner_mcp_registry.is_empty() {
-                session.set_mcp(runner_mcp_registry.clone());
-                crate::tools::register_mcp_tools(&mut session, &runner_mcp_registry);
-            }
-
-            // Permission gate. The TUI's picker channel is wired in so an
-            // `Ask` decision opens the 3-option permission picker (Approve
-            // once / Approve session / Deny) over the same plumbing
-            // `ask_user` uses; on `Approve session` the checker writes back
-            // into the shared `PermissionState`.
-            session.set_hooks(Box::new(
-                crate::permissions::checker::PermissionChecker::new(runner_permissions.clone())
-                    .with_picker(picker_tx_runner.clone()),
-            ));
-
-            let notice_msg = |content: &str| Message {
-                role: "assistant".to_string(),
-                content: Some(content.to_string()),
-                reasoning_content: None,
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-                created_at_ms: None,
-            };
-            let tx = agent_tx.clone();
-            match prompt {
-                Some(prompt) => {
-                    // Discard any cancel that arrived after the previous turn
-                    // already ended (its end-of-turn window) — it must not cancel
-                    // this fresh prompt.
-                    while cancel_rx.try_recv().is_ok() {}
-                    let (inj_tx, inj_rx) = mpsc::channel::<String>(8);
-                    *active_inject_runner.lock().unwrap() = Some(inj_tx);
-                    session.set_inject_source(inj_rx);
-                    tokio::select! {
-                        result = session.prompt(&prompt, tx) => {
-                            if let Err(e) = result {
-                                let _ = agent_tx.send(AgentEvent::TurnEnd).await;
-                                log::error!("Agent error: {}", e);
-                            }
-                        }
-                        _ = cancel_rx.recv() => {
-                            let _ = agent_tx.send(AgentEvent::TurnEnd).await;
-                        }
-                    }
-                    *active_inject_runner.lock().unwrap() = None;
-                }
-                None => {
-                    // /compact: summarize earlier history and report a notice.
-                    let _ = agent_tx.send(AgentEvent::TurnStart).await;
-                    let notice = match session.compact().await {
-                        Ok(0) => "Nothing to compact yet.".to_string(),
-                        Ok(n) => format!("Compacted {n} earlier messages into a summary."),
-                        Err(e) => format!("Compact failed: {e}"),
-                    };
-                    let _ = agent_tx
-                        .send(AgentEvent::MessageStart {
-                            message: notice_msg(""),
-                        })
-                        .await;
-                    let _ = agent_tx
-                        .send(AgentEvent::MessageUpdate {
-                            delta: notice.clone(),
-                        })
-                        .await;
-                    let _ = agent_tx
-                        .send(AgentEvent::MessageEnd {
-                            message: notice_msg(&notice),
-                        })
-                        .await;
-                    let _ = agent_tx.send(AgentEvent::TurnEnd).await;
-                }
-            }
-        }
-    });
+    // Background agent runner — the frontend-agnostic core loop, shared with
+    // the headless `--engine` mode.
+    tokio::spawn(agent_loop(
+        prompt_rx,
+        cancel_rx,
+        agent_tx,
+        picker_tx_runner,
+        active_inject_runner,
+        agent_config,
+        agent_system_prompt,
+        agent_storage_dir,
+        agent_cwd,
+        runner_hook_registry,
+        runner_skill_registry,
+        runner_mcp_registry,
+        runner_permissions,
+    ));
 
     // Frontend seam (PR #174, phase 1). The core drives a `FrontendHub` over a
     // `LocalTuiPort`; the ratatui loop below holds the matching `TuiHandle`.
