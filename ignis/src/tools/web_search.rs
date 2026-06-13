@@ -45,15 +45,14 @@ impl WebSearchTool {
 
     async fn search_brave(&self, query: &str, key: &str) -> Result<Vec<SearchResult>, String> {
         let count = RESULT_COUNT.to_string();
-        let resp = self
-            .client
-            .get("https://api.search.brave.com/res/v1/web/search")
-            .query(&[("q", query), ("count", count.as_str())])
-            .header("Accept", "application/json")
-            .header("X-Subscription-Token", key)
-            .send()
-            .await
-            .map_err(|e| format!("HTTP request failed: {e}"))?;
+        let resp = crate::tools::util::send_with_retry(
+            self.client
+                .get("https://api.search.brave.com/res/v1/web/search")
+                .query(&[("q", query), ("count", count.as_str())])
+                .header("Accept", "application/json")
+                .header("X-Subscription-Token", key),
+        )
+        .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -67,17 +66,16 @@ impl WebSearchTool {
     }
 
     async fn search_tavily(&self, query: &str, key: &str) -> Result<Vec<SearchResult>, String> {
-        let resp = self
-            .client
-            .post("https://api.tavily.com/search")
-            .json(&json!({
-                "api_key": key,
-                "query": query,
-                "max_results": RESULT_COUNT,
-            }))
-            .send()
-            .await
-            .map_err(|e| format!("HTTP request failed: {e}"))?;
+        let resp = crate::tools::util::send_with_retry(
+            self.client
+                .post("https://api.tavily.com/search")
+                .json(&json!({
+                    "api_key": key,
+                    "query": query,
+                    "max_results": RESULT_COUNT,
+                })),
+        )
+        .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();

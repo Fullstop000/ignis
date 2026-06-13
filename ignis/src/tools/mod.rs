@@ -10,6 +10,7 @@ mod grep;
 mod list_dir;
 mod read_file;
 mod skill;
+mod util;
 mod web_fetch;
 mod web_search;
 

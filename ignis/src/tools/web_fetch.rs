@@ -47,10 +47,7 @@ impl StaticTool for WebFetchTool {
             return Err("url must start with http:// or https://".to_string());
         }
 
-        let resp = self
-            .client
-            .get(url)
-            .send()
+        let resp = crate::tools::util::send_with_retry(self.client.get(url))
             .await
             .map_err(|e| format!("Request failed: {e}"))?;
         let status = resp.status();
