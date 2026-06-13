@@ -13,15 +13,19 @@
 //!     internal signals, making the responsibility boundary explicit.
 //!   * [`local`] — the first concrete [`FrontendPort`]: a non-serializing
 //!     channel bridge for the bundled (same-process) ratatui TUI.
+//!   * [`hub`] — the one object the runner drives, composing acceptor + broker
+//!     + command classification with disconnect/handover recovery.
 
 pub mod broker;
 pub mod command;
+pub mod hub;
 pub mod local;
 pub mod port;
 pub mod protocol;
 
 pub use broker::RequestBroker;
 pub use command::{control_signal, ControlSignal};
+pub use hub::{CommandOutcome, FrontendHub};
 pub use local::{local_tui, LocalTuiPort, TuiHandle};
 pub use port::{Acceptor, FrontendPort, PortError};
 pub use protocol::{ClientCommand, ClientRequest, Outbound, ReplyAnswer, RequestId, Snapshot};
