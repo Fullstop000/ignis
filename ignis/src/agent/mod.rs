@@ -616,6 +616,35 @@ fn retry_backoff_ms(attempt: u32) -> u64 {
         .min(MAX_BACKOFF_MS)
 }
 
+/// Decide whether a pre-stream failure is worth retrying. Transport blips
+/// (timeouts, connection resets, 5xx) are retryable; client/4xx errors and
+/// malformed responses are treated as fatal so we don't burn the retry budget
+/// on something that won't recover.
+fn is_retryable_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(req_err) = cause.downcast_ref::<reqwest::Error>() {
+            return req_err.is_timeout()
+                || req_err.is_connect()
+                || req_err.status().is_none_or(|s| s.is_server_error());
+        }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+            );
+        }
+    }
+    // Our own explicit timeout from `send_with_timeout` doesn't wrap a reqwest
+    // error, so also retry on the timeout message.
+    let s = err.to_string().to_lowercase();
+    s.contains("timed out") || s.contains("timeout")
+}
+
 /// Emit `Reconnecting { attempt, max }` and back off before the next stream
 /// attempt. Shared by both retry triggers (pre-stream error, empty mid-stream
 /// drop) so the reconnect-and-sleep sequence lives in exactly one place.
@@ -763,7 +792,7 @@ impl Agent {
                 .chat_stream(effective_prompt, messages, tool_schemas)
                 .await
             {
-                Err(err) if attempt < MAX_STREAM_RETRIES => {
+                Err(err) if attempt < MAX_STREAM_RETRIES && is_retryable_error(&err) => {
                     attempt += 1;
                     reconnect(
                         tx,
@@ -1339,6 +1368,17 @@ mod tests {
         t.message_started = false;
         t.reasoning_streaming = true;
         assert!(!t.is_empty());
+    }
+
+    #[test]
+    fn retryable_error_classifies_transient_failures() {
+        assert!(is_retryable_error(&anyhow::anyhow!(
+            "LLM request timed out after 120s"
+        )));
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        assert!(is_retryable_error(&anyhow::anyhow!(io_err)));
+        assert!(!is_retryable_error(&anyhow::anyhow!("invalid api key")));
+        assert!(!is_retryable_error(&anyhow::anyhow!("model not found")));
     }
 
     #[test]
