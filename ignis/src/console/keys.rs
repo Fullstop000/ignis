@@ -205,7 +205,6 @@ pub(crate) async fn handle_key(
     app: &mut App,
     key: KeyEvent,
     prompt_tx: &mpsc::Sender<AgentRequest>,
-    active_inject: &ActiveInject,
     storage_dir: &std::path::Path,
     picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
     notice_tx: &mpsc::Sender<String>,
@@ -330,28 +329,24 @@ pub(crate) async fn handle_key(
                 .composer
                 .expand_pastes(app.composer.input.trim().to_string());
             if !text.is_empty() {
-                let sender = active_inject.lock().unwrap().clone();
-                match sender {
-                    Some(tx) => match tx.try_send(text.clone()) {
-                        Ok(()) => {
-                            app.pending_injects.push(text);
-                            app.composer.clear();
-                            app.reset_slash_selection();
-                        }
-                        Err(_) => {
-                            app.error_flash = Some((
-                                "Couldn't steer — try again".to_string(),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                    },
-                    // Busy but no live prompt run (e.g. /compact): queue it — the
-                    // queue is visible while busy and drains at the next TurnEnd.
-                    None => {
-                        app.enqueue(text);
-                        app.composer.clear();
-                        app.reset_slash_selection();
-                    }
+                if app.accepting_injects {
+                    // Steer the live prompt: the core forwards this to the turn's
+                    // inject source. `try_send` so a keypress never blocks; we
+                    // optimistically show it in `pending_injects` (the inject
+                    // channel is bounded but ample, so a drop is not a real case).
+                    let _ = commands.try_send(crate::console::frontend::ClientCommand::Inject {
+                        text: text.clone(),
+                    });
+                    app.pending_injects.push(text);
+                    app.composer.clear();
+                    app.reset_slash_selection();
+                } else {
+                    // Busy but no live prompt accepting injects (e.g. /compact):
+                    // queue it — the queue is visible while busy and drains at the
+                    // next TurnEnd.
+                    app.enqueue(text);
+                    app.composer.clear();
+                    app.reset_slash_selection();
                 }
             }
         }
@@ -707,6 +702,8 @@ pub(crate) async fn submit_text(
                 // turn (CC/Codex show the compact invocation, not the expansion).
                 app.pending_user_display = Some(text.trim().to_string());
                 app.turn_in_flight = true;
+                // A real prompt run accepts Ctrl+S injects (unlike /compact).
+                app.accepting_injects = true;
                 let _ = prompt_tx
                     .send(AgentRequest::Prompt {
                         session_id: app.session_id.clone(),
@@ -724,6 +721,7 @@ pub(crate) async fn submit_text(
         }
         _ => {
             app.turn_in_flight = true;
+            app.accepting_injects = true;
             let _ = prompt_tx
                 .send(AgentRequest::Prompt {
                     session_id: app.session_id.clone(),
@@ -1345,12 +1343,10 @@ mod tests {
 
         let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
         let (cmd_tx, _cmd_rx) = mpsc::channel(8);
-        let inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &p_tx,
-            &inject,
             std::path::Path::new("/tmp"),
             &pk_tx,
             &n_tx,
@@ -1383,12 +1379,10 @@ mod tests {
     async fn press_ctrl_o(app: &mut App) {
         let (p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
         let (cmd_tx, _cmd_rx) = mpsc::channel(8);
-        let inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
         handle_key(
             app,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
             &p_tx,
-            &inject,
             std::path::Path::new("/tmp"),
             &pk_tx,
             &n_tx,

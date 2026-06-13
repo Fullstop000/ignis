@@ -433,6 +433,7 @@ pub async fn run_console(
         agent_rx,
         tool_picker_rx,
         cancel_tx,
+        active_inject,
     ));
 
     // The in-progress block's already-streamed row count lives on `app`
@@ -463,7 +464,6 @@ pub async fn run_console(
         prompt_tx,
         local_picker_tx,
         notice_tx,
-        active_inject,
         ui_storage_dir,
     };
     console.run().await?;
@@ -499,14 +499,16 @@ pub async fn run_console(
 /// frontend's picker answers back onto the blocked tools' oneshots via the
 /// broker. Runs until the frontend disconnects with no successor.
 ///
-/// `Reply` is resolved against the broker inside `handle_command`; `Cancel` is
-/// forwarded to the agent task's cancel channel here. `Submit` / `Inject` still
-/// travel their direct channels in this phase, so those outcomes are no-ops.
+/// `Reply` is resolved against the broker inside `handle_command`. `Cancel`
+/// and `Inject` are forwarded to the agent task here (the cancel channel and
+/// the live turn's inject source). `Submit` still travels its direct channel in
+/// this phase, so that outcome is a no-op.
 async fn drive_frontend_core(
     mut hub: FrontendHub,
     mut agent_rx: mpsc::Receiver<AgentEvent>,
     mut tool_picker_rx: mpsc::Receiver<crate::console::picker::PickerRequest>,
     cancel_tx: mpsc::Sender<()>,
+    active_inject: ActiveInject,
 ) {
     // `CoreWake` dodges the select-arm borrow: only `next_command` borrows
     // `hub` inside the select, and every arm future is dropped before the match
@@ -519,15 +521,25 @@ async fn drive_frontend_core(
             Some(req) = tool_picker_rx.recv() => CoreWake::Request(req),
         };
         match wake {
-            CoreWake::Command(Some(cmd)) => {
-                // `Reply` is resolved inside `handle_command`; `Cancel` forwards
-                // to the agent task (which drains stale cancels at each prompt's
-                // start, so an inter-turn cancel is harmless — no gating needed).
-                // Submit / Inject / Shutdown aren't routed through the hub yet.
-                if let CommandOutcome::Control(ControlSignal::Cancel) = hub.handle_command(cmd) {
+            // `Reply` is resolved inside `handle_command`; `Submit` / `Shutdown`
+            // aren't routed through the hub yet this phase.
+            CoreWake::Command(Some(cmd)) => match hub.handle_command(cmd) {
+                // The agent task drains stale cancels at each prompt's start, so
+                // an inter-turn cancel is harmless — no gating needed here.
+                CommandOutcome::Control(ControlSignal::Cancel) => {
                     let _ = cancel_tx.try_send(());
                 }
-            }
+                // Steer the live prompt's inject source. The frontend only sends
+                // this while a prompt is accepting injects, so the sender is
+                // normally present; a missing/full one is dropped, not blocked.
+                CommandOutcome::Control(ControlSignal::Inject(text)) => {
+                    let sender = active_inject.lock().unwrap().clone();
+                    if let Some(tx) = sender {
+                        let _ = tx.try_send(text);
+                    }
+                }
+                _ => {}
+            },
             // Frontend disconnected with no successor — nothing left to drive.
             CoreWake::Command(None) => break,
             CoreWake::Event(ev) => hub.emit_event(ev).await,
@@ -604,7 +616,6 @@ struct ConsoleLoop {
     /// `/connect`'s multi-step flow can open its next picker locally.
     local_picker_tx: mpsc::Sender<crate::console::picker::PickerRequest>,
     notice_tx: mpsc::Sender<String>,
-    active_inject: ActiveInject,
     ui_storage_dir: PathBuf,
 }
 
@@ -768,7 +779,6 @@ impl ConsoleLoop {
                         &mut self.app,
                         key,
                         &self.prompt_tx,
-                        &self.active_inject,
                         &self.ui_storage_dir,
                         &self.local_picker_tx,
                         &self.notice_tx,
@@ -1249,11 +1259,22 @@ mod tests {
         let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (tool_tx, tool_rx) = mpsc::channel::<PickerRequest>(4);
         let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
+        // Stand in for a live prompt's inject source so we can assert Inject
+        // reaches it, the same way the agent task wires `set_inject_source`.
+        let (inj_tx, mut inj_rx) = mpsc::channel::<String>(8);
+        let active_inject: crate::console::keys::ActiveInject =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(inj_tx)));
         let (local_port, mut handle) = local_tui(8);
         let mut acceptor = Acceptor::new();
         acceptor.attach(Box::new(local_port));
         let hub = FrontendHub::new("s1".to_string(), acceptor, RequestBroker::new());
-        let driver = tokio::spawn(drive_frontend_core(hub, agent_rx, tool_rx, cancel_tx));
+        let driver = tokio::spawn(drive_frontend_core(
+            hub,
+            agent_rx,
+            tool_rx,
+            cancel_tx,
+            active_inject,
+        ));
 
         // 1) An agent event reaches the frontend verbatim as `Outbound::Event`.
         agent_tx.send(AgentEvent::TurnStart).await.unwrap();
@@ -1302,7 +1323,23 @@ mod tests {
             "ClientCommand::Cancel reaches the agent task's cancel channel"
         );
 
-        // 4) Dropping the frontend ends the driver (disconnect, no successor).
+        // 4) An `Inject` command reaches the live prompt's inject source.
+        handle
+            .commands
+            .send(ClientCommand::Inject {
+                text: "steer".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), inj_rx.recv())
+                .await
+                .expect("inject forwarded within timeout"),
+            Some("steer".to_string()),
+            "ClientCommand::Inject reaches the turn's inject source"
+        );
+
+        // 5) Dropping the frontend ends the driver (disconnect, no successor).
         drop(handle);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
     }
