@@ -35,6 +35,9 @@ async fn main() -> Result<(), anyhow::Error> {
         None => {}
     }
 
+    // Headless engine mode (`--engine`): captured before `cli` is consumed by
+    // `to_session_args`. Routes to `run_engine` instead of the ratatui TUI.
+    let engine_mode = cli.engine;
     let cli = cli.to_session_args();
     let is_oneshot = !cli.prompt_args.is_empty();
 
@@ -121,6 +124,27 @@ async fn main() -> Result<(), anyhow::Error> {
     // runner shares this handle so `/hooks reload` swaps the live config
     // for every session that follows.
     let hook_registry = ignis::hooks::HookRegistry::from_config_dir(&home)?;
+
+    // Route: headless engine (`--engine`) — protocol over stdin/stdout, no TUI.
+    // The out-of-process frontend (Ink `ignis-tui`) owns the terminal and
+    // spawns this; it reads Outbound frames from our stdout and writes
+    // ClientCommands to our stdin.
+    if engine_mode {
+        let res = ignis::console::run_engine(
+            session_request.session_id,
+            system_prompt,
+            storage_dir,
+            cwd,
+            config,
+            skill_registry.clone(),
+            mcp_registry.clone(),
+            permissions.clone(),
+            hook_registry.clone(),
+        )
+        .await;
+        mcp_registry.shutdown().await;
+        return res;
+    }
 
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {

@@ -16,7 +16,7 @@ use crate::console::app::{App, UIBlock};
 use crate::console::format::AgentRequest;
 use crate::console::frontend::{
     local_tui, Acceptor, ClientCommand, ClientRequest, CommandOutcome, ControlSignal, FrontendHub,
-    Outbound, ReplyAnswer, RequestBroker,
+    Outbound, ReplyAnswer, RequestBroker, StdioPort,
 };
 use crate::console::inline_picker;
 use crate::console::keys::{handle_key, ActiveInject};
@@ -532,6 +532,74 @@ pub async fn run_console(
         drop(_term_guard);
         let _ = print_resume_hint(&session_id, band_bottom);
     }
+    Ok(())
+}
+
+/// Headless core engine (PR #174, topology ii). Run the agent + `FrontendHub`
+/// over NDJSON on this process's own stdin/stdout, with no terminal/ratatui:
+/// the interactive frontend (the Ink `ignis-tui`) owns the TTY and spawns this
+/// process, reading `Outbound` frames from our stdout and writing
+/// `ClientCommand`s to our stdin. Doubles as a scriptable agent — pipe NDJSON
+/// in, get NDJSON out.
+///
+/// Reuses the exact same [`agent_loop`] and [`drive_frontend_core`] as the
+/// ratatui runner — only the port differs ([`StdioPort`] vs `LocalTuiPort`).
+/// Documented gaps vs. the ratatui path (not part of the protocol): no
+/// `AssistantMessageRender` hook rewrite and no `/afk`·`/telemetry` notice
+/// relay — those are frontend-local UI affordances, not core behavior.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_engine(
+    session_id: String,
+    system_prompt: String,
+    storage_dir: PathBuf,
+    cwd: PathBuf,
+    config: crate::config::Config,
+    skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
+    mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
+    permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
+    hook_registry: crate::hooks::HookRegistry,
+) -> Result<(), anyhow::Error> {
+    let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(256);
+    let (prompt_tx, prompt_rx) = mpsc::channel::<AgentRequest>(8);
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(8);
+    let (tool_picker_tx, tool_picker_rx) =
+        mpsc::channel::<crate::console::picker::PickerRequest>(4);
+    let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    tokio::spawn(agent_loop(
+        prompt_rx,
+        cancel_rx,
+        agent_tx,
+        tool_picker_tx,
+        active_inject.clone(),
+        config,
+        system_prompt,
+        storage_dir,
+        cwd,
+        hook_registry,
+        skill_registry,
+        mcp_registry,
+        permissions,
+    ));
+
+    // The frontend speaks NDJSON on our own stdio. emit() writes Outbound to
+    // stdout (→ frontend); next_command() reads ClientCommands from stdin.
+    let port = StdioPort::new(tokio::io::stdout(), tokio::io::stdin());
+    let mut acceptor = Acceptor::new();
+    acceptor.attach(Box::new(port));
+    let hub = FrontendHub::new(session_id.clone(), acceptor, RequestBroker::new());
+
+    // Drive until the frontend closes our stdin (EOF = clean disconnect).
+    drive_frontend_core(
+        hub,
+        agent_rx,
+        tool_picker_rx,
+        cancel_tx,
+        active_inject,
+        prompt_tx,
+        session_id,
+    )
+    .await;
     Ok(())
 }
 

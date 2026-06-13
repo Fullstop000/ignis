@@ -40,6 +40,12 @@ pub struct Cli {
     #[arg(long)]
     pub afk: bool,
 
+    /// Run as a headless protocol engine over stdin/stdout (NDJSON) with no
+    /// terminal UI — driven by an out-of-process frontend (the Ink `ignis-tui`)
+    /// that owns the terminal and spawns this process. Experimental.
+    #[arg(long, hide = true)]
+    pub engine: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 
