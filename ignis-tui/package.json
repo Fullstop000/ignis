@@ -17,5 +17,8 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "ink-testing-library": "^4.0.0"
   }
 }
