@@ -76,6 +76,17 @@ pub enum ClientCommand {
     /// only recognizes and forwards.
     #[serde(rename = "submit")]
     Submit { text: String },
+    /// Tell the core which session id subsequent [`ClientCommand::Submit`]s
+    /// belong to, after the frontend switched it (`/clear`, `/resume`, startup).
+    ///
+    /// This is a LOCAL-frontend concept: the in-process ratatui TUI owns session
+    /// creation today (it mints ids and writes the JSONL). A remote frontend
+    /// can't create the core's session files, so the transport-agnostic endgame
+    /// is for the CORE to own session lifecycle (creation + a core→frontend id
+    /// signal). That is a deferred refinement (plan "approach B"); until then a
+    /// local frontend syncs the id it created via this command.
+    #[serde(rename = "set_session")]
+    SetSession { session_id: String },
     /// Inject text into the *in-flight* turn (the running prompt's inject
     /// source) rather than queuing a new turn.
     #[serde(rename = "inject")]

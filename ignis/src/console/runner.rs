@@ -422,8 +422,11 @@ pub async fn run_console(
     // `LocalTuiPort`; the ratatui loop below holds the matching `TuiHandle`.
     // Agent events and tool-picker requests flow core→frontend as `Outbound`
     // frames; the frontend's picker answers flow back as `ClientCommand::Reply`,
-    // which the broker correlates to the blocked tool's oneshot. Submit / cancel
-    // / inject still travel their direct channels in this phase.
+    // which the broker correlates to the blocked tool's oneshot. Submit, cancel,
+    // and inject also ride the protocol now; the core maps Submit→AgentRequest
+    // against the session id it tracks (seeded here, retargeted by SetSession on
+    // /clear · /resume). The frontend keeps a `prompt_tx` clone only for config
+    // commands (model switch / config + skills reload).
     let (local_port, tui_handle) = local_tui(256);
     let mut acceptor = Acceptor::new();
     acceptor.attach(Box::new(local_port));
@@ -434,6 +437,8 @@ pub async fn run_console(
         tool_picker_rx,
         cancel_tx,
         active_inject,
+        prompt_tx.clone(),
+        app.session_id.clone(),
     ));
 
     // The in-progress block's already-streamed row count lives on `app`
@@ -499,16 +504,20 @@ pub async fn run_console(
 /// frontend's picker answers back onto the blocked tools' oneshots via the
 /// broker. Runs until the frontend disconnects with no successor.
 ///
-/// `Reply` is resolved against the broker inside `handle_command`. `Cancel`
-/// and `Inject` are forwarded to the agent task here (the cancel channel and
-/// the live turn's inject source). `Submit` still travels its direct channel in
-/// this phase, so that outcome is a no-op.
+/// `Reply` is resolved against the broker inside `handle_command`. `Submit` is
+/// mapped to an [`AgentRequest`] (against the core-tracked session id) and sent
+/// to the agent task; `SetSession` retargets that id; `Cancel` / `Inject` are
+/// forwarded to the agent (the cancel channel and the live turn's inject
+/// source). The frontend keeps `prompt_tx` only for config commands (model
+/// switch / config + skills reload), which still travel that channel directly.
 async fn drive_frontend_core(
     mut hub: FrontendHub,
     mut agent_rx: mpsc::Receiver<AgentEvent>,
     mut tool_picker_rx: mpsc::Receiver<crate::console::picker::PickerRequest>,
     cancel_tx: mpsc::Sender<()>,
     active_inject: ActiveInject,
+    prompt_tx: mpsc::Sender<AgentRequest>,
+    mut current_session_id: String,
 ) {
     // `CoreWake` dodges the select-arm borrow: only `next_command` borrows
     // `hub` inside the select, and every arm future is dropped before the match
@@ -521,9 +530,29 @@ async fn drive_frontend_core(
             Some(req) = tool_picker_rx.recv() => CoreWake::Request(req),
         };
         match wake {
-            // `Reply` is resolved inside `handle_command`; `Submit` / `Shutdown`
-            // aren't routed through the hub yet this phase.
             CoreWake::Command(Some(cmd)) => match hub.handle_command(cmd) {
+                // Map the user line to an agent request against the current
+                // session. The frontend pre-resolves App-dependent dispatch
+                // (provider gate, skill expansion, app-only commands), so what
+                // arrives here is either "/compact" or a ready-to-run prompt.
+                CommandOutcome::Submit(text) => {
+                    let request = if text == "/compact" {
+                        AgentRequest::Compact {
+                            session_id: current_session_id.clone(),
+                        }
+                    } else {
+                        AgentRequest::Prompt {
+                            session_id: current_session_id.clone(),
+                            prompt: text,
+                        }
+                    };
+                    // `send` (not `try_send`): submits only arrive while the
+                    // agent is idle/just-ended, so the queue isn't full — back-
+                    // pressure here is correct, matching the pre-seam behavior.
+                    let _ = prompt_tx.send(request).await;
+                }
+                // The frontend switched sessions (/clear, /resume); retarget.
+                CommandOutcome::SetSession(id) => current_session_id = id,
                 // The agent task drains stale cancels at each prompt's start, so
                 // an inter-turn cancel is harmless — no gating needed here.
                 CommandOutcome::Control(ControlSignal::Cancel) => {
@@ -760,7 +789,7 @@ impl ConsoleLoop {
                 crate::console::keys::submit_text(
                     &mut self.app,
                     text,
-                    &self.prompt_tx,
+                    &self.commands,
                     &self.local_picker_tx,
                     &self.notice_tx,
                     &self.ui_storage_dir,
@@ -1259,6 +1288,7 @@ mod tests {
         let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (tool_tx, tool_rx) = mpsc::channel::<PickerRequest>(4);
         let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
+        let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
         // Stand in for a live prompt's inject source so we can assert Inject
         // reaches it, the same way the agent task wires `set_inject_source`.
         let (inj_tx, mut inj_rx) = mpsc::channel::<String>(8);
@@ -1274,6 +1304,8 @@ mod tests {
             tool_rx,
             cancel_tx,
             active_inject,
+            prompt_tx,
+            "s1".to_string(),
         ));
 
         // 1) An agent event reaches the frontend verbatim as `Outbound::Event`.
@@ -1339,7 +1371,54 @@ mod tests {
             "ClientCommand::Inject reaches the turn's inject source"
         );
 
-        // 5) Dropping the frontend ends the driver (disconnect, no successor).
+        // 5) A `Submit` maps to an AgentRequest against the current session id.
+        handle
+            .commands
+            .send(ClientCommand::Submit {
+                text: "hello".to_string(),
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), prompt_rx.recv())
+            .await
+            .expect("submit forwarded within timeout")
+        {
+            Some(AgentRequest::Prompt { session_id, prompt }) => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(prompt, "hello");
+            }
+            Some(AgentRequest::Compact { .. }) => panic!("expected Prompt, got Compact"),
+            None => panic!("expected Prompt, got nothing"),
+            _ => panic!("expected Prompt, got SetModel/ReloadConfig/ReloadSkills"),
+        }
+
+        // 6) SetSession retargets the id; a later Submit lands in the new
+        //    session, and "/compact" maps to Compact.
+        handle
+            .commands
+            .send(ClientCommand::SetSession {
+                session_id: "s2".to_string(),
+            })
+            .await
+            .unwrap();
+        handle
+            .commands
+            .send(ClientCommand::Submit {
+                text: "/compact".to_string(),
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), prompt_rx.recv())
+            .await
+            .expect("compact forwarded within timeout")
+        {
+            Some(AgentRequest::Compact { session_id }) => assert_eq!(session_id, "s2"),
+            Some(AgentRequest::Prompt { .. }) => panic!("expected Compact, got Prompt"),
+            None => panic!("expected Compact, got nothing"),
+            _ => panic!("expected Compact, got SetModel/ReloadConfig/ReloadSkills"),
+        }
+
+        // 7) Dropping the frontend ends the driver (disconnect, no successor).
         drop(handle);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
     }

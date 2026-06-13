@@ -28,6 +28,10 @@ use crate::console::picker::{PickerRequest, PickerResponse};
 pub enum CommandOutcome {
     /// A user line to route through the core slash dispatcher.
     Submit(String),
+    /// The active session id changed on the frontend; the core should retarget
+    /// subsequent submits at it (local-frontend session sync — see
+    /// [`ClientCommand::SetSession`]).
+    SetSession(String),
     /// A mechanical control signal (cancel / inject / shutdown).
     Control(ControlSignal),
     /// A `Reply` the hub already resolved against the broker — nothing left for
@@ -85,11 +89,11 @@ impl FrontendHub {
             }
             return CommandOutcome::Handled;
         }
-        if let Some(text) = match &cmd {
-            ClientCommand::Submit { text } => Some(text.clone()),
-            _ => None,
-        } {
-            return CommandOutcome::Submit(text);
+        if let ClientCommand::Submit { text } = &cmd {
+            return CommandOutcome::Submit(text.clone());
+        }
+        if let ClientCommand::SetSession { session_id } = &cmd {
+            return CommandOutcome::SetSession(session_id.clone());
         }
         // Remaining variants are mechanical control signals.
         match control_signal(&cmd) {

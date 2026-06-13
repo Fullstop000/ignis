@@ -486,7 +486,16 @@ pub(crate) async fn handle_key(
                 if let Some(session_id) = app.selected_session_id() {
                     let storage = FileStorage::new(storage_dir.to_path_buf());
                     match storage.load_session(&session_id).await {
-                        Ok(messages) => app.render_session_history(session_id, messages),
+                        Ok(messages) => {
+                            app.render_session_history(session_id.clone(), messages);
+                            // Retarget the core so submits after the resume land
+                            // in the resumed session, not the one we left.
+                            let _ = commands
+                                .send(crate::console::frontend::ClientCommand::SetSession {
+                                    session_id,
+                                })
+                                .await;
+                        }
                         Err(e) => app.add_assistant_notice(format!(
                             "Failed to load session `{}`: {}",
                             session_id, e
@@ -581,7 +590,7 @@ pub(crate) async fn handle_key(
             }
             let text = app.submit().unwrap_or_default();
             if !text.is_empty() {
-                submit_text(app, text, prompt_tx, picker_tx, notice_tx, storage_dir).await;
+                submit_text(app, text, commands, picker_tx, notice_tx, storage_dir).await;
             }
         }
         (_, KeyCode::Up) if !app.slash_suggestions().is_empty() => {
@@ -613,7 +622,7 @@ pub(crate) async fn handle_key(
 pub(crate) async fn submit_text(
     app: &mut App,
     text: String,
-    prompt_tx: &mpsc::Sender<AgentRequest>,
+    commands: &mpsc::Sender<crate::console::frontend::ClientCommand>,
     picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
     notice_tx: &mpsc::Sender<String>,
     storage_dir: &std::path::Path,
@@ -664,7 +673,12 @@ pub(crate) async fn submit_text(
             let new_id = crate::session::SessionManager::create_id();
             let storage = crate::storage::FileStorage::new(storage_dir.to_path_buf());
             let _ = storage.save_session(&new_id, &[], None).await;
-            app.start_new_session(new_id);
+            app.start_new_session(new_id.clone());
+            // Retarget the core at the fresh session so the next Submit lands in
+            // it, not the one we just left.
+            let _ = commands
+                .send(crate::console::frontend::ClientCommand::SetSession { session_id: new_id })
+                .await;
         }
         "/connect" if arg_count == 1 => {
             if let Some(req) = app.start_connect() {
@@ -673,9 +687,10 @@ pub(crate) async fn submit_text(
         }
         "/compact" if arg_count == 1 => {
             app.turn_in_flight = true;
-            let _ = prompt_tx
-                .send(AgentRequest::Compact {
-                    session_id: app.session_id.clone(),
+            // The core dispatcher maps "/compact" → AgentRequest::Compact.
+            let _ = commands
+                .send(crate::console::frontend::ClientCommand::Submit {
+                    text: "/compact".to_string(),
                 })
                 .await;
         }
@@ -704,11 +719,10 @@ pub(crate) async fn submit_text(
                 app.turn_in_flight = true;
                 // A real prompt run accepts Ctrl+S injects (unlike /compact).
                 app.accepting_injects = true;
-                let _ = prompt_tx
-                    .send(AgentRequest::Prompt {
-                        session_id: app.session_id.clone(),
-                        prompt,
-                    })
+                // The expanded skill body is the prompt; the core wraps it in
+                // AgentRequest::Prompt against the current session.
+                let _ = commands
+                    .send(crate::console::frontend::ClientCommand::Submit { text: prompt })
                     .await;
             } else {
                 app.add_assistant_notice(format!(
@@ -722,11 +736,8 @@ pub(crate) async fn submit_text(
         _ => {
             app.turn_in_flight = true;
             app.accepting_injects = true;
-            let _ = prompt_tx
-                .send(AgentRequest::Prompt {
-                    session_id: app.session_id.clone(),
-                    prompt: text,
-                })
+            let _ = commands
+                .send(crate::console::frontend::ClientCommand::Submit { text })
                 .await;
         }
     }
@@ -1062,6 +1073,23 @@ mod tests {
         (p_tx, p_rx, pk_tx, pk_rx, n_tx, n_rx)
     }
 
+    /// A command channel for `submit_text` tests, which now emit
+    /// `ClientCommand`s (Submit/SetSession) instead of `AgentRequest`s.
+    fn cmd_channel() -> (
+        mpsc::Sender<crate::console::frontend::ClientCommand>,
+        mpsc::Receiver<crate::console::frontend::ClientCommand>,
+    ) {
+        mpsc::channel(8)
+    }
+
+    /// The text of a `ClientCommand::Submit`, or `None` for any other / no command.
+    fn submitted(cmd: Option<crate::console::frontend::ClientCommand>) -> Option<String> {
+        match cmd {
+            Some(crate::console::frontend::ClientCommand::Submit { text }) => Some(text),
+            _ => None,
+        }
+    }
+
     #[tokio::test]
     async fn queued_compact_routes_to_compact_request_not_prompt() {
         // Bug fix: a `/compact` typed while busy used to be enqueued and then
@@ -1069,20 +1097,22 @@ mod tests {
         // now the shared dispatcher for Enter and drain, so it must route
         // `/compact` to `AgentRequest::Compact`.
         let mut app = test_app();
-        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (_p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (cmd_tx, mut cmd_rx) = cmd_channel();
         submit_text(
             &mut app,
             "/compact".to_string(),
-            &p_tx,
+            &cmd_tx,
             &pk_tx,
             &n_tx,
             std::path::Path::new("/tmp"),
         )
         .await;
-        match p_rx.try_recv().expect("expected a Compact request") {
-            AgentRequest::Compact { .. } => {}
-            other => panic!("expected Compact, got {:?}", std::mem::discriminant(&other)),
-        }
+        assert_eq!(
+            submitted(cmd_rx.try_recv().ok()).as_deref(),
+            Some("/compact"),
+            "/compact is forwarded verbatim for the core to map to Compact"
+        );
         assert!(app.turn_in_flight, "/compact marks the turn in flight");
     }
 
@@ -1092,19 +1122,20 @@ mod tests {
         // (or emit "No models configured." when empty), never send the
         // literal string to the LLM.
         let mut app = test_app();
-        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (_p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (cmd_tx, mut cmd_rx) = cmd_channel();
         submit_text(
             &mut app,
             "/model".to_string(),
-            &p_tx,
+            &cmd_tx,
             &pk_tx,
             &n_tx,
             std::path::Path::new("/tmp"),
         )
         .await;
         assert!(
-            p_rx.try_recv().is_err(),
-            "/model must not push anything onto the agent request channel"
+            cmd_rx.try_recv().is_err(),
+            "/model is handled locally — no command crosses to the core"
         );
         assert!(!app.turn_in_flight, "/model does not start a turn");
     }
@@ -1112,20 +1143,22 @@ mod tests {
     #[tokio::test]
     async fn plain_text_routes_to_prompt_request() {
         let mut app = test_app();
-        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (_p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (cmd_tx, mut cmd_rx) = cmd_channel();
         submit_text(
             &mut app,
             "hello world".to_string(),
-            &p_tx,
+            &cmd_tx,
             &pk_tx,
             &n_tx,
             std::path::Path::new("/tmp"),
         )
         .await;
-        match p_rx.try_recv().expect("expected a Prompt request") {
-            AgentRequest::Prompt { prompt, .. } => assert_eq!(prompt, "hello world"),
-            _ => panic!("expected Prompt"),
-        }
+        assert_eq!(
+            submitted(cmd_rx.try_recv().ok()).as_deref(),
+            Some("hello world"),
+            "a plain line is forwarded as Submit for the core to wrap in Prompt"
+        );
         assert!(app.turn_in_flight);
     }
 
@@ -1151,23 +1184,22 @@ mod tests {
         // The model must receive the expanded skill body; the transcript must
         // show only the compact `/skill-name args` the user typed.
         let mut app = app_with_skill("react", "React body instructions.");
-        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (_p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (cmd_tx, mut cmd_rx) = cmd_channel();
         submit_text(
             &mut app,
             "/react fix it".to_string(),
-            &p_tx,
+            &cmd_tx,
             &pk_tx,
             &n_tx,
             std::path::Path::new("/tmp"),
         )
         .await;
-        match p_rx.try_recv().expect("expected a Prompt request") {
-            AgentRequest::Prompt { prompt, .. } => assert!(
-                prompt.contains("React body instructions."),
-                "model receives the full expanded skill body"
-            ),
-            _ => panic!("expected Prompt"),
-        }
+        assert!(
+            submitted(cmd_rx.try_recv().ok())
+                .is_some_and(|p| p.contains("React body instructions.")),
+            "model receives the full expanded skill body via Submit"
+        );
         assert_eq!(
             app.pending_user_display.as_deref(),
             Some("/react fix it"),
@@ -1182,11 +1214,12 @@ mod tests {
         // next prompt. Dispatch clears it up front.
         let mut app = test_app();
         app.pending_user_display = Some("/react stale".to_string());
-        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (_p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (cmd_tx, mut cmd_rx) = cmd_channel();
         submit_text(
             &mut app,
             "hello".to_string(),
-            &p_tx,
+            &cmd_tx,
             &pk_tx,
             &n_tx,
             std::path::Path::new("/tmp"),
@@ -1196,10 +1229,7 @@ mod tests {
             app.pending_user_display.is_none(),
             "a stale override is cleared at the top of dispatch"
         );
-        match p_rx.try_recv().expect("expected a Prompt request") {
-            AgentRequest::Prompt { prompt, .. } => assert_eq!(prompt, "hello"),
-            _ => panic!("expected Prompt"),
-        }
+        assert_eq!(submitted(cmd_rx.try_recv().ok()).as_deref(), Some("hello"));
     }
 
     fn last_notice(app: &App) -> Option<String> {
@@ -1217,20 +1247,21 @@ mod tests {
         // picker.
         let mut app = test_app();
         app.provider = String::new();
-        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (_p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (cmd_tx, mut cmd_rx) = cmd_channel();
 
         submit_text(
             &mut app,
             "hi there".to_string(),
-            &p_tx,
+            &cmd_tx,
             &pk_tx,
             &n_tx,
             std::path::Path::new("/tmp"),
         )
         .await;
         assert!(
-            p_rx.try_recv().is_err(),
-            "plain prompt must not reach the agent with no provider"
+            cmd_rx.try_recv().is_err(),
+            "plain prompt must not reach the core with no provider"
         );
         assert!(!app.turn_in_flight);
         assert_eq!(last_notice(&app).as_deref(), Some(NO_PROVIDER_HINT));
@@ -1238,7 +1269,7 @@ mod tests {
         submit_text(
             &mut app,
             "/model".to_string(),
-            &p_tx,
+            &cmd_tx,
             &pk_tx,
             &n_tx,
             std::path::Path::new("/tmp"),
@@ -1256,19 +1287,20 @@ mod tests {
         // A `/`-prefixed token that matches no command and no skill falls to
         // the unknown-command arm — a notice, never a prompt to the agent.
         let mut app = test_app();
-        let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (_p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
+        let (cmd_tx, mut cmd_rx) = cmd_channel();
         submit_text(
             &mut app,
             "/nope".to_string(),
-            &p_tx,
+            &cmd_tx,
             &pk_tx,
             &n_tx,
             std::path::Path::new("/tmp"),
         )
         .await;
         assert!(
-            p_rx.try_recv().is_err(),
-            "unknown command must not be sent to the agent"
+            cmd_rx.try_recv().is_err(),
+            "unknown command must not cross to the core"
         );
         assert!(!app.turn_in_flight);
         assert_eq!(
@@ -1297,12 +1329,13 @@ mod tests {
         let mut app = test_app();
         app.provider = String::new();
         app.skills = Some(Arc::new(reg));
-        let (p_tx, _p_rx, pk_tx, mut pk_rx, n_tx, _n_rx) = channels();
+        let (_p_tx, _p_rx, pk_tx, mut pk_rx, n_tx, _n_rx) = channels();
+        let (cmd_tx, _cmd_rx) = cmd_channel();
 
         submit_text(
             &mut app,
             "/connect".to_string(),
-            &p_tx,
+            &cmd_tx,
             &pk_tx,
             &n_tx,
             std::path::Path::new("/tmp"),
