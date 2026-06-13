@@ -15,8 +15,8 @@ use tokio::sync::mpsc;
 use crate::console::app::{App, UIBlock};
 use crate::console::format::AgentRequest;
 use crate::console::frontend::{
-    local_tui, Acceptor, ClientCommand, ClientRequest, FrontendHub, Outbound, ReplyAnswer,
-    RequestBroker,
+    local_tui, Acceptor, ClientCommand, ClientRequest, CommandOutcome, ControlSignal, FrontendHub,
+    Outbound, ReplyAnswer, RequestBroker,
 };
 use crate::console::inline_picker;
 use crate::console::keys::{handle_key, ActiveInject};
@@ -428,7 +428,12 @@ pub async fn run_console(
     let mut acceptor = Acceptor::new();
     acceptor.attach(Box::new(local_port));
     let hub = FrontendHub::new(app.session_id.clone(), acceptor, RequestBroker::new());
-    tokio::spawn(drive_frontend_core(hub, agent_rx, tool_picker_rx));
+    tokio::spawn(drive_frontend_core(
+        hub,
+        agent_rx,
+        tool_picker_rx,
+        cancel_tx,
+    ));
 
     // The in-progress block's already-streamed row count lives on `app`
     // (`app.committed_rows`) so a session reset (`/clear`, `/resume`) resets it
@@ -456,7 +461,6 @@ pub async fn run_console(
         update_check_rx,
         render_hook_queue,
         prompt_tx,
-        cancel_tx,
         local_picker_tx,
         notice_tx,
         active_inject,
@@ -495,13 +499,14 @@ pub async fn run_console(
 /// frontend's picker answers back onto the blocked tools' oneshots via the
 /// broker. Runs until the frontend disconnects with no successor.
 ///
-/// In this phase the frontend only sends `Reply` through the hub (submit /
-/// cancel / inject still travel their direct channels), so every other
-/// [`CommandOutcome`](crate::console::frontend::CommandOutcome) is a no-op here.
+/// `Reply` is resolved against the broker inside `handle_command`; `Cancel` is
+/// forwarded to the agent task's cancel channel here. `Submit` / `Inject` still
+/// travel their direct channels in this phase, so those outcomes are no-ops.
 async fn drive_frontend_core(
     mut hub: FrontendHub,
     mut agent_rx: mpsc::Receiver<AgentEvent>,
     mut tool_picker_rx: mpsc::Receiver<crate::console::picker::PickerRequest>,
+    cancel_tx: mpsc::Sender<()>,
 ) {
     // `CoreWake` dodges the select-arm borrow: only `next_command` borrows
     // `hub` inside the select, and every arm future is dropped before the match
@@ -514,9 +519,14 @@ async fn drive_frontend_core(
             Some(req) = tool_picker_rx.recv() => CoreWake::Request(req),
         };
         match wake {
-            // `Reply` is resolved against the broker inside `handle_command`.
             CoreWake::Command(Some(cmd)) => {
-                let _ = hub.handle_command(cmd);
+                // `Reply` is resolved inside `handle_command`; `Cancel` forwards
+                // to the agent task (which drains stale cancels at each prompt's
+                // start, so an inter-turn cancel is harmless — no gating needed).
+                // Submit / Inject / Shutdown aren't routed through the hub yet.
+                if let CommandOutcome::Control(ControlSignal::Cancel) = hub.handle_command(cmd) {
+                    let _ = cancel_tx.try_send(());
+                }
             }
             // Frontend disconnected with no successor — nothing left to drive.
             CoreWake::Command(None) => break,
@@ -590,7 +600,6 @@ struct ConsoleLoop {
         Option<tokio::sync::oneshot::Receiver<Option<crate::cli::upgrade::UpdateNotice>>>,
     render_hook_queue: mpsc::Sender<RenderJob>,
     prompt_tx: mpsc::Sender<AgentRequest>,
-    cancel_tx: mpsc::Sender<()>,
     /// Sender half of [`Self::local_picker_rx`] — handed to the key handlers so
     /// `/connect`'s multi-step flow can open its next picker locally.
     local_picker_tx: mpsc::Sender<crate::console::picker::PickerRequest>,
@@ -759,7 +768,6 @@ impl ConsoleLoop {
                         &mut self.app,
                         key,
                         &self.prompt_tx,
-                        &self.cancel_tx,
                         &self.active_inject,
                         &self.ui_storage_dir,
                         &self.local_picker_tx,
@@ -1240,11 +1248,12 @@ mod tests {
 
         let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (tool_tx, tool_rx) = mpsc::channel::<PickerRequest>(4);
+        let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
         let (local_port, mut handle) = local_tui(8);
         let mut acceptor = Acceptor::new();
         acceptor.attach(Box::new(local_port));
         let hub = FrontendHub::new("s1".to_string(), acceptor, RequestBroker::new());
-        let driver = tokio::spawn(drive_frontend_core(hub, agent_rx, tool_rx));
+        let driver = tokio::spawn(drive_frontend_core(hub, agent_rx, tool_rx, cancel_tx));
 
         // 1) An agent event reaches the frontend verbatim as `Outbound::Event`.
         agent_tx.send(AgentEvent::TurnStart).await.unwrap();
@@ -1283,7 +1292,17 @@ mod tests {
             PickerResponse::Answered(v) if v == vec![PickerAnswer::Single("ok".to_string())]
         ));
 
-        // 3) Dropping the frontend ends the driver (disconnect, no successor).
+        // 3) A `Cancel` command is forwarded to the agent task's cancel channel.
+        handle.commands.send(ClientCommand::Cancel).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), cancel_rx.recv())
+                .await
+                .expect("cancel forwarded within timeout")
+                .is_some(),
+            "ClientCommand::Cancel reaches the agent task's cancel channel"
+        );
+
+        // 4) Dropping the frontend ends the driver (disconnect, no successor).
         drop(handle);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
     }

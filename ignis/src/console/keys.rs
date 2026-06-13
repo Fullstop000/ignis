@@ -205,7 +205,6 @@ pub(crate) async fn handle_key(
     app: &mut App,
     key: KeyEvent,
     prompt_tx: &mpsc::Sender<AgentRequest>,
-    cancel_tx: &mpsc::Sender<()>,
     active_inject: &ActiveInject,
     storage_dir: &std::path::Path,
     picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
@@ -306,10 +305,15 @@ pub(crate) async fn handle_key(
             if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
         {
             app.clear_exit_hint();
-            // Only cancellable while a prompt run is live. The resulting TurnEnd
-            // drives the state transition + drain (keeps the queue).
-            if active_inject.lock().unwrap().is_some() {
-                let _ = cancel_tx.try_send(());
+            // Only meaningful while a turn is in flight. The core forwards the
+            // command to the agent's cancel channel; the resulting TurnEnd drives
+            // the state transition + drain (keeps the queue). `turn_in_flight` is
+            // set synchronously at submit (no event-lag race), and a cancel that
+            // lands between turns is drained by the agent at the next prompt's
+            // start — so this is safe to send whenever a turn is dispatched.
+            // `try_send`: answering a keypress must never block the handler.
+            if app.turn_in_flight {
+                let _ = commands.try_send(crate::console::frontend::ClientCommand::Cancel);
             }
             return;
         }
@@ -1340,14 +1344,12 @@ mod tests {
         app.show_skill_picker();
 
         let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
-        let (c_tx, _c_rx) = mpsc::channel::<()>(1);
         let (cmd_tx, _cmd_rx) = mpsc::channel(8);
         let inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
             &p_tx,
-            &c_tx,
             &inject,
             std::path::Path::new("/tmp"),
             &pk_tx,
@@ -1380,14 +1382,12 @@ mod tests {
 
     async fn press_ctrl_o(app: &mut App) {
         let (p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
-        let (c_tx, _c_rx) = mpsc::channel::<()>(1);
         let (cmd_tx, _cmd_rx) = mpsc::channel(8);
         let inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
         handle_key(
             app,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
             &p_tx,
-            &c_tx,
             &inject,
             std::path::Path::new("/tmp"),
             &pk_tx,
