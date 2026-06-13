@@ -14,6 +14,10 @@ use tokio::sync::mpsc;
 
 use crate::console::app::{App, UIBlock};
 use crate::console::format::AgentRequest;
+use crate::console::frontend::{
+    local_tui, Acceptor, ClientCommand, ClientRequest, FrontendHub, Outbound, ReplyAnswer,
+    RequestBroker,
+};
 use crate::console::inline_picker;
 use crate::console::keys::{handle_key, ActiveInject};
 use crate::console::render::anchor::{self, Anchor, ClearOutcome, Wipe};
@@ -191,11 +195,20 @@ pub async fn run_console(
     let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
     let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
-    // Tool → console: the `ask_user` tool sends a PickerRequest when the model
-    // wants to ask the user something mid-turn. Capacity 4 — pickers serialize
-    // (one open at a time); the buffer just decouples send from console drain.
-    let (picker_tx, picker_rx) = mpsc::channel::<crate::console::picker::PickerRequest>(4);
-    let picker_tx_runner = picker_tx.clone();
+    // Two picker channels, split by origin (capacity 4 — pickers serialize, one
+    // open at a time; the buffer just decouples send from drain):
+    //   * `tool_picker_*` — the `ask_user` tool and the permission gate
+    //     (core side). These ride the `FrontendHub`/`RequestBroker` so the
+    //     answer correlates back to the blocked tool by id — the same path an
+    //     out-of-process frontend will use.
+    //   * `local_picker_*` — frontend-originated pickers (`/connect`, `/afk`,
+    //     `/telemetry`) whose reply logic runs in the frontend itself; they
+    //     open directly with a local oneshot and never cross the core boundary.
+    let (tool_picker_tx, tool_picker_rx) =
+        mpsc::channel::<crate::console::picker::PickerRequest>(4);
+    let picker_tx_runner = tool_picker_tx;
+    let (local_picker_tx, local_picker_rx) =
+        mpsc::channel::<crate::console::picker::PickerRequest>(4);
     // Picker reply confirmation channel: handlers that run in `tokio::spawn`
     // (telemetry, AFK) can't reach `app.add_assistant_notice` directly, so
     // they send the confirm string here and the main loop drains it.
@@ -405,6 +418,18 @@ pub async fn run_console(
         }
     });
 
+    // Frontend seam (PR #174, phase 1). The core drives a `FrontendHub` over a
+    // `LocalTuiPort`; the ratatui loop below holds the matching `TuiHandle`.
+    // Agent events and tool-picker requests flow core→frontend as `Outbound`
+    // frames; the frontend's picker answers flow back as `ClientCommand::Reply`,
+    // which the broker correlates to the blocked tool's oneshot. Submit / cancel
+    // / inject still travel their direct channels in this phase.
+    let (local_port, tui_handle) = local_tui(256);
+    let mut acceptor = Acceptor::new();
+    acceptor.attach(Box::new(local_port));
+    let hub = FrontendHub::new(app.session_id.clone(), acceptor, RequestBroker::new());
+    tokio::spawn(drive_frontend_core(hub, agent_rx, tool_picker_rx));
+
     // The in-progress block's already-streamed row count lives on `app`
     // (`app.committed_rows`) so a session reset (`/clear`, `/resume`) resets it
     // in lockstep with `app.committed` — see reset_transcript_view.
@@ -424,14 +449,15 @@ pub async fn run_console(
         scrollback_replay: None,
         app,
         terminal,
-        agent_rx,
-        picker_rx,
+        outbound: tui_handle.outbound,
+        commands: tui_handle.commands,
+        local_picker_rx,
         notice_rx,
         update_check_rx,
         render_hook_queue,
         prompt_tx,
         cancel_tx,
-        picker_tx,
+        local_picker_tx,
         notice_tx,
         active_inject,
         ui_storage_dir,
@@ -464,6 +490,42 @@ pub async fn run_console(
     Ok(())
 }
 
+/// The core driver (PR #174, phase 1). Bridges agent events and tool-initiated
+/// picker requests to the active frontend through `hub`, and resolves the
+/// frontend's picker answers back onto the blocked tools' oneshots via the
+/// broker. Runs until the frontend disconnects with no successor.
+///
+/// In this phase the frontend only sends `Reply` through the hub (submit /
+/// cancel / inject still travel their direct channels), so every other
+/// [`CommandOutcome`](crate::console::frontend::CommandOutcome) is a no-op here.
+async fn drive_frontend_core(
+    mut hub: FrontendHub,
+    mut agent_rx: mpsc::Receiver<AgentEvent>,
+    mut tool_picker_rx: mpsc::Receiver<crate::console::picker::PickerRequest>,
+) {
+    // `CoreWake` dodges the select-arm borrow: only `next_command` borrows
+    // `hub` inside the select, and every arm future is dropped before the match
+    // touches `hub` again (mirrors `ConsoleLoop::wake`).
+    loop {
+        let wake = tokio::select! {
+            biased;
+            cmd = hub.next_command() => CoreWake::Command(cmd),
+            Some(ev) = agent_rx.recv() => CoreWake::Event(ev),
+            Some(req) = tool_picker_rx.recv() => CoreWake::Request(req),
+        };
+        match wake {
+            // `Reply` is resolved against the broker inside `handle_command`.
+            CoreWake::Command(Some(cmd)) => {
+                let _ = hub.handle_command(cmd);
+            }
+            // Frontend disconnected with no successor — nothing left to drive.
+            CoreWake::Command(None) => break,
+            CoreWake::Event(ev) => hub.emit_event(ev).await,
+            CoreWake::Request(req) => hub.open_request(req).await,
+        }
+    }
+}
+
 /// Redraw cadence for the live band: agent events and keystrokes are coalesced
 /// between frames and the screen is redrawn at most once per interval, so a
 /// fast token stream never triggers a redraw per delta — which tears/flickers
@@ -474,10 +536,22 @@ const FRAME: std::time::Duration = std::time::Duration::from_millis(33);
 enum Wake {
     /// Frame deadline: nothing arrived, just tick/draw.
     Tick,
-    /// An agent event from the background runner.
+    /// A frame from the core: an agent event or a tool-initiated picker
+    /// request (or a snapshot, unused with a single local frontend).
+    Frame(Outbound),
+    /// A frontend-originated picker (`/connect`, `/afk`, `/telemetry`) opened
+    /// over the local channel — never crosses the core boundary.
+    LocalPicker(crate::console::picker::PickerRequest),
+}
+
+/// What woke the core driver task (the `FrontendHub` side; see `run_console`).
+enum CoreWake {
+    /// An upstream command from the active frontend (`None` = disconnected).
+    Command(Option<ClientCommand>),
+    /// A streaming agent event to forward to the frontend.
     Event(AgentEvent),
-    /// An `ask_user`/permission picker request from a tool.
-    Picker(crate::console::picker::PickerRequest),
+    /// A tool-initiated picker request to bridge through the broker.
+    Request(crate::console::picker::PickerRequest),
 }
 
 /// The live console: `App` (the UI model), the inline terminal, the `Anchor`
@@ -502,15 +576,24 @@ struct ConsoleLoop {
     /// from an active stream at the new width.
     scrollback_replay: Option<usize>,
     last_draw: std::time::Instant,
-    agent_rx: mpsc::Receiver<AgentEvent>,
-    picker_rx: mpsc::Receiver<crate::console::picker::PickerRequest>,
+    /// Core → frontend frames (agent events, tool picker requests, snapshots),
+    /// delivered through the `FrontendHub`'s `LocalTuiPort`.
+    outbound: mpsc::Receiver<Outbound>,
+    /// Frontend → core commands. Used here only to answer a tool-initiated
+    /// picker with a `ClientCommand::Reply` (see `keys::reply_picker`).
+    commands: mpsc::Sender<ClientCommand>,
+    /// Frontend-originated picker requests (`/connect`, `/afk`, `/telemetry`),
+    /// opened locally with a oneshot reply — distinct from the core boundary.
+    local_picker_rx: mpsc::Receiver<crate::console::picker::PickerRequest>,
     notice_rx: mpsc::Receiver<String>,
     update_check_rx:
         Option<tokio::sync::oneshot::Receiver<Option<crate::cli::upgrade::UpdateNotice>>>,
     render_hook_queue: mpsc::Sender<RenderJob>,
     prompt_tx: mpsc::Sender<AgentRequest>,
     cancel_tx: mpsc::Sender<()>,
-    picker_tx: mpsc::Sender<crate::console::picker::PickerRequest>,
+    /// Sender half of [`Self::local_picker_rx`] — handed to the key handlers so
+    /// `/connect`'s multi-step flow can open its next picker locally.
+    local_picker_tx: mpsc::Sender<crate::console::picker::PickerRequest>,
     notice_tx: mpsc::Sender<String>,
     active_inject: ActiveInject,
     ui_storage_dir: PathBuf,
@@ -547,18 +630,30 @@ impl ConsoleLoop {
         Ok(())
     }
 
-    /// Park until there's work: the next frame deadline, an agent event, or an
-    /// `ask_user` picker request from a tool.
+    /// Park until there's work: the next frame deadline, a core frame, or a
+    /// frontend-originated picker request.
     async fn wake(&mut self) {
         let wake = tokio::select! {
             _ = tokio::time::sleep(FRAME) => Wake::Tick,
-            Some(ev) = self.agent_rx.recv() => Wake::Event(ev),
-            Some(req) = self.picker_rx.recv() => Wake::Picker(req),
+            Some(frame) = self.outbound.recv() => Wake::Frame(frame),
+            Some(req) = self.local_picker_rx.recv() => Wake::LocalPicker(req),
         };
         match wake {
             Wake::Tick => {}
-            Wake::Event(ev) => self.on_agent_event(ev),
-            Wake::Picker(req) => self.open_picker(req),
+            Wake::Frame(frame) => self.on_frame(frame),
+            Wake::LocalPicker(req) => self.open_local_picker(req),
+        }
+    }
+
+    /// Apply one core → frontend frame to the UI model.
+    fn on_frame(&mut self, frame: Outbound) {
+        match frame {
+            Outbound::Event(ev) => self.on_agent_event(*ev),
+            Outbound::Request(req) => self.open_request(req),
+            // A snapshot only arrives on a FIFO handover to a freshly-promoted
+            // frontend. With a single in-process TUI there is no successor, so
+            // this is unreachable today; ignore it rather than invent state.
+            Outbound::Snapshot(_) => {}
         }
     }
 
@@ -573,23 +668,38 @@ impl ConsoleLoop {
         self.app.handle_event(ev);
     }
 
-    /// Open a tool-initiated picker — one at a time; a second request is
-    /// rejected so the tool returns an error instead of stalling.
-    fn open_picker(&mut self, req: crate::console::picker::PickerRequest) {
+    /// Open a tool-initiated picker delivered over the frontend protocol — one
+    /// at a time. A second request is refused with a `Cancelled` reply so the
+    /// blocked tool fails fast instead of stalling.
+    fn open_request(&mut self, req: ClientRequest) {
+        if self.app.inline_picker.is_some() {
+            let _ = self.commands.try_send(ClientCommand::Reply {
+                id: req.id,
+                answer: ReplyAnswer::Cancelled,
+            });
+        } else {
+            self.app.inline_picker = Some(inline_picker::InlinePickerState::from_request(req));
+        }
+    }
+
+    /// Open a frontend-originated picker (`/connect`, `/afk`, `/telemetry`),
+    /// which replies on its own oneshot. Same one-at-a-time rule as
+    /// [`Self::open_request`].
+    fn open_local_picker(&mut self, req: crate::console::picker::PickerRequest) {
         if self.app.inline_picker.is_some() {
             let _ = req
                 .reply
                 .send(crate::console::picker::PickerResponse::Cancelled);
         } else {
-            self.app.inline_picker = Some(inline_picker::InlinePickerState::new(req));
+            self.app.inline_picker = Some(inline_picker::InlinePickerState::local(req));
         }
     }
 
-    /// Drain everything else pending — agent events, picker-spawn notices, the
-    /// auto-update oneshot, queued picker requests. State only, no draw.
+    /// Drain everything else pending — core frames, picker-spawn notices, the
+    /// auto-update oneshot, queued local picker requests. State only, no draw.
     fn drain_events(&mut self) {
-        while let Ok(ev) = self.agent_rx.try_recv() {
-            self.on_agent_event(ev);
+        while let Ok(frame) = self.outbound.try_recv() {
+            self.on_frame(frame);
         }
         while let Ok(msg) = self.notice_rx.try_recv() {
             self.app.add_assistant_notice(msg);
@@ -608,8 +718,8 @@ impl ConsoleLoop {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
         }
-        while let Ok(req) = self.picker_rx.try_recv() {
-            self.open_picker(req);
+        while let Ok(req) = self.local_picker_rx.try_recv() {
+            self.open_local_picker(req);
         }
     }
 
@@ -631,7 +741,7 @@ impl ConsoleLoop {
                     &mut self.app,
                     text,
                     &self.prompt_tx,
-                    &self.picker_tx,
+                    &self.local_picker_tx,
                     &self.notice_tx,
                     &self.ui_storage_dir,
                 )
@@ -652,8 +762,9 @@ impl ConsoleLoop {
                         &self.cancel_tx,
                         &self.active_inject,
                         &self.ui_storage_dir,
-                        &self.picker_tx,
+                        &self.local_picker_tx,
                         &self.notice_tx,
+                        &self.commands,
                     )
                     .await;
                 }
@@ -1105,6 +1216,77 @@ mod tests {
     use crate::{AgentEvent, Message};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    /// The core driver (PR #174, phase 1) end to end over the real
+    /// `LocalTuiPort`: an agent event reaches the frontend as `Outbound::Event`,
+    /// a tool picker request surfaces as `Outbound::Request`, and the frontend's
+    /// `ClientCommand::Reply` resolves the blocked tool's oneshot by id.
+    #[tokio::test]
+    async fn core_driver_forwards_events_and_resolves_picker_replies() {
+        use crate::console::picker::{PickerAnswer, PickerQuestion, PickerRequest, PickerResponse};
+
+        fn question() -> PickerQuestion {
+            PickerQuestion {
+                question: "proceed?".to_string(),
+                kind: "ask_user".to_string(),
+                header: "Q".to_string(),
+                multi_select: false,
+                options: vec![],
+                allow_other: true,
+                text_input: false,
+                mask: false,
+            }
+        }
+
+        let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (tool_tx, tool_rx) = mpsc::channel::<PickerRequest>(4);
+        let (local_port, mut handle) = local_tui(8);
+        let mut acceptor = Acceptor::new();
+        acceptor.attach(Box::new(local_port));
+        let hub = FrontendHub::new("s1".to_string(), acceptor, RequestBroker::new());
+        let driver = tokio::spawn(drive_frontend_core(hub, agent_rx, tool_rx));
+
+        // 1) An agent event reaches the frontend verbatim as `Outbound::Event`.
+        agent_tx.send(AgentEvent::TurnStart).await.unwrap();
+        assert!(matches!(
+            handle.outbound.recv().await,
+            Some(Outbound::Event(e)) if matches!(*e, AgentEvent::TurnStart)
+        ));
+
+        // 2) A tool picker request surfaces as `Outbound::Request`; the
+        //    frontend's `Reply` resolves the blocked tool's oneshot.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tool_tx
+            .send(PickerRequest {
+                questions: vec![question()],
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let id = match handle.outbound.recv().await {
+            Some(Outbound::Request(req)) => {
+                assert_eq!(req.questions.len(), 1);
+                req.id
+            }
+            other => panic!("expected Outbound::Request, got {other:?}"),
+        };
+        handle
+            .commands
+            .send(ClientCommand::Reply {
+                id,
+                answer: ReplyAnswer::Answered(vec![PickerAnswer::Single("ok".to_string())]),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            PickerResponse::Answered(v) if v == vec![PickerAnswer::Single("ok".to_string())]
+        ));
+
+        // 3) Dropping the frontend ends the driver (disconnect, no successor).
+        drop(handle);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
+    }
 
     #[test]
     fn quote_session_id_keeps_generated_ids_bare_and_quotes_unsafe() {

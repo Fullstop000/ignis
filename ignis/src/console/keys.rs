@@ -170,6 +170,36 @@ macro_rules! toggle_picker {
     };
 }
 
+/// Route a closed picker's answer back to whoever asked. A frontend-internal
+/// picker (`/connect`, `/afk`, `/telemetry`) fires its local oneshot; a
+/// tool-initiated one — bridged across the frontend protocol — replies with a
+/// `ClientCommand::Reply` so the [`RequestBroker`] can resolve the blocked
+/// tool's oneshot by id.
+///
+/// `try_send` (not `await`): answering must never block the key handler, since
+/// a stalled command channel would also stall the frontend draining `outbound`
+/// and deadlock the core driver. The buffer holds far more than the one reply a
+/// single open picker can produce, so a full channel is not a real case.
+///
+/// [`RequestBroker`]: crate::console::frontend::RequestBroker
+fn reply_picker(
+    reply: inline_picker::PickerReply,
+    response: crate::console::picker::PickerResponse,
+    commands: &mpsc::Sender<crate::console::frontend::ClientCommand>,
+) {
+    match reply {
+        inline_picker::PickerReply::Local(tx) => {
+            let _ = tx.send(response);
+        }
+        inline_picker::PickerReply::Request(id) => {
+            let _ = commands.try_send(crate::console::frontend::ClientCommand::Reply {
+                id,
+                answer: response.into(),
+            });
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_key(
     app: &mut App,
@@ -180,6 +210,11 @@ pub(crate) async fn handle_key(
     storage_dir: &std::path::Path,
     picker_tx: &mpsc::Sender<crate::console::picker::PickerRequest>,
     notice_tx: &mpsc::Sender<String>,
+    // Frontend → core channel, used here only to answer a tool-initiated
+    // picker (`ask_user`/permission) via `ClientCommand::Reply`. Frontend-
+    // internal pickers (`/connect`, `/afk`, `/telemetry`) reply on their own
+    // oneshot instead — see [`reply_picker`].
+    commands: &mpsc::Sender<crate::console::frontend::ClientCommand>,
 ) {
     // Inline (tool-initiated) picker captures ALL keys while open, including
     // ESC and Ctrl+C — must come before global handlers and the busy-mode
@@ -192,10 +227,8 @@ pub(crate) async fn handle_key(
         match outcome {
             KeyOutcome::Continue => {}
             KeyOutcome::Cancel => {
-                if let Some(mut picker) = app.inline_picker.take() {
-                    if let Some(reply) = picker.reply.take() {
-                        let _ = reply.send(PickerResponse::Cancelled);
-                    }
+                if let Some(picker) = app.inline_picker.take() {
+                    reply_picker(picker.reply, PickerResponse::Cancelled, commands);
                 }
                 // If the user cancelled mid-`/connect`, drop the draft so the
                 // next /connect starts clean. Tool-initiated cancels (no
@@ -203,10 +236,12 @@ pub(crate) async fn handle_key(
                 app.cancel_connect();
             }
             KeyOutcome::Done(answers) => {
-                if let Some(mut picker) = app.inline_picker.take() {
-                    if let Some(reply) = picker.reply.take() {
-                        let _ = reply.send(PickerResponse::Answered(answers.clone()));
-                    }
+                if let Some(picker) = app.inline_picker.take() {
+                    reply_picker(
+                        picker.reply,
+                        PickerResponse::Answered(answers.clone()),
+                        commands,
+                    );
                 }
                 // Multi-step `/connect`: route the answer back into the draft
                 // state machine. The advance returns the next picker to open
@@ -963,6 +998,44 @@ mod tests {
     use std::path::PathBuf;
     use tokio::sync::mpsc;
 
+    #[tokio::test]
+    async fn reply_picker_local_fires_oneshot_and_sends_no_command() {
+        use crate::console::picker::{PickerAnswer, PickerResponse};
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        reply_picker(
+            inline_picker::PickerReply::Local(tx),
+            PickerResponse::Answered(vec![PickerAnswer::Single("ok".to_string())]),
+            &cmd_tx,
+        );
+        // A local picker resolves its own oneshot and crosses no boundary.
+        assert!(matches!(
+            rx.await.unwrap(),
+            PickerResponse::Answered(v) if v == vec![PickerAnswer::Single("ok".to_string())]
+        ));
+        assert!(cmd_rx.try_recv().is_err(), "no command should be emitted");
+    }
+
+    #[tokio::test]
+    async fn reply_picker_request_emits_client_command_reply() {
+        use crate::console::frontend::{ClientCommand, ReplyAnswer};
+        use crate::console::picker::PickerResponse;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        reply_picker(
+            inline_picker::PickerReply::Request(42),
+            PickerResponse::Cancelled,
+            &cmd_tx,
+        );
+        // A tool-initiated picker bridges its answer back as a correlated Reply.
+        match cmd_rx.try_recv().expect("a reply command") {
+            ClientCommand::Reply { id, answer } => {
+                assert_eq!(id, 42);
+                assert!(matches!(answer, ReplyAnswer::Cancelled));
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
     fn test_app() -> App {
         App::new(
             "test-provider".to_string(),
@@ -1268,6 +1341,7 @@ mod tests {
 
         let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
         let (c_tx, _c_rx) = mpsc::channel::<()>(1);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
         let inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
         handle_key(
             &mut app,
@@ -1278,6 +1352,7 @@ mod tests {
             std::path::Path::new("/tmp"),
             &pk_tx,
             &n_tx,
+            &cmd_tx,
         )
         .await;
 
@@ -1306,6 +1381,7 @@ mod tests {
     async fn press_ctrl_o(app: &mut App) {
         let (p_tx, _p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
         let (c_tx, _c_rx) = mpsc::channel::<()>(1);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
         let inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
         handle_key(
             app,
@@ -1316,6 +1392,7 @@ mod tests {
             std::path::Path::new("/tmp"),
             &pk_tx,
             &n_tx,
+            &cmd_tx,
         )
         .await;
     }

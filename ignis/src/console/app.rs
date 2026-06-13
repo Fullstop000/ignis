@@ -1612,7 +1612,7 @@ mod connect_tests {
         let mut app = fresh_app();
         // Fake an existing picker (simulate `/afk` being mid-flight).
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        app.inline_picker = Some(crate::console::inline_picker::InlinePickerState::new(
+        app.inline_picker = Some(crate::console::inline_picker::InlinePickerState::local(
             crate::console::picker::PickerRequest {
                 questions: vec![crate::console::picker::PickerQuestion {
                     question: "x".into(),
