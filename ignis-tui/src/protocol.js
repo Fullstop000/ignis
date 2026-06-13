@@ -70,7 +70,7 @@ function reduceEvent(state, ev) {
       return {
         ...state,
         blocks: state.blocks.map((b) =>
-          b.kind === 'tool' && b.id === p.tool_call_id ? { ...b, done: true } : b,
+          b.kind === 'tool' && b.id === p.tool_call_id ? { ...b, done: true, result: p.result } : b,
         ),
       };
     case 'warning':
@@ -114,6 +114,18 @@ export function toolArgsSummary(argsJson, cap = 80) {
 
 function clip(s, cap) {
   return s.length > cap ? s.slice(0, cap - 1) + '…' : s;
+}
+
+/**
+ * Tool-result preview: the first few lines of `content` plus a "… N more lines"
+ * count, mirroring the ratatui tool block (3 lines for success, 5 for errors).
+ */
+export function toolOutputPreview(content, isError = false) {
+  const text = (content ?? '').replace(/\s+$/, '');
+  if (!text) return { lines: [], more: 0 };
+  const cap = isError ? 5 : 3;
+  const all = text.split('\n');
+  return { lines: all.slice(0, cap), more: Math.max(0, all.length - cap) };
 }
 
 // ── ClientCommand builders (return objects to JSON.stringify onto the wire) ──

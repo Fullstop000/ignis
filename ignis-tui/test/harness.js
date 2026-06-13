@@ -62,8 +62,10 @@ export function plain(frame) {
   return (frame ?? '').replace(/\x1b\[[0-9;]*m/g, '');
 }
 
-/** Let queued React state updates / effects flush. */
-export const tick = (ms = 5) => new Promise((r) => setTimeout(r, ms));
+/** Let queued React state updates / effects flush. Generous enough to stay
+ *  reliable when `node --test` runs files in parallel (CPU contention can delay
+ *  Ink's re-render past a too-short timeout). */
+export const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
 // ── Outbound frame builders (mirror the engine's wire shapes) ──
 export const ev = (type, payload) => ({ kind: 'event', data: payload === undefined ? { type } : { type, payload } });

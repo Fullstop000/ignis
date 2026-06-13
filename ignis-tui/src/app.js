@@ -24,6 +24,7 @@ import {
   answered,
   answerCancelled,
   toolArgsSummary,
+  toolOutputPreview,
 } from './protocol.js';
 import { parseMarkdown } from './markdown.js';
 
@@ -32,7 +33,11 @@ const e = React.createElement;
 export default function App({ engine }) {
   const { exit } = useApp();
   const [state, setState] = useState(initialState());
-  const [input, setInput] = useState('');
+  // Composer text + caret in one object so every edit is an atomic functional
+  // update (no stale-closure splits under fast input).
+  const [comp, setComp] = useState({ text: '', cursor: 0 });
+  const [history, setHistory] = useState([]);
+  const [histIdx, setHistIdx] = useState(-1); // -1 = editing live (not recalling)
 
   useEffect(() => {
     engine.onFrame((frame) => setState((s) => reduceOutbound(s, frame)));
@@ -41,6 +46,10 @@ export default function App({ engine }) {
 
   const req = state.request;
   const clearRequest = () => setState((s) => ({ ...s, request: null }));
+  const resetComposer = () => {
+    setComp({ text: '', cursor: 0 });
+    setHistIdx(-1);
+  };
 
   useInput((ch, key) => {
     // While a picker is open it owns all keys (PickerFlow has its own useInput).
@@ -55,24 +64,76 @@ export default function App({ engine }) {
       return;
     }
     if (key.ctrl && ch === 's') {
-      if (input.trim()) {
-        engine.send(inject(input));
-        setInput('');
+      if (comp.text.trim()) {
+        engine.send(inject(comp.text));
+        resetComposer();
       }
       return;
     }
     if (key.return) {
-      if (input.trim()) {
-        engine.send(submit(input));
-        setInput('');
+      const t = comp.text;
+      if (t.trim()) {
+        engine.send(submit(t));
+        setHistory((h) => [...h, t]);
+        resetComposer();
       }
       return;
     }
-    if (key.backspace || key.delete) {
-      setInput((t) => t.slice(0, -1));
+    // History recall (↑/↓), matching ratatui.
+    if (key.upArrow) {
+      if (!history.length) return;
+      const ni = histIdx < 0 ? history.length - 1 : Math.max(0, histIdx - 1);
+      setHistIdx(ni);
+      setComp({ text: history[ni], cursor: history[ni].length });
       return;
     }
-    if (ch && !key.ctrl && !key.meta) setInput((t) => t + ch);
+    if (key.downArrow) {
+      if (histIdx < 0) return;
+      const ni = histIdx + 1;
+      if (ni >= history.length) resetComposer();
+      else {
+        setHistIdx(ni);
+        setComp({ text: history[ni], cursor: history[ni].length });
+      }
+      return;
+    }
+    // Cursor movement + line editing (Ctrl+A/E/U/W), matching ratatui's apply_edit_key.
+    if (key.leftArrow) {
+      setComp((c) => ({ ...c, cursor: Math.max(0, c.cursor - 1) }));
+      return;
+    }
+    if (key.rightArrow) {
+      setComp((c) => ({ ...c, cursor: Math.min(c.text.length, c.cursor + 1) }));
+      return;
+    }
+    if (key.ctrl && ch === 'a') {
+      setComp((c) => ({ ...c, cursor: 0 }));
+      return;
+    }
+    if (key.ctrl && ch === 'e') {
+      setComp((c) => ({ ...c, cursor: c.text.length }));
+      return;
+    }
+    if (key.ctrl && ch === 'u') {
+      resetComposer();
+      return;
+    }
+    if (key.ctrl && ch === 'w') {
+      setComp(deleteWordBefore);
+      return;
+    }
+    // Delete before the caret. Ink maps the common Backspace byte (\x7f) to
+    // `key.delete` (and \x08 to `key.backspace`), and can't distinguish it from
+    // the Delete key — so both flags do backspace, the overwhelmingly common case.
+    if (key.backspace || key.delete) {
+      setComp((c) =>
+        c.cursor > 0 ? { text: c.text.slice(0, c.cursor - 1) + c.text.slice(c.cursor), cursor: c.cursor - 1 } : c,
+      );
+      return;
+    }
+    if (ch && !key.ctrl && !key.meta) {
+      setComp((c) => ({ text: c.text.slice(0, c.cursor) + ch + c.text.slice(c.cursor), cursor: c.cursor + ch.length }));
+    }
   });
 
   const children = [];
@@ -82,9 +143,17 @@ export default function App({ engine }) {
     req
       ? // Key by request id so a fresh request resets the flow's internal state.
         e(PickerFlow, { key: `picker-${req.id}`, req, engine, onDone: clearRequest })
-      : e(Composer, { key: 'composer', input, status: state.status }),
+      : e(Composer, { key: 'composer', text: comp.text, cursor: comp.cursor, status: state.status }),
   );
   return e(Box, { flexDirection: 'column' }, children);
+}
+
+/** Ctrl+W: delete the word (and any spaces) before the caret. */
+function deleteWordBefore(c) {
+  let i = c.cursor;
+  while (i > 0 && c.text[i - 1] === ' ') i--;
+  while (i > 0 && c.text[i - 1] !== ' ') i--;
+  return { text: c.text.slice(0, i) + c.text.slice(c.cursor), cursor: i };
 }
 
 function Block({ block }) {
@@ -94,11 +163,7 @@ function Block({ block }) {
     case 'assistant':
       return e(Markdown, { text: block.text });
     case 'tool':
-      return e(
-        Text,
-        { color: block.done ? 'green' : 'yellow' },
-        `● ${block.name}(${toolArgsSummary(block.args)})${block.done ? '' : ' …'}`,
-      );
+      return e(ToolBlock, { block });
     case 'inject':
       return e(Text, { color: 'cyan' }, `↳ ${block.text}`);
     default:
@@ -106,14 +171,38 @@ function Block({ block }) {
   }
 }
 
-function Composer({ input, status }) {
+// Tool call: a `● name(args)` header (yellow pending / green done / red error),
+// with the result preview indented under a `╰` gutter once it completes.
+function ToolBlock({ block }) {
+  const isError = block.result?.is_error;
+  const headerColor = !block.done ? 'yellow' : isError ? 'red' : 'green';
+  const header = e(
+    Text,
+    { key: 'h', color: headerColor },
+    `● ${block.name}(${toolArgsSummary(block.args)})${block.done ? '' : ' …'}`,
+  );
+  if (!block.done || !block.result) return header;
+  const { lines, more } = toolOutputPreview(block.result.content, isError);
+  if (!lines.length) return header;
+  const body = lines.map((ln, i) =>
+    e(Text, { key: `l${i}`, color: isError ? 'red' : 'gray' }, `  ${i === 0 ? '╰ ' : '  '}${ln}`),
+  );
+  if (more) body.push(e(Text, { key: 'more', dimColor: true }, `    … +${more} more lines`));
+  return e(Box, { flexDirection: 'column' }, [header, ...body]);
+}
+
+function Composer({ text, cursor, status }) {
+  // Faux block caret at the cursor position — Ink hides the real cursor inline.
+  const before = text.slice(0, cursor);
+  const at = text.slice(cursor, cursor + 1) || ' ';
+  const after = text.slice(cursor + 1);
   return e(
     Box,
     { marginTop: 1 },
     e(Text, { color: 'gray' }, status === 'idle' ? '› ' : '… '),
-    e(Text, null, input),
-    // Faux block caret — Ink hides the real cursor in inline mode.
-    status === 'idle' ? e(Text, { inverse: true }, ' ') : null,
+    e(Text, null, before),
+    e(Text, { inverse: true }, at),
+    e(Text, null, after),
   );
 }
 

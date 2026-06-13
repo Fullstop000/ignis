@@ -67,11 +67,27 @@ test('tool block: pending shows …, done drops it, values-only args', async () 
   await tick();
   let f = plain(lastFrame());
   assert.match(f, /● bash\(ls -l, 10\) …/, 'pending: values-only + ellipsis');
-  engine.emit(ev('tool_execution_end', { tool_call_id: 't1', result: { content: 'ok', is_error: false } }));
+  engine.emit(ev('tool_execution_end', { tool_call_id: 't1', result: { content: 'line1\nline2\nline3\nline4\nline5', is_error: false } }));
   await tick();
   f = plain(lastFrame());
   assert.match(f, /● bash\(ls -l, 10\)/);
-  assert.doesNotMatch(f, /…/, 'done: no ellipsis');
+  assert.match(f, /╰ line1/, 'output preview under a gutter');
+  assert.match(f, /line3/);
+  assert.doesNotMatch(f, /line4/, 'capped at 3 lines for success');
+  assert.match(f, /\+2 more lines/);
+});
+
+test('tool error output renders red, up to 5 lines', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  engine.emit(ev('tool_execution_start', { tool_call_id: 'e1', tool_name: 'bash', arguments: '{"command":"boom"}' }));
+  engine.emit(ev('tool_execution_end', { tool_call_id: 'e1', result: { content: 'a\nb\nc\nd\ne\nf', is_error: true } }));
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /╰ a/);
+  assert.match(f, /e\b/);
+  assert.doesNotMatch(f, /^.*\bf\b.*$/m, 'capped at 5 for errors');
+  assert.match(f, /\+1 more lines/);
 });
 
 test('inject + warning render their own blocks', async () => {
@@ -181,6 +197,28 @@ test('multi-question picker advances and collects one answer each', async () => 
     kind: 'reply',
     data: { id: 5, answer: { Answered: [{ Single: 'Red' }, { Single: 'Green' }] } },
   });
+});
+
+test('no React warnings (e.g. missing keys) leak to stderr while rendering rich blocks', async () => {
+  const orig = console.error;
+  const errs = [];
+  console.error = (...a) => errs.push(a.join(' '));
+  try {
+    const { engine, stdin } = renderApp();
+    await tick();
+    engine.emit(ev('user_prompt_committed', { text: 'go' }));
+    engine.emit(ev('tool_execution_start', { tool_call_id: 't', tool_name: 'bash', arguments: '{"command":"ls"}' }));
+    engine.emit(ev('tool_execution_end', { tool_call_id: 't', result: { content: 'a\nb\nc\nd', is_error: false } }));
+    engine.emit(ev('message_end', { message: { content: '# H\n- x\n- y\n\n`code`' } }));
+    await tick();
+    engine.emit(request(77, [{ question: 'q', multi_select: true, allow_other: true, options: [{ label: 'A' }, { label: 'B' }] }]));
+    await tick();
+    stdin.write(KEY.down);
+    await tick();
+  } finally {
+    console.error = orig;
+  }
+  assert.deepEqual(errs, [], `unexpected console.error output: ${errs.join(' | ')}`);
 });
 
 test('snapshot hydrates a pending request (handover) → picker shown', async () => {

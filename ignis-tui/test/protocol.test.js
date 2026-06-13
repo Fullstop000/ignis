@@ -13,6 +13,7 @@ import {
   answerSingle,
   answerCancelled,
   toolArgsSummary,
+  toolOutputPreview,
 } from '../src/protocol.js';
 
 test('a streaming assistant message accumulates deltas then finalizes', () => {
@@ -88,4 +89,13 @@ test('toolArgsSummary shows values only, never param names', () => {
   assert.equal(toolArgsSummary('{"opts":{"a":1}}'), '{"a":1}');
   // Capped to keep the header one line.
   assert.ok(toolArgsSummary(`{"x":"${'a'.repeat(200)}"}`).length <= 80);
+});
+
+test('toolOutputPreview caps lines (3 ok / 5 error) and counts the rest', () => {
+  assert.deepEqual(toolOutputPreview(''), { lines: [], more: 0 });
+  assert.deepEqual(toolOutputPreview('one\ntwo'), { lines: ['one', 'two'], more: 0 });
+  assert.deepEqual(toolOutputPreview('a\nb\nc\nd\ne'), { lines: ['a', 'b', 'c'], more: 2 });
+  assert.deepEqual(toolOutputPreview('a\nb\nc\nd\ne\nf\ng', true), { lines: ['a', 'b', 'c', 'd', 'e'], more: 2 });
+  // Trailing whitespace trimmed before counting.
+  assert.deepEqual(toolOutputPreview('only\n\n'), { lines: ['only'], more: 0 });
 });
