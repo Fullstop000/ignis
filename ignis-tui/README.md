@@ -17,16 +17,21 @@ ignis --engine (headless Rust core)
 
 ## Status
 
-**Real but minimal — not yet at parity with the in-process ratatui TUI.** It
-renders the streaming transcript (user / assistant / tool / inject / notice
-blocks), a single-select `ask_user` picker, and a one-line composer, and sends
-submit / cancel (Ctrl+C) / inject (Ctrl+S) / picker replies. Not yet: multi-
-select & free-text picker answers, markdown, scrollback paging, `/connect`-style
-text-input prompts.
+**Real, usable, approaching parity with the in-process ratatui TUI.** It renders
+the streaming transcript (user / assistant / tool / inject / notice blocks) with
+**markdown** (headings, bold/italic, inline + fenced code, bullet/ordered
+lists), an `ask_user` picker that supports **single-select, multi-select, and
+free-text "Other"** answers across **multiple questions**, and a one-line
+composer. It sends submit / cancel (Ctrl+C) / inject (Ctrl+S) / picker replies.
 
-The pure protocol logic (Outbound→view-state reducer, key→ClientCommand mapper)
-lives in `src/protocol.js` and is unit-tested with `node --test` (no install
-required).
+Not yet at parity: native scrollback paging (long output reflows in place rather
+than scrolling into terminal history — see `<Static>` follow-up) and
+`/connect`-style masked text-input prompts (the wire carries `text_input`/`mask`,
+but no slash-command surface drives them yet).
+
+The pure logic — the Outbound→view-state reducer and command/answer builders
+(`src/protocol.js`), and the markdown parser (`src/markdown.js`) — is unit-tested
+with `node --test` (no install required).
 
 ## Run it (manual dogfood)
 
@@ -37,9 +42,12 @@ npm install                       # fetches ink + react
 IGNIS_ENGINE_BIN=../target/debug/ignis npm start
 ```
 
-(Default engine binary is `ignis` on `PATH`.) Phase 4 will add a launcher so the
-`ignis` binary itself selects this frontend when Node is present, falling back
-to the in-process ratatui TUI otherwise.
+(Default engine binary is `ignis` on `PATH`.) The `ignis` binary can also select
+this frontend itself: set `IGNIS_FRONTEND=ink` and `IGNIS_TUI_ENTRY=<path to
+src/cli.js>`; on any failure (Node missing, entry unset) it falls back to the
+in-process ratatui TUI. Auto-locating the entry without `IGNIS_TUI_ENTRY` is a
+packaging decision (how the JS + a Node runtime ship) that is deliberately left
+open — see PR #174.
 
 ## Test
 

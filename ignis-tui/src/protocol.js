@@ -84,6 +84,38 @@ function reduceEvent(state, ev) {
   }
 }
 
+/**
+ * Tool-call header summary: argument VALUES only, never param names — matching
+ * the ratatui TUI (`grep("x")`, not `grep(pattern="x")`). Objects/arrays are
+ * compact-JSON'd; the whole thing is capped so the header stays one line.
+ */
+export function toolArgsSummary(argsJson, cap = 80) {
+  if (argsJson == null || argsJson === '') return '';
+  let obj;
+  try {
+    obj = JSON.parse(argsJson);
+  } catch {
+    return clip(String(argsJson), cap);
+  }
+  if (obj == null || typeof obj !== 'object') return clip(String(obj), cap);
+  const vals = Object.values(obj)
+    .map((v) =>
+      typeof v === 'string'
+        ? v
+        : v == null
+          ? ''
+          : typeof v === 'object'
+            ? JSON.stringify(v)
+            : String(v),
+    )
+    .filter((s) => s !== '');
+  return clip(vals.join(', '), cap);
+}
+
+function clip(s, cap) {
+  return s.length > cap ? s.slice(0, cap - 1) + '…' : s;
+}
+
 // ── ClientCommand builders (return objects to JSON.stringify onto the wire) ──
 export const submit = (text) => ({ kind: 'submit', data: { text } });
 export const inject = (text) => ({ kind: 'inject', data: { text } });
@@ -93,6 +125,12 @@ export const reply = (id, answer) => ({ kind: 'reply', data: { id, answer } });
 
 // ReplyAnswer shapes (externally-tagged, matching the Rust enum):
 //   Answered(vec) → {Answered:[…]} ; Cancelled → "Cancelled"
-// PickerAnswer::Single(label) → {Single:label}
-export const answerSingle = (label) => ({ Answered: [{ Single: label }] });
+// Each element of the vec is one question's PickerAnswer:
+//   Single(label)  → {Single: label}
+//   Multi(labels)  → {Multi: [label, …]}   (selection order, non-empty)
+export const pickSingle = (label) => ({ Single: label });
+export const pickMulti = (labels) => ({ Multi: labels });
+export const answered = (picks) => ({ Answered: picks });
 export const answerCancelled = () => 'Cancelled';
+// Convenience for the common single-question / single-select case.
+export const answerSingle = (label) => answered([pickSingle(label)]);

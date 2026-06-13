@@ -12,6 +12,7 @@ import {
   setSession,
   answerSingle,
   answerCancelled,
+  toolArgsSummary,
 } from '../src/protocol.js';
 
 test('a streaming assistant message accumulates deltas then finalizes', () => {
@@ -75,4 +76,16 @@ test('command builders match the Rust ClientCommand wire shapes', () => {
     data: { id: 7, answer: { Answered: [{ Single: 'Yes' }] } },
   });
   assert.deepEqual(reply(7, answerCancelled()), { kind: 'reply', data: { id: 7, answer: 'Cancelled' } });
+});
+
+test('toolArgsSummary shows values only, never param names', () => {
+  assert.equal(toolArgsSummary('{"command":"sleep 6 && echo banana","timeout_secs":10}'), 'sleep 6 && echo banana, 10');
+  assert.equal(toolArgsSummary('{"pattern":"foo"}'), 'foo');
+  assert.equal(toolArgsSummary(''), '');
+  assert.equal(toolArgsSummary(null), '');
+  // Non-JSON falls back to the raw string; objects are compact-JSON'd.
+  assert.equal(toolArgsSummary('not json'), 'not json');
+  assert.equal(toolArgsSummary('{"opts":{"a":1}}'), '{"a":1}');
+  // Capped to keep the header one line.
+  assert.ok(toolArgsSummary(`{"x":"${'a'.repeat(200)}"}`).length <= 80);
 });

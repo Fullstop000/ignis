@@ -8,4 +8,7 @@ import { spawnEngine } from './engine.js';
 import App from './app.js';
 
 const engine = spawnEngine();
-render(React.createElement(App, { engine }));
+// exitOnCtrlC:false — Ink's default would exit the whole app on Ctrl+C before
+// our handler runs, killing an in-flight turn. App owns Ctrl+C: cancel the turn
+// when busy, exit cleanly when idle (see app.js).
+render(React.createElement(App, { engine }), { exitOnCtrlC: false });

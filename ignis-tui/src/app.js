@@ -2,13 +2,14 @@
 // so it runs under plain `node` with no build/transform step — only `ink` +
 // `react` need installing.
 //
-// REAL-BUT-MINIMAL (PR #174, phase 3b): this is an initial frontend, not full
-// parity with the ratatui TUI. It renders the streaming transcript (user /
-// assistant / tool / inject / notice blocks), a single-select `ask_user`
-// picker, and a one-line composer; it sends submit / cancel / inject / reply.
-// Not yet covered: multi-select & free-text ("Other") picker answers, markdown
-// rendering, scrollback paging, /connect-style text-input prompts. The pure
-// state/command logic lives in protocol.js (unit-tested via `node --test`).
+// PR #174: the frontend renders the streaming transcript (user / assistant /
+// tool / inject / notice blocks) with markdown, an `ask_user` picker
+// (single- and multi-select, free-text "Other", multi-question), and a
+// one-line composer; it sends submit / cancel (Ctrl+C) / inject (Ctrl+S) /
+// reply. Not yet at parity: native scrollback paging and /connect-style
+// text-input (masked) prompts. Pure logic — the Outbound→state reducer, the
+// command/answer builders, and the markdown parser — lives in protocol.js /
+// markdown.js and is unit-tested via `node --test`.
 import React, { useState, useEffect } from 'react';
 import { Box, Text, useInput, useApp } from 'ink';
 import {
@@ -18,9 +19,13 @@ import {
   cancel,
   inject,
   reply,
-  answerSingle,
+  pickSingle,
+  pickMulti,
+  answered,
   answerCancelled,
+  toolArgsSummary,
 } from './protocol.js';
+import { parseMarkdown } from './markdown.js';
 
 const e = React.createElement;
 
@@ -28,7 +33,6 @@ export default function App({ engine }) {
   const { exit } = useApp();
   const [state, setState] = useState(initialState());
   const [input, setInput] = useState('');
-  const [cursor, setCursor] = useState(0);
 
   useEffect(() => {
     engine.onFrame((frame) => setState((s) => reduceOutbound(s, frame)));
@@ -36,27 +40,11 @@ export default function App({ engine }) {
   }, [engine, exit]);
 
   const req = state.request;
+  const clearRequest = () => setState((s) => ({ ...s, request: null }));
 
   useInput((ch, key) => {
-    // A picker captures all keys while open.
-    if (req) {
-      const opts = req.questions[0]?.options ?? [];
-      if (key.upArrow) setCursor((c) => Math.max(0, c - 1));
-      else if (key.downArrow) setCursor((c) => Math.min(Math.max(opts.length - 1, 0), c + 1));
-      else if (key.escape) {
-        engine.send(reply(req.id, answerCancelled()));
-        setState((s) => ({ ...s, request: null }));
-        setCursor(0);
-      } else if (key.return) {
-        const label = opts[cursor]?.label;
-        if (label != null) {
-          engine.send(reply(req.id, answerSingle(label)));
-          setState((s) => ({ ...s, request: null }));
-          setCursor(0);
-        }
-      }
-      return;
-    }
+    // While a picker is open it owns all keys (PickerFlow has its own useInput).
+    if (req) return;
 
     if (key.ctrl && ch === 'c') {
       if (state.status !== 'idle') engine.send(cancel());
@@ -89,10 +77,11 @@ export default function App({ engine }) {
 
   const children = [];
   state.blocks.forEach((b, i) => children.push(e(Block, { key: `b${i}`, block: b })));
-  if (state.stream != null) children.push(e(Text, { key: 'stream' }, state.stream));
+  if (state.stream != null) children.push(e(Markdown, { key: 'stream', text: state.stream }));
   children.push(
     req
-      ? e(Picker, { key: 'picker', req, cursor })
+      ? // Key by request id so a fresh request resets the flow's internal state.
+        e(PickerFlow, { key: `picker-${req.id}`, req, engine, onDone: clearRequest })
       : e(Composer, { key: 'composer', input, status: state.status }),
   );
   return e(Box, { flexDirection: 'column' }, children);
@@ -103,12 +92,12 @@ function Block({ block }) {
     case 'user':
       return e(Text, { color: 'magenta' }, `▌ ${block.text}`);
     case 'assistant':
-      return e(Text, null, block.text);
+      return e(Markdown, { text: block.text });
     case 'tool':
       return e(
         Text,
         { color: block.done ? 'green' : 'yellow' },
-        `● ${block.name}(${block.args ?? ''})${block.done ? '' : ' …'}`,
+        `● ${block.name}(${toolArgsSummary(block.args)})${block.done ? '' : ' …'}`,
       );
     case 'inject':
       return e(Text, { color: 'cyan' }, `↳ ${block.text}`);
@@ -123,17 +112,150 @@ function Composer({ input, status }) {
     { marginTop: 1 },
     e(Text, { color: 'gray' }, status === 'idle' ? '› ' : '… '),
     e(Text, null, input),
+    // Faux block caret — Ink hides the real cursor in inline mode.
+    status === 'idle' ? e(Text, { inverse: true }, ' ') : null,
   );
 }
 
-function Picker({ req, cursor }) {
-  const q = req.questions[0] ?? {};
-  const rows = [e(Text, { key: 'q', bold: true }, q.question ?? '')];
-  (q.options ?? []).forEach((o, i) =>
-    rows.push(
-      e(Text, { key: `o${i}`, color: i === cursor ? 'cyan' : undefined }, `${i === cursor ? '❯ ' : '  '}${o.label}`),
+// ── Picker (ask_user): single/multi-select, free-text "Other", multi-question ──
+
+function PickerFlow({ req, engine, onDone }) {
+  const [qIdx, setQIdx] = useState(0);
+  const [cursor, setCursor] = useState(0);
+  const [selected, setSelected] = useState([]); // selection-order indices (multi)
+  const [acc, setAcc] = useState([]); // completed PickerAnswers for prior questions
+  const [other, setOther] = useState(''); // free-text buffer for the "Other" row
+
+  const q = req.questions[qIdx] ?? {};
+  const opts = q.options ?? [];
+  const otherIdx = q.allow_other ? opts.length : -1;
+  const rowCount = opts.length + (q.allow_other ? 1 : 0);
+  const labelAt = (i) => (i === otherIdx ? other : opts[i]?.label);
+
+  const finish = (pick) => {
+    const picks = [...acc, pick];
+    if (qIdx + 1 < req.questions.length) {
+      setAcc(picks);
+      setQIdx(qIdx + 1);
+      setCursor(0);
+      setSelected([]);
+      setOther('');
+    } else {
+      engine.send(reply(req.id, answered(picks)));
+      onDone();
+    }
+  };
+
+  useInput((ch, key) => {
+    // Precedence matters: special keys are handled before free-text capture,
+    // because Enter/Tab/etc. carry a truthy `ch` that would otherwise be typed
+    // into the "Other" buffer instead of confirming.
+    if (key.escape) {
+      engine.send(reply(req.id, answerCancelled()));
+      onDone();
+      return;
+    }
+    if (key.upArrow) {
+      setCursor((c) => Math.max(0, c - 1));
+      return;
+    }
+    if (key.downArrow) {
+      setCursor((c) => Math.min(Math.max(rowCount - 1, 0), c + 1));
+      return;
+    }
+    if (key.return) {
+      if (q.multi_select) {
+        const idxs = selected.length ? selected : [cursor];
+        const labels = idxs.map(labelAt).filter((l) => l != null && l !== '');
+        if (labels.length) finish(pickMulti(labels));
+      } else {
+        const label = labelAt(cursor);
+        if (label != null && label !== '') finish(pickSingle(label));
+      }
+      return;
+    }
+    // Space toggles in multi-select (reserved, so it can't type into "Other").
+    if (q.multi_select && ch === ' ') {
+      setSelected((s) => (s.includes(cursor) ? s.filter((i) => i !== cursor) : [...s, cursor]));
+      return;
+    }
+    // The "Other" row captures printable free-text.
+    const onOther = cursor === otherIdx;
+    if (onOther && (key.backspace || key.delete)) {
+      setOther((t) => t.slice(0, -1));
+      return;
+    }
+    if (onOther && ch && ch.charCodeAt(0) >= 0x20 && !key.ctrl && !key.meta) {
+      setOther((t) => t + ch);
+    }
+  });
+
+  const rows = [];
+  if (req.questions.length > 1) {
+    rows.push(e(Text, { key: 'prog', dimColor: true }, `(${qIdx + 1}/${req.questions.length})`));
+  }
+  rows.push(e(Text, { key: 'q', bold: true }, q.question ?? ''));
+  opts.forEach((o, i) => rows.push(e(PickerRow, { key: `o${i}`, label: o.label, focused: i === cursor, checked: selected.includes(i), multi: q.multi_select })));
+  if (q.allow_other) {
+    const label = other ? `Other: ${other}` : 'Other (type custom)…';
+    rows.push(e(PickerRow, { key: 'other', label, focused: cursor === otherIdx, checked: selected.includes(otherIdx), multi: q.multi_select }));
+  }
+  rows.push(
+    e(
+      Text,
+      { key: 'hint', dimColor: true },
+      q.multi_select ? '↑/↓ move · space toggle · enter confirm · esc cancel' : '↑/↓ select · enter confirm · esc cancel',
     ),
   );
-  rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ select · enter confirm · esc cancel'));
   return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
+}
+
+function PickerRow({ label, focused, checked, multi }) {
+  const box = multi ? (checked ? '[x] ' : '[ ] ') : '';
+  return e(Text, { color: focused ? 'cyan' : undefined }, `${focused ? '❯ ' : '  '}${box}${label}`);
+}
+
+// ── Markdown rendering (token tree from markdown.js → Ink elements) ──
+
+function Markdown({ text }) {
+  const blocks = parseMarkdown(text);
+  return e(
+    Box,
+    { flexDirection: 'column' },
+    blocks.map((b, i) => e(MdBlock, { key: `m${i}`, block: b })),
+  );
+}
+
+/** Inline spans → keyed nested <Text> segments. */
+function spanEls(spans) {
+  return spans.map((s, i) =>
+    e(
+      Text,
+      { key: `s${i}`, bold: s.bold || undefined, italic: s.italic || undefined, color: s.code ? 'cyan' : undefined },
+      s.text,
+    ),
+  );
+}
+
+function MdBlock({ block }) {
+  switch (block.type) {
+    case 'heading':
+      return e(Text, { bold: true, color: block.level <= 2 ? 'magenta' : undefined }, spanEls(block.spans));
+    case 'bullet':
+      return e(Text, null, [`${' '.repeat(block.indent)}• `, ...spanEls(block.spans)]);
+    case 'ordered':
+      return e(Text, null, [`${' '.repeat(block.indent)}${block.marker}. `, ...spanEls(block.spans)]);
+    case 'code':
+      return e(
+        Box,
+        { flexDirection: 'column', paddingLeft: 2 },
+        block.lines.map((ln, i) => e(Text, { key: `c${i}`, color: 'green' }, ln.length ? ln : ' ')),
+      );
+    case 'rule':
+      return e(Text, { dimColor: true }, '─'.repeat(40));
+    case 'blank':
+      return e(Text, null, ' ');
+    default:
+      return e(Text, null, spanEls(block.spans));
+  }
 }
