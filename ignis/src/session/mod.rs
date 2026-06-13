@@ -337,10 +337,9 @@ impl Session {
             created_at_ms: None,
         };
 
-        let mut compacted = Vec::with_capacity(1 + n - cut);
-        compacted.push(summary_msg);
-        compacted.extend_from_slice(&self.history[cut..]);
-        self.history = compacted;
+        // Replace the summarized prefix with the summary message in-place, moving
+        // the kept tail without cloning it.
+        self.history.splice(..cut, std::iter::once(summary_msg));
         self.persist().await?;
         Ok(cut)
     }
@@ -381,17 +380,16 @@ fn heal_interrupted_tool_calls(history: &mut Vec<Message>) {
     {
         return;
     }
-    let calls = history[a].tool_calls.clone().unwrap_or_default();
-    let missing: Vec<crate::ToolCall> = {
-        let answered: std::collections::HashSet<&str> = history[a + 1..]
-            .iter()
-            .filter_map(|m| m.tool_call_id.as_deref())
-            .collect();
-        calls
-            .into_iter()
-            .filter(|tc| !answered.contains(tc.id.as_str()))
-            .collect()
-    };
+    let calls = history[a].tool_calls.as_ref().unwrap();
+    let answered: std::collections::HashSet<&str> = history[a + 1..]
+        .iter()
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    let missing: Vec<crate::ToolCall> = calls
+        .iter()
+        .filter(|tc| !answered.contains(tc.id.as_str()))
+        .cloned()
+        .collect();
     for tc in missing {
         let envelope = serde_json::json!({
             "result": "Tool call interrupted by user (Ctrl+C) before it completed.",
