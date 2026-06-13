@@ -6,7 +6,7 @@
 //! input mid-turn. Without an attached channel the tool is a no-op (returns an
 //! error explaining the situation); this keeps subagents and one-shot CLI runs
 //! safe to construct even when no TUI is wired up.
-use crate::console::picker::{
+use crate::interaction::{
     PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse,
 };
 use crate::{AgentTool, ExecutionMode, ToolResult};

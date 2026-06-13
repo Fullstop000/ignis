@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::runtime::PermissionState;
 use super::{check, default_policy_for_tool, rule, Decision};
-use crate::console::picker::{
+use crate::interaction::{
     PickerAnswer, PickerOption, PickerQuestion, PickerRequest, PickerResponse,
 };
 use crate::tools::tool::ToolHooks;
