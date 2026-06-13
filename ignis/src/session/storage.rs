@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
 #[async_trait]
@@ -204,41 +205,26 @@ impl SessionStorage for FileStorage {
 
         let _lock = self.write_lock.write().await;
 
-        // Atomic write procedure
+        // Atomic write procedure: write to a temp file, fsync, then rename.
         let temp_filename = format!("{}.json.tmp", uuid::Uuid::new_v4());
         let temp_path = parent.join(temp_filename);
-
-        // Scope to ensure file is closed and synced before rename
+        let serialized = Self::serialize_jsonl_session(session_id, messages, start_dir)?;
         {
-            use std::io::Write;
-            let serialized = Self::serialize_jsonl_session(session_id, messages, start_dir)?;
-
-            // Standard synchronous file operations inside tokio::task::block_in_place or spawn_blocking
-            // to ensure OS flush and sync_all are completed safely.
-            let temp_path_clone = temp_path.clone();
-            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                let mut file = std::fs::File::create(&temp_path_clone)?;
-                file.write_all(&serialized)?;
-                file.flush()?;
-                file.sync_all()?;
-                Ok(())
-            })
-            .await??;
+            let mut file = tokio::fs::File::create(&temp_path).await?;
+            file.write_all(&serialized).await?;
+            file.flush().await?;
+            file.sync_all().await?;
         }
 
         // Atomic rename
-        std::fs::rename(&temp_path, &path)?;
+        tokio::fs::rename(&temp_path, &path).await?;
 
         // Directory sync (Linux/Unix durability)
         #[cfg(unix)]
         {
-            let parent_clone = parent.to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                if let Ok(dir) = std::fs::File::open(parent_clone) {
-                    let _ = dir.sync_all();
-                }
-            })
-            .await?;
+            if let Ok(dir) = tokio::fs::File::open(parent).await {
+                let _ = dir.sync_all().await;
+            }
         }
 
         Ok(())
