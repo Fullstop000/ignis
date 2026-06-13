@@ -78,8 +78,13 @@ function reduceEvent(state, ev) {
         ...state,
         blocks: [...state.blocks, { kind: 'notice', text: `[warn] ${p.source}: ${p.message}` }],
       };
+    case 'reconnecting':
+      return {
+        ...state,
+        blocks: [...state.blocks, { kind: 'notice', text: `⟳ reconnecting ${p.attempt}/${p.max}: ${p.reason}` }],
+      };
     default:
-      // run_start / run_end / usage / reconnecting — not surfaced in the minimal UI.
+      // run_start / run_end / usage — not surfaced in the minimal UI.
       return state;
   }
 }

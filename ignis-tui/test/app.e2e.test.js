@@ -90,15 +90,27 @@ test('tool error output renders red, up to 5 lines', async () => {
   assert.match(f, /\+1 more lines/);
 });
 
-test('inject + warning render their own blocks', async () => {
+test('inject + warning + reconnecting render their own blocks', async () => {
   const { engine, lastFrame } = renderApp();
   await tick();
   engine.emit(ev('user_injected', { text: 'steer left' }));
   engine.emit(ev('warning', { source: 'hooks', message: 'soft fail' }));
+  engine.emit(ev('reconnecting', { attempt: 1, max: 3, reason: 'connection reset' }));
   await tick();
   const f = plain(lastFrame());
   assert.match(f, /↳ steer left/);
   assert.match(f, /\[warn\] hooks: soft fail/);
+  assert.match(f, /⟳ reconnecting 1\/3: connection reset/);
+});
+
+test('welcome banner shows on an empty transcript, then disappears', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  assert.match(plain(lastFrame()), /ignis/);
+  assert.match(plain(lastFrame()), /Type a message/);
+  engine.emit(ev('user_prompt_committed', { text: 'go' }));
+  await tick();
+  assert.doesNotMatch(plain(lastFrame()), /Type a message/, 'welcome gone once the transcript starts');
 });
 
 test('Ctrl+C cancels a busy turn (Cancel command), exits when idle', async () => {

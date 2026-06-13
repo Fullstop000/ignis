@@ -137,6 +137,9 @@ export default function App({ engine }) {
   });
 
   const children = [];
+  if (state.blocks.length === 0 && state.stream == null && !req) {
+    children.push(e(Welcome, { key: 'welcome' }));
+  }
   state.blocks.forEach((b, i) => children.push(e(Block, { key: `b${i}`, block: b })));
   if (state.stream != null) children.push(e(Markdown, { key: 'stream', text: state.stream }));
   children.push(
@@ -189,6 +192,15 @@ function ToolBlock({ block }) {
   );
   if (more) body.push(e(Text, { key: 'more', dimColor: true }, `    … +${more} more lines`));
   return e(Box, { flexDirection: 'column' }, [header, ...body]);
+}
+
+function Welcome() {
+  return e(
+    Box,
+    { flexDirection: 'column', marginBottom: 1 },
+    e(Text, { bold: true, color: 'magenta' }, 'ignis'),
+    e(Text, { dimColor: true }, 'Type a message and press Enter · Ctrl+C to cancel a turn or exit'),
+  );
 }
 
 function Composer({ text, cursor, status }) {
