@@ -597,7 +597,7 @@ pub(crate) async fn submit_text(
     // prompts, the built-in LLM commands, skill commands) until /connect runs.
     // PROVIDER_GATE_EXEMPT commands bypass it even when a same-named skill is
     // registered (they were dispatched before this gate in the original ladder).
-    if app.provider.is_empty()
+    if app.provider.is_none()
         && !PROVIDER_GATE_EXEMPT.contains(&command)
         && requires_provider(app, command)
     {
@@ -965,8 +965,8 @@ mod tests {
 
     fn test_app() -> App {
         App::new(
-            "test-provider".to_string(),
-            "test-model".to_string(),
+            Some("test-provider".to_string()),
+            Some("test-model".to_string()),
             "s".to_string(),
             PathBuf::from("/tmp"),
         )
@@ -1141,7 +1141,7 @@ mod tests {
         // blocked with the connect hint and never reach the agent or open a
         // picker.
         let mut app = test_app();
-        app.provider = String::new();
+        app.provider = None;
         let (p_tx, mut p_rx, pk_tx, _pk_rx, n_tx, _n_rx) = channels();
 
         submit_text(
@@ -1220,7 +1220,7 @@ mod tests {
         );
 
         let mut app = test_app();
-        app.provider = String::new();
+        app.provider = None;
         app.skills = Some(Arc::new(reg));
         let (p_tx, _p_rx, pk_tx, mut pk_rx, n_tx, _n_rx) = channels();
 

@@ -29,8 +29,8 @@ pub(crate) struct FooterProps<'a> {
     pub cwd: &'a std::path::Path,
     pub git_branch: Option<&'a str>,
     pub turns: usize,
-    pub provider: &'a str,
-    pub model: &'a str,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub ctx_tokens: u64,
     pub ctx_pct: u8,
@@ -53,8 +53,8 @@ impl<'a> From<&'a App> for FooterProps<'a> {
             cwd: app.cwd.as_path(),
             git_branch: app.git_branch.as_deref(),
             turns: app.turn_count(),
-            provider: app.provider.as_str(),
-            model: app.model.as_str(),
+            provider: app.provider.as_deref(),
+            model: app.model.as_deref(),
             effort: app.effort.as_deref(),
             ctx_tokens,
             ctx_pct,
@@ -75,10 +75,12 @@ impl Widget for FooterProps<'_> {
         // /settings → Statusline. `·`-joined; empty string when both are hidden.
         let mut right_parts: Vec<String> = Vec::new();
         if self.show_model {
-            right_parts.push(match self.effort {
-                Some(e) => format!("{}/{} ({})", self.provider, self.model, e),
-                None => format!("{}/{}", self.provider, self.model),
-            });
+            if let (Some(p), Some(m)) = (self.provider, self.model) {
+                right_parts.push(match self.effort {
+                    Some(e) => format!("{}/{} ({})", p, m, e),
+                    None => format!("{}/{}", p, m),
+                });
+            }
         }
         if self.show_tokens {
             right_parts.push(format!(
@@ -205,8 +207,8 @@ mod tests {
             cwd,
             git_branch: None,
             turns: 0,
-            provider: "minimax",
-            model: "MiniMax-M3",
+            provider: Some("minimax"),
+            model: Some("MiniMax-M3"),
             effort: None,
             ctx_tokens: 1500,
             ctx_pct: 1,
@@ -266,7 +268,12 @@ mod tests {
 
     #[test]
     fn footer_shows_git_branch_when_present() {
-        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        let mut app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
         app.git_branch = Some("feature/login".into());
         let out = footer_text(&app, 120);
         assert!(out.contains("git:("), "expected git segment, got: {out}");
@@ -275,7 +282,12 @@ mod tests {
 
     #[test]
     fn footer_omits_git_segment_outside_repo() {
-        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        let mut app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
         app.git_branch = None;
         let out = footer_text(&app, 120);
         assert!(

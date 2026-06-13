@@ -110,15 +110,15 @@ async fn main() -> Result<(), anyhow::Error> {
         .collect();
     let mcp_registry = ignis::mcp::McpRegistry::spawn_all(&config.mcp.servers, disabled_mcp).await;
 
-    // When no provider is configured, hand the TUI empty strings; it renders
-    // the no-provider welcome and routes the user through `/connect`. The
-    // one-shot CLI path still hard-errors below — there's no interactive way
-    // to recover from "no provider" in a single-shot invocation.
-    let active_provider = config.active_provider().unwrap_or_default();
-    let active_model = config.active_model().unwrap_or_default();
+    // When no provider is configured, hand the TUI `None`; it renders the
+    // no-provider welcome and routes the user through `/connect`. The one-shot
+    // CLI path still hard-errors below — there's no interactive way to recover
+    // from "no provider" in a single-shot invocation.
+    let active_provider = config.active_provider();
+    let active_model = config.active_model();
 
-    if !active_provider.is_empty() {
-        ignis::telemetry::record_session_start(&active_provider, &active_model);
+    if let (Some(p), Some(m)) = (&active_provider, &active_model) {
+        ignis::telemetry::record_session_start(p, m);
     }
 
     // Load the external-subprocess hook registry once at startup; the
@@ -149,11 +149,14 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Route: One-shot CLI mode (ignis "do something") — needs a real provider.
-    if active_provider.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No provider configured. Launch the TUI (run `ignis` with no args) and run /connect."
-        ));
-    }
+    let (active_provider, active_model) = match (active_provider, active_model) {
+        (Some(p), Some(m)) => (p, m),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "No provider configured. Launch the TUI (run `ignis` with no args) and run /connect."
+            ));
+        }
+    };
     println!("=== Ignis (one-shot) ===");
     println!("Provider: {}/{}", active_provider, active_model);
     println!("Session: {}", session_request.session_id);

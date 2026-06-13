@@ -329,7 +329,14 @@ pub(crate) fn welcome_lines(app: &App) -> Vec<Line<'static>> {
             Style::default().fg(SUBTEXT),
         ),
     ]);
-    let info_line = if app.provider.is_empty() {
+    let info_line = if let (Some(p), Some(m)) = (app.provider.as_deref(), app.model.as_deref()) {
+        Line::from(vec![
+            Span::styled("  Provider  ", Style::default().fg(TEXT_DIM)),
+            Span::styled(format!("{}/{}", p, m), Style::default().fg(TEXT)),
+            Span::styled("   Directory  ", Style::default().fg(TEXT_DIM)),
+            Span::styled(format!("{}", app.cwd.display()), Style::default().fg(TEXT)),
+        ])
+    } else {
         // First-launch / no-provider mode. Tell the user the one thing they
         // need to do next; don't show a fake provider value.
         Line::from(vec![
@@ -344,16 +351,6 @@ pub(crate) fn welcome_lines(app: &App) -> Vec<Line<'static>> {
                 " to pick one and paste your API key.",
                 Style::default().fg(TEXT_DIM),
             ),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("  Provider  ", Style::default().fg(TEXT_DIM)),
-            Span::styled(
-                format!("{}/{}", app.provider, app.model),
-                Style::default().fg(TEXT),
-            ),
-            Span::styled("   Directory  ", Style::default().fg(TEXT_DIM)),
-            Span::styled(format!("{}", app.cwd.display()), Style::default().fg(TEXT)),
         ])
     };
     vec![Line::from(""), title, info_line, Line::from("")]

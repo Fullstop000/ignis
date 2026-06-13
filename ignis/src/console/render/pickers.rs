@@ -823,8 +823,8 @@ pub(crate) struct SettingsData {
     pub msgs: usize,
     pub tools: Vec<(String, usize)>,
     pub uptime_ms: u128,
-    pub provider: String,
-    pub model: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub effort: Option<String>,
     /// Which footer segments are on, aligned to `STATUSLINE_SEGMENTS`.
     pub segment_shown: [bool; STATUSLINE_SEGMENTS.len()],
@@ -1023,11 +1023,13 @@ fn render_stats_tab(lines: &mut Vec<Line<'static>>, data: &SettingsData) {
         "uptime",
         vec![Span::styled(format_elapsed(data.uptime_ms), val)],
     );
-    let model = match &data.effort {
-        Some(e) => format!("{}/{} ({e})", data.provider, data.model),
-        None => format!("{}/{}", data.provider, data.model),
-    };
-    row("model", vec![Span::styled(model, val)]);
+    if let (Some(p), Some(m)) = (&data.provider, &data.model) {
+        let model = match &data.effort {
+            Some(e) => format!("{}/{} ({e})", p, m),
+            None => format!("{}/{}", p, m),
+        };
+        row("model", vec![Span::styled(model, val)]);
+    }
 }
 
 #[cfg(test)]
@@ -1070,8 +1072,8 @@ mod tests {
             msgs: 7,
             tools,
             uptime_ms: 65_000,
-            provider: "minimax".to_string(),
-            model: "MiniMax-M3".to_string(),
+            provider: Some("minimax".to_string()),
+            model: Some("MiniMax-M3".to_string()),
             effort: None,
             segment_shown: [true; STATUSLINE_SEGMENTS.len()],
         }
