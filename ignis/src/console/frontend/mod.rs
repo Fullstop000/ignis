@@ -22,6 +22,7 @@ pub mod hub;
 pub mod local;
 pub mod port;
 pub mod protocol;
+pub mod stdio;
 
 pub use broker::RequestBroker;
 pub use command::{control_signal, ControlSignal};
@@ -29,6 +30,7 @@ pub use hub::{CommandOutcome, FrontendHub};
 pub use local::{local_tui, LocalTuiPort, TuiHandle};
 pub use port::{Acceptor, FrontendPort, PortError};
 pub use protocol::{ClientCommand, ClientRequest, Outbound, ReplyAnswer, RequestId, Snapshot};
+pub use stdio::{spawn_stdio_port, StdioPort};
 
 #[cfg(test)]
 mod tests {
