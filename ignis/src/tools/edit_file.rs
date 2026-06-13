@@ -20,7 +20,9 @@ impl EditFileTool {
 impl StaticTool for EditFileTool {
     const NAME: &'static str = "edit_file";
     const DESCRIPTION: &'static str =
-        "Edit a file by replacing the first occurrence of old_text with new_text.";
+        "Edit a file by replacing occurrences of old_text with new_text. \
+         By default only the first occurrence is replaced; set global_replace=true \
+         to replace every occurrence.";
     const PARAMETERS: &'static [ToolParam] = &[
         ToolParam {
             name: "path",
@@ -37,6 +39,11 @@ impl StaticTool for EditFileTool {
             ty: "string",
             description: "The replacement text",
         },
+        ToolParam {
+            name: "global_replace",
+            ty: "boolean",
+            description: "Replace all occurrences in the file (default: false)",
+        },
     ];
     const REQUIRED: &'static [&'static str] = &["path", "old_text", "new_text"];
     const EXECUTION_MODE: ExecutionMode = ExecutionMode::Sequential;
@@ -45,6 +52,10 @@ impl StaticTool for EditFileTool {
         let path = args.require_str("path")?;
         let old_text = args.require_str("old_text")?;
         let new_text = args.require_str("new_text")?;
+        let global_replace = args
+            .get("global_replace")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let resolved = crate::util::resolve_path(&self.cwd, path);
         let content = tokio::fs::read_to_string(&resolved)
@@ -55,7 +66,11 @@ impl StaticTool for EditFileTool {
             return Err("old_text not found in file".to_string());
         }
 
-        let new_content = content.replacen(old_text, new_text, 1);
+        let new_content = if global_replace {
+            content.replace(old_text, new_text)
+        } else {
+            content.replacen(old_text, new_text, 1)
+        };
         tokio::fs::write(&resolved, &new_content)
             .await
             .map_err(|e| format!("Failed to write file: {e}"))?;
@@ -145,6 +160,31 @@ mod tests {
 
         assert!(res.is_error);
         assert!(res.content.contains("old_text not found"));
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_global_replace() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_edit_global.txt");
+        tokio::fs::write(&file_path, "foo bar foo baz foo")
+            .await
+            .unwrap();
+
+        let tool = EditFileTool::new(&temp_dir);
+        let res = tool
+            .call(json!({
+                "path": "test_edit_global.txt",
+                "old_text": "foo",
+                "new_text": "qux",
+                "global_replace": true
+            }))
+            .await;
+
+        assert!(!res.is_error);
+        let edited_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(edited_content, "qux bar qux baz qux");
 
         let _ = tokio::fs::remove_file(&file_path).await;
     }
