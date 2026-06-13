@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 /// Largest skill body we will load (≈12k tokens). Oversized skills are skipped
 /// so loading or inlining one can never blow the context window.
@@ -174,7 +174,10 @@ pub(crate) fn parse_skill_md(content: &str) -> Result<(String, Option<String>, S
 /// layer, and the `/skills` picker.
 pub struct SkillRegistry {
     skills: Vec<Skill>, // unique by name, sorted by name
-    disabled: Mutex<HashSet<String>>,
+    /// `RwLock` because reads (`is_enabled`, `catalog_prompt`, picker renders)
+    /// vastly outnumber writes (only on toggle), and the guard is never held
+    /// across an await.
+    disabled: RwLock<HashSet<String>>,
 }
 
 fn xml_escape(s: &str) -> String {
@@ -234,7 +237,7 @@ impl SkillRegistry {
         }
         Self {
             skills: map.into_values().collect(),
-            disabled: Mutex::new(disabled),
+            disabled: RwLock::new(disabled),
         }
     }
 
@@ -252,7 +255,11 @@ impl SkillRegistry {
     }
 
     pub fn is_enabled(&self, name: &str) -> bool {
-        !self.disabled.lock().unwrap().contains(name)
+        !self
+            .disabled
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
     }
 
     /// The enabled skill of this name, or `None` if unknown or disabled.
@@ -276,7 +283,7 @@ impl SkillRegistry {
     /// the resulting enabled state. The lock is dropped before disk I/O.
     pub fn toggle(&self, name: &str) -> bool {
         let (now_enabled, snapshot) = {
-            let mut d = self.disabled.lock().unwrap();
+            let mut d = self.disabled.write().unwrap_or_else(|e| e.into_inner());
             let now_enabled = if d.remove(name) {
                 true
             } else {

@@ -198,7 +198,7 @@ impl LlmProvider for AnthropicCompatible {
             Auth::XApiKey => req.header("x-api-key", self.api_key.clone()),
             _ => req.header("Authorization", format!("Bearer {}", self.api_key)),
         };
-        let res = req.json(&req_body).send().await?;
+        let res = super::send_with_timeout(req.json(&req_body)).await?;
 
         if !res.status().is_success() {
             let error_text = res

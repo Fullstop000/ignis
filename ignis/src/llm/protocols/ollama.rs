@@ -76,7 +76,7 @@ impl LlmProvider for Ollama {
 
         let endpoint = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
 
-        let res = self.client.post(&endpoint).json(&req_body).send().await?;
+        let res = super::send_with_timeout(self.client.post(&endpoint).json(&req_body)).await?;
 
         if !res.status().is_success() {
             let error_text = res

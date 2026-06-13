@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 mod message;
 pub use message::{now_ms, Message, ToolCall, ToolCallFunction, Usage};
@@ -89,6 +90,25 @@ pub struct Resolved {
     pub model: String,
     pub request_headers: Vec<(String, String)>,
     pub reasoning_effort: Option<String>,
+}
+
+/// Time-to-first-byte timeout for LLM chat requests. Covers connection
+/// establishment + response headers; the returned stream is not bounded by this.
+const LLM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Send a request and fail fast if the provider doesn't start responding within
+/// [`LLM_RESPONSE_TIMEOUT`]. This prevents a hung connection from blocking the
+/// agent loop forever without cutting off a slow-but-healthy streaming body.
+async fn send_with_timeout(
+    req: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, anyhow::Error> {
+    match tokio::time::timeout(LLM_RESPONSE_TIMEOUT, req.send()).await {
+        Ok(res) => res.map_err(Into::into),
+        Err(_) => Err(anyhow::anyhow!(
+            "LLM request timed out after {}s waiting for response",
+            LLM_RESPONSE_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// Construct the concrete protocol client for a [`Resolved`] selection. The single
@@ -471,7 +491,7 @@ pub(crate) async fn openai_compatible_chat_stream(
     for (name, value) in request_headers {
         req = req.header(name.as_str(), value.as_str());
     }
-    let res = req.send().await?;
+    let res = send_with_timeout(req).await?;
 
     if !res.status().is_success() {
         let error_text = res

@@ -91,9 +91,10 @@ async fn main() -> Result<(), anyhow::Error> {
     let system_prompt = ignis::agent::build_system_prompt(&cwd);
 
     // Discover skills (global + project roots) and read the disabled set.
-    let state = ignis::state::load_state();
+    // Reuse the state loaded earlier so permissions and skill/MCP disables are
+    // consistent even if a background writer modifies state.json mid-startup.
     let disabled_skills: std::collections::HashSet<String> =
-        state.disabled_skills.iter().cloned().collect();
+        persisted_state.disabled_skills.iter().cloned().collect();
     let skill_registry = std::sync::Arc::new(ignis::skills::SkillRegistry::load(
         Some(&home),
         &cwd,
@@ -102,8 +103,11 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Spawn MCP servers (in parallel; each bounded by its `startup_timeout_secs`).
     // Failures don't block ignis — they surface in `/mcp` and `ignis mcp list`.
-    let disabled_mcp: std::collections::HashSet<String> =
-        state.disabled_mcp_servers.iter().cloned().collect();
+    let disabled_mcp: std::collections::HashSet<String> = persisted_state
+        .disabled_mcp_servers
+        .iter()
+        .cloned()
+        .collect();
     let mcp_registry = ignis::mcp::McpRegistry::spawn_all(&config.mcp.servers, disabled_mcp).await;
 
     // When no provider is configured, hand the TUI empty strings; it renders
