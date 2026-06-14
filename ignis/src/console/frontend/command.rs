@@ -51,7 +51,8 @@ pub fn control_signal(cmd: &ClientCommand) -> Option<ControlSignal> {
         | ClientCommand::ToggleSkill { .. }
         | ClientCommand::ToggleMcp { .. }
         | ClientCommand::ListSessions
-        | ClientCommand::ResumeSession { .. } => None,
+        | ClientCommand::ResumeSession { .. }
+        | ClientCommand::Copy { .. } => None,
     }
 }
 

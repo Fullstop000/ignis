@@ -26,6 +26,7 @@ import {
   toggleMcp,
   listSessions,
   resumeSession,
+  copy,
   parseSlash,
   expandPastes,
   pickSingle,
@@ -99,6 +100,16 @@ export default function App({ engine }) {
         engine.send(listSessions());
         setLocalPicker('sessions');
         return true;
+      case 'copy': {
+        // The frontend holds the transcript: extract the last assistant reply
+        // and hand the text to the engine to copy (it reuses its platform
+        // clipboard helper). Optimistic local notice; the engine warns on fail.
+        const last = [...state.blocks].reverse().find((b) => b.kind === 'assistant' && b.text.trim());
+        const note = last ? 'Copied to clipboard.' : 'Nothing to copy.';
+        if (last) engine.send(copy(last.text));
+        setState((s) => ({ ...s, blocks: [...s.blocks, { kind: 'notice', text: note }] }));
+        return true;
+      }
       default:
         return false; // /compact + unknown → submit (engine / LLM handles)
     }

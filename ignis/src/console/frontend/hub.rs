@@ -57,6 +57,9 @@ pub enum CommandOutcome {
     /// Resume a past session (`/sessions` pick / `/resume`): the core retargets
     /// subsequent submits at it, replays its transcript, and re-snapshots.
     ResumeSession(String),
+    /// Copy text to the system clipboard (`/copy`): the core writes it via its
+    /// platform clipboard helper and warns only on failure.
+    Copy(String),
     /// A mechanical control signal (cancel / inject / shutdown).
     Control(ControlSignal),
     /// A `Reply` the hub already resolved against the broker — nothing left for
@@ -224,6 +227,9 @@ impl FrontendHub {
         }
         if let ClientCommand::ResumeSession { session_id } = cmd {
             return CommandOutcome::ResumeSession(session_id);
+        }
+        if let ClientCommand::Copy { text } = cmd {
+            return CommandOutcome::Copy(text);
         }
         // Remaining variants are mechanical control signals.
         match control_signal(&cmd) {
@@ -413,6 +419,12 @@ mod tests {
         assert_eq!(
             hub.handle_command(ClientCommand::Cancel),
             CommandOutcome::Control(ControlSignal::Cancel)
+        );
+        assert_eq!(
+            hub.handle_command(ClientCommand::Copy {
+                text: "hi".to_string()
+            }),
+            CommandOutcome::Copy("hi".to_string())
         );
     }
 

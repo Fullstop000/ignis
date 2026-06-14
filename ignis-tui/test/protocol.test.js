@@ -17,6 +17,7 @@ import {
   toggleMcp,
   listSessions,
   resumeSession,
+  copy,
   parseSlash,
   expandPastes,
   answerSingle,
@@ -117,6 +118,7 @@ test('command builders match the Rust ClientCommand wire shapes', () => {
   assert.deepEqual(toggleMcp('fs'), { kind: 'toggle_mcp', data: { name: 'fs' } });
   assert.deepEqual(listSessions(), { kind: 'list_sessions' });
   assert.deepEqual(resumeSession('session-x'), { kind: 'resume_session', data: { session_id: 'session-x' } });
+  assert.deepEqual(copy('hello'), { kind: 'copy', data: { text: 'hello' } });
 });
 
 test('a sessions frame stores the picker list', () => {

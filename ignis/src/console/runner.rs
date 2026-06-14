@@ -887,6 +887,19 @@ async fn drive_frontend_core(
                     hub.set_mcp(mcp_toggles(&mcp_registry));
                     hub.send_snapshot().await;
                 }
+                // `/copy`: write the frontend-supplied text (the last assistant
+                // message) to the clipboard via the platform helper, warning
+                // only if it fails — success is the frontend's optimistic notice
+                // (mirrors ratatui's local feedback).
+                CommandOutcome::Copy(text) => {
+                    if let Err(err) = crate::console::clipboard::set_clipboard(&text) {
+                        hub.emit_event(AgentEvent::Warning {
+                            source: "clipboard".to_string(),
+                            message: err,
+                        })
+                        .await;
+                    }
+                }
                 // `/sessions`: list the project's past sessions off disk
                 // (current one excluded) for the frontend's picker.
                 CommandOutcome::ListSessions => {

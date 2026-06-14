@@ -208,6 +208,7 @@ export const toggleSkill = (name) => ({ kind: 'toggle_skill', data: { name } });
 export const toggleMcp = (name) => ({ kind: 'toggle_mcp', data: { name } });
 export const listSessions = () => ({ kind: 'list_sessions' });
 export const resumeSession = (sessionId) => ({ kind: 'resume_session', data: { session_id: sessionId } });
+export const copy = (text) => ({ kind: 'copy', data: { text } });
 export const reply = (id, answer) => ({ kind: 'reply', data: { id, answer } });
 
 /**

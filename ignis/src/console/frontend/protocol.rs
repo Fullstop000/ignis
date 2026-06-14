@@ -201,6 +201,12 @@ pub enum ClientCommand {
     /// replays its transcript as an [`Outbound::Transcript`], and re-snapshots.
     #[serde(rename = "resume_session")]
     ResumeSession { session_id: String },
+    /// Copy text to the system clipboard (`/copy`). The frontend holds the
+    /// transcript, so it extracts the last assistant message and sends the text;
+    /// the core reuses its platform clipboard helper (no Ink-stdout/OSC52 risk)
+    /// and surfaces a `Warning` only if the copy fails.
+    #[serde(rename = "copy")]
+    Copy { text: String },
     /// Answer a [`ClientRequest`]. `id` must match the outstanding request; a
     /// stale or unknown id is dropped by the broker.
     #[serde(rename = "reply")]
