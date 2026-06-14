@@ -67,6 +67,29 @@ test('selecting a session resumes it and replays the transcript', async () => {
   assert.doesNotMatch(f, /Resume a session/);
 });
 
+test('a long session list is windowed so it never overflows', async () => {
+  const many = Array.from({ length: 20 }, (_, i) => ({
+    id: `session-${i}`,
+    preview: `task ${i}`,
+    message_count: 1,
+    last_modified: 1000 - i,
+  }));
+  const { engine, stdin, lastFrame } = renderApp();
+  await tick();
+  stdin.write('/sessions');
+  await tick();
+  stdin.write(KEY.enter);
+  await tick();
+  engine.emit(sessions(many));
+  await tick();
+  const f = plain(lastFrame());
+  // Only a window is shown, with a "more below" affordance; the top rows render
+  // (cursor at 0) but the far tail does not.
+  assert.match(f, /task 0/);
+  assert.match(f, /↓ \d+ more/);
+  assert.doesNotMatch(f, /task 19/, 'far tail is windowed out');
+});
+
 test('Esc cancels the session picker without resuming', async () => {
   const { engine, stdin, lastFrame } = renderApp();
   await tick();

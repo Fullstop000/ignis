@@ -567,7 +567,16 @@ function SessionPicker({ items, onPick, onCancel }) {
   if (!items.length) {
     rows.push(e(Text, { key: 'empty', dimColor: true }, 'Loading sessions…'));
   } else {
-    items.forEach((s, i) => {
+    // Window the (two-line) rows so a long list never overflows the terminal —
+    // keep the cursor centered, clamped to the ends.
+    const VISIBLE = 8;
+    const start =
+      items.length <= VISIBLE
+        ? 0
+        : Math.max(0, Math.min(cursor - Math.floor(VISIBLE / 2), items.length - VISIBLE));
+    if (start > 0) rows.push(e(Text, { key: 'above', dimColor: true }, `  ↑ ${start} more`));
+    items.slice(start, start + VISIBLE).forEach((s, j) => {
+      const i = start + j;
       const focused = i === cursor;
       const title = (s.preview && s.preview.trim()) || '(no preview)';
       const meta = `${ageStr(s.last_modified)} · ${s.id} · ${s.message_count} msg${s.message_count === 1 ? '' : 's'}`;
@@ -580,6 +589,8 @@ function SessionPicker({ items, onPick, onCancel }) {
         ),
       );
     });
+    const below = items.length - (start + VISIBLE);
+    if (below > 0) rows.push(e(Text, { key: 'below', dimColor: true }, `  ↓ ${below} more`));
   }
   rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ select · enter resume · esc cancel'));
   return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
