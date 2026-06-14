@@ -22,6 +22,8 @@ export function initialState() {
     cwd: null,
     mode: null,
     models: [],
+    skills: [],
+    mcp: [],
     turns: 0,
     usage: null,
   };
@@ -44,6 +46,8 @@ export function reduceOutbound(state, frame) {
         cwd: frame.data?.cwd ?? state.cwd,
         mode: frame.data?.mode ?? state.mode,
         models: frame.data?.models ?? state.models,
+        skills: frame.data?.skills ?? state.skills,
+        mcp: frame.data?.mcp ?? state.mcp,
         request: frame.data?.pending_request ? toRequest(frame.data.pending_request) : null,
       };
     default:
@@ -163,6 +167,8 @@ export const setSession = (sessionId) => ({ kind: 'set_session', data: { session
 export const newSession = () => ({ kind: 'new_session' });
 export const setModel = (provider, model) => ({ kind: 'set_model', data: { provider, model } });
 export const setMode = (mode) => ({ kind: 'set_mode', data: { mode } });
+export const toggleSkill = (name) => ({ kind: 'toggle_skill', data: { name } });
+export const toggleMcp = (name) => ({ kind: 'toggle_mcp', data: { name } });
 export const reply = (id, answer) => ({ kind: 'reply', data: { id, answer } });
 
 /**

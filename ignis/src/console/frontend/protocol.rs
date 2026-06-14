@@ -66,6 +66,14 @@ pub struct ModelRef {
     pub model: String,
 }
 
+/// A named, toggleable feature (a skill or an MCP server) with its enabled
+/// state — for the `/skills` and `/mcp` toggle pickers.
+#[derive(Debug, Clone, Serialize)]
+pub struct Toggle {
+    pub name: String,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub session_id: String,
@@ -79,6 +87,9 @@ pub struct Snapshot {
     pub mode: String,
     /// The configured models, for the `/model` picker (the engine owns the list).
     pub models: Vec<ModelRef>,
+    /// Skills + MCP servers with their enabled state, for `/skills` and `/mcp`.
+    pub skills: Vec<Toggle>,
+    pub mcp: Vec<Toggle>,
     /// Request awaiting an answer at activation time, if a tool was blocked
     /// when this frontend took over.
     pub pending_request: Option<ClientRequest>,
@@ -125,6 +136,12 @@ pub enum ClientCommand {
     /// `fully_unattended`. The core applies + persists it and re-snapshots.
     #[serde(rename = "set_mode")]
     SetMode { mode: String },
+    /// Toggle a skill (`/skills`) or MCP server (`/mcp`) on/off. The core flips
+    /// + persists it and re-snapshots with the new enabled state.
+    #[serde(rename = "toggle_skill")]
+    ToggleSkill { name: String },
+    #[serde(rename = "toggle_mcp")]
+    ToggleMcp { name: String },
     /// Answer a [`ClientRequest`]. `id` must match the outstanding request; a
     /// stale or unknown id is dropped by the broker.
     #[serde(rename = "reply")]

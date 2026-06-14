@@ -19,7 +19,7 @@
 use crate::console::frontend::command::{control_signal, ControlSignal};
 use crate::console::frontend::port::Acceptor;
 use crate::console::frontend::protocol::{
-    ClientCommand, ClientRequest, ModelRef, Outbound, Snapshot,
+    ClientCommand, ClientRequest, ModelRef, Outbound, Snapshot, Toggle,
 };
 use crate::console::frontend::RequestBroker;
 use crate::console::picker::{PickerRequest, PickerResponse};
@@ -39,10 +39,17 @@ pub enum CommandOutcome {
     NewSession,
     /// Switch the active provider/model (`/model`): the core applies it to the
     /// next prompt and re-snapshots so the statusline updates.
-    SetModel { provider: String, model: String },
+    SetModel {
+        provider: String,
+        model: String,
+    },
     /// Switch the permission mode (`/afk`): the core applies + persists it and
     /// re-snapshots.
     SetMode(String),
+    /// Toggle a skill / MCP server (`/skills`, `/mcp`): the core flips + persists
+    /// it and re-snapshots.
+    ToggleSkill(String),
+    ToggleMcp(String),
     /// A mechanical control signal (cancel / inject / shutdown).
     Control(ControlSignal),
     /// A `Reply` the hub already resolved against the broker — nothing left for
@@ -61,6 +68,9 @@ pub struct FrontendHub {
     mode: String,
     /// The configured models, surfaced to the frontend's `/model` picker.
     models: Vec<ModelRef>,
+    /// Skills + MCP servers with enabled state (set after construction + on toggle).
+    skills: Vec<Toggle>,
+    mcp: Vec<Toggle>,
     acceptor: Acceptor,
     broker: RequestBroker,
     /// The single picker awaiting an answer, if any. The console opens pickers
@@ -86,6 +96,8 @@ impl FrontendHub {
             cwd,
             mode: String::new(),
             models,
+            skills: Vec::new(),
+            mcp: Vec::new(),
             acceptor,
             broker,
             pending: None,
@@ -104,6 +116,8 @@ impl FrontendHub {
             cwd: self.cwd.clone(),
             mode: self.mode.clone(),
             models: self.models.clone(),
+            skills: self.skills.clone(),
+            mcp: self.mcp.clone(),
             pending_request: self.pending.clone(),
         }
     }
@@ -111,6 +125,14 @@ impl FrontendHub {
     /// Update the permission mode the hub reports (startup + after `/afk`).
     pub fn set_mode(&mut self, mode: String) {
         self.mode = mode;
+    }
+
+    /// Update the skill / MCP enabled lists the hub reports (startup + on toggle).
+    pub fn set_skills(&mut self, skills: Vec<Toggle>) {
+        self.skills = skills;
+    }
+    pub fn set_mcp(&mut self, mcp: Vec<Toggle>) {
+        self.mcp = mcp;
     }
 
     /// Retarget the session this hub reports in snapshots (after `/clear`).
@@ -171,6 +193,12 @@ impl FrontendHub {
         }
         if let ClientCommand::SetMode { mode } = cmd {
             return CommandOutcome::SetMode(mode);
+        }
+        if let ClientCommand::ToggleSkill { name } = cmd {
+            return CommandOutcome::ToggleSkill(name);
+        }
+        if let ClientCommand::ToggleMcp { name } = cmd {
+            return CommandOutcome::ToggleMcp(name);
         }
         // Remaining variants are mechanical control signals.
         match control_signal(&cmd) {

@@ -22,6 +22,8 @@ import {
   newSession,
   setModel,
   setMode,
+  toggleSkill,
+  toggleMcp,
   parseSlash,
   pickSingle,
   pickMulti,
@@ -77,6 +79,12 @@ export default function App({ engine }) {
         return true;
       case 'afk':
         setLocalPicker('afk');
+        return true;
+      case 'skills':
+        setLocalPicker('skills');
+        return true;
+      case 'mcp':
+        setLocalPicker('mcp');
         return true;
       default:
         return false; // /compact + unknown → submit (engine / LLM handles)
@@ -212,6 +220,26 @@ export default function App({ engine }) {
           setLocalPicker(null);
         },
         onCancel: () => setLocalPicker(null),
+      }),
+    );
+  } else if (localPicker === 'skills') {
+    children.push(
+      e(TogglePicker, {
+        key: 'skills-picker',
+        title: 'Skills (space to toggle)',
+        items: state.skills,
+        onToggle: (name) => engine.send(toggleSkill(name)),
+        onClose: () => setLocalPicker(null),
+      }),
+    );
+  } else if (localPicker === 'mcp') {
+    children.push(
+      e(TogglePicker, {
+        key: 'mcp-picker',
+        title: 'MCP servers (space to toggle)',
+        items: state.mcp,
+        onToggle: (name) => engine.send(toggleMcp(name)),
+        onClose: () => setLocalPicker(null),
       }),
     );
   } else {
@@ -445,6 +473,34 @@ function ChoicePicker({ title, items, labelOf, isCurrent, onPick, onCancel }) {
     rows.push(e(PickerRow, { key: `i${i}`, label: labelOf(it), focused: i === cursor, checked: false, multi: false })),
   );
   rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ select · enter confirm · esc cancel'));
+  return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
+}
+
+// Local multi-toggle picker (used by /skills, /mcp). Each space sends a toggle
+// command; the engine re-snapshots and `items` reflects the new enabled state.
+function TogglePicker({ title, items, onToggle, onClose }) {
+  const [cursor, setCursor] = useState(0);
+  useInput((ch, key) => {
+    if (key.escape) {
+      onClose();
+      return;
+    }
+    if (key.upArrow) {
+      setCursor((c) => Math.max(0, c - 1));
+      return;
+    }
+    if (key.downArrow) {
+      setCursor((c) => Math.min(Math.max(items.length - 1, 0), c + 1));
+      return;
+    }
+    if (ch === ' ' && items[cursor]) onToggle(items[cursor].name);
+  });
+  const rows = [e(Text, { key: 'q', bold: true }, title)];
+  if (!items.length) rows.push(e(Text, { key: 'empty', dimColor: true }, 'Nothing configured.'));
+  items.forEach((it, i) =>
+    rows.push(e(PickerRow, { key: `i${i}`, label: it.name, focused: i === cursor, checked: it.enabled, multi: true })),
+  );
+  rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ move · space toggle · esc close'));
   return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
 }
 

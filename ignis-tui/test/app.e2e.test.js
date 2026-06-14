@@ -324,6 +324,36 @@ test('/model opens a picker of engine-supplied models; selection sends set_model
   assert.doesNotMatch(plain(lastFrame()), /Switch model/);
 });
 
+test('/skills picker shows enabled state and space toggles via toggle_skill', async () => {
+  const { engine, lastFrame, stdin } = renderApp();
+  await tick();
+  engine.emit(
+    snapshot({
+      session_id: 's1',
+      skills: [
+        { name: 'git', enabled: true },
+        { name: 'web', enabled: false },
+      ],
+    }),
+  );
+  await tick();
+  stdin.write('/skills');
+  await tick();
+  stdin.write(KEY.enter);
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /\[x\] git/);
+  assert.match(f, /\[ \] web/);
+  // Space on the first row (git) → toggle_skill.
+  stdin.write(KEY.space);
+  await tick();
+  assert.deepEqual(engine.last(), { kind: 'toggle_skill', data: { name: 'git' } });
+  // Engine re-snapshots with git now disabled → checkbox flips.
+  engine.emit(snapshot({ session_id: 's1', skills: [{ name: 'git', enabled: false }, { name: 'web', enabled: false }] }));
+  await tick();
+  assert.match(plain(lastFrame()), /\[ \] git/);
+});
+
 test('/afk picker switches permission mode and the footer shows a badge', async () => {
   const { engine, lastFrame, stdin } = renderApp();
   await tick();

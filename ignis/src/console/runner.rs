@@ -418,9 +418,11 @@ pub async fn run_console(
     // The UI keeps its own `App.skills` clone; `agent_loop` owns the runner's
     // copy (and takes it `mut` so `ReloadSkills` can swap in a fresh scan).
     let runner_skill_registry = skill_registry.clone();
+    let driver_skill_registry = skill_registry.clone();
     app.skills = Some(ui_skill_registry);
 
     let runner_mcp_registry = mcp_registry.clone();
+    let driver_mcp_registry = mcp_registry.clone();
     app.mcp = Some(mcp_registry);
 
     let runner_permissions = permissions.clone();
@@ -486,6 +488,8 @@ pub async fn run_console(
         active_inject,
         prompt_tx.clone(),
         driver_permissions,
+        driver_skill_registry,
+        driver_mcp_registry,
         app.session_id.clone(),
     ));
 
@@ -604,8 +608,8 @@ pub async fn run_engine(
         storage_dir,
         cwd,
         hook_registry,
-        skill_registry,
-        mcp_registry,
+        skill_registry.clone(),
+        mcp_registry.clone(),
         permissions.clone(),
     ));
 
@@ -633,6 +637,8 @@ pub async fn run_engine(
         active_inject,
         prompt_tx,
         permissions,
+        skill_registry,
+        mcp_registry,
         session_id,
     )
     .await;
@@ -650,6 +656,29 @@ pub async fn run_engine(
 /// forwarded to the agent (the cancel channel and the live turn's inject
 /// source). The frontend keeps `prompt_tx` only for config commands (model
 /// switch / config + skills reload), which still travel that channel directly.
+/// Skill/MCP enabled state as wire [`Toggle`]s for the `/skills` `/mcp` pickers.
+fn skill_toggles(
+    reg: &crate::skills::SkillRegistry,
+) -> Vec<crate::console::frontend::protocol::Toggle> {
+    reg.all()
+        .iter()
+        .map(|s| crate::console::frontend::protocol::Toggle {
+            name: s.name.clone(),
+            enabled: reg.is_enabled(&s.name),
+        })
+        .collect()
+}
+
+fn mcp_toggles(reg: &crate::mcp::McpRegistry) -> Vec<crate::console::frontend::protocol::Toggle> {
+    reg.entries()
+        .into_iter()
+        .map(|e| crate::console::frontend::protocol::Toggle {
+            enabled: !matches!(e.status, crate::mcp::McpStatus::Disabled),
+            name: e.name,
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_frontend_core(
     mut hub: FrontendHub,
@@ -659,10 +688,14 @@ async fn drive_frontend_core(
     active_inject: ActiveInject,
     prompt_tx: mpsc::Sender<AgentRequest>,
     permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
+    skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
+    mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
     mut current_session_id: String,
 ) {
-    // Seed the snapshot with the live permission mode (for the statusline badge).
+    // Seed the snapshot with the live permission mode + skill/MCP state.
     hub.set_mode(permissions.mode().as_str().to_string());
+    hub.set_skills(skill_toggles(&skill_registry));
+    hub.set_mcp(mcp_toggles(&mcp_registry));
     // Hand the freshly-attached frontend its session snapshot (provider/model/
     // cwd/session id) so it can render a statusline before any turn. The
     // ratatui frontend ignores snapshots; the out-of-process Ink one consumes it.
@@ -733,6 +766,32 @@ async fn drive_frontend_core(
                         hub.set_mode(m.as_str().to_string());
                         hub.send_snapshot().await;
                     }
+                }
+                // `/skills`: flip the skill, persist the disabled set, re-snapshot.
+                CommandOutcome::ToggleSkill(name) => {
+                    skill_registry.toggle(&name);
+                    let disabled: Vec<String> = skill_registry
+                        .all()
+                        .iter()
+                        .filter(|s| !skill_registry.is_enabled(&s.name))
+                        .map(|s| s.name.clone())
+                        .collect();
+                    let _ = crate::state::persist_disabled_skills(&disabled);
+                    hub.set_skills(skill_toggles(&skill_registry));
+                    hub.send_snapshot().await;
+                }
+                // `/mcp`: same, for MCP servers.
+                CommandOutcome::ToggleMcp(name) => {
+                    mcp_registry.toggle(&name);
+                    let disabled: Vec<String> = mcp_registry
+                        .entries()
+                        .into_iter()
+                        .filter(|e| matches!(e.status, crate::mcp::McpStatus::Disabled))
+                        .map(|e| e.name)
+                        .collect();
+                    let _ = crate::state::persist_disabled_mcp_servers(&disabled);
+                    hub.set_mcp(mcp_toggles(&mcp_registry));
+                    hub.send_snapshot().await;
                 }
                 // The agent task drains stale cancels at each prompt's start, so
                 // an inter-turn cancel is harmless — no gating needed here.
@@ -1495,6 +1554,12 @@ mod tests {
             active_inject,
             prompt_tx,
             crate::permissions::runtime::PermissionState::new(crate::permissions::Mode::Off),
+            std::sync::Arc::new(crate::skills::SkillRegistry::load(
+                None,
+                std::path::Path::new("/nonexistent-skills-test"),
+                std::collections::HashSet::new(),
+            )),
+            crate::mcp::McpRegistry::empty(),
             "s1".to_string(),
         ));
 

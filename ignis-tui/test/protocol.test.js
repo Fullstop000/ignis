@@ -13,6 +13,8 @@ import {
   newSession,
   setModel,
   setMode,
+  toggleSkill,
+  toggleMcp,
   parseSlash,
   answerSingle,
   answerCancelled,
@@ -84,6 +86,8 @@ test('command builders match the Rust ClientCommand wire shapes', () => {
   assert.deepEqual(newSession(), { kind: 'new_session' });
   assert.deepEqual(setModel('deepseek', 'v4'), { kind: 'set_model', data: { provider: 'deepseek', model: 'v4' } });
   assert.deepEqual(setMode('hands_free'), { kind: 'set_mode', data: { mode: 'hands_free' } });
+  assert.deepEqual(toggleSkill('git'), { kind: 'toggle_skill', data: { name: 'git' } });
+  assert.deepEqual(toggleMcp('fs'), { kind: 'toggle_mcp', data: { name: 'fs' } });
 });
 
 test('parseSlash recognizes slash commands, ignores normal prompts', () => {
