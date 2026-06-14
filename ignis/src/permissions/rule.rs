@@ -200,7 +200,11 @@ impl Rule {
                 return false;
             };
             return match extract_host(url) {
-                Some(host) => simple_glob(host_pat, &host),
+                // Lowercase both sides so an uppercase rule like `domain:EVIL.com`
+                // still matches the normalized host `evil.com`.
+                Some(host) => {
+                    simple_glob(&host_pat.to_ascii_lowercase(), &host.to_ascii_lowercase())
+                }
                 None => false,
             };
         }
@@ -767,6 +771,21 @@ mod tests {
         let set = rs(&[], &[], &["web_fetch(domain:evil.com)"]);
         assert!(matches!(
             set.decide("web_fetch", &json!({"url": "https://EVIL.com/x"})),
+            Some(Decision::Deny { .. })
+        ));
+    }
+
+    #[test]
+    fn domain_rule_is_case_insensitive_for_existing_uppercase_rules() {
+        // A previously-suggested or hand-authored uppercase rule must still match
+        // after we normalize the fetched URL to lowercase.
+        let set = rs(&[], &[], &["web_fetch(domain:EVIL.com)"]);
+        assert!(matches!(
+            set.decide("web_fetch", &json!({"url": "https://EVIL.com/x"})),
+            Some(Decision::Deny { .. })
+        ));
+        assert!(matches!(
+            set.decide("web_fetch", &json!({"url": "https://evil.com/x"})),
             Some(Decision::Deny { .. })
         ));
     }
