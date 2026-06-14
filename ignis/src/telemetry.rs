@@ -370,19 +370,19 @@ mod tests {
     #[test]
     fn is_enabled_reads_env_var() {
         let config = Config::default();
-        // Default on — env var not set, config says true.
+        // Default off — env var not set, config says false.
         std::env::remove_var("IGNIS_ENABLE_TELEMETRY");
-        assert!(is_enabled(&config));
+        assert!(!is_enabled(&config));
 
         // Env var set to truthy overrides config.
         std::env::set_var("IGNIS_ENABLE_TELEMETRY", "1");
         assert!(is_enabled(&config));
         std::env::remove_var("IGNIS_ENABLE_TELEMETRY");
 
-        // Config disabled, env var not set — disabled.
+        // Config explicitly enabled, env var not set — enabled.
         let mut config = Config::default();
-        config.telemetry.enabled = false;
-        assert!(!is_enabled(&config));
+        config.telemetry.enabled = true;
+        assert!(is_enabled(&config));
     }
 
     #[test]

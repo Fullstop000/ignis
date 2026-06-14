@@ -298,7 +298,12 @@ mod tests {
     #[test]
     fn draw_input_shows_placeholder_via_app() {
         use std::path::PathBuf;
-        let app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        let app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
         let mut term = Terminal::new(TestBackend::new(40, 3)).unwrap();
         term.draw(|f| draw_input(f, f.size(), &app)).unwrap();
         let text: String = term

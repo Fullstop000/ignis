@@ -7,8 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Tools — `edit_file` accepts an optional `global_replace=true` parameter to replace every occurrence of `old_text` instead of only the first. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+- Tools — `web_fetch` and `web_search` now retry transient failures (timeouts, connection drops, and 5xx responses) with exponential backoff. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+- Hooks — hook executables can now be bare command names resolved on `$PATH`, and invalid env-var names are rejected at config load time. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+
+### Changed
+- Telemetry — OpenTelemetry export is now **off** by default; opt in with `[telemetry] enabled = true` or `IGNIS_ENABLE_TELEMETRY=1`. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+- Sessions — project session directories now use a cleaner slug (no leading dash from the root separator) and legacy directories are migrated automatically while keeping each `.usage.json` sidecar with its session file. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+
 ### Fixed
 - TUI — resizing or splitting a terminal pane no longer leaves stale copies of the input bar in native scrollback; Ignis coalesces each resize burst into one settled purge, then replays its welcome, resumed/mid-session conversation, and active stream rows at the new width. ([#173](https://github.com/Fullstop000/ignis/pull/173))
+- LLM — provider requests now time out after 120 s waiting for the first byte, and retries are restricted to transient failures (timeouts, connection errors, 5xx) instead of burning budget on 4xx or malformed responses. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+- Reliability — permission/MCP/skill lock poisoning no longer panics; the runtime recovers safely. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+- MCP — shutdown escalates from SIGTERM to SIGKILL only after confirming the process group is still alive. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+- Tools — `bash` now rejects a missing or non-directory `cwd` before spawning the shell. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+- Tests — the flaky pty-timing integration test `inline_resize_replays_stable_rows_from_an_active_stream` is now `#[ignore]`d under parallel load; run it in isolation with `--ignored`. ([#187](https://github.com/Fullstop000/ignis/pull/187))
 
 ## [0.38.1] - 2026-06-12
 

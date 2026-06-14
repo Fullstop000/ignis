@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
@@ -237,12 +237,8 @@ async fn push_with_hook(history: &mut Vec<Message>, hooks: Option<&dyn ToolHooks
         let transformed = h
             .after_tool_call(msg.name.as_deref().unwrap_or(""), original_result)
             .await;
-        let result_json = serde_json::json!({
-            "result": transformed.content,
-            "is_error": transformed.is_error
-        });
         history.push(Message {
-            content: Some(result_json.to_string()),
+            content: Some(tool_result_envelope(&transformed)),
             ..msg
         });
     } else {
@@ -317,17 +313,23 @@ async fn execute_single_tool(
     tool_result_message(&tool_name, &tc_id, &result)
 }
 
+/// Serialize a tool result into the `{result, is_error}` JSON envelope the
+/// agent loop expects.
+fn tool_result_envelope(result: &ToolResult) -> String {
+    serde_json::json!({
+        "result": result.content,
+        "is_error": result.is_error,
+    })
+    .to_string()
+}
+
 /// Build the `role:"tool"` history message for a finished tool call, wrapping
 /// the result as the `{result, is_error}` JSON envelope the rest of the loop
 /// expects. Shared by the normal execution path and the hook-blocked path.
 fn tool_result_message(name: &str, call_id: &str, result: &ToolResult) -> Message {
-    let result_json = serde_json::json!({
-        "result": result.content,
-        "is_error": result.is_error,
-    });
     Message {
         role: "tool".to_string(),
-        content: Some(result_json.to_string()),
+        content: Some(tool_result_envelope(result)),
         reasoning_content: None,
         name: Some(name.to_string()),
         tool_call_id: Some(call_id.to_string()),
@@ -419,7 +421,7 @@ async fn consume_run_stream(
     use futures_util::stream::StreamExt;
     let mut assistant_content = String::new();
     let mut reasoning_content = String::new();
-    let mut pending_tool_calls: HashMap<usize, AccumulatingToolCall> = HashMap::new();
+    let mut pending_tool_calls: BTreeMap<usize, AccumulatingToolCall> = BTreeMap::new();
     let mut message_started = false;
     let mut reasoning_streaming = false;
     let mut run_usage = Usage::default();
@@ -551,24 +553,18 @@ async fn consume_run_stream(
         }
     }
 
-    // Sort by index to maintain deterministic order
-    let mut tool_calls = Vec::new();
-    if !pending_tool_calls.is_empty() {
-        let mut sorted_keys: Vec<&usize> = pending_tool_calls.keys().collect();
-        sorted_keys.sort();
-        for key in sorted_keys {
-            if let Some(pending) = pending_tool_calls.get(key) {
-                tool_calls.push(ToolCall {
-                    id: pending.id.clone(),
-                    r#type: "function".to_string(),
-                    function: ToolCallFunction {
-                        name: pending.name.clone(),
-                        arguments: pending.arguments.clone(),
-                    },
-                });
-            }
-        }
-    }
+    // BTreeMap keeps tool calls in index order without an explicit sort.
+    let tool_calls: Vec<ToolCall> = pending_tool_calls
+        .into_values()
+        .map(|pending| ToolCall {
+            id: pending.id,
+            r#type: "function".to_string(),
+            function: ToolCallFunction {
+                name: pending.name,
+                arguments: pending.arguments,
+            },
+        })
+        .collect();
 
     RunStream {
         assistant_content,
@@ -614,6 +610,38 @@ fn retry_backoff_ms(attempt: u32) -> u64 {
         .checked_shl(shift)
         .unwrap_or(u64::MAX)
         .min(MAX_BACKOFF_MS)
+}
+
+/// Decide whether a pre-stream failure is worth retrying. Transport blips
+/// (timeouts, connection resets, 5xx) are retryable; client/4xx errors and
+/// malformed responses are treated as fatal so we don't burn the retry budget
+/// on something that won't recover.
+fn is_retryable_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(req_err) = cause.downcast_ref::<reqwest::Error>() {
+            return req_err.is_timeout()
+                || req_err.is_connect()
+                || req_err.status().is_none_or(|s| s.is_server_error());
+        }
+        if let Some(http_err) = cause.downcast_ref::<crate::llm::protocols::LlmHttpError>() {
+            return http_err.status.is_server_error();
+        }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+            );
+        }
+    }
+    // Our own explicit timeout from `send_with_timeout` doesn't wrap a reqwest
+    // error, so also retry on the timeout message.
+    let s = err.to_string().to_lowercase();
+    s.contains("timed out") || s.contains("timeout")
 }
 
 /// Emit `Reconnecting { attempt, max }` and back off before the next stream
@@ -763,7 +791,7 @@ impl Agent {
                 .chat_stream(effective_prompt, messages, tool_schemas)
                 .await
             {
-                Err(err) if attempt < MAX_STREAM_RETRIES => {
+                Err(err) if attempt < MAX_STREAM_RETRIES && is_retryable_error(&err) => {
                     attempt += 1;
                     reconnect(
                         tx,
@@ -1339,6 +1367,26 @@ mod tests {
         t.message_started = false;
         t.reasoning_streaming = true;
         assert!(!t.is_empty());
+    }
+
+    #[test]
+    fn retryable_error_classifies_transient_failures() {
+        assert!(is_retryable_error(&anyhow::anyhow!(
+            "LLM request timed out after 120s"
+        )));
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        assert!(is_retryable_error(&anyhow::anyhow!(io_err)));
+        let http_5xx = crate::llm::protocols::LlmHttpError {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "overloaded".to_string(),
+        };
+        assert!(is_retryable_error(&anyhow::anyhow!(http_5xx)));
+        let http_4xx = crate::llm::protocols::LlmHttpError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: "bad key".to_string(),
+        };
+        assert!(!is_retryable_error(&anyhow::anyhow!(http_4xx)));
+        assert!(!is_retryable_error(&anyhow::anyhow!("model not found")));
     }
 
     #[test]

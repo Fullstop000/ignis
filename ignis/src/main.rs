@@ -2,7 +2,7 @@ use clap::Parser;
 use ignis::{
     cli::{resolve_session_request, Cli, Command},
     config::{build_provider, load_config},
-    session::{project_sessions_dir, SessionManager},
+    session::{project_sessions_dir_with_migration, SessionManager},
     storage::FileStorage,
     AgentEvent, Session,
 };
@@ -13,23 +13,24 @@ async fn main() -> Result<(), anyhow::Error> {
     // clap parses argv, handles --help / --version / errors with proper exits.
     let cli = Cli::parse();
 
+    // Home directory and file logger are shared by every branch (TUI, one-shot,
+    // and subcommands). Initialize once up front and keep going even if logging
+    // fails — the user still wants the command to run.
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not locate home directory"))?;
+    if let Err(e) = ignis::logger::init(&home.join(".ignis/logs")) {
+        eprintln!("Failed to initialize logger: {}", e);
+    }
+
     // Subcommands short-circuit the session flow.
     match cli.command {
         Some(Command::Mcp(cmd)) => {
-            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-            if let Err(e) = ignis::logger::init(&home.join(".ignis/logs")) {
-                eprintln!("Failed to initialize logger: {}", e);
-            }
             return ignis::cli::mcp::run(cmd).await;
         }
         Some(Command::Upgrade(cmd)) => {
             return ignis::cli::upgrade::run(cmd).await;
         }
         Some(Command::Sessions(cmd)) => {
-            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-            if let Err(e) = ignis::logger::init(&home.join(".ignis/logs")) {
-                eprintln!("Failed to initialize logger: {}", e);
-            }
             return ignis::cli::sessions::run(cmd).await;
         }
         None => {}
@@ -69,31 +70,25 @@ async fn main() -> Result<(), anyhow::Error> {
     );
 
     // 2. Resolve paths
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not locate home directory"))?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let ignis_home = home.join(".ignis");
     let storage_root = ignis_home.clone();
-
-    // Initialize logger
-    if let Err(e) = ignis::logger::init(&ignis_home.join("logs")) {
-        eprintln!("Failed to initialize logger: {}", e);
-    }
 
     // Telemetry — no-op unless IGNIS_ENABLE_TELEMETRY=1 (or [telemetry] enabled).
     // Guard's Drop flushes + shuts down OTel providers on exit.
     let _telemetry_guard = ignis::telemetry::init(&config);
 
-    let storage_dir = project_sessions_dir(&storage_root, &cwd);
+    let storage_dir = project_sessions_dir_with_migration(&storage_root, &cwd);
     let session_manager = SessionManager::new(storage_dir.clone());
     let auto_resume = config.auto_resume_last_session.unwrap_or(false);
     let session_request = resolve_session_request(cli, &session_manager, auto_resume, &cwd);
     let system_prompt = ignis::agent::build_system_prompt(&cwd);
 
     // Discover skills (global + project roots) and read the disabled set.
-    let state = ignis::state::load_state();
+    // Reuse the state loaded earlier so permissions and skill/MCP disables are
+    // consistent even if a background writer modifies state.json mid-startup.
     let disabled_skills: std::collections::HashSet<String> =
-        state.disabled_skills.iter().cloned().collect();
+        persisted_state.disabled_skills.iter().cloned().collect();
     let skill_registry = std::sync::Arc::new(ignis::skills::SkillRegistry::load(
         Some(&home),
         &cwd,
@@ -102,19 +97,22 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Spawn MCP servers (in parallel; each bounded by its `startup_timeout_secs`).
     // Failures don't block ignis — they surface in `/mcp` and `ignis mcp list`.
-    let disabled_mcp: std::collections::HashSet<String> =
-        state.disabled_mcp_servers.iter().cloned().collect();
+    let disabled_mcp: std::collections::HashSet<String> = persisted_state
+        .disabled_mcp_servers
+        .iter()
+        .cloned()
+        .collect();
     let mcp_registry = ignis::mcp::McpRegistry::spawn_all(&config.mcp.servers, disabled_mcp).await;
 
-    // When no provider is configured, hand the TUI empty strings; it renders
-    // the no-provider welcome and routes the user through `/connect`. The
-    // one-shot CLI path still hard-errors below — there's no interactive way
-    // to recover from "no provider" in a single-shot invocation.
-    let active_provider = config.active_provider().unwrap_or_default();
-    let active_model = config.active_model().unwrap_or_default();
+    // When no provider is configured, hand the TUI `None`; it renders the
+    // no-provider welcome and routes the user through `/connect`. The one-shot
+    // CLI path still hard-errors below — there's no interactive way to recover
+    // from "no provider" in a single-shot invocation.
+    let active_provider = config.active_provider();
+    let active_model = config.active_model();
 
-    if !active_provider.is_empty() {
-        ignis::telemetry::record_session_start(&active_provider, &active_model);
+    if let (Some(p), Some(m)) = (&active_provider, &active_model) {
+        ignis::telemetry::record_session_start(p, m);
     }
 
     // Load the external-subprocess hook registry once at startup; the
@@ -145,11 +143,14 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Route: One-shot CLI mode (ignis "do something") — needs a real provider.
-    if active_provider.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No provider configured. Launch the TUI (run `ignis` with no args) and run /connect."
-        ));
-    }
+    let (active_provider, active_model) = match (active_provider, active_model) {
+        (Some(p), Some(m)) => (p, m),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "No provider configured. Launch the TUI (run `ignis` with no args) and run /connect."
+            ));
+        }
+    };
     println!("=== Ignis (one-shot) ===");
     println!("Provider: {}/{}", active_provider, active_model);
     println!("Session: {}", session_request.session_id);

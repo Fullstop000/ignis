@@ -118,8 +118,8 @@ impl Drop for TerminalGuard {
 }
 #[allow(clippy::too_many_arguments)]
 pub async fn run_console(
-    provider_name: String,
-    model_name: String,
+    provider_name: Option<String>,
+    model_name: Option<String>,
     session_id: String,
     system_prompt: String,
     storage_dir: std::path::PathBuf,

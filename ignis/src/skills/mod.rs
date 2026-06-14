@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 /// Largest skill body we will load (≈12k tokens). Oversized skills are skipped
 /// so loading or inlining one can never blow the context window.
@@ -84,9 +84,36 @@ pub fn valid_skill_name(name: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Leading-space count of a line (for YAML block-scalar indentation).
-fn indent_width(line: &str) -> usize {
-    line.len() - line.trim_start().len()
+/// Frontmatter fields we recognize from a `SKILL.md`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct SkillFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+/// Quote simple `name`/`description` values that contain an extra colon so
+/// the strict YAML parser accepts frontmatter written for the old parser,
+/// e.g. `description: Use when: reviewing PRs`. Block-scalar lines (`|`, `>`)
+/// and already-quoted values are left untouched.
+fn normalize_frontmatter_line(line: &str) -> String {
+    let Some((key, value)) = line.split_once(':') else {
+        return line.to_string();
+    };
+    let key = key.trim();
+    if !matches!(key, "name" | "description") {
+        return line.to_string();
+    }
+    let value = value.trim_start();
+    if value.starts_with('"')
+        || value.starts_with('\'')
+        || value.starts_with('|')
+        || value.starts_with('>')
+        || !value.contains(':')
+    {
+        return line.to_string();
+    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("{key}: \"{escaped}\"")
 }
 
 /// Parse a `SKILL.md` body. Returns `(name, description, body)` or an `Err`
@@ -115,45 +142,30 @@ pub(crate) fn parse_skill_md(content: &str) -> Result<(String, Option<String>, S
     let body = lines.collect::<Vec<_>>().join("\n");
     let body = body.trim();
 
-    let mut name: Option<String> = None;
-    let mut description: Option<String> = None;
-    let mut i = 0;
-    while i < front.len() {
-        let Some((k, v)) = front[i].split_once(':') else {
-            i += 1;
-            continue;
-        };
-        let key = k.trim();
-        let raw = v.trim();
-        // A YAML block scalar (`|`/`>`, with optional chomping like `|-`): the
-        // value is the following more-indented lines, collapsed to one line.
-        let value = if raw.starts_with('|') || raw.starts_with('>') {
-            let key_indent = indent_width(front[i]);
-            let mut block: Vec<&str> = Vec::new();
-            i += 1;
-            while i < front.len()
-                && (front[i].trim().is_empty() || indent_width(front[i]) > key_indent)
-            {
-                block.push(front[i].trim());
-                i += 1;
-            }
-            block
-                .join(" ")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        } else {
-            i += 1;
-            raw.trim_matches('"').trim_matches('\'').to_string()
-        };
-        match key {
-            "name" if !value.is_empty() => name = Some(value),
-            "description" if !value.is_empty() => description = Some(value),
-            _ => {}
-        }
-    }
+    // Backwards compatibility: the old parser treated everything after the
+    // first `:` as the raw value, so descriptions like
+    // `description: Use when: reviewing PRs` were accepted. Strict YAML sees
+    // the second colon as a nested mapping and errors. Quote those values
+    // before handing the frontmatter to serde_yaml.
+    let normalized: Vec<String> = front
+        .iter()
+        .copied()
+        .map(normalize_frontmatter_line)
+        .collect();
 
-    let name = name.ok_or("missing required `name`")?;
+    let frontmatter: SkillFrontmatter = serde_yaml::from_str(&normalized.join("\n"))
+        .map_err(|e| format!("invalid frontmatter: {e}"))?;
+
+    let name = frontmatter
+        .name
+        .filter(|n| !n.is_empty())
+        .ok_or("missing required `name`")?;
+    // Descriptions are used as one-line metadata; collapse YAML block scalars
+    // and any whitespace runs into a single space.
+    let description = frontmatter
+        .description
+        .filter(|d| !d.trim().is_empty())
+        .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "));
     if !valid_skill_name(&name) {
         return Err(format!("invalid skill name `{name}`"));
     }
@@ -174,7 +186,10 @@ pub(crate) fn parse_skill_md(content: &str) -> Result<(String, Option<String>, S
 /// layer, and the `/skills` picker.
 pub struct SkillRegistry {
     skills: Vec<Skill>, // unique by name, sorted by name
-    disabled: Mutex<HashSet<String>>,
+    /// `RwLock` because reads (`is_enabled`, `catalog_prompt`, picker renders)
+    /// vastly outnumber writes (only on toggle), and the guard is never held
+    /// across an await.
+    disabled: RwLock<HashSet<String>>,
 }
 
 fn xml_escape(s: &str) -> String {
@@ -234,7 +249,7 @@ impl SkillRegistry {
         }
         Self {
             skills: map.into_values().collect(),
-            disabled: Mutex::new(disabled),
+            disabled: RwLock::new(disabled),
         }
     }
 
@@ -252,7 +267,11 @@ impl SkillRegistry {
     }
 
     pub fn is_enabled(&self, name: &str) -> bool {
-        !self.disabled.lock().unwrap().contains(name)
+        !self
+            .disabled
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
     }
 
     /// The enabled skill of this name, or `None` if unknown or disabled.
@@ -276,7 +295,7 @@ impl SkillRegistry {
     /// the resulting enabled state. The lock is dropped before disk I/O.
     pub fn toggle(&self, name: &str) -> bool {
         let (now_enabled, snapshot) = {
-            let mut d = self.disabled.lock().unwrap();
+            let mut d = self.disabled.write().unwrap_or_else(|e| e.into_inner());
             let now_enabled = if d.remove(name) {
                 true
             } else {
@@ -373,6 +392,17 @@ mod tests {
             parse_skill_md(&md("name: \"react\"\ndescription: 'quoted'", "body")).unwrap();
         assert_eq!(n, "react");
         assert_eq!(d.as_deref(), Some("quoted"));
+    }
+
+    #[test]
+    fn description_with_inline_colon_is_accepted() {
+        // Backwards compatibility with skills written for the old parser.
+        let (_, d, _) = parse_skill_md(&md(
+            "name: pr-review\ndescription: Use when: reviewing PRs",
+            "body",
+        ))
+        .unwrap();
+        assert_eq!(d.as_deref(), Some("Use when: reviewing PRs"));
     }
 
     #[test]
@@ -549,14 +579,10 @@ mod tests {
 
     #[test]
     fn toggle_round_trips_through_state() {
-        let _env = crate::util::ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let tmp = crate::util::unique_temp_dir("ignis-skills-toggle");
         let cwd = tmp.join("proj");
         write_skill(&cwd.join(".ignis/skills"), "react", "body");
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp);
+        let _home = crate::util::HomeGuard::set(&tmp);
 
         let reg = SkillRegistry::load(None, &cwd, HashSet::new());
         assert!(reg.is_enabled("react"));
@@ -569,10 +595,6 @@ mod tests {
         assert!(reg.toggle("react")); // back on
         assert!(crate::state::load_state().disabled_skills.is_empty());
 
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

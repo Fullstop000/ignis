@@ -343,8 +343,8 @@ pub(crate) enum Mode {
 }
 
 pub(crate) struct App {
-    pub(crate) provider: String,
-    pub(crate) model: String,
+    pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
     /// Active reasoning effort level (shown in the footer); `None` = not set.
     pub(crate) effort: Option<String>,
     pub(crate) session_id: String,
@@ -478,7 +478,12 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(provider: String, model: String, session_id: String, cwd: PathBuf) -> Self {
+    pub(crate) fn new(
+        provider: Option<String>,
+        model: Option<String>,
+        session_id: String,
+        cwd: PathBuf,
+    ) -> Self {
         let git_branch = super::git::branch(&cwd);
         Self {
             provider,
@@ -549,9 +554,16 @@ impl App {
     fn context_window(&self) -> usize {
         self.model_options
             .iter()
-            .find(|o| o.provider == self.provider && o.model == self.model)
+            .find(|o| {
+                Some(o.provider.as_str()) == self.provider.as_deref()
+                    && Some(o.model.as_str()) == self.model.as_deref()
+            })
             .and_then(|o| o.context)
-            .or_else(|| self.model_catalog.context_for(&self.model))
+            .or_else(|| {
+                self.model
+                    .as_deref()
+                    .and_then(|m| self.model_catalog.context_for(m))
+            })
             .map(|c| c as usize)
             .unwrap_or(self.fallback_context_window)
     }
@@ -956,7 +968,7 @@ impl App {
     /// and turns a "picker already open" refusal into a notice + `None`.
     pub(crate) fn start_connect(&mut self) -> Option<crate::console::picker::PickerRequest> {
         self.exit_pending = false;
-        let current = (!self.provider.is_empty()).then(|| self.provider.clone());
+        let current = self.provider.clone();
         match self.connect.start(self.inline_picker.is_some(), current) {
             Ok(req) => Some(req),
             Err(notice) => {
@@ -976,8 +988,7 @@ impl App {
         &mut self,
         answers: Vec<crate::console::picker::PickerAnswer>,
     ) -> ConnectAdvance {
-        let current = (!self.provider.is_empty() && !self.model.is_empty())
-            .then(|| (self.provider.clone(), self.model.clone()));
+        let current = self.provider.clone().zip(self.model.clone());
         let current_ref = current.as_ref().map(|(p, m)| (p.as_str(), m.as_str()));
         match self.connect.advance(answers, current_ref) {
             ConnectOutcome::NextPicker(req) => ConnectAdvance::NextPicker(req),
@@ -987,8 +998,8 @@ impl App {
                 }
                 match result {
                     ConnectResult::Switched(provider, model) => {
-                        self.provider = provider;
-                        self.model = model;
+                        self.provider = Some(provider);
+                        self.model = Some(model);
                         self.effort = None;
                         self.rebuild_model_options();
                         ConnectAdvance::Saved
@@ -1028,8 +1039,8 @@ impl App {
         self.exit_pending = false;
         match ModelPicker::open(
             &self.model_options,
-            &self.provider,
-            &self.model,
+            self.provider.as_deref().unwrap_or(""),
+            self.model.as_deref().unwrap_or(""),
             self.effort.as_deref(),
         ) {
             Some(p) => self.model_picker = Some(p),
@@ -1056,8 +1067,8 @@ impl App {
     pub(crate) fn apply_model_selection(&mut self) -> Option<(String, String, Option<String>)> {
         let picker = self.model_picker.take()?;
         let (provider, model, effort) = picker.resolve(&self.model_options)?;
-        self.provider = provider.clone();
-        self.model = model.clone();
+        self.provider = Some(provider.clone());
+        self.model = Some(model.clone());
         self.effort = effort.clone();
         Some((provider, model, effort))
     }
@@ -1424,8 +1435,8 @@ mod copy_tests {
 
     fn test_app() -> App {
         let mut app = App::new(
-            "p".to_string(),
-            "m".to_string(),
+            Some("p".to_string()),
+            Some("m".to_string()),
             "s".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -1575,14 +1586,9 @@ mod connect_tests {
     use std::path::PathBuf;
 
     fn fresh_app() -> App {
-        // Empty provider/model = no-provider mode, matching the typical
+        // No provider/model = no-provider mode, matching the typical
         // first-launch caller of /connect.
-        App::new(
-            String::new(),
-            String::new(),
-            "s".to_string(),
-            PathBuf::from("/tmp"),
-        )
+        App::new(None, None, "s".to_string(), PathBuf::from("/tmp"))
     }
 
     #[test]
@@ -1729,8 +1735,8 @@ mod connect_tests {
         // Re-connecting (a model is already active) — the model step leads with
         // a "keep current" row so the user can connect without switching away.
         let mut app = App::new(
-            "deepseek".to_string(),
-            "deepseek-v4-flash".to_string(),
+            Some("deepseek".to_string()),
+            Some("deepseek-v4-flash".to_string()),
             "s".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -1829,8 +1835,8 @@ mod tests {
         // incremental-commit cursor in lockstep with `committed`, or the runner
         // skips the first rows of the new session's output.
         let mut app = App::new(
-            "p".into(),
-            "m".into(),
+            Some("p".into()),
+            Some("m".into()),
             "s".into(),
             std::path::PathBuf::from("/"),
         );
@@ -1895,8 +1901,8 @@ mod tests {
 
     fn test_app() -> App {
         App::new(
-            "p".to_string(),
-            "m".to_string(),
+            Some("p".to_string()),
+            Some("m".to_string()),
             "s".to_string(),
             PathBuf::from("/tmp"),
         )
@@ -1961,8 +1967,8 @@ mod tests {
             None,
         );
         // Exactly what the `Switched` arm does: adopt the new selection.
-        app.provider = "minimax-token-plan".to_string();
-        app.model = "MiniMax-M3".to_string();
+        app.provider = Some("minimax-token-plan".to_string());
+        app.model = Some("MiniMax-M3".to_string());
         assert_eq!(app.context_window(), 1_000_000);
     }
 
@@ -1975,18 +1981,18 @@ mod tests {
         app.fallback_context_window = 120_000;
         app.set_model_options(vec![], None);
         app.model_catalog = crate::llm::ModelCatalog::from_entries([("ad-hoc-model", 512_000)]);
-        app.provider = "some-provider".to_string();
-        app.model = "ad-hoc-model".to_string();
+        app.provider = Some("some-provider".to_string());
+        app.model = Some("ad-hoc-model".to_string());
         assert_eq!(app.context_window(), 512_000);
         // Unknown to both → compaction fallback.
-        app.model = "totally-unknown".to_string();
+        app.model = Some("totally-unknown".to_string());
         assert_eq!(app.context_window(), 120_000);
     }
 
     fn picker_app() -> App {
         let mut app = App::new(
-            "deepseek".to_string(),
-            "deepseek-v4-flash".to_string(),
+            Some("deepseek".to_string()),
+            Some("deepseek-v4-flash".to_string()),
             "s".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -2044,8 +2050,8 @@ mod tests {
             (provider.as_str(), model.as_str(), effort.as_deref()),
             ("deepseek", "deepseek-v4-pro", Some("max"))
         );
-        assert_eq!(app.provider, "deepseek");
-        assert_eq!(app.model, "deepseek-v4-pro");
+        assert_eq!(app.provider, Some("deepseek".to_string()));
+        assert_eq!(app.model, Some("deepseek-v4-pro".to_string()));
         assert_eq!(app.effort.as_deref(), Some("max"));
         assert!(app.model_picker.is_none());
     }
@@ -2276,7 +2282,12 @@ mod tests {
         // A MessageStart whose Message carries reasoning_content but no
         // content is the agent loop's signal "this turn is opening a
         // thinking block" — the app must mint a Reasoning, not Assistant.
-        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        let mut app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
         app.handle_event(AgentEvent::MessageStart {
             message: crate::Message {
                 role: "assistant".to_string(),
@@ -2293,7 +2304,12 @@ mod tests {
 
     #[test]
     fn message_start_with_content_pushes_assistant_block() {
-        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        let mut app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
         app.handle_event(AgentEvent::MessageStart {
             message: crate::Message {
                 role: "assistant".to_string(),
@@ -2310,7 +2326,12 @@ mod tests {
 
     #[test]
     fn message_update_appends_to_reasoning_block() {
-        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        let mut app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
         app.handle_event(AgentEvent::MessageStart {
             message: crate::Message {
                 role: "assistant".to_string(),
@@ -2344,7 +2365,12 @@ mod tests {
 
     #[test]
     fn ctrl_o_toggles_reasoning_and_rewinds_commit() {
-        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        let mut app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
         app.committed = 5;
         assert!(!app.reasoning_expanded);
         app.toggle_reasoning_expanded();
@@ -2359,7 +2385,12 @@ mod tests {
 
     #[test]
     fn live_reasoning_tracks_streaming_collapsed_thought() {
-        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        let mut app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
         assert_eq!(app.live_reasoning(), None, "no thought yet");
 
         app.handle_event(AgentEvent::MessageStart {
@@ -2388,7 +2419,12 @@ mod tests {
         // must close the previous block and open a new one — the user should
         // see three distinct UIBlocks in the order they streamed in, not
         // glued together.
-        let mut app = App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"));
+        let mut app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
         let reasoning_start = || AgentEvent::MessageStart {
             message: crate::Message {
                 role: "assistant".to_string(),
@@ -2461,7 +2497,7 @@ mod tests {
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", &tmp);
 
-        let mut app = App::new("p".into(), "m".into(), "s".into(), cwd.clone());
+        let mut app = App::new(Some("p".into()), Some("m".into()), "s".into(), cwd.clone());
         app.skills = Some(Arc::new(crate::skills::SkillRegistry::load(
             None,
             &cwd,
@@ -2488,7 +2524,12 @@ mod paste_tests {
     use std::path::PathBuf;
 
     fn app() -> App {
-        App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"))
+        App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        )
     }
 
     #[test]
@@ -2614,8 +2655,8 @@ mod settings_tests {
 
     fn test_app() -> App {
         App::new(
-            "openai".to_string(),
-            "gpt-5.5".to_string(),
+            Some("openai".to_string()),
+            Some("gpt-5.5".to_string()),
             "s".to_string(),
             PathBuf::from("/tmp"),
         )

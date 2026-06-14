@@ -86,7 +86,11 @@ fn spec_with(program: PathBuf, sandbox: bool, env: Vec<String>) -> HookSpec {
 async fn run_dispatch(spec: HookSpec, payload: &str) -> (HookOutcome, Vec<ignis::AgentEvent>) {
     use ignis::hooks::HookEvent;
     let (tx, mut rx) = mpsc::channel(8);
-    let outcome = ignis::hooks::dispatch::run_hook(
+
+    // The Linux `exec(2)` path can transiently return `ETXTBSY` when a
+    // freshly-written script is still draining through tmpfs under load.
+    // Retry a few times before treating it as a real failure.
+    let mut outcome = ignis::hooks::dispatch::run_hook(
         &spec,
         HookEvent::UserPromptSubmit,
         payload,
@@ -97,6 +101,26 @@ async fn run_dispatch(spec: HookSpec, payload: &str) -> (HookOutcome, Vec<ignis:
         Some(&tx),
     )
     .await;
+    for attempt in 1..=8 {
+        let is_txtbsy = matches!(&outcome, HookOutcome::SoftFailed { reason, .. }
+            if reason.contains("Text file busy"));
+        if !is_txtbsy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20 * attempt)).await;
+        outcome = ignis::hooks::dispatch::run_hook(
+            &spec,
+            HookEvent::UserPromptSubmit,
+            payload,
+            &DispatchContext {
+                session_id: "s",
+                cwd: "/tmp",
+            },
+            Some(&tx),
+        )
+        .await;
+    }
+
     drop(tx);
     let mut events = Vec::new();
     while let Some(ev) = rx.recv().await {
@@ -107,10 +131,16 @@ async fn run_dispatch(spec: HookSpec, payload: &str) -> (HookOutcome, Vec<ignis:
 
 fn write_executable(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, body).unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    // Write to a sibling temp file first, then rename into place. This keeps
+    // the executable path from ever being open for writing at exec time,
+    // avoiding the Linux `ETXTBSY` race that can flare under tmpfs writeback
+    // contention on a loaded CI runner.
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, body).unwrap();
+    let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
     perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
+    std::fs::set_permissions(&tmp, perms).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
     path
 }
 

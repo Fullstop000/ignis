@@ -100,8 +100,8 @@ impl McpServer {
     ///   1. Cancel the rmcp service (this consumes it; rmcp closes the
     ///      transport, the child sees EOF on stdin, and most servers exit).
     ///   2. On Unix, SIGTERM the child's process group to catch descendants
-    ///      that wrapper commands like `npx` leave behind. SIGKILL after a
-    ///      short grace period if anything is still standing.
+    ///      that wrapper commands like `npx` leave behind. SIGKILL only if the
+    ///      process group is still alive after a short grace period.
     ///
     /// Safe to call multiple times — the second call is a no-op.
     pub async fn shutdown(&self) {
@@ -116,12 +116,24 @@ impl McpServer {
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGTERM);
             }
+            // Give the process group a short grace period to exit; only escalate
+            // to SIGKILL if it is still alive. This avoids firing SIGKILL at an
+            // already-reaped child, which would fail harmlessly but log noise.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
+            if process_group_is_alive(pid) {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn process_group_is_alive(pid: u32) -> bool {
+    // Signal 0 performs error checking without delivering a signal. A return
+    // value of 0 means at least one process in the group exists.
+    unsafe { libc::kill(-(pid as i32), 0) == 0 }
 }
 
 /// Concatenate every `text` content block (newline-separated) into one string.

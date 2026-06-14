@@ -4,6 +4,7 @@
 //! is a startup error — ignis aborts before the first prompt, mirroring the
 //! posture for a broken `config.toml` (loud, not silent).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -149,7 +150,7 @@ fn parse_entry(entry: HookJsonEntry, home: &Path) -> Result<HookSpec> {
     // Mutual exclusion: pick exactly one of `command` (single string,
     // whitespace-split — simple default) or `argv` (pre-tokenised, supports
     // paths-with-spaces — escape hatch).
-    match (entry.command.as_deref(), entry.argv.as_deref()) {
+    let mut spec = match (entry.command.as_deref(), entry.argv.as_deref()) {
         (Some(_), Some(_)) => Err(anyhow!(
             "hook entry has both `command` and `argv`; use exactly one"
         )),
@@ -191,7 +192,110 @@ fn parse_entry(entry: HookJsonEntry, home: &Path) -> Result<HookSpec> {
                 sandbox,
             })
         }
+    }?;
+
+    spec.program = resolve_program_path(&spec.program)?;
+    for name in &spec.env {
+        validate_env_var_name(name)?;
     }
+    Ok(spec)
+}
+
+/// Resolve a hook program path.
+///
+/// * Absolute paths (including `~`-expanded ones) pass through unchanged.
+/// * Bare command names like `"python"` or `"sh"` are looked up in `$PATH`
+///   (with `PATHEXT` honored on Windows) so existing configs keep working.
+/// * Relative paths that contain a directory separator (e.g. `.ignis/hooks/check`)
+///   are left as-is so they resolve relative to the process cwd at dispatch time,
+///   matching the previous `Command::new` behaviour.
+fn resolve_program_path(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(anyhow!("hook program path is empty"));
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    if is_bare_command_name(path) {
+        if let Some(found) = find_in_path(path.as_os_str()) {
+            return Ok(found);
+        }
+        return Err(anyhow!(
+            "hook program '{}' not found in PATH; use an absolute path or a command on PATH",
+            path.display()
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+/// A "bare" command name has a single normal component and no directory
+/// separator. Examples: `python`, `node`. Not bare: `./run`, `.ignis/hooks/check`.
+fn is_bare_command_name(path: &Path) -> bool {
+    let mut comps = path.components();
+    matches!(comps.next(), Some(std::path::Component::Normal(_))) && comps.next().is_none()
+}
+
+fn find_in_path(name: &OsStr) -> Option<PathBuf> {
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_env) {
+        let candidate = dir.join(name);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+
+        #[cfg(windows)]
+        {
+            if let Some(name_str) = name.to_str() {
+                let ext_env = std::env::var("PATHEXT").unwrap_or_else(|_| {
+                    ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC".to_string()
+                });
+                for ext in ext_env.split(';') {
+                    if ext.is_empty() {
+                        continue;
+                    }
+                    let candidate = dir.join(format!("{name_str}{ext}"));
+                    if is_executable(&candidate) {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+fn validate_env_var_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow!("hook env var name is empty"));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return Err(anyhow!(
+            "hook env var name '{name}' must start with a letter or underscore"
+        ));
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(anyhow!(
+            "hook env var name '{name}' contains invalid characters; use letters, digits, and underscores"
+        ));
+    }
+    Ok(())
 }
 
 fn expand_home(s: &str, home: &Path) -> PathBuf {
@@ -424,5 +528,56 @@ mod tests {
             r#"{"hooks": {"UserPromptSubmit": [{"command": "/bin/true", "sandbox": false}]}}"#;
         let cfg = HooksConfig::from_str(raw, &home).unwrap();
         assert!(!cfg.user_prompt_submit[0].sandbox);
+    }
+
+    #[test]
+    fn relative_program_path_is_resolved_from_path() {
+        let home = PathBuf::from("/h");
+        let raw = r#"{"hooks": {"UserPromptSubmit": [{"command": "sh -c true"}]}}"#;
+        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        let program = cfg.user_prompt_submit[0].program.to_string_lossy();
+        assert!(
+            program.ends_with("/sh"),
+            "expected PATH-resolved sh, got: {program}"
+        );
+        assert_eq!(cfg.user_prompt_submit[0].args, vec!["-c", "true"]);
+    }
+
+    #[test]
+    fn unknown_relative_program_path_is_rejected() {
+        let home = PathBuf::from("/h");
+        let raw = r#"{"hooks": {"UserPromptSubmit": [{"command": "run.py"}]}}"#;
+        let err = HooksConfig::from_str(raw, &home).unwrap_err();
+        assert!(err.to_string().contains("not found in PATH"));
+    }
+
+    #[test]
+    fn relative_program_path_with_separator_is_preserved() {
+        // A path with a directory component should not be reduced to its file
+        // name and looked up on PATH; it is left for Command::new to resolve
+        // relative to the cwd at dispatch time.
+        let home = PathBuf::from("/h");
+        let raw = r#"{"hooks": {"UserPromptSubmit": [{"command": ".ignis/hooks/check"}]}}"#;
+        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        assert_eq!(
+            cfg.user_prompt_submit[0].program,
+            PathBuf::from(".ignis/hooks/check")
+        );
+    }
+
+    #[test]
+    fn invalid_env_var_names_are_rejected() {
+        let home = PathBuf::from("/h");
+        for name in ["", "1KEY", "KEY-NAME", "KEY=NAME", "KEY NAME"] {
+            let raw = format!(
+                r#"{{"hooks": {{"UserPromptSubmit": [{{"command": "/bin/true", "env": ["{name}"]}}]}}}}"#
+            );
+            let err = HooksConfig::from_str(&raw, &home).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("env var name") || msg.contains("empty"),
+                "expected env validation error for '{name}', got: {msg}"
+            );
+        }
     }
 }

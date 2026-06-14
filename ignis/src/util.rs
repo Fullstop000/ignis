@@ -56,6 +56,35 @@ pub fn parse_jsonl_messages(content: &str) -> Vec<Message> {
 #[cfg(test)]
 pub static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// RAII guard that sets `$HOME` to `path` for the duration of a test and
+/// restores the previous value on drop, even if the test panics. Also holds
+/// the global env lock so no other HOME-mutating test runs concurrently.
+#[cfg(test)]
+pub struct HomeGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl HomeGuard {
+    pub fn set(path: &Path) -> Self {
+        let _lock = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", path);
+        Self { _lock, prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
 /// Generate a unique temporary directory path for tests.
 ///
 /// Combines wall-clock nanos with a process-wide monotonic counter so

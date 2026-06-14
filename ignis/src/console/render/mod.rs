@@ -382,7 +382,12 @@ mod queue_render_tests {
     use std::path::PathBuf;
 
     fn app() -> App {
-        App::new("p".into(), "m".into(), "s".into(), PathBuf::from("/tmp"))
+        App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        )
     }
 
     /// Regression: a long `ask_user` trace once produced rows wider than the
@@ -595,8 +600,8 @@ mod tests {
     #[test]
     fn render_model_picker_shows_effort_only_for_reasoning_models() {
         let mut app = App::new(
-            "deepseek".to_string(),
-            "deepseek-v4-flash".to_string(),
+            Some("deepseek".to_string()),
+            Some("deepseek-v4-flash".to_string()),
             "s".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -714,8 +719,8 @@ mod tests {
             .map(|i| opt("p", &format!("m{i}"), &["high"]))
             .collect();
         let mut app = App::new(
-            "p".to_string(),
-            "m0".to_string(),
+            Some("p".to_string()),
+            Some("m0".to_string()),
             "s".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -787,8 +792,8 @@ mod tests {
     fn render_welcome_banner() {
         // The welcome banner is committed once to scrollback at launch.
         let app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("/home/test"),
         );
@@ -808,8 +813,8 @@ mod tests {
     #[test]
     fn render_shows_user_message() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -828,8 +833,8 @@ mod tests {
     #[test]
     fn render_shows_assistant_message() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -849,8 +854,8 @@ mod tests {
     #[test]
     fn render_reasoning_shows_header_and_dim_color() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -884,8 +889,8 @@ mod tests {
     #[test]
     fn render_shows_tool_block() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -911,8 +916,8 @@ mod tests {
         // The block must show a single "loaded skill instructions" line, never
         // the wrapper or the body (model reads it, not the user).
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -955,8 +960,8 @@ mod tests {
     #[test]
     fn render_edit_file_shows_diff_lines() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -983,8 +988,8 @@ mod tests {
     #[test]
     fn diff_lines_have_solid_background_and_syntax_colors() {
         let mut app = App::new(
-            "p".to_string(),
-            "m".to_string(),
+            Some("p".to_string()),
+            Some("m".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -1026,8 +1031,8 @@ mod tests {
         // Regression: truncation appended `…` past the width, making the line one
         // cell too wide so its solid bg wrapped onto a second row.
         let mut app = App::new(
-            "p".to_string(),
-            "m".to_string(),
+            Some("p".to_string()),
+            Some("m".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -1064,8 +1069,8 @@ mod tests {
         // reaching ratatui as a literal \t desyncs the terminal layout and
         // garbles the screen. The renderer must expand tabs first.
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -1091,8 +1096,8 @@ mod tests {
     #[test]
     fn render_shows_session_picker() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -1153,8 +1158,8 @@ mod tests {
     #[test]
     fn render_idle_has_no_keybinding_bar() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -1177,8 +1182,8 @@ mod tests {
     #[test]
     fn render_loading_line_shows_thinking() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -1198,8 +1203,8 @@ mod tests {
     #[test]
     fn render_footer_shows_model_dir_and_context() {
         let mut app = App::new(
-            "openai".to_string(),
-            "gpt-4".to_string(),
+            Some("openai".to_string()),
+            Some("gpt-4".to_string()),
             "work".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -1227,8 +1232,8 @@ mod tests {
         use crate::permissions::{runtime::PermissionState, Mode as PermMode};
 
         let mut app = App::new(
-            "openai".to_string(),
-            "gpt-4".to_string(),
+            Some("openai".to_string()),
+            Some("gpt-4".to_string()),
             "work".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -1264,8 +1269,8 @@ mod tests {
         use crate::permissions::{runtime::PermissionState, Mode as PermMode};
 
         let mut app = App::new(
-            "openai".to_string(),
-            "gpt-4".to_string(),
+            Some("openai".to_string()),
+            Some("gpt-4".to_string()),
             "work".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -1298,8 +1303,8 @@ mod tests {
     #[test]
     fn render_footer_omits_update_segment_when_no_notice() {
         let mut app = App::new(
-            "openai".to_string(),
-            "gpt-4".to_string(),
+            Some("openai".to_string()),
+            Some("gpt-4".to_string()),
             "work".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -1318,8 +1323,8 @@ mod tests {
         use crate::cli::upgrade::UpdateNotice;
 
         let mut app = App::new(
-            "openai".to_string(),
-            "gpt-4".to_string(),
+            Some("openai".to_string()),
+            Some("gpt-4".to_string()),
             "work".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -1354,8 +1359,8 @@ mod tests {
     #[test]
     fn render_loading_shows_live_token_stats_when_streaming() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -1384,8 +1389,8 @@ mod tests {
     #[test]
     fn render_input_with_wide_chars_does_not_panic() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -1407,8 +1412,8 @@ mod tests {
     #[test]
     fn input_bar_shows_prompt_glyph() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -1436,8 +1441,8 @@ mod tests {
         // Long wrapping turns all become scrollback lines; the latest turn is
         // present (the terminal's own scrollback handles viewing earlier ones).
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("."),
         );
@@ -1488,8 +1493,8 @@ mod tests {
         // Regression (bug 2a): a resumed tool result must render as a tool block,
         // not the raw persisted {"result":…,"is_error":…} JSON.
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -1549,8 +1554,8 @@ mod tests {
         // Regression (bug 2b): while the resume picker is open, the prior
         // conversation must not be shown.
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -1583,8 +1588,8 @@ mod tests {
     #[test]
     fn render_session_history_shows_reasoning_content() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("/tmp"),
         );
@@ -1621,8 +1626,8 @@ mod tests {
     #[test]
     fn render_session_history_with_only_reasoning() {
         let mut app = App::new(
-            "test".to_string(),
-            "model".to_string(),
+            Some("test".to_string()),
+            Some("model".to_string()),
             "default".to_string(),
             PathBuf::from("/tmp"),
         );

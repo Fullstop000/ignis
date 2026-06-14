@@ -32,6 +32,14 @@ struct Inner {
 }
 
 impl PermissionState {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn new(mode: Mode) -> Arc<Self> {
         Arc::new(Self {
             inner: RwLock::new(Inner {
@@ -59,51 +67,35 @@ impl PermissionState {
 
     /// A clone of the live rule set, for feeding into `check()`.
     pub fn rules_snapshot(&self) -> RuleSet {
-        self.inner
-            .read()
-            .expect("permissions lock poisoned")
-            .rules
-            .clone()
+        self.read().rules.clone()
     }
 
     /// The persisted-grant strings, for re-writing `state.json`.
     pub fn grants(&self) -> Vec<String> {
-        self.inner
-            .read()
-            .expect("permissions lock poisoned")
-            .grants
-            .clone()
+        self.read().grants.clone()
     }
 
     /// Fold a new "Always allow" grant into the live rules and the grant list.
     pub fn add_grant(&self, grant: &str) {
-        let mut inner = self.inner.write().expect("permissions lock poisoned");
+        let mut inner = self.write();
         inner.rules.add_grant(grant);
         inner.grants.push(grant.to_string());
     }
 
     pub fn mode(&self) -> Mode {
-        self.inner.read().expect("permissions lock poisoned").mode
+        self.read().mode
     }
 
     pub fn set_mode(&self, mode: Mode) {
-        self.inner.write().expect("permissions lock poisoned").mode = mode;
+        self.write().mode = mode;
     }
 
     pub fn is_session_allowed(&self, tool_name: &str) -> bool {
-        self.inner
-            .read()
-            .expect("permissions lock poisoned")
-            .session_allow
-            .contains(tool_name)
+        self.read().session_allow.contains(tool_name)
     }
 
     pub fn add_session_allow(&self, tool_name: impl Into<String>) {
-        self.inner
-            .write()
-            .expect("permissions lock poisoned")
-            .session_allow
-            .insert(tool_name.into());
+        self.write().session_allow.insert(tool_name.into());
     }
 }
 

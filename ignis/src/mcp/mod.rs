@@ -7,7 +7,7 @@
 //! details consumed inside the crate.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use rmcp::transport::TokioChildProcess;
 use rmcp::ServiceExt;
@@ -65,8 +65,10 @@ pub struct McpRegistry {
     connected: HashMap<String, Arc<McpServer>>,
     /// Servers that failed to start, with the reason text.
     failed: HashMap<String, String>,
-    /// Live disabled set — toggling persists to `state.json`.
-    disabled: Mutex<HashSet<String>>,
+    /// Live disabled set — toggling persists to `state.json`. `RwLock` because
+    /// reads (every picker render, every `entries()` call) vastly outnumber
+    /// writes (only on toggle), and the guard is never held across an await.
+    disabled: RwLock<HashSet<String>>,
     /// Names of every server present in config (connected, failed, or
     /// disabled), kept for stable ordering in pickers/CLI output.
     all_names: Vec<String>,
@@ -82,7 +84,7 @@ impl McpRegistry {
         Arc::new(Self {
             connected: HashMap::new(),
             failed: HashMap::new(),
-            disabled: Mutex::new(HashSet::new()),
+            disabled: RwLock::new(HashSet::new()),
             all_names: Vec::new(),
             transports: HashMap::new(),
         })
@@ -136,7 +138,7 @@ impl McpRegistry {
         Arc::new(Self {
             connected,
             failed,
-            disabled: Mutex::new(disabled),
+            disabled: RwLock::new(disabled),
             all_names,
             transports,
         })
@@ -154,7 +156,7 @@ impl McpRegistry {
     /// Snapshot of every known server with its current status. Stable order:
     /// matches `all_names` (sorted alphabetically at spawn time).
     pub fn entries(&self) -> Vec<McpServerEntry> {
-        let disabled = self.disabled.lock().unwrap();
+        let disabled = self.disabled.read().unwrap_or_else(|e| e.into_inner());
         self.all_names
             .iter()
             .map(|name| {
@@ -186,7 +188,7 @@ impl McpRegistry {
     /// (we don't (re)spawn the server mid-session in v1).
     pub fn toggle(&self, name: &str) -> bool {
         let (now_enabled, snapshot) = {
-            let mut d = self.disabled.lock().unwrap();
+            let mut d = self.disabled.write().unwrap_or_else(|e| e.into_inner());
             let now_enabled = if d.remove(name) {
                 true
             } else {
