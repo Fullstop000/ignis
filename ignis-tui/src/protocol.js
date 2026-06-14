@@ -24,6 +24,8 @@ export function initialState() {
     models: [],
     skills: [],
     mcp: [],
+    // Past sessions for the `/sessions` picker, hydrated by a 'sessions' frame.
+    sessions: [],
     turns: 0,
     usage: null,
   };
@@ -50,9 +52,32 @@ export function reduceOutbound(state, frame) {
         mcp: frame.data?.mcp ?? state.mcp,
         request: frame.data?.pending_request ? toRequest(frame.data.pending_request) : null,
       };
+    case 'sessions':
+      // The `/sessions` picker's list (answers a `list_sessions` command).
+      return { ...state, sessions: frame.data ?? [] };
+    case 'transcript':
+      // A resumed session replayed as render-ready blocks: replace the
+      // transcript wholesale and adopt the retargeted session id. A streaming
+      // turn can't be in flight (resume only fires while idle), so clear it.
+      return {
+        ...state,
+        blocks: (frame.data?.blocks ?? []).map(toBlock),
+        stream: null,
+        sessionId: frame.data?.session_id ?? state.sessionId,
+        turns: 0,
+        usage: null,
+      };
     default:
       return state;
   }
+}
+
+/** Map a wire transcript block to a view block (tool blocks resume done). */
+function toBlock(b) {
+  if (b.kind === 'tool') {
+    return { kind: 'tool', id: '', name: b.name, args: b.args, done: true, result: b.result };
+  }
+  return b; // user / assistant pass through unchanged.
 }
 
 function toRequest(data) {
@@ -169,6 +194,8 @@ export const setModel = (provider, model) => ({ kind: 'set_model', data: { provi
 export const setMode = (mode) => ({ kind: 'set_mode', data: { mode } });
 export const toggleSkill = (name) => ({ kind: 'toggle_skill', data: { name } });
 export const toggleMcp = (name) => ({ kind: 'toggle_mcp', data: { name } });
+export const listSessions = () => ({ kind: 'list_sessions' });
+export const resumeSession = (sessionId) => ({ kind: 'resume_session', data: { session_id: sessionId } });
 export const reply = (id, answer) => ({ kind: 'reply', data: { id, answer } });
 
 /**

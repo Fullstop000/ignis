@@ -44,6 +44,53 @@ pub enum Outbound {
     /// `ask_user` survives a frontend swap.
     #[serde(rename = "snapshot")]
     Snapshot(Snapshot),
+    /// The project's past sessions, in reply to [`ClientCommand::ListSessions`]
+    /// — for the `/sessions` picker. Most-recent-first, current session
+    /// excluded; the engine owns the listing (it reads the JSONL off disk).
+    #[serde(rename = "sessions")]
+    Sessions(Vec<SessionInfo>),
+    /// A resumed session's transcript, replayed as render-ready blocks so the
+    /// frontend rebuilds its scrollback without parsing the stored JSONL. Sent
+    /// in reply to [`ClientCommand::ResumeSession`]; the frontend replaces its
+    /// transcript with these blocks, and the following [`Snapshot`] carries the
+    /// retargeted session id.
+    #[serde(rename = "transcript")]
+    Transcript {
+        session_id: String,
+        blocks: Vec<TranscriptBlock>,
+    },
+}
+
+/// One past session, for the `/sessions` picker. The engine reads this off disk
+/// (mirrors `SessionMeta`); the frontend formats the relative age itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionInfo {
+    pub id: String,
+    /// First user message, trimmed — the picker's title line.
+    pub preview: String,
+    pub message_count: usize,
+    /// Unix seconds of last modification.
+    pub last_modified: u64,
+}
+
+/// A render-ready transcript entry. The wire shape mirrors the frontend's block
+/// model so a resumed session drops straight into scrollback. Reasoning blocks
+/// are intentionally absent for now — the frontend has no reasoning rendering
+/// yet (that lands with the reasoning feature, which will add a variant here).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscriptBlock {
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    Tool {
+        name: String,
+        args: String,
+        result: crate::ToolResult,
+    },
 }
 
 /// A blocking interaction request surfaced to the active frontend.
@@ -142,6 +189,15 @@ pub enum ClientCommand {
     ToggleSkill { name: String },
     #[serde(rename = "toggle_mcp")]
     ToggleMcp { name: String },
+    /// Request the project's past sessions (`/sessions`). The core replies with
+    /// an [`Outbound::Sessions`] frame (current session excluded).
+    #[serde(rename = "list_sessions")]
+    ListSessions,
+    /// Resume a past session (`/sessions` → pick, or `/resume <id>`). The core
+    /// retargets subsequent submits at it (like [`ClientCommand::SetSession`]),
+    /// replays its transcript as an [`Outbound::Transcript`], and re-snapshots.
+    #[serde(rename = "resume_session")]
+    ResumeSession { session_id: String },
     /// Answer a [`ClientRequest`]. `id` must match the outstanding request; a
     /// stale or unknown id is dropped by the broker.
     #[serde(rename = "reply")]

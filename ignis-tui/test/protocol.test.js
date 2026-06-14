@@ -15,6 +15,8 @@ import {
   setMode,
   toggleSkill,
   toggleMcp,
+  listSessions,
+  resumeSession,
   parseSlash,
   expandPastes,
   answerSingle,
@@ -89,6 +91,43 @@ test('command builders match the Rust ClientCommand wire shapes', () => {
   assert.deepEqual(setMode('hands_free'), { kind: 'set_mode', data: { mode: 'hands_free' } });
   assert.deepEqual(toggleSkill('git'), { kind: 'toggle_skill', data: { name: 'git' } });
   assert.deepEqual(toggleMcp('fs'), { kind: 'toggle_mcp', data: { name: 'fs' } });
+  assert.deepEqual(listSessions(), { kind: 'list_sessions' });
+  assert.deepEqual(resumeSession('session-x'), { kind: 'resume_session', data: { session_id: 'session-x' } });
+});
+
+test('a sessions frame stores the picker list', () => {
+  const list = [{ id: 'session-a', preview: 'hi', message_count: 3, last_modified: 100 }];
+  const s = reduceOutbound(initialState(), { kind: 'sessions', data: list });
+  assert.deepEqual(s.sessions, list);
+});
+
+test('a transcript frame replaces blocks (tool blocks resume done) and adopts the id', () => {
+  // A non-trivial starting state to prove the transcript REPLACES, not appends.
+  let s = reduceOutbound(initialState(), { kind: 'event', data: { type: 'user_prompt_committed', payload: { text: 'stale' } } });
+  s = reduceOutbound(s, {
+    kind: 'transcript',
+    data: {
+      session_id: 'session-z',
+      blocks: [
+        { kind: 'user', text: 'do it' },
+        { kind: 'assistant', text: 'done' },
+        { kind: 'tool', name: 'bash', args: 'ls', result: { content: 'out', is_error: false } },
+      ],
+    },
+  });
+  assert.equal(s.sessionId, 'session-z');
+  assert.equal(s.blocks.length, 3, 'replaced, not appended');
+  assert.deepEqual(s.blocks[0], { kind: 'user', text: 'do it' });
+  // The tool block is reconstructed as a completed one so it renders green.
+  assert.deepEqual(s.blocks[2], {
+    kind: 'tool',
+    id: '',
+    name: 'bash',
+    args: 'ls',
+    done: true,
+    result: { content: 'out', is_error: false },
+  });
+  assert.equal(s.stream, null);
 });
 
 test('parseSlash recognizes slash commands, ignores normal prompts', () => {

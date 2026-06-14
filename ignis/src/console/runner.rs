@@ -408,6 +408,7 @@ pub async fn run_console(
 
     let agent_system_prompt = system_prompt;
     let agent_storage_dir = storage_dir.clone();
+    let driver_storage_dir = storage_dir.clone();
     let ui_storage_dir = storage_dir;
     let agent_cwd = cwd;
     let agent_config = config;
@@ -491,6 +492,7 @@ pub async fn run_console(
         driver_skill_registry,
         driver_mcp_registry,
         app.session_id.clone(),
+        driver_storage_dir,
     ));
 
     // The in-progress block's already-streamed row count lives on `app`
@@ -605,7 +607,7 @@ pub async fn run_engine(
         active_inject.clone(),
         config,
         system_prompt,
-        storage_dir,
+        storage_dir.clone(),
         cwd,
         hook_registry,
         skill_registry.clone(),
@@ -640,6 +642,7 @@ pub async fn run_engine(
         skill_registry,
         mcp_registry,
         session_id,
+        storage_dir,
     )
     .await;
     Ok(())
@@ -679,6 +682,93 @@ fn mcp_toggles(reg: &crate::mcp::McpRegistry) -> Vec<crate::console::frontend::p
         .collect()
 }
 
+/// The project's past sessions as wire [`SessionInfo`]s for the `/sessions`
+/// picker — most-recent-first, with `exclude_id` (the live session) dropped.
+fn session_infos(
+    storage_dir: &std::path::Path,
+    exclude_id: &str,
+) -> Vec<crate::console::frontend::protocol::SessionInfo> {
+    crate::session::SessionManager::new(storage_dir.to_path_buf())
+        .list()
+        .into_iter()
+        .filter(|m| m.id != exclude_id)
+        .map(|m| crate::console::frontend::protocol::SessionInfo {
+            id: m.id,
+            preview: m.preview,
+            message_count: m.message_count,
+            last_modified: m.last_modified,
+        })
+        .collect()
+}
+
+/// Convert a loaded session's messages into render-ready [`TranscriptBlock`]s
+/// for replay. Mirrors `App::render_session_history`'s message→block mapping:
+/// a `tool` message fills the result of the most recent matching call; an
+/// orphan result becomes a standalone block. Reasoning is omitted (the wire has
+/// no reasoning block yet — see [`TranscriptBlock`]).
+fn transcript_blocks(
+    messages: Vec<Message>,
+) -> Vec<crate::console::frontend::protocol::TranscriptBlock> {
+    use crate::console::frontend::protocol::TranscriptBlock;
+    let mut blocks: Vec<TranscriptBlock> = Vec::new();
+    // tool_call_id -> index in `blocks`, so a following `tool` message attaches
+    // its result to the matching call.
+    let mut tool_idx: Vec<(String, usize)> = Vec::new();
+    for message in messages {
+        match message.role.as_str() {
+            "user" => {
+                if let Some(content) = message.content.filter(|c| !c.is_empty()) {
+                    blocks.push(TranscriptBlock::User { text: content });
+                }
+            }
+            "assistant" => {
+                if let Some(content) = message.content.filter(|c| !c.is_empty()) {
+                    blocks.push(TranscriptBlock::Assistant { text: content });
+                }
+                if let Some(tool_calls) = message.tool_calls {
+                    for tc in tool_calls {
+                        tool_idx.push((tc.id, blocks.len()));
+                        blocks.push(TranscriptBlock::Tool {
+                            name: tc.function.name,
+                            args: tc.function.arguments,
+                            // Empty-success until the matching `tool` message
+                            // fills it; an interrupted call keeps it empty.
+                            result: crate::ToolResult::ok(String::new()),
+                        });
+                    }
+                }
+            }
+            "tool" => {
+                let (content, is_error) = crate::console::app::parse_tool_result(
+                    message.content.as_deref().unwrap_or(""),
+                );
+                let result = crate::ToolResult { content, is_error };
+                let idx = message.tool_call_id.as_deref().and_then(|id| {
+                    tool_idx
+                        .iter()
+                        .rev()
+                        .find(|(tid, _)| tid == id)
+                        .map(|(_, i)| *i)
+                });
+                match idx {
+                    Some(i) => {
+                        if let TranscriptBlock::Tool { result: r, .. } = &mut blocks[i] {
+                            *r = result;
+                        }
+                    }
+                    None => blocks.push(TranscriptBlock::Tool {
+                        name: message.name.unwrap_or_else(|| "tool".to_string()),
+                        args: String::new(),
+                        result,
+                    }),
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_frontend_core(
     mut hub: FrontendHub,
@@ -691,6 +781,7 @@ async fn drive_frontend_core(
     skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
     mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
     mut current_session_id: String,
+    storage_dir: PathBuf,
 ) {
     // Seed the snapshot with the live permission mode + skill/MCP state.
     hub.set_mode(permissions.mode().as_str().to_string());
@@ -791,6 +882,26 @@ async fn drive_frontend_core(
                         .collect();
                     let _ = crate::state::persist_disabled_mcp_servers(&disabled);
                     hub.set_mcp(mcp_toggles(&mcp_registry));
+                    hub.send_snapshot().await;
+                }
+                // `/sessions`: list the project's past sessions off disk
+                // (current one excluded) for the frontend's picker.
+                CommandOutcome::ListSessions => {
+                    let sessions = session_infos(&storage_dir, &current_session_id);
+                    hub.send_sessions(sessions).await;
+                }
+                // `/sessions` pick / `/resume`: retarget subsequent submits at
+                // the chosen session (the agent's `Session::open` continues it),
+                // replay its transcript so the frontend repaints scrollback, and
+                // re-snapshot so the statusline session id follows.
+                CommandOutcome::ResumeSession(id) => {
+                    let messages = FileStorage::new(storage_dir.clone())
+                        .load_session(&id)
+                        .await
+                        .unwrap_or_default();
+                    current_session_id = id.clone();
+                    hub.set_session_id(id.clone());
+                    hub.send_transcript(id, transcript_blocks(messages)).await;
                     hub.send_snapshot().await;
                 }
                 // The agent task drains stale cancels at each prompt's start, so
@@ -943,6 +1054,11 @@ impl ConsoleLoop {
             // frontend. With a single in-process TUI there is no successor, so
             // this is unreachable today; ignore it rather than invent state.
             Outbound::Snapshot(_) => {}
+            // Session list / transcript replay answer `ListSessions` /
+            // `ResumeSession`, which only the out-of-process frontend sends —
+            // the ratatui TUI drives `/sessions` against `App` directly, so it
+            // never requests these and ignores them if they ever arrive.
+            Outbound::Sessions(_) | Outbound::Transcript { .. } => {}
         }
     }
 
@@ -1499,6 +1615,7 @@ pub(crate) fn spawn_render_hook_worker(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::console::frontend::protocol::TranscriptBlock;
     use crate::hooks::{HookRegistry, HookSpec, HooksConfig};
     use crate::{AgentEvent, Message};
     use std::os::unix::fs::PermissionsExt;
@@ -1546,6 +1663,21 @@ mod tests {
             acceptor,
             RequestBroker::new(),
         );
+        // A session store with one prior session, for the list/resume steps.
+        let store = tempfile::TempDir::new().unwrap();
+        let user_msg = |text: &str| Message {
+            role: "user".to_string(),
+            content: Some(text.to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        };
+        FileStorage::new(store.path().to_path_buf())
+            .save_session("older-session", &[user_msg("hi from older")], None)
+            .await
+            .unwrap();
         let driver = tokio::spawn(drive_frontend_core(
             hub,
             agent_rx,
@@ -1561,6 +1693,7 @@ mod tests {
             )),
             crate::mcp::McpRegistry::empty(),
             "s1".to_string(),
+            store.path().to_path_buf(),
         ));
 
         // 0) The driver greets the freshly-attached frontend with a snapshot.
@@ -1679,7 +1812,69 @@ mod tests {
             _ => panic!("expected Compact, got SetModel/ReloadConfig/ReloadSkills"),
         }
 
-        // 7) Dropping the frontend ends the driver (disconnect, no successor).
+        // 7) `ListSessions` answers with the project's sessions, current one
+        //    ("s2", set above) excluded; the seeded prior session is listed.
+        handle
+            .commands
+            .send(ClientCommand::ListSessions)
+            .await
+            .unwrap();
+        match handle.outbound.recv().await {
+            Some(Outbound::Sessions(list)) => {
+                assert!(list.iter().any(|s| s.id == "older-session"));
+                assert!(
+                    !list.iter().any(|s| s.id == "s2"),
+                    "current session excluded"
+                );
+            }
+            other => panic!("expected Outbound::Sessions, got {other:?}"),
+        }
+
+        // 8) `ResumeSession` replays the chosen session's transcript, then
+        //    re-snapshots with the retargeted id; a later submit lands there.
+        handle
+            .commands
+            .send(ClientCommand::ResumeSession {
+                session_id: "older-session".to_string(),
+            })
+            .await
+            .unwrap();
+        match handle.outbound.recv().await {
+            Some(Outbound::Transcript { session_id, blocks }) => {
+                assert_eq!(session_id, "older-session");
+                assert!(matches!(
+                    blocks.as_slice(),
+                    [TranscriptBlock::User { text }] if text == "hi from older"
+                ));
+            }
+            other => panic!("expected Outbound::Transcript, got {other:?}"),
+        }
+        assert!(matches!(
+            handle.outbound.recv().await,
+            Some(Outbound::Snapshot(s)) if s.session_id == "older-session"
+        ));
+        handle
+            .commands
+            .send(ClientCommand::Submit {
+                text: "next".to_string(),
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), prompt_rx.recv())
+            .await
+            .expect("submit after resume forwarded")
+        {
+            Some(AgentRequest::Prompt { session_id, .. }) => {
+                assert_eq!(
+                    session_id, "older-session",
+                    "submit targets the resumed session"
+                )
+            }
+            Some(_) => panic!("expected Prompt against resumed session, got another request"),
+            None => panic!("expected Prompt against resumed session, got nothing"),
+        }
+
+        // 9) Dropping the frontend ends the driver (disconnect, no successor).
         drop(handle);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
     }
@@ -1719,6 +1914,46 @@ mod tests {
             tool_calls: None,
             created_at_ms: None,
         }
+    }
+
+    #[test]
+    fn transcript_blocks_maps_user_assistant_and_attaches_tool_results() {
+        use crate::{ToolCall, ToolCallFunction};
+        let plain = |role: &str, content: &str| Message {
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        };
+        let mut assistant = assistant_msg("on it", Some("thinking — must be dropped"));
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call-1".to_string(),
+            r#type: "function".to_string(),
+            function: ToolCallFunction {
+                name: "bash".to_string(),
+                arguments: "ls".to_string(),
+            },
+        }]);
+        let mut tool_result = plain("tool", r#"{"result":"file.txt","is_error":false}"#);
+        tool_result.tool_call_id = Some("call-1".to_string());
+
+        let blocks = transcript_blocks(vec![plain("user", "do it"), assistant, tool_result]);
+        // user + assistant + tool; reasoning is intentionally omitted.
+        assert!(matches!(&blocks[0], TranscriptBlock::User { text } if text == "do it"));
+        assert!(matches!(&blocks[1], TranscriptBlock::Assistant { text } if text == "on it"));
+        match &blocks[2] {
+            TranscriptBlock::Tool { name, args, result } => {
+                assert_eq!(name, "bash");
+                assert_eq!(args, "ls");
+                assert_eq!(result.content, "file.txt");
+                assert!(!result.is_error);
+            }
+            _ => panic!("expected the tool call's result attached to its block"),
+        }
+        assert_eq!(blocks.len(), 3, "no reasoning block, no stray blocks");
     }
 
     #[test]

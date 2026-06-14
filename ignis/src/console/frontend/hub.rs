@@ -19,7 +19,8 @@
 use crate::console::frontend::command::{control_signal, ControlSignal};
 use crate::console::frontend::port::Acceptor;
 use crate::console::frontend::protocol::{
-    ClientCommand, ClientRequest, ModelRef, Outbound, Snapshot, Toggle,
+    ClientCommand, ClientRequest, ModelRef, Outbound, SessionInfo, Snapshot, Toggle,
+    TranscriptBlock,
 };
 use crate::console::frontend::RequestBroker;
 use crate::console::picker::{PickerRequest, PickerResponse};
@@ -50,6 +51,12 @@ pub enum CommandOutcome {
     /// it and re-snapshots.
     ToggleSkill(String),
     ToggleMcp(String),
+    /// List the project's past sessions (`/sessions`): the core reads them off
+    /// disk and replies with an [`Outbound::Sessions`] frame.
+    ListSessions,
+    /// Resume a past session (`/sessions` pick / `/resume`): the core retargets
+    /// subsequent submits at it, replays its transcript, and re-snapshots.
+    ResumeSession(String),
     /// A mechanical control signal (cancel / inject / shutdown).
     Control(ControlSignal),
     /// A `Reply` the hub already resolved against the broker — nothing left for
@@ -159,6 +166,18 @@ impl FrontendHub {
         self.send(Outbound::Event(Box::new(ev))).await;
     }
 
+    /// Send the project's session list to the active frontend (answers
+    /// `/sessions`).
+    pub async fn send_sessions(&mut self, sessions: Vec<SessionInfo>) {
+        self.send(Outbound::Sessions(sessions)).await;
+    }
+
+    /// Replay a resumed session's transcript to the active frontend so it can
+    /// rebuild its scrollback (answers `/sessions` pick / `/resume`).
+    pub async fn send_transcript(&mut self, session_id: String, blocks: Vec<TranscriptBlock>) {
+        self.send(Outbound::Transcript { session_id, blocks }).await;
+    }
+
     /// Surface a tool's blocking picker request: register it with the broker,
     /// remember it as the in-flight request (for handover), and emit it.
     pub async fn open_request(&mut self, req: PickerRequest) {
@@ -199,6 +218,12 @@ impl FrontendHub {
         }
         if let ClientCommand::ToggleMcp { name } = cmd {
             return CommandOutcome::ToggleMcp(name);
+        }
+        if matches!(cmd, ClientCommand::ListSessions) {
+            return CommandOutcome::ListSessions;
+        }
+        if let ClientCommand::ResumeSession { session_id } = cmd {
+            return CommandOutcome::ResumeSession(session_id);
         }
         // Remaining variants are mechanical control signals.
         match control_signal(&cmd) {

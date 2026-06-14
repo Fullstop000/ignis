@@ -71,3 +71,5 @@ export const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 export const ev = (type, payload) => ({ kind: 'event', data: payload === undefined ? { type } : { type, payload } });
 export const request = (id, questions) => ({ kind: 'request', data: { id, questions } });
 export const snapshot = (data) => ({ kind: 'snapshot', data });
+export const sessions = (list) => ({ kind: 'sessions', data: list });
+export const transcript = (sessionId, blocks) => ({ kind: 'transcript', data: { session_id: sessionId, blocks } });

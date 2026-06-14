@@ -24,6 +24,8 @@ import {
   setMode,
   toggleSkill,
   toggleMcp,
+  listSessions,
+  resumeSession,
   parseSlash,
   expandPastes,
   pickSingle,
@@ -52,7 +54,7 @@ export default function App({ engine }) {
   const [comp, setComp] = useState({ text: '', cursor: 0 });
   const [history, setHistory] = useState([]);
   const [histIdx, setHistIdx] = useState(-1); // -1 = editing live (not recalling)
-  const [localPicker, setLocalPicker] = useState(null); // null | 'model' | 'afk' | 'skills' | 'mcp'
+  const [localPicker, setLocalPicker] = useState(null); // null | 'model' | 'afk' | 'skills' | 'mcp' | 'sessions'
   const [pastes, setPastes] = useState([]); // multi-line paste contents, shown as [paste #N] chips
 
   useEffect(() => {
@@ -88,6 +90,13 @@ export default function App({ engine }) {
         return true;
       case 'mcp':
         setLocalPicker('mcp');
+        return true;
+      case 'sessions':
+      case 'resume':
+        // Ask the engine for the project's sessions; the picker renders them
+        // once the 'sessions' frame lands (engine owns the listing).
+        engine.send(listSessions());
+        setLocalPicker('sessions');
         return true;
       default:
         return false; // /compact + unknown → submit (engine / LLM handles)
@@ -252,6 +261,18 @@ export default function App({ engine }) {
         items: state.mcp,
         onToggle: (name) => engine.send(toggleMcp(name)),
         onClose: () => setLocalPicker(null),
+      }),
+    );
+  } else if (localPicker === 'sessions') {
+    children.push(
+      e(SessionPicker, {
+        key: 'sessions-picker',
+        items: state.sessions,
+        onPick: (s) => {
+          engine.send(resumeSession(s.id));
+          setLocalPicker(null);
+        },
+        onCancel: () => setLocalPicker(null),
       }),
     );
   } else {
@@ -519,6 +540,62 @@ function TogglePicker({ title, items, onToggle, onClose }) {
 function PickerRow({ label, focused, checked, multi }) {
   const box = multi ? (checked ? '[x] ' : '[ ] ') : '';
   return e(Text, { color: focused ? 'cyan' : undefined }, `${focused ? '❯ ' : '  '}${box}${label}`);
+}
+
+// Local session picker (/sessions, /resume). The list arrives asynchronously
+// via the 'sessions' frame, so `items` starts empty and fills in. Two-line
+// rows like the ratatui picker: derived title + a dim age·id·count meta line.
+function SessionPicker({ items, onPick, onCancel }) {
+  const [cursor, setCursor] = useState(0);
+  useInput((ch, key) => {
+    if (key.escape) {
+      onCancel();
+      return;
+    }
+    if (key.upArrow) {
+      setCursor((c) => Math.max(0, c - 1));
+      return;
+    }
+    if (key.downArrow) {
+      setCursor((c) => Math.min(Math.max(items.length - 1, 0), c + 1));
+      return;
+    }
+    if (key.return && items[cursor]) onPick(items[cursor]);
+  });
+
+  const rows = [e(Text, { key: 'q', bold: true }, 'Resume a session')];
+  if (!items.length) {
+    rows.push(e(Text, { key: 'empty', dimColor: true }, 'Loading sessions…'));
+  } else {
+    items.forEach((s, i) => {
+      const focused = i === cursor;
+      const title = (s.preview && s.preview.trim()) || '(no preview)';
+      const meta = `${ageStr(s.last_modified)} · ${s.id} · ${s.message_count} msg${s.message_count === 1 ? '' : 's'}`;
+      rows.push(
+        e(
+          Box,
+          { key: `s${i}`, flexDirection: 'column' },
+          e(Text, { color: focused ? 'cyan' : undefined }, `${focused ? '❯ ' : '  '}${title}`),
+          e(Text, { dimColor: true }, `    ${meta}`),
+        ),
+      );
+    });
+  }
+  rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ select · enter resume · esc cancel'));
+  return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
+}
+
+// Relative age from a Unix-seconds timestamp, mirroring SessionMeta::age_str.
+function ageStr(secs) {
+  const delta = Math.max(0, Math.floor(Date.now() / 1000) - Number(secs || 0));
+  if (delta < 60) return 'just now';
+  if (delta < 3600) return `${Math.floor(delta / 60)} min ago`;
+  if (delta < 86400) {
+    const h = Math.floor(delta / 3600);
+    return h === 1 ? '1 hour ago' : `${h} hours ago`;
+  }
+  const d = Math.floor(delta / 86400);
+  return d === 1 ? '1 day ago' : `${d} days ago`;
 }
 
 // ── Markdown rendering (token tree from markdown.js → Ink elements) ──
