@@ -10,7 +10,19 @@
 // Kept free of `ink`/`react` so it runs under `node --test` with no install.
 
 export function initialState() {
-  return { blocks: [], stream: null, status: 'idle', sessionId: null, request: null };
+  return {
+    blocks: [],
+    stream: null,
+    status: 'idle',
+    sessionId: null,
+    request: null,
+    // Statusline meta (from the startup snapshot) + live counters.
+    provider: null,
+    model: null,
+    cwd: null,
+    turns: 0,
+    usage: null,
+  };
 }
 
 /** Reduce one Outbound frame into a new view state. */
@@ -25,6 +37,9 @@ export function reduceOutbound(state, frame) {
       return {
         ...state,
         sessionId: frame.data?.session_id ?? state.sessionId,
+        provider: frame.data?.provider ?? state.provider,
+        model: frame.data?.model ?? state.model,
+        cwd: frame.data?.cwd ?? state.cwd,
         request: frame.data?.pending_request ? toRequest(frame.data.pending_request) : null,
       };
     default:
@@ -40,7 +55,7 @@ function reduceEvent(state, ev) {
   const p = ev.payload || {};
   switch (ev.type) {
     case 'turn_start':
-      return { ...state, status: 'busy' };
+      return { ...state, status: 'busy', turns: state.turns + 1 };
     case 'turn_end':
       return { ...state, status: 'idle' };
     case 'message_start':
@@ -83,8 +98,11 @@ function reduceEvent(state, ev) {
         ...state,
         blocks: [...state.blocks, { kind: 'notice', text: `⟳ reconnecting ${p.attempt}/${p.max}: ${p.reason}` }],
       };
+    case 'usage':
+      // AgentEvent::Usage(Usage) — the payload IS the Usage struct.
+      return { ...state, usage: p };
     default:
-      // run_start / run_end / usage — not surfaced in the minimal UI.
+      // run_start / run_end — not surfaced in the minimal UI.
       return state;
   }
 }

@@ -148,6 +148,7 @@ export default function App({ engine }) {
         e(PickerFlow, { key: `picker-${req.id}`, req, engine, onDone: clearRequest })
       : e(Composer, { key: 'composer', text: comp.text, cursor: comp.cursor, status: state.status }),
   );
+  children.push(e(Footer, { key: 'footer', state }));
   return e(Box, { flexDirection: 'column' }, children);
 }
 
@@ -192,6 +193,23 @@ function ToolBlock({ block }) {
   );
   if (more) body.push(e(Text, { key: 'more', dimColor: true }, `    … +${more} more lines`));
   return e(Box, { flexDirection: 'column' }, [header, ...body]);
+}
+
+// Statusline footer: provider/model · cwd · turns · context tokens — fed by the
+// startup snapshot and the `usage`/`turn_start` events (engine-owned data).
+function Footer({ state }) {
+  const segs = [];
+  if (state.provider || state.model) segs.push(`${state.provider || '?'}/${state.model || '?'}`);
+  if (state.cwd) segs.push(baseName(state.cwd));
+  segs.push(`${state.turns} turn${state.turns === 1 ? '' : 's'}`);
+  if (state.usage && state.usage.input_tokens != null) segs.push(`${state.usage.input_tokens} tok`);
+  if (!segs.length) return null;
+  return e(Box, { marginTop: 1 }, e(Text, { dimColor: true }, segs.join('  ·  ')));
+}
+
+function baseName(p) {
+  const parts = String(p).replace(/[/\\]+$/, '').split(/[/\\]/);
+  return parts[parts.length - 1] || p;
 }
 
 function Welcome() {

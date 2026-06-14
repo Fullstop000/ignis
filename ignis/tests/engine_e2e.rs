@@ -47,17 +47,33 @@ fn engine_round_trips_a_submit_over_stdio() {
         }
     });
 
+    // The engine greets a fresh frontend with a session snapshot (statusline
+    // meta) before any turn.
+    let first = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("engine emitted an Outbound line within 20s");
+    let snap: serde_json::Value =
+        serde_json::from_str(&first).expect("Outbound line is valid JSON");
+    assert_eq!(
+        snap["kind"], "snapshot",
+        "first frame is a snapshot, got: {first}"
+    );
+    assert!(
+        snap["data"]["session_id"].is_string() && snap["data"]["cwd"].is_string(),
+        "snapshot carries session meta, got: {first}"
+    );
+
     stdin
         .write_all(b"{\"kind\":\"submit\",\"data\":{\"text\":\"hi\"}}\n")
         .unwrap();
     stdin.flush().unwrap();
 
-    // First Outbound frame must be a valid, kind-tagged event.
+    // The submit then produces a valid, kind-tagged event frame.
     let line = rx
         .recv_timeout(Duration::from_secs(20))
-        .expect("engine emitted an Outbound line within 20s");
+        .expect("engine emitted an event within 20s");
     let v: serde_json::Value = serde_json::from_str(&line).expect("Outbound line is valid JSON");
-    assert_eq!(v["kind"], "event", "first frame is an event, got: {line}");
+    assert_eq!(v["kind"], "event", "submit produces an event, got: {line}");
     assert!(
         v["data"]["type"].is_string(),
         "event carries a typed AgentEvent, got: {line}"

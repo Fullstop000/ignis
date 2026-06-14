@@ -12,6 +12,7 @@ export function spawnEngine({ bin = process.env.IGNIS_ENGINE_BIN || 'ignis', arg
   const rl = readline.createInterface({ input: child.stdout });
   const frameHandlers = [];
   const closeHandlers = [];
+  const pending = []; // frames that arrive before onFrame is registered (e.g. the startup snapshot)
 
   rl.on('line', (line) => {
     const t = line.trim();
@@ -21,6 +22,10 @@ export function spawnEngine({ bin = process.env.IGNIS_ENGINE_BIN || 'ignis', arg
       frame = JSON.parse(t);
     } catch {
       return; // ignore malformed lines rather than crash the UI
+    }
+    if (frameHandlers.length === 0) {
+      pending.push(frame); // buffer until the UI subscribes
+      return;
     }
     for (const h of frameHandlers) h(frame);
   });
@@ -33,7 +38,10 @@ export function spawnEngine({ bin = process.env.IGNIS_ENGINE_BIN || 'ignis', arg
   });
 
   return {
-    onFrame: (cb) => frameHandlers.push(cb),
+    onFrame: (cb) => {
+      frameHandlers.push(cb);
+      if (pending.length) pending.splice(0).forEach(cb); // flush buffered frames
+    },
     onClose: (cb) => closeHandlers.push(cb),
     send: (cmd) => {
       if (child.stdin.writable) child.stdin.write(JSON.stringify(cmd) + '\n');

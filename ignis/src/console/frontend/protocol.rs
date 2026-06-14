@@ -62,6 +62,11 @@ pub struct ClientRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub session_id: String,
+    /// Active provider/model and working directory, so an out-of-process
+    /// frontend can render a statusline without re-deriving the core's config.
+    pub provider: String,
+    pub model: String,
+    pub cwd: String,
     /// Request awaiting an answer at activation time, if a tool was blocked
     /// when this frontend took over.
     pub pending_request: Option<ClientRequest>,

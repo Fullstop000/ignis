@@ -233,6 +233,20 @@ test('no React warnings (e.g. missing keys) leak to stderr while rendering rich 
   assert.deepEqual(errs, [], `unexpected console.error output: ${errs.join(' | ')}`);
 });
 
+test('statusline footer shows model, cwd, turns, and context tokens', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  engine.emit(snapshot({ session_id: 's1', provider: 'minimax', model: 'M3', cwd: '/home/me/proj' }));
+  engine.emit(ev('turn_start'));
+  engine.emit(ev('usage', { input_tokens: 1234, output_tokens: 50 }));
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /minimax\/M3/);
+  assert.match(f, /proj/, 'cwd basename');
+  assert.match(f, /1 turn\b/);
+  assert.match(f, /1234 tok/);
+});
+
 test('snapshot hydrates a pending request (handover) → picker shown', async () => {
   const { engine, lastFrame } = renderApp();
   await tick();

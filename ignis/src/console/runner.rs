@@ -466,7 +466,14 @@ pub async fn run_console(
     let (local_port, tui_handle) = local_tui(256);
     let mut acceptor = Acceptor::new();
     acceptor.attach(Box::new(local_port));
-    let hub = FrontendHub::new(app.session_id.clone(), acceptor, RequestBroker::new());
+    let hub = FrontendHub::new(
+        app.session_id.clone(),
+        app.provider.clone(),
+        app.model.clone(),
+        app.cwd.to_string_lossy().to_string(),
+        acceptor,
+        RequestBroker::new(),
+    );
     tokio::spawn(drive_frontend_core(
         hub,
         agent_rx,
@@ -566,6 +573,11 @@ pub async fn run_engine(
         mpsc::channel::<crate::console::picker::PickerRequest>(4);
     let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
 
+    // Capture the statusline meta before `config`/`cwd` move into the agent loop.
+    let provider = config.active_provider().unwrap_or_default();
+    let model = config.active_model().unwrap_or_default();
+    let cwd_str = cwd.to_string_lossy().to_string();
+
     tokio::spawn(agent_loop(
         prompt_rx,
         cancel_rx,
@@ -587,7 +599,14 @@ pub async fn run_engine(
     let port = StdioPort::new(tokio::io::stdout(), tokio::io::stdin());
     let mut acceptor = Acceptor::new();
     acceptor.attach(Box::new(port));
-    let hub = FrontendHub::new(session_id.clone(), acceptor, RequestBroker::new());
+    let hub = FrontendHub::new(
+        session_id.clone(),
+        provider,
+        model,
+        cwd_str,
+        acceptor,
+        RequestBroker::new(),
+    );
 
     // Drive until the frontend closes our stdin (EOF = clean disconnect).
     drive_frontend_core(
@@ -623,6 +642,11 @@ async fn drive_frontend_core(
     prompt_tx: mpsc::Sender<AgentRequest>,
     mut current_session_id: String,
 ) {
+    // Hand the freshly-attached frontend its session snapshot (provider/model/
+    // cwd/session id) so it can render a statusline before any turn. The
+    // ratatui frontend ignores snapshots; the out-of-process Ink one consumes it.
+    hub.send_snapshot().await;
+
     // `CoreWake` dodges the select-arm borrow: only `next_command` borrows
     // `hub` inside the select, and every arm future is dropped before the match
     // touches `hub` again (mirrors `ConsoleLoop::wake`).
@@ -1401,7 +1425,14 @@ mod tests {
         let (local_port, mut handle) = local_tui(8);
         let mut acceptor = Acceptor::new();
         acceptor.attach(Box::new(local_port));
-        let hub = FrontendHub::new("s1".to_string(), acceptor, RequestBroker::new());
+        let hub = FrontendHub::new(
+            "s1".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            acceptor,
+            RequestBroker::new(),
+        );
         let driver = tokio::spawn(drive_frontend_core(
             hub,
             agent_rx,
@@ -1410,6 +1441,12 @@ mod tests {
             active_inject,
             prompt_tx,
             "s1".to_string(),
+        ));
+
+        // 0) The driver greets the freshly-attached frontend with a snapshot.
+        assert!(matches!(
+            handle.outbound.recv().await,
+            Some(Outbound::Snapshot(s)) if s.session_id == "s1"
         ));
 
         // 1) An agent event reaches the frontend verbatim as `Outbound::Event`.

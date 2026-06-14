@@ -41,6 +41,11 @@ pub enum CommandOutcome {
 
 pub struct FrontendHub {
     session_id: String,
+    /// Static session meta surfaced to frontends in every [`Snapshot`] so an
+    /// out-of-process renderer can draw a statusline (provider/model/cwd).
+    provider: String,
+    model: String,
+    cwd: String,
     acceptor: Acceptor,
     broker: RequestBroker,
     /// The single picker awaiting an answer, if any. The console opens pickers
@@ -50,9 +55,19 @@ pub struct FrontendHub {
 }
 
 impl FrontendHub {
-    pub fn new(session_id: String, acceptor: Acceptor, broker: RequestBroker) -> Self {
+    pub fn new(
+        session_id: String,
+        provider: String,
+        model: String,
+        cwd: String,
+        acceptor: Acceptor,
+        broker: RequestBroker,
+    ) -> Self {
         Self {
             session_id,
+            provider,
+            model,
+            cwd,
             acceptor,
             broker,
             pending: None,
@@ -61,6 +76,23 @@ impl FrontendHub {
 
     pub fn has_active(&self) -> bool {
         self.acceptor.has_active()
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            session_id: self.session_id.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            cwd: self.cwd.clone(),
+            pending_request: self.pending.clone(),
+        }
+    }
+
+    /// Emit the current session snapshot to the active frontend. Sent once when
+    /// the core driver starts so a fresh frontend can render its statusline.
+    pub async fn send_snapshot(&mut self) {
+        let snap = self.snapshot();
+        self.send(Outbound::Snapshot(snap)).await;
     }
 
     /// Push a streaming agent event to the active frontend, recovering from a
@@ -149,10 +181,7 @@ impl FrontendHub {
     /// tools fail fast. Returns whether a successor took over.
     async fn handover(&mut self) -> bool {
         if self.acceptor.handover() {
-            let snapshot = Snapshot {
-                session_id: self.session_id.clone(),
-                pending_request: self.pending.clone(),
-            };
+            let snapshot = self.snapshot();
             // Best-effort: if the successor is *also* already gone, the next
             // emit/next_command will drive another handover.
             if let Some(port) = self.acceptor.active_mut() {
@@ -241,7 +270,14 @@ mod tests {
     fn hub_with(port: Box<dyn FrontendPort>) -> FrontendHub {
         let mut acc = Acceptor::new();
         acc.attach(port);
-        FrontendHub::new("s1".to_string(), acc, RequestBroker::new())
+        FrontendHub::new(
+            "s1".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            acc,
+            RequestBroker::new(),
+        )
     }
 
     #[tokio::test]
@@ -291,7 +327,14 @@ mod tests {
         let mut acc = Acceptor::new();
         acc.attach(Box::new(dead));
         acc.attach(Box::new(live));
-        let mut hub = FrontendHub::new("s1".to_string(), acc, RequestBroker::new());
+        let mut hub = FrontendHub::new(
+            "s1".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            acc,
+            RequestBroker::new(),
+        );
 
         let (req, _rx) = picker_request();
         // open_request emits to the dead active port -> triggers handover ->
@@ -315,7 +358,14 @@ mod tests {
         dead.dead = true;
         let mut acc = Acceptor::new();
         acc.attach(Box::new(dead));
-        let mut hub = FrontendHub::new("s1".to_string(), acc, RequestBroker::new());
+        let mut hub = FrontendHub::new(
+            "s1".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            acc,
+            RequestBroker::new(),
+        );
 
         let (req, rx) = picker_request();
         hub.open_request(req).await; // emit fails, no successor -> cancel_all
