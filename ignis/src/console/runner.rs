@@ -424,6 +424,7 @@ pub async fn run_console(
     app.mcp = Some(mcp_registry);
 
     let runner_permissions = permissions.clone();
+    let driver_permissions = permissions.clone();
     app.permissions = Some(permissions);
 
     // Auto-update check: fire-and-forget HTTP GET in the background; the
@@ -484,6 +485,7 @@ pub async fn run_console(
         cancel_tx,
         active_inject,
         prompt_tx.clone(),
+        driver_permissions,
         app.session_id.clone(),
     ));
 
@@ -604,7 +606,7 @@ pub async fn run_engine(
         hook_registry,
         skill_registry,
         mcp_registry,
-        permissions,
+        permissions.clone(),
     ));
 
     // The frontend speaks NDJSON on our own stdio. emit() writes Outbound to
@@ -630,6 +632,7 @@ pub async fn run_engine(
         cancel_tx,
         active_inject,
         prompt_tx,
+        permissions,
         session_id,
     )
     .await;
@@ -647,6 +650,7 @@ pub async fn run_engine(
 /// forwarded to the agent (the cancel channel and the live turn's inject
 /// source). The frontend keeps `prompt_tx` only for config commands (model
 /// switch / config + skills reload), which still travel that channel directly.
+#[allow(clippy::too_many_arguments)]
 async fn drive_frontend_core(
     mut hub: FrontendHub,
     mut agent_rx: mpsc::Receiver<AgentEvent>,
@@ -654,8 +658,11 @@ async fn drive_frontend_core(
     cancel_tx: mpsc::Sender<()>,
     active_inject: ActiveInject,
     prompt_tx: mpsc::Sender<AgentRequest>,
+    permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
     mut current_session_id: String,
 ) {
+    // Seed the snapshot with the live permission mode (for the statusline badge).
+    hub.set_mode(permissions.mode().as_str().to_string());
     // Hand the freshly-attached frontend its session snapshot (provider/model/
     // cwd/session id) so it can render a statusline before any turn. The
     // ratatui frontend ignores snapshots; the out-of-process Ink one consumes it.
@@ -716,6 +723,16 @@ async fn drive_frontend_core(
                         .await;
                     hub.set_active_model(provider, model);
                     hub.send_snapshot().await;
+                }
+                // `/afk`: apply + persist the permission mode and re-snapshot so
+                // the statusline badge updates.
+                CommandOutcome::SetMode(mode_str) => {
+                    if let Some(m) = crate::permissions::Mode::parse(&mode_str) {
+                        permissions.set_mode(m);
+                        let _ = crate::state::persist_permission_mode(Some(m.as_str()));
+                        hub.set_mode(m.as_str().to_string());
+                        hub.send_snapshot().await;
+                    }
                 }
                 // The agent task drains stale cancels at each prompt's start, so
                 // an inter-turn cancel is harmless — no gating needed here.
@@ -1477,6 +1494,7 @@ mod tests {
             cancel_tx,
             active_inject,
             prompt_tx,
+            crate::permissions::runtime::PermissionState::new(crate::permissions::Mode::Off),
             "s1".to_string(),
         ));
 

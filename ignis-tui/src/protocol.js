@@ -20,6 +20,7 @@ export function initialState() {
     provider: null,
     model: null,
     cwd: null,
+    mode: null,
     models: [],
     turns: 0,
     usage: null,
@@ -41,6 +42,7 @@ export function reduceOutbound(state, frame) {
         provider: frame.data?.provider ?? state.provider,
         model: frame.data?.model ?? state.model,
         cwd: frame.data?.cwd ?? state.cwd,
+        mode: frame.data?.mode ?? state.mode,
         models: frame.data?.models ?? state.models,
         request: frame.data?.pending_request ? toRequest(frame.data.pending_request) : null,
       };
@@ -160,6 +162,7 @@ export const cancel = () => ({ kind: 'cancel' });
 export const setSession = (sessionId) => ({ kind: 'set_session', data: { session_id: sessionId } });
 export const newSession = () => ({ kind: 'new_session' });
 export const setModel = (provider, model) => ({ kind: 'set_model', data: { provider, model } });
+export const setMode = (mode) => ({ kind: 'set_mode', data: { mode } });
 export const reply = (id, answer) => ({ kind: 'reply', data: { id, answer } });
 
 /**

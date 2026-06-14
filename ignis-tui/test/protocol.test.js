@@ -12,6 +12,7 @@ import {
   setSession,
   newSession,
   setModel,
+  setMode,
   parseSlash,
   answerSingle,
   answerCancelled,
@@ -82,6 +83,7 @@ test('command builders match the Rust ClientCommand wire shapes', () => {
   assert.deepEqual(reply(7, answerCancelled()), { kind: 'reply', data: { id: 7, answer: 'Cancelled' } });
   assert.deepEqual(newSession(), { kind: 'new_session' });
   assert.deepEqual(setModel('deepseek', 'v4'), { kind: 'set_model', data: { provider: 'deepseek', model: 'v4' } });
+  assert.deepEqual(setMode('hands_free'), { kind: 'set_mode', data: { mode: 'hands_free' } });
 });
 
 test('parseSlash recognizes slash commands, ignores normal prompts', () => {

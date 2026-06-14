@@ -21,6 +21,7 @@ import {
   reply,
   newSession,
   setModel,
+  setMode,
   parseSlash,
   pickSingle,
   pickMulti,
@@ -33,6 +34,13 @@ import { parseMarkdown } from './markdown.js';
 
 const e = React.createElement;
 
+// Permission modes for the /afk picker (mode strings match the Rust enum).
+const AFK_MODES = [
+  { mode: 'off', label: 'Off — approve each tool' },
+  { mode: 'hands_free', label: 'Hands-free — auto-approve, stay interactive' },
+  { mode: 'fully_unattended', label: 'AFK — fully unattended' },
+];
+
 export default function App({ engine }) {
   const { exit } = useApp();
   const [state, setState] = useState(initialState());
@@ -41,7 +49,7 @@ export default function App({ engine }) {
   const [comp, setComp] = useState({ text: '', cursor: 0 });
   const [history, setHistory] = useState([]);
   const [histIdx, setHistIdx] = useState(-1); // -1 = editing live (not recalling)
-  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [localPicker, setLocalPicker] = useState(null); // null | 'model' | 'afk'
 
   useEffect(() => {
     engine.onFrame((frame) => setState((s) => reduceOutbound(s, frame)));
@@ -65,7 +73,10 @@ export default function App({ engine }) {
         setState((s) => ({ ...s, blocks: [], stream: null, turns: 0, usage: null }));
         return true;
       case 'model':
-        setModelPickerOpen(true);
+        setLocalPicker('model');
+        return true;
+      case 'afk':
+        setLocalPicker('afk');
         return true;
       default:
         return false; // /compact + unknown → submit (engine / LLM handles)
@@ -73,9 +84,9 @@ export default function App({ engine }) {
   };
 
   useInput((ch, key) => {
-    // While a picker is open it owns all keys (PickerFlow / ModelPicker each
+    // While a picker is open it owns all keys (PickerFlow / ChoicePicker each
     // have their own useInput).
-    if (req || modelPickerOpen) return;
+    if (req || localPicker) return;
 
     if (key.ctrl && ch === 'c') {
       if (state.status !== 'idle') engine.send(cancel());
@@ -173,17 +184,34 @@ export default function App({ engine }) {
   if (req) {
     // Key by request id so a fresh request resets the flow's internal state.
     children.push(e(PickerFlow, { key: `picker-${req.id}`, req, engine, onDone: clearRequest }));
-  } else if (modelPickerOpen) {
+  } else if (localPicker === 'model') {
     children.push(
-      e(ModelPicker, {
+      e(ChoicePicker, {
         key: 'model-picker',
-        models: state.models,
-        current: { provider: state.provider, model: state.model },
+        title: 'Switch model',
+        items: state.models,
+        labelOf: (m) => `${m.provider}/${m.model}`,
+        isCurrent: (m) => m.provider === state.provider && m.model === state.model,
         onPick: (m) => {
           engine.send(setModel(m.provider, m.model));
-          setModelPickerOpen(false);
+          setLocalPicker(null);
         },
-        onCancel: () => setModelPickerOpen(false),
+        onCancel: () => setLocalPicker(null),
+      }),
+    );
+  } else if (localPicker === 'afk') {
+    children.push(
+      e(ChoicePicker, {
+        key: 'afk-picker',
+        title: 'Permission mode',
+        items: AFK_MODES,
+        labelOf: (m) => m.label,
+        isCurrent: (m) => m.mode === state.mode,
+        onPick: (m) => {
+          engine.send(setMode(m.mode));
+          setLocalPicker(null);
+        },
+        onCancel: () => setLocalPicker(null),
       }),
     );
   } else {
@@ -244,8 +272,15 @@ function Footer({ state }) {
   if (state.cwd) segs.push(baseName(state.cwd));
   segs.push(`${state.turns} turn${state.turns === 1 ? '' : 's'}`);
   if (state.usage && state.usage.input_tokens != null) segs.push(`${state.usage.input_tokens} tok`);
-  if (!segs.length) return null;
-  return e(Box, { marginTop: 1 }, e(Text, { dimColor: true }, segs.join('  ·  ')));
+  // Permission-mode badge (HANDS-FREE peach / AFK red), like the ratatui footer.
+  const badge =
+    state.mode === 'hands_free'
+      ? e(Text, { color: 'yellow' }, ' HANDS-FREE ')
+      : state.mode === 'fully_unattended'
+        ? e(Text, { color: 'red' }, ' AFK ')
+        : null;
+  if (!segs.length && !badge) return null;
+  return e(Box, { marginTop: 1 }, e(Text, { dimColor: true }, segs.join('  ·  ')), badge ? e(Text, null, '  ') : null, badge);
 }
 
 function baseName(p) {
@@ -383,13 +418,10 @@ function PickerFlow({ req, engine, onDone }) {
   return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
 }
 
-// Local `/model` picker: single-select over the engine-supplied model list.
-function ModelPicker({ models, current, onPick, onCancel }) {
-  const start = Math.max(
-    0,
-    models.findIndex((m) => m.provider === current.provider && m.model === current.model),
-  );
-  const [cursor, setCursor] = useState(start);
+// Generic single-select local picker (used by /model, /afk). The cursor
+// preselects the current item via `isCurrent`.
+function ChoicePicker({ title, items, labelOf, isCurrent, onPick, onCancel }) {
+  const [cursor, setCursor] = useState(Math.max(0, items.findIndex((it) => isCurrent && isCurrent(it))));
 
   useInput((ch, key) => {
     if (key.escape) {
@@ -401,22 +433,18 @@ function ModelPicker({ models, current, onPick, onCancel }) {
       return;
     }
     if (key.downArrow) {
-      setCursor((c) => Math.min(Math.max(models.length - 1, 0), c + 1));
+      setCursor((c) => Math.min(Math.max(items.length - 1, 0), c + 1));
       return;
     }
-    if (key.return && models[cursor]) onPick(models[cursor]);
+    if (key.return && items[cursor]) onPick(items[cursor]);
   });
 
-  const rows = [e(Text, { key: 'q', bold: true }, 'Switch model')];
-  if (!models.length) {
-    rows.push(e(Text, { key: 'empty', dimColor: true }, 'No models configured.'));
-  }
-  models.forEach((m, i) =>
-    rows.push(
-      e(PickerRow, { key: `m${i}`, label: `${m.provider}/${m.model}`, focused: i === cursor, checked: false, multi: false }),
-    ),
+  const rows = [e(Text, { key: 'q', bold: true }, title)];
+  if (!items.length) rows.push(e(Text, { key: 'empty', dimColor: true }, 'Nothing to choose.'));
+  items.forEach((it, i) =>
+    rows.push(e(PickerRow, { key: `i${i}`, label: labelOf(it), focused: i === cursor, checked: false, multi: false })),
   );
-  rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ select · enter switch · esc cancel'));
+  rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ select · enter confirm · esc cancel'));
   return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
 }
 

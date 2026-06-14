@@ -74,6 +74,9 @@ pub struct Snapshot {
     pub provider: String,
     pub model: String,
     pub cwd: String,
+    /// Active permission mode (`off` / `hands_free` / `fully_unattended`), for
+    /// the statusline badge and the `/afk` picker.
+    pub mode: String,
     /// The configured models, for the `/model` picker (the engine owns the list).
     pub models: Vec<ModelRef>,
     /// Request awaiting an answer at activation time, if a tool was blocked
@@ -118,6 +121,10 @@ pub enum ClientCommand {
     /// subsequent prompts and re-snapshots so the statusline updates.
     #[serde(rename = "set_model")]
     SetModel { provider: String, model: String },
+    /// Switch the permission mode (`/afk`): `off` / `hands_free` /
+    /// `fully_unattended`. The core applies + persists it and re-snapshots.
+    #[serde(rename = "set_mode")]
+    SetMode { mode: String },
     /// Answer a [`ClientRequest`]. `id` must match the outstanding request; a
     /// stale or unknown id is dropped by the broker.
     #[serde(rename = "reply")]

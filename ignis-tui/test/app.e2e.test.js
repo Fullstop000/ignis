@@ -324,6 +324,28 @@ test('/model opens a picker of engine-supplied models; selection sends set_model
   assert.doesNotMatch(plain(lastFrame()), /Switch model/);
 });
 
+test('/afk picker switches permission mode and the footer shows a badge', async () => {
+  const { engine, lastFrame, stdin } = renderApp();
+  await tick();
+  engine.emit(snapshot({ session_id: 's1', mode: 'off' }));
+  await tick();
+  assert.doesNotMatch(plain(lastFrame()), /HANDS-FREE|AFK/, 'no badge while off');
+  stdin.write('/afk');
+  await tick();
+  stdin.write(KEY.enter);
+  await tick();
+  assert.match(plain(lastFrame()), /Permission mode/);
+  stdin.write(KEY.down); // off → hands_free
+  await tick();
+  stdin.write(KEY.enter);
+  await tick();
+  assert.deepEqual(engine.last(), { kind: 'set_mode', data: { mode: 'hands_free' } });
+  // Engine confirms via a re-snapshot → footer badge appears.
+  engine.emit(snapshot({ session_id: 's1', mode: 'hands_free' }));
+  await tick();
+  assert.match(plain(lastFrame()), /HANDS-FREE/);
+});
+
 test('/model picker cancels on Esc without sending a command', async () => {
   const { engine, lastFrame, stdin } = renderApp();
   await tick();

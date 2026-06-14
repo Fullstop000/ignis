@@ -40,6 +40,9 @@ pub enum CommandOutcome {
     /// Switch the active provider/model (`/model`): the core applies it to the
     /// next prompt and re-snapshots so the statusline updates.
     SetModel { provider: String, model: String },
+    /// Switch the permission mode (`/afk`): the core applies + persists it and
+    /// re-snapshots.
+    SetMode(String),
     /// A mechanical control signal (cancel / inject / shutdown).
     Control(ControlSignal),
     /// A `Reply` the hub already resolved against the broker — nothing left for
@@ -54,6 +57,8 @@ pub struct FrontendHub {
     provider: String,
     model: String,
     cwd: String,
+    /// Active permission mode (set after construction + on `/afk`).
+    mode: String,
     /// The configured models, surfaced to the frontend's `/model` picker.
     models: Vec<ModelRef>,
     acceptor: Acceptor,
@@ -79,6 +84,7 @@ impl FrontendHub {
             provider,
             model,
             cwd,
+            mode: String::new(),
             models,
             acceptor,
             broker,
@@ -96,9 +102,15 @@ impl FrontendHub {
             provider: self.provider.clone(),
             model: self.model.clone(),
             cwd: self.cwd.clone(),
+            mode: self.mode.clone(),
             models: self.models.clone(),
             pending_request: self.pending.clone(),
         }
+    }
+
+    /// Update the permission mode the hub reports (startup + after `/afk`).
+    pub fn set_mode(&mut self, mode: String) {
+        self.mode = mode;
     }
 
     /// Retarget the session this hub reports in snapshots (after `/clear`).
@@ -156,6 +168,9 @@ impl FrontendHub {
         }
         if let ClientCommand::SetModel { provider, model } = cmd {
             return CommandOutcome::SetModel { provider, model };
+        }
+        if let ClientCommand::SetMode { mode } = cmd {
+            return CommandOutcome::SetMode(mode);
         }
         // Remaining variants are mechanical control signals.
         match control_signal(&cmd) {
