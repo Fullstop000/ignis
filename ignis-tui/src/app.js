@@ -56,6 +56,7 @@ export default function App({ engine }) {
   const [histIdx, setHistIdx] = useState(-1); // -1 = editing live (not recalling)
   const [localPicker, setLocalPicker] = useState(null); // null | 'model' | 'afk' | 'skills' | 'mcp' | 'sessions'
   const [pastes, setPastes] = useState([]); // multi-line paste contents, shown as [paste #N] chips
+  const [reasoningExpanded, setReasoningExpanded] = useState(false); // Ctrl+O expands ✻ Thinking blocks
 
   useEffect(() => {
     engine.onFrame((frame) => setState((s) => reduceOutbound(s, frame)));
@@ -121,6 +122,11 @@ export default function App({ engine }) {
         engine.send(inject(expandPastes(comp.text, pastes)));
         resetComposer();
       }
+      return;
+    }
+    // Ctrl+O expands/collapses ✻ Thinking (reasoning) blocks, like ratatui.
+    if (key.ctrl && ch === 'o') {
+      setReasoningExpanded((x) => !x);
       return;
     }
     if (key.return) {
@@ -208,8 +214,16 @@ export default function App({ engine }) {
   if (state.blocks.length === 0 && state.stream == null && !req) {
     children.push(e(Welcome, { key: 'welcome' }));
   }
-  state.blocks.forEach((b, i) => children.push(e(Block, { key: `b${i}`, block: b })));
-  if (state.stream != null) children.push(e(Markdown, { key: 'stream', text: state.stream }));
+  state.blocks.forEach((b, i) => children.push(e(Block, { key: `b${i}`, block: b, expanded: reasoningExpanded })));
+  if (state.stream != null) {
+    // The in-flight stream renders as live reasoning (rolling ✻ Thinking) or
+    // streaming markdown, depending on what the engine opened.
+    children.push(
+      state.streamKind === 'reasoning'
+        ? e(ReasoningView, { key: 'stream', text: state.stream, done: false, expanded: reasoningExpanded })
+        : e(Markdown, { key: 'stream', text: state.stream }),
+    );
+  }
   if (req) {
     // Key by request id so a fresh request resets the flow's internal state.
     children.push(e(PickerFlow, { key: `picker-${req.id}`, req, engine, onDone: clearRequest }));
@@ -290,12 +304,14 @@ function deleteWordBefore(c) {
   return { text: c.text.slice(0, i) + c.text.slice(c.cursor), cursor: i };
 }
 
-function Block({ block }) {
+function Block({ block, expanded }) {
   switch (block.kind) {
     case 'user':
       return e(Text, { color: 'magenta' }, `▌ ${block.text}`);
     case 'assistant':
       return e(Markdown, { text: block.text });
+    case 'reasoning':
+      return e(ReasoningView, { text: block.text, done: true, expanded });
     case 'tool':
       return e(ToolBlock, { block });
     case 'inject':
@@ -303,6 +319,28 @@ function Block({ block }) {
     default:
       return e(Text, { dimColor: true }, block.text);
   }
+}
+
+// Chain-of-thought block (✻ Thinking). While streaming, a rolling tail of the
+// last few lines; once done, collapsed to a lead line + "(+N lines · ctrl+o)"
+// breadcrumb unless expanded (Ctrl+O), mirroring the ratatui reasoning block.
+const REASONING_PREVIEW = 3;
+function ReasoningView({ text, done, expanded }) {
+  const lines = String(text == null ? '' : text).split('\n');
+  const header = e(Text, { key: 'h', color: 'magenta' }, done ? '✻ Thinking' : '✻ Thinking…');
+  let body;
+  if (!done) {
+    // Live: rolling window of the last few lines.
+    body = lines.slice(-REASONING_PREVIEW).map((ln, i) => e(Text, { key: `t${i}`, dimColor: true }, `  ${ln || ' '}`));
+  } else if (expanded || lines.length <= REASONING_PREVIEW + 1) {
+    body = lines.map((ln, i) => e(Text, { key: `f${i}`, dimColor: true }, `  ${ln || ' '}`));
+  } else {
+    body = [
+      e(Text, { key: 'lead', dimColor: true }, `  ${lines[0]}`),
+      e(Text, { key: 'more', dimColor: true }, `  … (+${lines.length - 1} lines · ctrl+o to expand)`),
+    ];
+  }
+  return e(Box, { flexDirection: 'column' }, [header, ...body]);
 }
 
 // Tool call: a `● name(args)` header (yellow pending / green done / red error),

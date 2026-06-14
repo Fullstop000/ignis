@@ -53,6 +53,7 @@ export const KEY = {
   ctrlA: '\x01',
   ctrlE: '\x05',
   ctrlW: '\x17',
+  ctrlO: '\x0f',
   space: ' ',
 };
 

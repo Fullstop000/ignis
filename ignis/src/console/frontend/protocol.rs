@@ -74,13 +74,16 @@ pub struct SessionInfo {
 }
 
 /// A render-ready transcript entry. The wire shape mirrors the frontend's block
-/// model so a resumed session drops straight into scrollback. Reasoning blocks
-/// are intentionally absent for now — the frontend has no reasoning rendering
-/// yet (that lands with the reasoning feature, which will add a variant here).
+/// model so a resumed session drops straight into scrollback.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TranscriptBlock {
     User {
+        text: String,
+    },
+    /// Chain-of-thought, rendered as a collapsible `✻ Thinking` block. Pushed
+    /// before its assistant reply, mirroring the streaming order.
+    Reasoning {
         text: String,
     },
     Assistant {

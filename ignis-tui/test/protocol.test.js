@@ -43,6 +43,30 @@ test('a streaming assistant message accumulates deltas then finalizes', () => {
   assert.equal(s.status, 'idle');
 });
 
+test('a reasoning stream finalizes to a reasoning block, not an assistant one', () => {
+  // The engine opens a reasoning block with reasoning_content set + content
+  // omitted (skip_serializing_if); text blocks open with content.
+  let s = initialState();
+  s = reduceOutbound(s, { kind: 'event', data: { type: 'message_start', payload: { message: { reasoning_content: '' } } } });
+  assert.equal(s.streamKind, 'reasoning');
+  s = reduceOutbound(s, { kind: 'event', data: { type: 'message_update', payload: { delta: 'let me ' } } });
+  s = reduceOutbound(s, { kind: 'event', data: { type: 'message_update', payload: { delta: 'think' } } });
+  assert.equal(s.stream, 'let me think');
+  s = reduceOutbound(s, {
+    kind: 'event',
+    data: { type: 'message_end', payload: { message: { reasoning_content: 'let me think' } } },
+  });
+  assert.deepEqual(s.blocks.at(-1), { kind: 'reasoning', text: 'let me think' });
+  assert.equal(s.stream, null);
+  assert.equal(s.streamKind, null);
+
+  // A subsequent text reply still becomes an assistant block.
+  s = reduceOutbound(s, { kind: 'event', data: { type: 'message_start', payload: { message: { content: '' } } } });
+  assert.equal(s.streamKind, 'assistant');
+  s = reduceOutbound(s, { kind: 'event', data: { type: 'message_end', payload: { message: { content: 'the answer' } } } });
+  assert.deepEqual(s.blocks.at(-1), { kind: 'assistant', text: 'the answer' });
+});
+
 test('user prompt and tool lifecycle render blocks', () => {
   let s = initialState();
   s = reduceOutbound(s, { kind: 'event', data: { type: 'user_prompt_committed', payload: { text: 'hi' } } });

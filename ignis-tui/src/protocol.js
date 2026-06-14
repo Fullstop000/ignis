@@ -13,6 +13,10 @@ export function initialState() {
   return {
     blocks: [],
     stream: null,
+    // What the in-flight `stream` is: 'assistant' reply text or 'reasoning'
+    // (chain-of-thought). Both arrive as MessageStart/Update/End; the start
+    // event's message shape disambiguates them.
+    streamKind: null,
     status: 'idle',
     sessionId: null,
     request: null,
@@ -63,6 +67,7 @@ export function reduceOutbound(state, frame) {
         ...state,
         blocks: (frame.data?.blocks ?? []).map(toBlock),
         stream: null,
+        streamKind: null,
         sessionId: frame.data?.session_id ?? state.sessionId,
         turns: 0,
         usage: null,
@@ -77,7 +82,7 @@ function toBlock(b) {
   if (b.kind === 'tool') {
     return { kind: 'tool', id: '', name: b.name, args: b.args, done: true, result: b.result };
   }
-  return b; // user / assistant pass through unchanged.
+  return b; // user / assistant / reasoning pass through unchanged.
 }
 
 function toRequest(data) {
@@ -91,16 +96,23 @@ function reduceEvent(state, ev) {
       return { ...state, status: 'busy', turns: state.turns + 1 };
     case 'turn_end':
       return { ...state, status: 'idle' };
-    case 'message_start':
-      return { ...state, stream: '' };
+    case 'message_start': {
+      // A reasoning block opens as { reasoning_content: "", content: null };
+      // a reply opens with content. Track which the stream is so its deltas
+      // and final block are routed correctly (and rendered differently).
+      const m = p.message || {};
+      const kind = m.reasoning_content != null && m.content == null ? 'reasoning' : 'assistant';
+      return { ...state, stream: '', streamKind: kind };
+    }
     case 'message_update':
       return { ...state, stream: (state.stream ?? '') + (p.delta ?? '') };
     case 'message_end': {
-      const text = p.message?.content ?? state.stream ?? '';
+      const isReasoning = state.streamKind === 'reasoning';
+      const text = (isReasoning ? p.message?.reasoning_content : p.message?.content) ?? state.stream ?? '';
       const blocks = text.trim().length
-        ? [...state.blocks, { kind: 'assistant', text }]
+        ? [...state.blocks, { kind: isReasoning ? 'reasoning' : 'assistant', text }]
         : state.blocks;
-      return { ...state, blocks, stream: null };
+      return { ...state, blocks, stream: null, streamKind: null };
     }
     case 'user_prompt_committed':
       return { ...state, blocks: [...state.blocks, { kind: 'user', text: p.text ?? '' }] };

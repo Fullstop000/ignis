@@ -703,9 +703,8 @@ fn session_infos(
 
 /// Convert a loaded session's messages into render-ready [`TranscriptBlock`]s
 /// for replay. Mirrors `App::render_session_history`'s message→block mapping:
-/// a `tool` message fills the result of the most recent matching call; an
-/// orphan result becomes a standalone block. Reasoning is omitted (the wire has
-/// no reasoning block yet — see [`TranscriptBlock`]).
+/// reasoning precedes the assistant reply; a `tool` message fills the result of
+/// the most recent matching call; an orphan result becomes a standalone block.
 fn transcript_blocks(
     messages: Vec<Message>,
 ) -> Vec<crate::console::frontend::protocol::TranscriptBlock> {
@@ -722,6 +721,10 @@ fn transcript_blocks(
                 }
             }
             "assistant" => {
+                // Reasoning before the reply, matching the streaming order.
+                if let Some(reasoning) = message.reasoning_content.filter(|r| !r.is_empty()) {
+                    blocks.push(TranscriptBlock::Reasoning { text: reasoning });
+                }
                 if let Some(content) = message.content.filter(|c| !c.is_empty()) {
                     blocks.push(TranscriptBlock::Assistant { text: content });
                 }
@@ -1928,7 +1931,7 @@ mod tests {
             tool_calls: None,
             created_at_ms: None,
         };
-        let mut assistant = assistant_msg("on it", Some("thinking — must be dropped"));
+        let mut assistant = assistant_msg("on it", Some("let me think"));
         assistant.tool_calls = Some(vec![ToolCall {
             id: "call-1".to_string(),
             r#type: "function".to_string(),
@@ -1941,10 +1944,13 @@ mod tests {
         tool_result.tool_call_id = Some("call-1".to_string());
 
         let blocks = transcript_blocks(vec![plain("user", "do it"), assistant, tool_result]);
-        // user + assistant + tool; reasoning is intentionally omitted.
+        // user + reasoning (before the reply) + assistant + tool.
         assert!(matches!(&blocks[0], TranscriptBlock::User { text } if text == "do it"));
-        assert!(matches!(&blocks[1], TranscriptBlock::Assistant { text } if text == "on it"));
-        match &blocks[2] {
+        assert!(
+            matches!(&blocks[1], TranscriptBlock::Reasoning { text } if text == "let me think")
+        );
+        assert!(matches!(&blocks[2], TranscriptBlock::Assistant { text } if text == "on it"));
+        match &blocks[3] {
             TranscriptBlock::Tool { name, args, result } => {
                 assert_eq!(name, "bash");
                 assert_eq!(args, "ls");
@@ -1953,7 +1959,7 @@ mod tests {
             }
             _ => panic!("expected the tool call's result attached to its block"),
         }
-        assert_eq!(blocks.len(), 3, "no reasoning block, no stray blocks");
+        assert_eq!(blocks.len(), 4, "reasoning + reply + tool, no stray blocks");
     }
 
     #[test]
