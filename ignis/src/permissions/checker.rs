@@ -158,7 +158,7 @@ impl ToolHooks for PermissionChecker {
 
         let decision = check(
             tool_name,
-            &args.to_string(),
+            args,
             default_policy_for_tool(tool_name),
             self.state.mode(),
             session_allowed,
@@ -434,13 +434,9 @@ mod tests {
     // the guard stays in a purely synchronous scope.
     #[test]
     fn picker_always_allow_persists_grant_and_silences_followups() {
-        let _env = crate::util::ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let tmp = crate::util::unique_temp_dir("ignis-checker-grant");
         std::fs::create_dir_all(&tmp).unwrap();
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp);
+        let _home = crate::util::HomeGuard::set(&tmp);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -478,10 +474,6 @@ mod tests {
             assert!(r2.is_ok(), "follow-up should be allowed by the grant");
         });
 
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 

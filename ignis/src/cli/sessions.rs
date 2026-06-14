@@ -2,7 +2,7 @@
 //! `~/.ignis/projects/` and writes an HTML report. See
 //! `docs/superpowers/specs/2026-05-28-sessions-html-export-design.md`.
 
-use crate::session::project_slug;
+use crate::session::{project_sessions_dir_with_migration, project_slug};
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
@@ -517,6 +517,13 @@ pub fn load_session_detail(
 
 pub fn walk_sessions(projects_dir: &Path, scope: Scope, cwd: &Path) -> Result<Vec<SessionRecord>> {
     let mut out = Vec::new();
+
+    if matches!(scope, Scope::Current) {
+        if let Some(root) = projects_dir.parent() {
+            let _ = project_sessions_dir_with_migration(root, cwd);
+        }
+    }
+
     let entries = match std::fs::read_dir(projects_dir) {
         Ok(e) => e,
         Err(_) => return Ok(out),

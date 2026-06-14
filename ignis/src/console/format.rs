@@ -76,10 +76,13 @@ pub(crate) fn format_context(n: u64) -> String {
         format!("{}M", n / MIB)
     } else if n != 0 && n.is_multiple_of(1024) {
         format!("{}K", n / 1024) // binary, e.g. 262144 -> 256K
-    } else if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
-        format!("{}M", n / 1_000_000)
     } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        // Decimal megabytes: omit the fractional part when it is exact.
+        if n.is_multiple_of(1_000_000) {
+            format!("{}M", n / 1_000_000)
+        } else {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        }
     } else {
         format!("{}K", (n as f64 / 1000.0).round() as u64) // decimal, e.g. 200000 -> 200K
     }
@@ -128,7 +131,7 @@ pub(crate) fn next_selection(current: usize, len: usize, direction: SelectionDir
 
 #[cfg(test)]
 mod tests {
-    use super::format_elapsed;
+    use super::{format_context, format_elapsed};
 
     #[test]
     fn elapsed_drops_leading_zero_units() {
@@ -139,5 +142,16 @@ mod tests {
         assert_eq!(format_elapsed(65_000), "1m 05s");
         assert_eq!(format_elapsed(600_000), "10m 00s");
         assert_eq!(format_elapsed(3_725_000), "1h 02m 05s"); // 1h 2m 5s
+    }
+
+    #[test]
+    fn context_prefers_binary_then_decimal_labels() {
+        assert_eq!(format_context(0), "0K");
+        assert_eq!(format_context(999), "1K");
+        assert_eq!(format_context(200_000), "200K");
+        assert_eq!(format_context(262_144), "256K"); // exact KiB
+        assert_eq!(format_context(1_048_576), "1M"); // exact MiB
+        assert_eq!(format_context(1_500_000), "1.5M");
+        assert_eq!(format_context(2_000_000), "2M"); // exact decimal MB
     }
 }

@@ -6,6 +6,7 @@ use crate::storage::SessionStorage;
 use crate::tools::tool::{AgentTool, ToolHooks};
 use crate::{AgentEvent, Message};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -496,24 +497,138 @@ Then provide the summary inside <summary> tags with these numbered sections:
 Use terse, accurate bullets. Preserve exact paths, commands, identifiers, and error strings. Do not mention that the conversation was compacted.";
 
 pub fn project_slug(cwd: &Path) -> String {
-    let raw = cwd.to_string_lossy();
-    let mut slug = String::new();
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
-            slug.push(ch);
-        } else {
-            slug.push('-');
+    fn sanitize(comp: &str) -> String {
+        comp.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    }
+
+    let mut parts = Vec::new();
+    for comp in cwd.components() {
+        let s = match comp {
+            std::path::Component::Normal(os) => sanitize(&os.to_string_lossy()),
+            std::path::Component::Prefix(p) => sanitize(&p.as_os_str().to_string_lossy()),
+            _ => continue,
+        };
+        if !s.is_empty() {
+            parts.push(s);
         }
     }
+
+    let mut slug = parts.join("-");
     if slug.is_empty() {
-        "unknown".to_string()
-    } else {
-        slug
+        return "unknown".to_string();
     }
+
+    // The root separator is gone because we built the slug from components.
+    // If the first real path component starts with '-' or '.', escape it so
+    // the directory name is not treated as a shell flag or hidden file.
+    if slug.starts_with('-') || slug.starts_with('.') {
+        slug.insert(0, '%');
+    }
+    slug
 }
 
 pub fn project_sessions_dir(root: &Path, cwd: &Path) -> PathBuf {
     root.join("projects").join(project_slug(cwd))
+}
+
+/// Legacy slug used before leading dashes were trimmed. Kept so existing
+/// session directories can be migrated to the new slug on first access.
+fn legacy_project_slug(cwd: &Path) -> String {
+    let raw = cwd.to_string_lossy();
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Merge legacy session files into the current project sessions directory.
+/// Entries whose names already exist in `new_dir` are left in place in `legacy`
+/// to avoid overwriting newer sessions. A session file and its `.usage.json`
+/// sidecar are treated as a single unit: the sidecar is only migrated when the
+/// corresponding session file is migrated, preventing legacy usage data from
+/// attaching to a newer session that happens to share the same ID.
+fn merge_legacy_sessions(legacy: &Path, new_dir: &Path) -> std::io::Result<()> {
+    if !new_dir.exists() {
+        std::fs::create_dir_all(new_dir)?;
+    }
+
+    let entries: Vec<_> = std::fs::read_dir(legacy)?.collect::<Result<_, _>>()?;
+    let mut migrated_stems = HashSet::new();
+
+    // First pass: migrate session files (.jsonl / .json) and record migrated IDs.
+    for entry in &entries {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.ends_with(".usage.json") {
+            continue;
+        }
+        let dst = new_dir.join(&name);
+        if !dst.exists() {
+            std::fs::rename(entry.path(), &dst)?;
+            if let Some(stem) = Path::new(name_str).file_stem().and_then(|s| s.to_str()) {
+                migrated_stems.insert(stem.to_string());
+            }
+        }
+    }
+
+    // Second pass: migrate usage sidecars only when their session file moved too.
+    for entry in &entries {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.ends_with(".usage.json") {
+            continue;
+        }
+        let base = &name_str[..name_str.len() - ".usage.json".len()];
+        if !migrated_stems.contains(base) {
+            continue;
+        }
+        let dst = new_dir.join(&name);
+        if !dst.exists() {
+            std::fs::rename(entry.path(), &dst)?;
+        }
+    }
+
+    std::fs::remove_dir(legacy)
+}
+
+/// Return the current project sessions directory, migrating any legacy
+/// leading-dash directory into it. If both directories already exist, legacy
+/// entries are merged in without overwriting newer entries.
+pub fn project_sessions_dir_with_migration(root: &Path, cwd: &Path) -> PathBuf {
+    let new_dir = project_sessions_dir(root, cwd);
+    let legacy = root.join("projects").join(legacy_project_slug(cwd));
+    if legacy.exists() {
+        let outcome = if !new_dir.exists() {
+            std::fs::rename(&legacy, &new_dir)
+        } else {
+            merge_legacy_sessions(&legacy, &new_dir)
+        };
+        if let Err(e) = outcome {
+            tracing::warn!(
+                "failed to migrate legacy session dir {} to {}: {e}",
+                legacy.display(),
+                new_dir.display()
+            );
+        }
+    }
+    new_dir
 }
 
 // ==========================================
@@ -738,13 +853,38 @@ mod tests {
 
     #[test]
     fn project_slug_matches_claude_style_path_slug() {
-        assert_eq!(
-            project_slug(Path::new("/home/zht/ignis")),
-            "-home-zht-ignis"
+        assert_eq!(project_slug(Path::new("/home/zht/ignis")), "home-zht-ignis");
+        assert_eq!(project_slug(Path::new("/tmp/with space")), "tmp-with-space");
+    }
+
+    #[test]
+    fn project_slug_escapes_leading_dashes_and_dots() {
+        // The root separator no longer leaks a leading dash.  If the first real
+        // path component starts with '-' or '.', escape it so the directory is
+        // not treated as a shell flag or hidden file.
+        assert_eq!(project_slug(Path::new("/-foo/bar")), "%-foo-bar");
+        assert_eq!(project_slug(Path::new("/...foo")), "%...foo");
+        // Normal paths are unchanged.
+        assert_eq!(project_slug(Path::new("/foo/bar")), "foo-bar");
+        assert_ne!(
+            project_slug(Path::new("/-foo/bar")),
+            project_slug(Path::new("/foo/bar"))
         );
+        // Trailing separators from path components are preserved.
+        assert_eq!(project_slug(Path::new("/foo/bar-")), "foo-bar-");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn project_slug_preserves_windows_drive_prefix() {
+        // Paths on different drives must not collide.
         assert_eq!(
-            project_slug(Path::new("/tmp/with space")),
-            "-tmp-with-space"
+            project_slug(Path::new("C:\\Users\\me\\proj")),
+            project_slug(Path::new("C:\\Users\\me\\proj"))
+        );
+        assert_ne!(
+            project_slug(Path::new("C:\\Users\\me\\proj")),
+            project_slug(Path::new("D:\\Users\\me\\proj"))
         );
     }
 
@@ -753,7 +893,89 @@ mod tests {
         let root = PathBuf::from("/tmp/ignis-sessions");
         assert_eq!(
             project_sessions_dir(&root, Path::new("/home/zht/ignis")),
-            PathBuf::from("/tmp/ignis-sessions/projects/-home-zht-ignis")
+            PathBuf::from("/tmp/ignis-sessions/projects/home-zht-ignis")
+        );
+    }
+
+    #[test]
+    fn project_sessions_dir_migrates_legacy_dir() {
+        let root = crate::util::unique_temp_dir("ignis-session-migrate");
+        let cwd = Path::new("/home/zht/ignis");
+        let legacy = root.join("projects").join(legacy_project_slug(cwd));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("default.jsonl"), b"{}\n").unwrap();
+
+        let new_dir = project_sessions_dir_with_migration(&root, cwd);
+        assert!(new_dir.exists());
+        assert!(!legacy.exists());
+        assert!(new_dir.join("default.jsonl").exists());
+    }
+
+    #[test]
+    fn project_sessions_dir_merges_legacy_dir_when_new_exists() {
+        let root = crate::util::unique_temp_dir("ignis-session-merge");
+        let cwd = Path::new("/home/zht/ignis");
+        let legacy = root.join("projects").join(legacy_project_slug(cwd));
+        let new_dir = project_sessions_dir(&root, cwd);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(legacy.join("old.jsonl"), b"{}\n").unwrap();
+        std::fs::write(new_dir.join("new.jsonl"), b"{}\n").unwrap();
+
+        let result = project_sessions_dir_with_migration(&root, cwd);
+        assert_eq!(result, new_dir);
+        assert!(!legacy.exists());
+        assert!(new_dir.join("old.jsonl").exists());
+        assert!(new_dir.join("new.jsonl").exists());
+    }
+
+    #[test]
+    fn project_sessions_dir_merge_skips_name_collisions() {
+        let root = crate::util::unique_temp_dir("ignis-session-merge-collision");
+        let cwd = Path::new("/home/zht/ignis");
+        let legacy = root.join("projects").join(legacy_project_slug(cwd));
+        let new_dir = project_sessions_dir(&root, cwd);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(legacy.join("default.jsonl"), b"legacy\n").unwrap();
+        std::fs::write(new_dir.join("default.jsonl"), b"current\n").unwrap();
+
+        let result = project_sessions_dir_with_migration(&root, cwd);
+        assert_eq!(result, new_dir);
+        assert!(legacy.exists());
+        assert!(legacy.join("default.jsonl").exists());
+        assert_eq!(
+            std::fs::read_to_string(new_dir.join("default.jsonl")).unwrap(),
+            "current\n"
+        );
+    }
+
+    #[test]
+    fn project_sessions_dir_merge_keeps_usage_sidecar_with_colliding_session() {
+        let root = crate::util::unique_temp_dir("ignis-session-merge-usage-collision");
+        let cwd = Path::new("/home/zht/ignis");
+        let legacy = root.join("projects").join(legacy_project_slug(cwd));
+        let new_dir = project_sessions_dir(&root, cwd);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(legacy.join("default.jsonl"), b"legacy\n").unwrap();
+        std::fs::write(legacy.join("default.usage.json"), b"legacy usage\n").unwrap();
+        std::fs::write(new_dir.join("default.jsonl"), b"current\n").unwrap();
+        std::fs::write(new_dir.join("default.usage.json"), b"current usage\n").unwrap();
+
+        let result = project_sessions_dir_with_migration(&root, cwd);
+        assert_eq!(result, new_dir);
+        // The legacy session file and its usage sidecar must stay together.
+        assert!(legacy.exists());
+        assert!(legacy.join("default.jsonl").exists());
+        assert!(legacy.join("default.usage.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(new_dir.join("default.jsonl")).unwrap(),
+            "current\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new_dir.join("default.usage.json")).unwrap(),
+            "current usage\n"
         );
     }
 

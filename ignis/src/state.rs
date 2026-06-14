@@ -175,13 +175,9 @@ mod tests {
 
     #[test]
     fn persist_permission_grants_preserves_siblings() {
-        let _env = crate::util::ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let tmp = crate::util::unique_temp_dir("ignis-state-grants-rmw");
         std::fs::create_dir_all(&tmp).unwrap();
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp);
+        let _home = crate::util::HomeGuard::set(&tmp);
 
         persist_model_selection("deepseek", "deepseek-v4-pro", Some("high")).unwrap();
         persist_permission_grants(&["bash(git status *)".to_string()]).unwrap();
@@ -199,10 +195,6 @@ mod tests {
         assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
         assert_eq!(s.permission_grants.len(), 2);
 
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -271,13 +263,9 @@ mod tests {
 
     #[test]
     fn model_persist_preserves_disabled_skills_and_vice_versa() {
-        let _env = crate::util::ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let tmp = crate::util::unique_temp_dir("ignis-state-rmw");
         std::fs::create_dir_all(&tmp).unwrap();
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp);
+        let _home = crate::util::HomeGuard::set(&tmp);
 
         persist_disabled_skills(&["sql-review".to_string()]).unwrap();
         persist_model_selection("deepseek", "deepseek-v4-pro", Some("high")).unwrap();
@@ -290,10 +278,6 @@ mod tests {
         assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
         assert_eq!(s.disabled_skills.len(), 2);
 
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -332,13 +316,9 @@ mod tests {
 
     #[test]
     fn permission_mode_persist_preserves_siblings() {
-        let _env = crate::util::ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let tmp = crate::util::unique_temp_dir("ignis-state-mode-rmw");
         std::fs::create_dir_all(&tmp).unwrap();
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp);
+        let _home = crate::util::HomeGuard::set(&tmp);
 
         persist_model_selection("deepseek", "deepseek-v4-pro", Some("high")).unwrap();
         persist_disabled_skills(&["sql-review".to_string()]).unwrap();
@@ -355,10 +335,6 @@ mod tests {
         assert_eq!(s.disabled_skills, vec!["sql-review".to_string()]);
         assert!(s.mode.is_none());
 
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -410,13 +386,9 @@ mod tests {
 
     #[test]
     fn persist_statusline_hidden_preserves_siblings() {
-        let _env = crate::util::ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let tmp = crate::util::unique_temp_dir("ignis-state-statusline-rmw");
         std::fs::create_dir_all(&tmp).unwrap();
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp);
+        let _home = crate::util::HomeGuard::set(&tmp);
 
         persist_model_selection("deepseek", "deepseek-v4-pro", Some("high")).unwrap();
         persist_statusline_hidden(&["git".to_string()]).unwrap();
@@ -429,22 +401,14 @@ mod tests {
         let s = load_state();
         assert_eq!(s.statusline_hidden, vec!["git".to_string()]);
 
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn mcp_persist_preserves_model_and_skills() {
-        let _env = crate::util::ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let tmp = crate::util::unique_temp_dir("ignis-state-mcp-rmw");
         std::fs::create_dir_all(&tmp).unwrap();
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp);
+        let _home = crate::util::HomeGuard::set(&tmp);
 
         persist_model_selection("deepseek", "deepseek-v4-pro", Some("high")).unwrap();
         persist_disabled_skills(&["sql-review".to_string()]).unwrap();
@@ -462,10 +426,6 @@ mod tests {
         assert_eq!(s.disabled_skills, vec!["sql-review".to_string()]);
         assert_eq!(s.disabled_mcp_servers.len(), 2);
 
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

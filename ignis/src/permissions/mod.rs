@@ -111,14 +111,12 @@ impl Decision {
 /// 7. **Per-tool default** policy.
 pub fn check(
     tool_name: &str,
-    arguments_json: &str,
+    args: &serde_json::Value,
     default_for_tool: Decision,
     mode: Mode,
     session_allowed: bool,
     ruleset: &rule::RuleSet,
 ) -> Decision {
-    let args: serde_json::Value = serde_json::from_str(arguments_json).unwrap_or_default();
-
     // Step 1: circuit breakers (raw bash arg scan). These ALWAYS take
     // precedence over session-allow shortcuts and any auto-approve mode —
     // that's the whole point of the floor.
@@ -162,7 +160,7 @@ pub fn check(
     // explicit hard no (beats session-allow + HandsFree), and a config `ask`
     // forces oversight even under HandsFree. Under FullyUnattended an `ask`
     // becomes `Deny` (no human to confirm), mirroring the floor.
-    match ruleset.decide(tool_name, &args) {
+    match ruleset.decide(tool_name, args) {
         Some(Decision::Deny { reason }) => return Decision::deny(reason),
         Some(Decision::Ask { reason }) => {
             return if mode.is_fully_unattended() {
@@ -226,8 +224,8 @@ pub fn default_policy_for_tool(tool_name: &str) -> Decision {
 mod tests {
     use super::*;
 
-    fn json(s: &str) -> &str {
-        s
+    fn json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
     }
 
     #[test]
@@ -288,7 +286,7 @@ mod tests {
     fn read_tool_in_off_mode_allows() {
         let d = check(
             "read_file",
-            json(r#"{"path":"src/main.rs"}"#),
+            &json(r#"{"path":"src/main.rs"}"#),
             default_policy_for_tool("read_file"),
             Mode::Off,
             false,
@@ -301,7 +299,7 @@ mod tests {
     fn bash_in_off_mode_asks() {
         let d = check(
             "bash",
-            json(r#"{"command":"cargo build"}"#),
+            &json(r#"{"command":"cargo build"}"#),
             default_policy_for_tool("bash"),
             Mode::Off,
             false,
@@ -314,7 +312,7 @@ mod tests {
     fn bash_read_only_auto_allows_even_in_off() {
         let d = check(
             "bash",
-            json(r#"{"command":"git status"}"#),
+            &json(r#"{"command":"git status"}"#),
             default_policy_for_tool("bash"),
             Mode::Off,
             false,
@@ -327,7 +325,7 @@ mod tests {
     fn hands_free_allows_normal_tools() {
         let d = check(
             "bash",
-            json(r#"{"command":"cargo build && cargo test"}"#),
+            &json(r#"{"command":"cargo build && cargo test"}"#),
             default_policy_for_tool("bash"),
             Mode::HandsFree,
             false,
@@ -340,7 +338,7 @@ mod tests {
     fn fully_unattended_allows_normal_tools() {
         let d = check(
             "bash",
-            json(r#"{"command":"cargo build"}"#),
+            &json(r#"{"command":"cargo build"}"#),
             default_policy_for_tool("bash"),
             Mode::FullyUnattended,
             false,
@@ -360,7 +358,7 @@ mod tests {
         ] {
             let d = check(
                 "bash",
-                cmd,
+                &json(cmd),
                 default_policy_for_tool("bash"),
                 Mode::HandsFree,
                 false,
@@ -379,7 +377,7 @@ mod tests {
     fn hands_free_still_asks_protected_path_edit() {
         let d = check(
             "edit_file",
-            json(r#"{"path":".git/config"}"#),
+            &json(r#"{"path":".git/config"}"#),
             default_policy_for_tool("edit_file"),
             Mode::HandsFree,
             false,
@@ -392,7 +390,7 @@ mod tests {
     fn fully_unattended_denies_circuit_breakers() {
         let d = check(
             "bash",
-            json(r#"{"command":"rm -rf /"}"#),
+            &json(r#"{"command":"rm -rf /"}"#),
             default_policy_for_tool("bash"),
             Mode::FullyUnattended,
             false,
@@ -409,7 +407,7 @@ mod tests {
     fn fully_unattended_denies_protected_path_edits() {
         let d = check(
             "edit_file",
-            json(r#"{"path":".bashrc"}"#),
+            &json(r#"{"path":".bashrc"}"#),
             default_policy_for_tool("edit_file"),
             Mode::FullyUnattended,
             false,
@@ -429,7 +427,7 @@ mod tests {
         // session-allow shortcut by design.
         let d = check(
             "bash",
-            json(r#"{"command":"rm -rf /"}"#),
+            &json(r#"{"command":"rm -rf /"}"#),
             default_policy_for_tool("bash"),
             Mode::Off,
             true, // session_allowed — must NOT win against the safety floor
@@ -446,7 +444,7 @@ mod tests {
     fn session_allow_does_not_bypass_protected_path() {
         let d = check(
             "edit_file",
-            json(r#"{"path":".bashrc"}"#),
+            &json(r#"{"path":".bashrc"}"#),
             default_policy_for_tool("edit_file"),
             Mode::Off,
             true,
@@ -463,7 +461,7 @@ mod tests {
     fn session_allow_does_speed_up_normal_tool_calls() {
         let d = check(
             "bash",
-            json(r#"{"command":"cargo build"}"#),
+            &json(r#"{"command":"cargo build"}"#),
             default_policy_for_tool("bash"),
             Mode::Off,
             true,
@@ -483,7 +481,7 @@ mod tests {
     fn config_allow_silences_a_normally_asked_tool() {
         let d = check(
             "bash",
-            json(r#"{"command":"cargo build"}"#),
+            &json(r#"{"command":"cargo build"}"#),
             default_policy_for_tool("bash"),
             Mode::Off,
             false,
@@ -497,7 +495,7 @@ mod tests {
         // Even with the tool session-allowed, a config deny rule blocks it.
         let d = check(
             "bash",
-            json(r#"{"command":"cargo publish"}"#),
+            &json(r#"{"command":"cargo publish"}"#),
             default_policy_for_tool("bash"),
             Mode::Off,
             true, // session_allowed
@@ -510,7 +508,7 @@ mod tests {
     fn config_deny_beats_hands_free_auto_approve() {
         let d = check(
             "bash",
-            json(r#"{"command":"cargo publish"}"#),
+            &json(r#"{"command":"cargo publish"}"#),
             default_policy_for_tool("bash"),
             Mode::HandsFree,
             false,
@@ -524,7 +522,7 @@ mod tests {
         // HandsFree would auto-approve, but a config ask rule forces the prompt.
         let d = check(
             "bash",
-            json(r#"{"command":"git push origin main"}"#),
+            &json(r#"{"command":"git push origin main"}"#),
             default_policy_for_tool("bash"),
             Mode::HandsFree,
             false,
@@ -537,7 +535,7 @@ mod tests {
     fn config_ask_becomes_deny_under_fully_unattended() {
         let d = check(
             "bash",
-            json(r#"{"command":"git push origin main"}"#),
+            &json(r#"{"command":"git push origin main"}"#),
             default_policy_for_tool("bash"),
             Mode::FullyUnattended,
             false,
@@ -551,7 +549,7 @@ mod tests {
         // A blanket bash allow does NOT override the circuit breaker.
         let d = check(
             "bash",
-            json(r#"{"command":"rm -rf /"}"#),
+            &json(r#"{"command":"rm -rf /"}"#),
             default_policy_for_tool("bash"),
             Mode::Off,
             false,
@@ -564,7 +562,7 @@ mod tests {
     fn floor_still_beats_config_allow_under_fully_unattended() {
         let d = check(
             "bash",
-            json(r#"{"command":"rm -rf /"}"#),
+            &json(r#"{"command":"rm -rf /"}"#),
             default_policy_for_tool("bash"),
             Mode::FullyUnattended,
             false,
@@ -578,10 +576,10 @@ mod tests {
     }
 
     #[test]
-    fn malformed_args_does_not_panic() {
+    fn missing_args_does_not_panic() {
         let d = check(
             "bash",
-            "not even json",
+            &serde_json::Value::default(),
             default_policy_for_tool("bash"),
             Mode::Off,
             false,

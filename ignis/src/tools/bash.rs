@@ -37,6 +37,15 @@ impl StaticTool for BashTool {
         let command = args.require_str("command")?;
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(60);
 
+        match tokio::fs::metadata(&self.cwd).await {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(format!("cwd '{}' is not a directory", self.cwd.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("cwd '{}' does not exist", self.cwd.display()));
+            }
+            Err(e) => return Err(format!("cwd '{}': {e}", self.cwd.display())),
+        }
+
         let child = tokio::process::Command::new("bash")
             .arg("-c")
             .arg(command)
@@ -138,6 +147,20 @@ mod tests {
 
         assert!(res.is_error);
         assert!(res.content.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_rejects_missing_cwd() {
+        let missing = std::env::temp_dir().join("ignis-bash-missing-cwd-xyz");
+        let tool = BashTool::new(&missing);
+        let res = tool.call(json!({ "command": "echo hi" })).await;
+
+        assert!(res.is_error);
+        assert!(
+            res.content.contains("does not exist"),
+            "got: {}",
+            res.content
+        );
     }
 
     #[test]

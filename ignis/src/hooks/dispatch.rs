@@ -149,6 +149,24 @@ pub async fn run_hook(
 ) -> HookOutcome {
     let started = std::time::Instant::now();
     let cmd_name = spec.display_name();
+    // Resolve a relative program path against the process cwd now. Dispatch
+    // sets the child's cwd to the program's directory, so a relative path like
+    // `.ignis/hooks/check` would otherwise be resolved as
+    // `.ignis/hooks/.ignis/hooks/check`.
+    let program: std::path::PathBuf = if spec.program.is_absolute() {
+        spec.program.clone()
+    } else if spec
+        .program
+        .parent()
+        .is_none_or(|p| p.as_os_str().is_empty())
+    {
+        // Bare command name (e.g. `python3`) — leave it for PATH lookup.
+        spec.program.clone()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&spec.program))
+            .unwrap_or_else(|_| spec.program.clone())
+    };
     // Compute the sandbox status once at the top so every HookOutcome we
     // build downstream can carry the same value (and so we can return
     // early on envelope-encode failure with a useful `Disabled` status).
@@ -199,7 +217,7 @@ pub async fn run_hook(
     // env_clear() first, then re-add only the explicit allowlist plus any
     // hook-declared names. Skips empty values silently (env vars set to ""
     // are legal but rarely useful and surprise more than they help).
-    let mut cmd = Command::new(&spec.program);
+    let mut cmd = Command::new(&program);
     cmd.args(&spec.args)
         .env_clear()
         .stdin(Stdio::piped())
@@ -228,7 +246,7 @@ pub async fn run_hook(
     // previous code fell back to `/`, which silently disabled read
     // confinement — sandboxed hooks now omit the program directory from
     // the read allowlist when it's unknown.
-    let hook_folder: Option<std::path::PathBuf> = spec.program.parent().map(|p| p.to_path_buf());
+    let hook_folder: Option<std::path::PathBuf> = program.parent().map(|p| p.to_path_buf());
     let want_sandbox = spec.sandbox;
     // Set the child's CWD to the hook's own directory. Two reasons:
     //   1. **Seatbelt bash-startup fix.** On macOS, bash's `shell-init`

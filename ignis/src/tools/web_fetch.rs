@@ -89,21 +89,33 @@ fn looks_like_html(s: &str) -> bool {
     head.starts_with("<!doctype html") || head.starts_with("<html")
 }
 
-/// Minimal HTML → text: drop `<script>`/`<style>` blocks, strip tags, decode a
-/// few common entities, and collapse blank runs. Good enough for an agent to
-/// read; not a full renderer (kept dependency-free on purpose).
+/// Minimal HTML → text: drop HTML comments, `<script>`/`<style>` blocks, strip
+/// tags, decode a few common entities, and collapse blank runs. Good enough for
+/// an agent to read; not a full renderer (kept dependency-free on purpose).
 fn html_to_text(html: &str) -> String {
-    let without_blocks = strip_blocks(html, "script");
+    let without_comments = strip_comments(html);
+    let without_blocks = strip_blocks(&without_comments, "script");
     let without_blocks = strip_blocks(&without_blocks, "style");
 
     let mut out = String::with_capacity(without_blocks.len() / 2);
     let mut in_tag = false;
+    let mut quote = None::<char>;
     for c in without_blocks.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
+        if in_tag {
+            match (quote, c) {
+                (Some(q), _) if c == q => quote = None,
+                (None, '"') | (None, '\'') => quote = Some(c),
+                (None, '>') => in_tag = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                '<' => {
+                    in_tag = true;
+                    quote = None;
+                }
+                _ => out.push(c),
+            }
         }
     }
 
@@ -127,7 +139,33 @@ fn html_to_text(html: &str) -> String {
     result
 }
 
-/// Remove `<tag …> … </tag>` blocks (case-insensitive) for script/style.
+/// Remove `<!-- … -->` comments, including any `<`/`>` inside them.
+fn strip_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '<' && s[i..].starts_with("<!--") {
+            if let Some(end) = s[i + 4..].find("-->") {
+                let after = i + 4 + end + 3;
+                // Advance the iterator to the character after `-->`.
+                while chars.peek().is_some_and(|(idx, _)| *idx < after) {
+                    chars.next();
+                }
+                continue;
+            }
+            break; // unterminated comment; drop the rest
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Remove `<tag …> … </tag>` blocks (case-insensitive) for script/style. The
+/// open-tag scanner is quote-aware so `>` characters inside attributes don't
+/// end the tag early. The body scanner is quote-aware so `</script>` inside a
+/// JS string is not mistaken for the real close tag. If quote state reaches
+/// EOF, we fall back to a literal search so an unmatched quote (e.g. an
+/// apostrophe in a comment) doesn't swallow the rest of the page.
 fn strip_blocks(s: &str, tag: &str) -> String {
     let lower = s.to_ascii_lowercase();
     let open = format!("<{tag}");
@@ -135,19 +173,59 @@ fn strip_blocks(s: &str, tag: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < s.len() {
-        if let Some(rel) = lower[i..].find(&open) {
-            let start = i + rel;
-            out.push_str(&s[i..start]);
-            // Find the matching close tag after the open.
-            if let Some(crel) = lower[start..].find(&close) {
-                i = start + crel + close.len();
-            } else {
-                break; // unterminated; drop the rest
-            }
-        } else {
+        let Some(rel) = lower[i..].find(&open) else {
             out.push_str(&s[i..]);
             break;
+        };
+        let start = i + rel;
+        out.push_str(&s[i..start]);
+        // Scan past the open tag (quote-aware) then find the matching close tag.
+        let mut j = start + open.len();
+        let mut in_tag = true;
+        let mut quote = None::<char>;
+        while j < s.len() && in_tag {
+            let c = s[j..].chars().next().unwrap();
+            match (quote, c) {
+                (Some(q), _) if c == q => quote = None,
+                (None, '"') | (None, '\'') => quote = Some(c),
+                (None, '>') => in_tag = false,
+                _ => {}
+            }
+            j += c.len_utf8();
         }
+
+        // Find the close tag, respecting quote state so `'</script>'` inside a
+        // JS string is not treated as the end of the block.
+        let body_start = j;
+        let mut quote = None::<char>;
+        let mut close_off = None;
+        while j < s.len() {
+            let c = s[j..].chars().next().unwrap();
+            match (quote, c) {
+                (Some(q), _) if c == q => quote = None,
+                (None, '"') | (None, '\'') => quote = Some(c),
+                (None, '<') if lower[j..].starts_with(&close) => {
+                    close_off = Some(j - body_start);
+                    break;
+                }
+                _ => {}
+            }
+            j += c.len_utf8();
+        }
+
+        // If we hit EOF while still inside a quote, an unmatched quote (common
+        // in comments or contractions like "don't") prevented finding the real
+        // close tag. Fall back to a literal search from just after the quote.
+        let off = match (close_off, quote) {
+            (Some(off), _) => off,
+            (None, Some(_)) => lower[body_start..].find(&close).unwrap_or(usize::MAX),
+            (None, None) => usize::MAX,
+        };
+
+        if off == usize::MAX {
+            break; // unterminated; drop the rest
+        }
+        i = body_start + off + close.len();
     }
     out
 }
@@ -176,6 +254,40 @@ mod tests {
         assert!(!text.contains("alert"), "script body must be dropped");
         assert!(!text.contains("color:red"), "style body must be dropped");
         assert!(!text.contains('<'), "tags must be stripped");
+    }
+
+    #[test]
+    fn html_to_text_handles_malformed_and_nested_tags() {
+        // `>` inside a quoted attribute should not end the tag early.
+        let html = r#"<p data-cond="a > b">kept</p>"#;
+        assert_eq!(html_to_text(html).trim(), "kept");
+
+        // `</script>` inside a JS string should not end the block early.
+        let html = "<script>var s='</script>'; alert(1)</script><p>after</p>";
+        let text = html_to_text(html);
+        assert!(!text.contains("alert"), "got: {text:?}");
+        assert!(text.contains("after"), "got: {text:?}");
+
+        // Nested tags inside a script block are dropped as one block.
+        let html = "<script><div>nested</div></script><p>safe</p>";
+        let text = html_to_text(html);
+        assert!(!text.contains("nested"), "got: {text:?}");
+        assert!(text.contains("safe"), "got: {text:?}");
+
+        // Unterminated script drops to EOF.
+        let html = "<script>never ends<p>not seen</p>";
+        assert_eq!(html_to_text(html).trim(), "");
+
+        // Comments containing `<`/`>` are removed entirely.
+        let html = "<!-- <weird> -->text";
+        assert_eq!(html_to_text(html).trim(), "text");
+
+        // Quotes inside script/style bodies must not prevent the close tag from
+        // ending the block.
+        let html = "<script>// don't</script><p>after</p>";
+        assert_eq!(html_to_text(html).trim(), "after");
+        let html = "<style>body::before { content: \"x\"; }</style><p>after</p>";
+        assert_eq!(html_to_text(html).trim(), "after");
     }
 
     #[tokio::test]

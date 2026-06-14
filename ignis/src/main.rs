@@ -2,7 +2,7 @@ use clap::Parser;
 use ignis::{
     cli::{resolve_session_request, Cli, Command},
     config::{build_provider, load_config},
-    session::{project_sessions_dir, SessionManager},
+    session::{project_sessions_dir_with_migration, SessionManager},
     storage::FileStorage,
     AgentEvent, Session,
 };
@@ -13,23 +13,24 @@ async fn main() -> Result<(), anyhow::Error> {
     // clap parses argv, handles --help / --version / errors with proper exits.
     let cli = Cli::parse();
 
+    // Home directory and file logger are shared by every branch (TUI, one-shot,
+    // and subcommands). Initialize once up front and keep going even if logging
+    // fails — the user still wants the command to run.
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not locate home directory"))?;
+    if let Err(e) = ignis::logger::init(&home.join(".ignis/logs")) {
+        eprintln!("Failed to initialize logger: {}", e);
+    }
+
     // Subcommands short-circuit the session flow.
     match cli.command {
         Some(Command::Mcp(cmd)) => {
-            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-            if let Err(e) = ignis::logger::init(&home.join(".ignis/logs")) {
-                eprintln!("Failed to initialize logger: {}", e);
-            }
             return ignis::cli::mcp::run(cmd).await;
         }
         Some(Command::Upgrade(cmd)) => {
             return ignis::cli::upgrade::run(cmd).await;
         }
         Some(Command::Sessions(cmd)) => {
-            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-            if let Err(e) = ignis::logger::init(&home.join(".ignis/logs")) {
-                eprintln!("Failed to initialize logger: {}", e);
-            }
             return ignis::cli::sessions::run(cmd).await;
         }
         None => {}
@@ -69,22 +70,15 @@ async fn main() -> Result<(), anyhow::Error> {
     );
 
     // 2. Resolve paths
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not locate home directory"))?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let ignis_home = home.join(".ignis");
     let storage_root = ignis_home.clone();
-
-    // Initialize logger
-    if let Err(e) = ignis::logger::init(&ignis_home.join("logs")) {
-        eprintln!("Failed to initialize logger: {}", e);
-    }
 
     // Telemetry — no-op unless IGNIS_ENABLE_TELEMETRY=1 (or [telemetry] enabled).
     // Guard's Drop flushes + shuts down OTel providers on exit.
     let _telemetry_guard = ignis::telemetry::init(&config);
 
-    let storage_dir = project_sessions_dir(&storage_root, &cwd);
+    let storage_dir = project_sessions_dir_with_migration(&storage_root, &cwd);
     let session_manager = SessionManager::new(storage_dir.clone());
     let auto_resume = config.auto_resume_last_session.unwrap_or(false);
     let session_request = resolve_session_request(cli, &session_manager, auto_resume, &cwd);
