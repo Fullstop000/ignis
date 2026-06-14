@@ -10,6 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::console::frontend::protocol::{ClientRequest, RequestId};
 use crate::console::picker::{PickerAnswer, PickerQuestion, PickerRequest, PickerResponse};
 use crate::tools::ask_user::{MAX_OTHER_LEN, OTHER_LABEL};
 
@@ -52,22 +53,51 @@ pub(crate) struct InlinePickerState {
     /// review-and-submit screen (multi-question batches only). Enter submits;
     /// Left/Shift-Tab steps back into the last question to revise it.
     reviewing: bool,
-    /// Taken on `Done` / `Cancel` so the caller can `send` on it.
-    pub(crate) reply: Option<tokio::sync::oneshot::Sender<PickerResponse>>,
+    /// How the answer travels back when the picker closes (`Done`/`Cancel`).
+    /// Consumed by value once the picker is taken out of `App` — see
+    /// `keys::reply_picker`.
+    pub(crate) reply: PickerReply,
+}
+
+/// Where a closed picker's answer goes — the seam between a frontend-internal
+/// picker and a tool-initiated one bridged across the frontend protocol.
+pub(crate) enum PickerReply {
+    /// Frontend-originated picker (`/connect`, `/afk`, `/telemetry`): the
+    /// answer fires this oneshot directly, in-process.
+    Local(tokio::sync::oneshot::Sender<PickerResponse>),
+    /// Tool-originated picker delivered as an [`Outbound::Request`]; the answer
+    /// travels back as a [`ClientCommand::Reply`] carrying this correlation id,
+    /// which the [`crate::console::frontend::RequestBroker`] resolves onto the
+    /// blocked tool's oneshot.
+    ///
+    /// [`Outbound::Request`]: crate::console::frontend::Outbound::Request
+    /// [`ClientCommand::Reply`]: crate::console::frontend::ClientCommand::Reply
+    Request(RequestId),
 }
 
 impl InlinePickerState {
-    pub(crate) fn new(request: PickerRequest) -> Self {
-        let first_opts = request.questions[0].options.len();
+    /// A frontend-originated picker whose answer fires the request's oneshot.
+    pub(crate) fn local(request: PickerRequest) -> Self {
+        Self::build(request.questions, PickerReply::Local(request.reply))
+    }
+
+    /// A tool-originated picker delivered over the frontend protocol; its
+    /// answer travels back as a `ClientCommand::Reply` carrying `req.id`.
+    pub(crate) fn from_request(req: ClientRequest) -> Self {
+        Self::build(req.questions, PickerReply::Request(req.id))
+    }
+
+    fn build(questions: Vec<PickerQuestion>, reply: PickerReply) -> Self {
+        let first_opts = questions[0].options.len();
         Self {
-            questions: request.questions,
+            questions,
             answers: Vec::new(),
             current: 0,
             cursor: 0,
             toggled: vec![false; first_opts],
             other_buf: String::new(),
             reviewing: false,
-            reply: Some(request.reply),
+            reply,
         }
     }
 
@@ -1028,7 +1058,7 @@ mod tests {
             questions: qs,
             reply: tx,
         };
-        (InlinePickerState::new(req), rx)
+        (InlinePickerState::local(req), rx)
     }
 
     fn q(question: &str, header: &str, multi: bool, labels: &[&str]) -> PickerQuestion {

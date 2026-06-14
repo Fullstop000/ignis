@@ -12,6 +12,7 @@ pub(crate) mod colors;
 pub(crate) mod composer;
 pub(crate) mod connect;
 pub(crate) mod format;
+pub mod frontend;
 pub(crate) mod git;
 pub mod highlight;
 pub(crate) mod inline_picker;
@@ -24,7 +25,7 @@ pub(crate) mod runner;
 pub(crate) mod slash;
 
 // Re-exports for paths the rest of the crate already uses.
-pub use runner::run_console;
+pub use runner::{run_console, run_engine};
 
 pub(crate) use colors::{
     ACCENT, BG, BORDER, BORDER_ACTIVE, CODE_BG, DIFF_ADD_BG, DIFF_DEL_BG, GREEN, LAVENDER, MAUVE,

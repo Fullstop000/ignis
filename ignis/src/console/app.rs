@@ -434,6 +434,12 @@ pub(crate) struct App {
     /// `TurnEnd` — `mode` can't, since an early failure ends a turn that never
     /// reached `TurnStart` (still `Idle`).
     pub(crate) turn_in_flight: bool,
+    /// True while a live *prompt* run is accepting `Ctrl+S` injects — i.e. a
+    /// real prompt was dispatched (not `/compact`, which has no inject source)
+    /// and its `TurnEnd` hasn't arrived. Lets the key handler decide
+    /// inject-vs-enqueue without reading the agent-side inject sender, which the
+    /// core now owns. Set in `keys::submit_text`, cleared at `TurnEnd`.
+    pub(crate) accepting_injects: bool,
 
     /// Clipboard function, injectable for testing.
     pub(crate) clipboard_fn: ClipFn,
@@ -515,6 +521,7 @@ impl App {
             pending_injects: Vec::new(),
             turn_just_ended: false,
             turn_in_flight: false,
+            accepting_injects: false,
             clipboard_fn: super::clipboard::set_clipboard,
             skills: None,
             mcp: None,
@@ -731,6 +738,7 @@ impl App {
                 // which still leaves `mode == Idle`).
                 if self.turn_in_flight {
                     self.turn_in_flight = false;
+                    self.accepting_injects = false;
                     self.turn_just_ended = true;
                     // Any inject that lost the end-of-turn race fires next turn.
                     if !self.pending_injects.is_empty() {
@@ -1612,7 +1620,7 @@ mod connect_tests {
         let mut app = fresh_app();
         // Fake an existing picker (simulate `/afk` being mid-flight).
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        app.inline_picker = Some(crate::console::inline_picker::InlinePickerState::new(
+        app.inline_picker = Some(crate::console::inline_picker::InlinePickerState::local(
             crate::console::picker::PickerRequest {
                 questions: vec![crate::console::picker::PickerQuestion {
                     question: "x".into(),

@@ -14,6 +14,10 @@ use tokio::sync::mpsc;
 
 use crate::console::app::{App, UIBlock};
 use crate::console::format::AgentRequest;
+use crate::console::frontend::{
+    local_tui, Acceptor, ClientCommand, ClientRequest, CommandOutcome, ControlSignal, FrontendHub,
+    Outbound, ReplyAnswer, RequestBroker, StdioPort,
+};
 use crate::console::inline_picker;
 use crate::console::keys::{handle_key, ActiveInject};
 use crate::console::render::anchor::{self, Anchor, ClearOutcome, Wipe};
@@ -116,6 +120,189 @@ impl Drop for TerminalGuard {
         let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
 }
+/// The frontend-agnostic agent loop: dispatch `AgentRequest`s into `Session`
+/// runs, streaming `AgentEvent`s out on `agent_tx`. Shared by the ratatui
+/// runner and the headless `--engine` mode — it has no idea which frontend
+/// (if any) is on the other end of `agent_tx`.
+#[allow(clippy::too_many_arguments)]
+async fn agent_loop(
+    mut prompt_rx: mpsc::Receiver<AgentRequest>,
+    mut cancel_rx: mpsc::Receiver<()>,
+    agent_tx: mpsc::Sender<AgentEvent>,
+    picker_tx_runner: mpsc::Sender<crate::console::picker::PickerRequest>,
+    active_inject_runner: ActiveInject,
+    mut agent_config: crate::config::Config,
+    agent_system_prompt: String,
+    agent_storage_dir: PathBuf,
+    agent_cwd: PathBuf,
+    runner_hook_registry: crate::hooks::HookRegistry,
+    mut runner_skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
+    runner_mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
+    runner_permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
+) {
+    while let Some(request) = prompt_rx.recv().await {
+        let (session_id, prompt) = match request {
+            AgentRequest::Prompt { session_id, prompt } => (session_id, Some(prompt)),
+            AgentRequest::Compact { session_id } => (session_id, None),
+            AgentRequest::SetModel {
+                provider,
+                model,
+                effort,
+            } => {
+                // Apply to the config the runner rebuilds the provider from;
+                // the next prompt picks it up. No session work needed.
+                agent_config.model = Some(format!("{provider}/{model}"));
+                agent_config.reasoning_effort = effort;
+                continue;
+            }
+            AgentRequest::ReloadConfig => {
+                // /connect just wrote a fresh `[providers.X] api_key = …`
+                // to disk; re-read it so the next prompt resolves with the
+                // new key. A read failure leaves the in-memory config as
+                // it was — but log loudly: the user will hit a stale-config
+                // error on their next prompt and the log is the only
+                // breadcrumb explaining why.
+                match crate::config::load_config() {
+                    Ok(reloaded) => agent_config = reloaded,
+                    Err(e) => log::error!("ReloadConfig: failed to re-read config.toml: {e}"),
+                }
+                continue;
+            }
+            AgentRequest::ReloadSkills(registry) => {
+                // The user pressed `r` in the `/skills` picker. Adopt the
+                // *same* registry the UI just built, so both share one `Arc`
+                // — a later enable/disable toggle (interior mutability) is
+                // then visible to the next prompt without another reload.
+                runner_skill_registry = registry;
+                continue;
+            }
+        };
+        let provider = match crate::config::build_provider(&agent_config) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = agent_tx.send(AgentEvent::TurnEnd).await;
+                log::error!("Provider error: {}", e);
+                continue;
+            }
+        };
+        let storage = crate::storage::FileStorage::new(agent_storage_dir.clone());
+        let mut session = match Session::open(
+            session_id,
+            agent_system_prompt.clone(),
+            provider,
+            Box::new(storage),
+            agent_cwd.to_string_lossy().to_string(),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = agent_tx.send(AgentEvent::TurnEnd).await;
+                log::error!("Session open error: {}", e);
+                continue;
+            }
+        };
+        session.set_compaction(agent_config.compaction.clone());
+        // Share the runner's HookRegistry handle so `/hooks reload`
+        // immediately affects the next prompt — Session::open loaded
+        // its own copy from disk, but the runner owns the live one.
+        session.set_hook_registry(runner_hook_registry.clone());
+
+        let mcp_for_subagent = if !runner_mcp_registry.is_empty() {
+            Some(runner_mcp_registry.clone())
+        } else {
+            None
+        };
+        crate::tools::register_native_tools_with_mcp(
+            &mut session,
+            &agent_cwd,
+            &agent_config,
+            mcp_for_subagent,
+            Some(picker_tx_runner.clone()),
+            Some(runner_permissions.clone()),
+        );
+        if !runner_skill_registry.is_empty() {
+            session.set_skills(runner_skill_registry.clone());
+            session.register_tool(std::sync::Arc::new(crate::tools::SkillTool::new(
+                runner_skill_registry.clone(),
+            )));
+        }
+        if !runner_mcp_registry.is_empty() {
+            session.set_mcp(runner_mcp_registry.clone());
+            crate::tools::register_mcp_tools(&mut session, &runner_mcp_registry);
+        }
+
+        // Permission gate. The TUI's picker channel is wired in so an
+        // `Ask` decision opens the 3-option permission picker (Approve
+        // once / Approve session / Deny) over the same plumbing
+        // `ask_user` uses; on `Approve session` the checker writes back
+        // into the shared `PermissionState`.
+        session.set_hooks(Box::new(
+            crate::permissions::checker::PermissionChecker::new(runner_permissions.clone())
+                .with_picker(picker_tx_runner.clone()),
+        ));
+
+        let notice_msg = |content: &str| Message {
+            role: "assistant".to_string(),
+            content: Some(content.to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        };
+        let tx = agent_tx.clone();
+        match prompt {
+            Some(prompt) => {
+                // Discard any cancel that arrived after the previous turn
+                // already ended (its end-of-turn window) — it must not cancel
+                // this fresh prompt.
+                while cancel_rx.try_recv().is_ok() {}
+                let (inj_tx, inj_rx) = mpsc::channel::<String>(8);
+                *active_inject_runner.lock().unwrap() = Some(inj_tx);
+                session.set_inject_source(inj_rx);
+                tokio::select! {
+                    result = session.prompt(&prompt, tx) => {
+                        if let Err(e) = result {
+                            let _ = agent_tx.send(AgentEvent::TurnEnd).await;
+                            log::error!("Agent error: {}", e);
+                        }
+                    }
+                    _ = cancel_rx.recv() => {
+                        let _ = agent_tx.send(AgentEvent::TurnEnd).await;
+                    }
+                }
+                *active_inject_runner.lock().unwrap() = None;
+            }
+            None => {
+                // /compact: summarize earlier history and report a notice.
+                let _ = agent_tx.send(AgentEvent::TurnStart).await;
+                let notice = match session.compact().await {
+                    Ok(0) => "Nothing to compact yet.".to_string(),
+                    Ok(n) => format!("Compacted {n} earlier messages into a summary."),
+                    Err(e) => format!("Compact failed: {e}"),
+                };
+                let _ = agent_tx
+                    .send(AgentEvent::MessageStart {
+                        message: notice_msg(""),
+                    })
+                    .await;
+                let _ = agent_tx
+                    .send(AgentEvent::MessageUpdate {
+                        delta: notice.clone(),
+                    })
+                    .await;
+                let _ = agent_tx
+                    .send(AgentEvent::MessageEnd {
+                        message: notice_msg(&notice),
+                    })
+                    .await;
+                let _ = agent_tx.send(AgentEvent::TurnEnd).await;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_console(
     provider_name: String,
@@ -189,13 +376,22 @@ pub async fn run_console(
     }
 
     let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(256);
-    let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
-    let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
-    // Tool → console: the `ask_user` tool sends a PickerRequest when the model
-    // wants to ask the user something mid-turn. Capacity 4 — pickers serialize
-    // (one open at a time); the buffer just decouples send from console drain.
-    let (picker_tx, picker_rx) = mpsc::channel::<crate::console::picker::PickerRequest>(4);
-    let picker_tx_runner = picker_tx.clone();
+    let (prompt_tx, prompt_rx) = mpsc::channel::<AgentRequest>(8);
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(8);
+    // Two picker channels, split by origin (capacity 4 — pickers serialize, one
+    // open at a time; the buffer just decouples send from drain):
+    //   * `tool_picker_*` — the `ask_user` tool and the permission gate
+    //     (core side). These ride the `FrontendHub`/`RequestBroker` so the
+    //     answer correlates back to the blocked tool by id — the same path an
+    //     out-of-process frontend will use.
+    //   * `local_picker_*` — frontend-originated pickers (`/connect`, `/afk`,
+    //     `/telemetry`) whose reply logic runs in the frontend itself; they
+    //     open directly with a local oneshot and never cross the core boundary.
+    let (tool_picker_tx, tool_picker_rx) =
+        mpsc::channel::<crate::console::picker::PickerRequest>(4);
+    let picker_tx_runner = tool_picker_tx;
+    let (local_picker_tx, local_picker_rx) =
+        mpsc::channel::<crate::console::picker::PickerRequest>(4);
     // Picker reply confirmation channel: handlers that run in `tokio::spawn`
     // (telemetry, AFK) can't reach `app.add_assistant_notice` directly, so
     // they send the confirm string here and the main loop drains it.
@@ -214,14 +410,14 @@ pub async fn run_console(
     let agent_storage_dir = storage_dir.clone();
     let ui_storage_dir = storage_dir;
     let agent_cwd = cwd;
-    let mut agent_config = config;
+    let agent_config = config;
     let runner_hook_registry = hook_registry.clone();
     app.hooks = Some(hook_registry);
 
     let ui_skill_registry = skill_registry.clone();
-    // `mut` so an `AgentRequest::ReloadSkills` can swap in a freshly-scanned
-    // registry; the UI rebuilds its own `App.skills` clone in parallel.
-    let mut runner_skill_registry = skill_registry.clone();
+    // The UI keeps its own `App.skills` clone; `agent_loop` owns the runner's
+    // copy (and takes it `mut` so `ReloadSkills` can swap in a fresh scan).
+    let runner_skill_registry = skill_registry.clone();
     app.skills = Some(ui_skill_registry);
 
     let runner_mcp_registry = mcp_registry.clone();
@@ -240,170 +436,56 @@ pub async fn run_console(
         None
     };
 
-    // Background agent runner
-    tokio::spawn(async move {
-        while let Some(request) = prompt_rx.recv().await {
-            let (session_id, prompt) = match request {
-                AgentRequest::Prompt { session_id, prompt } => (session_id, Some(prompt)),
-                AgentRequest::Compact { session_id } => (session_id, None),
-                AgentRequest::SetModel {
-                    provider,
-                    model,
-                    effort,
-                } => {
-                    // Apply to the config the runner rebuilds the provider from;
-                    // the next prompt picks it up. No session work needed.
-                    agent_config.model = Some(format!("{provider}/{model}"));
-                    agent_config.reasoning_effort = effort;
-                    continue;
-                }
-                AgentRequest::ReloadConfig => {
-                    // /connect just wrote a fresh `[providers.X] api_key = …`
-                    // to disk; re-read it so the next prompt resolves with the
-                    // new key. A read failure leaves the in-memory config as
-                    // it was — but log loudly: the user will hit a stale-config
-                    // error on their next prompt and the log is the only
-                    // breadcrumb explaining why.
-                    match crate::config::load_config() {
-                        Ok(reloaded) => agent_config = reloaded,
-                        Err(e) => log::error!("ReloadConfig: failed to re-read config.toml: {e}"),
-                    }
-                    continue;
-                }
-                AgentRequest::ReloadSkills(registry) => {
-                    // The user pressed `r` in the `/skills` picker. Adopt the
-                    // *same* registry the UI just built, so both share one `Arc`
-                    // — a later enable/disable toggle (interior mutability) is
-                    // then visible to the next prompt without another reload.
-                    runner_skill_registry = registry;
-                    continue;
-                }
-            };
-            let provider = match crate::config::build_provider(&agent_config) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = agent_tx.send(AgentEvent::TurnEnd).await;
-                    log::error!("Provider error: {}", e);
-                    continue;
-                }
-            };
-            let storage = crate::storage::FileStorage::new(agent_storage_dir.clone());
-            let mut session = match Session::open(
-                session_id,
-                agent_system_prompt.clone(),
-                provider,
-                Box::new(storage),
-                agent_cwd.to_string_lossy().to_string(),
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = agent_tx.send(AgentEvent::TurnEnd).await;
-                    log::error!("Session open error: {}", e);
-                    continue;
-                }
-            };
-            session.set_compaction(agent_config.compaction.clone());
-            // Share the runner's HookRegistry handle so `/hooks reload`
-            // immediately affects the next prompt — Session::open loaded
-            // its own copy from disk, but the runner owns the live one.
-            session.set_hook_registry(runner_hook_registry.clone());
+    // Background agent runner — the frontend-agnostic core loop, shared with
+    // the headless `--engine` mode.
+    tokio::spawn(agent_loop(
+        prompt_rx,
+        cancel_rx,
+        agent_tx,
+        picker_tx_runner,
+        active_inject_runner,
+        agent_config,
+        agent_system_prompt,
+        agent_storage_dir,
+        agent_cwd,
+        runner_hook_registry,
+        runner_skill_registry,
+        runner_mcp_registry,
+        runner_permissions,
+    ));
 
-            let mcp_for_subagent = if !runner_mcp_registry.is_empty() {
-                Some(runner_mcp_registry.clone())
-            } else {
-                None
-            };
-            crate::tools::register_native_tools_with_mcp(
-                &mut session,
-                &agent_cwd,
-                &agent_config,
-                mcp_for_subagent,
-                Some(picker_tx_runner.clone()),
-                Some(runner_permissions.clone()),
-            );
-            if !runner_skill_registry.is_empty() {
-                session.set_skills(runner_skill_registry.clone());
-                session.register_tool(std::sync::Arc::new(crate::tools::SkillTool::new(
-                    runner_skill_registry.clone(),
-                )));
-            }
-            if !runner_mcp_registry.is_empty() {
-                session.set_mcp(runner_mcp_registry.clone());
-                crate::tools::register_mcp_tools(&mut session, &runner_mcp_registry);
-            }
-
-            // Permission gate. The TUI's picker channel is wired in so an
-            // `Ask` decision opens the 3-option permission picker (Approve
-            // once / Approve session / Deny) over the same plumbing
-            // `ask_user` uses; on `Approve session` the checker writes back
-            // into the shared `PermissionState`.
-            session.set_hooks(Box::new(
-                crate::permissions::checker::PermissionChecker::new(runner_permissions.clone())
-                    .with_picker(picker_tx_runner.clone()),
-            ));
-
-            let notice_msg = |content: &str| Message {
-                role: "assistant".to_string(),
-                content: Some(content.to_string()),
-                reasoning_content: None,
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-                created_at_ms: None,
-            };
-            let tx = agent_tx.clone();
-            match prompt {
-                Some(prompt) => {
-                    // Discard any cancel that arrived after the previous turn
-                    // already ended (its end-of-turn window) — it must not cancel
-                    // this fresh prompt.
-                    while cancel_rx.try_recv().is_ok() {}
-                    let (inj_tx, inj_rx) = mpsc::channel::<String>(8);
-                    *active_inject_runner.lock().unwrap() = Some(inj_tx);
-                    session.set_inject_source(inj_rx);
-                    tokio::select! {
-                        result = session.prompt(&prompt, tx) => {
-                            if let Err(e) = result {
-                                let _ = agent_tx.send(AgentEvent::TurnEnd).await;
-                                log::error!("Agent error: {}", e);
-                            }
-                        }
-                        _ = cancel_rx.recv() => {
-                            let _ = agent_tx.send(AgentEvent::TurnEnd).await;
-                        }
-                    }
-                    *active_inject_runner.lock().unwrap() = None;
-                }
-                None => {
-                    // /compact: summarize earlier history and report a notice.
-                    let _ = agent_tx.send(AgentEvent::TurnStart).await;
-                    let notice = match session.compact().await {
-                        Ok(0) => "Nothing to compact yet.".to_string(),
-                        Ok(n) => format!("Compacted {n} earlier messages into a summary."),
-                        Err(e) => format!("Compact failed: {e}"),
-                    };
-                    let _ = agent_tx
-                        .send(AgentEvent::MessageStart {
-                            message: notice_msg(""),
-                        })
-                        .await;
-                    let _ = agent_tx
-                        .send(AgentEvent::MessageUpdate {
-                            delta: notice.clone(),
-                        })
-                        .await;
-                    let _ = agent_tx
-                        .send(AgentEvent::MessageEnd {
-                            message: notice_msg(&notice),
-                        })
-                        .await;
-                    let _ = agent_tx.send(AgentEvent::TurnEnd).await;
-                }
-            }
-        }
-    });
+    // Frontend seam (PR #174, phase 1). The core drives a `FrontendHub` over a
+    // `LocalTuiPort`; the ratatui loop below holds the matching `TuiHandle`.
+    // Agent events and tool-picker requests flow core→frontend as `Outbound`
+    // frames; the frontend's picker answers flow back as `ClientCommand::Reply`,
+    // which the broker correlates to the blocked tool's oneshot. Submit, cancel,
+    // and inject also ride the protocol now; the core maps Submit→AgentRequest
+    // against the session id it tracks (seeded here, retargeted by SetSession on
+    // /clear · /resume). The frontend keeps a `prompt_tx` clone only for config
+    // commands (model switch / config + skills reload).
+    let (local_port, tui_handle) = local_tui(256);
+    let mut acceptor = Acceptor::new();
+    acceptor.attach(Box::new(local_port));
+    let hub = FrontendHub::new(
+        app.session_id.clone(),
+        app.provider.clone(),
+        app.model.clone(),
+        app.cwd.to_string_lossy().to_string(),
+        // The ratatui frontend ignores snapshots (its /model picker reads App
+        // directly), so the wire model list is unused here.
+        Vec::new(),
+        acceptor,
+        RequestBroker::new(),
+    );
+    tokio::spawn(drive_frontend_core(
+        hub,
+        agent_rx,
+        tool_picker_rx,
+        cancel_tx,
+        active_inject,
+        prompt_tx.clone(),
+        app.session_id.clone(),
+    ));
 
     // The in-progress block's already-streamed row count lives on `app`
     // (`app.committed_rows`) so a session reset (`/clear`, `/resume`) resets it
@@ -424,16 +506,15 @@ pub async fn run_console(
         scrollback_replay: None,
         app,
         terminal,
-        agent_rx,
-        picker_rx,
+        outbound: tui_handle.outbound,
+        commands: tui_handle.commands,
+        local_picker_rx,
         notice_rx,
         update_check_rx,
         render_hook_queue,
         prompt_tx,
-        cancel_tx,
-        picker_tx,
+        local_picker_tx,
         notice_tx,
-        active_inject,
         ui_storage_dir,
     };
     console.run().await?;
@@ -464,6 +545,202 @@ pub async fn run_console(
     Ok(())
 }
 
+/// Headless core engine (PR #174, topology ii). Run the agent + `FrontendHub`
+/// over NDJSON on this process's own stdin/stdout, with no terminal/ratatui:
+/// the interactive frontend (the Ink `ignis-tui`) owns the TTY and spawns this
+/// process, reading `Outbound` frames from our stdout and writing
+/// `ClientCommand`s to our stdin. Doubles as a scriptable agent — pipe NDJSON
+/// in, get NDJSON out.
+///
+/// Reuses the exact same [`agent_loop`] and [`drive_frontend_core`] as the
+/// ratatui runner — only the port differs ([`StdioPort`] vs `LocalTuiPort`).
+/// Documented gaps vs. the ratatui path (not part of the protocol): no
+/// `AssistantMessageRender` hook rewrite and no `/afk`·`/telemetry` notice
+/// relay — those are frontend-local UI affordances, not core behavior.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_engine(
+    session_id: String,
+    system_prompt: String,
+    storage_dir: PathBuf,
+    cwd: PathBuf,
+    config: crate::config::Config,
+    skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
+    mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
+    permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
+    hook_registry: crate::hooks::HookRegistry,
+) -> Result<(), anyhow::Error> {
+    let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(256);
+    let (prompt_tx, prompt_rx) = mpsc::channel::<AgentRequest>(8);
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(8);
+    let (tool_picker_tx, tool_picker_rx) =
+        mpsc::channel::<crate::console::picker::PickerRequest>(4);
+    let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    // Capture the statusline + /model-picker meta before `config`/`cwd` move
+    // into the agent loop.
+    let provider = config.active_provider().unwrap_or_default();
+    let model = config.active_model().unwrap_or_default();
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let catalog = crate::llm::catalog::load();
+    let models: Vec<crate::console::frontend::protocol::ModelRef> = config
+        .model_options(&catalog)
+        .into_iter()
+        .map(|o| crate::console::frontend::protocol::ModelRef {
+            provider: o.provider,
+            model: o.model,
+        })
+        .collect();
+
+    tokio::spawn(agent_loop(
+        prompt_rx,
+        cancel_rx,
+        agent_tx,
+        tool_picker_tx,
+        active_inject.clone(),
+        config,
+        system_prompt,
+        storage_dir,
+        cwd,
+        hook_registry,
+        skill_registry,
+        mcp_registry,
+        permissions,
+    ));
+
+    // The frontend speaks NDJSON on our own stdio. emit() writes Outbound to
+    // stdout (→ frontend); next_command() reads ClientCommands from stdin.
+    let port = StdioPort::new(tokio::io::stdout(), tokio::io::stdin());
+    let mut acceptor = Acceptor::new();
+    acceptor.attach(Box::new(port));
+    let hub = FrontendHub::new(
+        session_id.clone(),
+        provider,
+        model,
+        cwd_str,
+        models,
+        acceptor,
+        RequestBroker::new(),
+    );
+
+    // Drive until the frontend closes our stdin (EOF = clean disconnect).
+    drive_frontend_core(
+        hub,
+        agent_rx,
+        tool_picker_rx,
+        cancel_tx,
+        active_inject,
+        prompt_tx,
+        session_id,
+    )
+    .await;
+    Ok(())
+}
+
+/// The core driver (PR #174, phase 1). Bridges agent events and tool-initiated
+/// picker requests to the active frontend through `hub`, and resolves the
+/// frontend's picker answers back onto the blocked tools' oneshots via the
+/// broker. Runs until the frontend disconnects with no successor.
+///
+/// `Reply` is resolved against the broker inside `handle_command`. `Submit` is
+/// mapped to an [`AgentRequest`] (against the core-tracked session id) and sent
+/// to the agent task; `SetSession` retargets that id; `Cancel` / `Inject` are
+/// forwarded to the agent (the cancel channel and the live turn's inject
+/// source). The frontend keeps `prompt_tx` only for config commands (model
+/// switch / config + skills reload), which still travel that channel directly.
+async fn drive_frontend_core(
+    mut hub: FrontendHub,
+    mut agent_rx: mpsc::Receiver<AgentEvent>,
+    mut tool_picker_rx: mpsc::Receiver<crate::console::picker::PickerRequest>,
+    cancel_tx: mpsc::Sender<()>,
+    active_inject: ActiveInject,
+    prompt_tx: mpsc::Sender<AgentRequest>,
+    mut current_session_id: String,
+) {
+    // Hand the freshly-attached frontend its session snapshot (provider/model/
+    // cwd/session id) so it can render a statusline before any turn. The
+    // ratatui frontend ignores snapshots; the out-of-process Ink one consumes it.
+    hub.send_snapshot().await;
+
+    // `CoreWake` dodges the select-arm borrow: only `next_command` borrows
+    // `hub` inside the select, and every arm future is dropped before the match
+    // touches `hub` again (mirrors `ConsoleLoop::wake`).
+    loop {
+        let wake = tokio::select! {
+            biased;
+            cmd = hub.next_command() => CoreWake::Command(cmd),
+            Some(ev) = agent_rx.recv() => CoreWake::Event(ev),
+            Some(req) = tool_picker_rx.recv() => CoreWake::Request(req),
+        };
+        match wake {
+            CoreWake::Command(Some(cmd)) => match hub.handle_command(cmd) {
+                // Map the user line to an agent request against the current
+                // session. The frontend pre-resolves App-dependent dispatch
+                // (provider gate, skill expansion, app-only commands), so what
+                // arrives here is either "/compact" or a ready-to-run prompt.
+                CommandOutcome::Submit(text) => {
+                    let request = if text == "/compact" {
+                        AgentRequest::Compact {
+                            session_id: current_session_id.clone(),
+                        }
+                    } else {
+                        AgentRequest::Prompt {
+                            session_id: current_session_id.clone(),
+                            prompt: text,
+                        }
+                    };
+                    // `send` (not `try_send`): submits only arrive while the
+                    // agent is idle/just-ended, so the queue isn't full — back-
+                    // pressure here is correct, matching the pre-seam behavior.
+                    let _ = prompt_tx.send(request).await;
+                }
+                // The frontend switched sessions (/resume); retarget.
+                CommandOutcome::SetSession(id) => current_session_id = id,
+                // `/clear`: the core mints a fresh session id, retargets the next
+                // submit at it, and re-snapshots the frontend with the new id
+                // (engine owns session creation for out-of-process frontends).
+                CommandOutcome::NewSession => {
+                    let new_id = crate::session::SessionManager::create_id();
+                    current_session_id = new_id.clone();
+                    hub.set_session_id(new_id);
+                    hub.send_snapshot().await;
+                }
+                // `/model`: apply the switch to subsequent prompts and re-snapshot
+                // so the frontend's statusline reflects the new model.
+                CommandOutcome::SetModel { provider, model } => {
+                    let _ = prompt_tx
+                        .send(AgentRequest::SetModel {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            effort: None,
+                        })
+                        .await;
+                    hub.set_active_model(provider, model);
+                    hub.send_snapshot().await;
+                }
+                // The agent task drains stale cancels at each prompt's start, so
+                // an inter-turn cancel is harmless — no gating needed here.
+                CommandOutcome::Control(ControlSignal::Cancel) => {
+                    let _ = cancel_tx.try_send(());
+                }
+                // Steer the live prompt's inject source. The frontend only sends
+                // this while a prompt is accepting injects, so the sender is
+                // normally present; a missing/full one is dropped, not blocked.
+                CommandOutcome::Control(ControlSignal::Inject(text)) => {
+                    let sender = active_inject.lock().unwrap().clone();
+                    if let Some(tx) = sender {
+                        let _ = tx.try_send(text);
+                    }
+                }
+                _ => {}
+            },
+            // Frontend disconnected with no successor — nothing left to drive.
+            CoreWake::Command(None) => break,
+            CoreWake::Event(ev) => hub.emit_event(ev).await,
+            CoreWake::Request(req) => hub.open_request(req).await,
+        }
+    }
+}
+
 /// Redraw cadence for the live band: agent events and keystrokes are coalesced
 /// between frames and the screen is redrawn at most once per interval, so a
 /// fast token stream never triggers a redraw per delta — which tears/flickers
@@ -474,10 +751,22 @@ const FRAME: std::time::Duration = std::time::Duration::from_millis(33);
 enum Wake {
     /// Frame deadline: nothing arrived, just tick/draw.
     Tick,
-    /// An agent event from the background runner.
+    /// A frame from the core: an agent event or a tool-initiated picker
+    /// request (or a snapshot, unused with a single local frontend).
+    Frame(Outbound),
+    /// A frontend-originated picker (`/connect`, `/afk`, `/telemetry`) opened
+    /// over the local channel — never crosses the core boundary.
+    LocalPicker(crate::console::picker::PickerRequest),
+}
+
+/// What woke the core driver task (the `FrontendHub` side; see `run_console`).
+enum CoreWake {
+    /// An upstream command from the active frontend (`None` = disconnected).
+    Command(Option<ClientCommand>),
+    /// A streaming agent event to forward to the frontend.
     Event(AgentEvent),
-    /// An `ask_user`/permission picker request from a tool.
-    Picker(crate::console::picker::PickerRequest),
+    /// A tool-initiated picker request to bridge through the broker.
+    Request(crate::console::picker::PickerRequest),
 }
 
 /// The live console: `App` (the UI model), the inline terminal, the `Anchor`
@@ -502,17 +791,24 @@ struct ConsoleLoop {
     /// from an active stream at the new width.
     scrollback_replay: Option<usize>,
     last_draw: std::time::Instant,
-    agent_rx: mpsc::Receiver<AgentEvent>,
-    picker_rx: mpsc::Receiver<crate::console::picker::PickerRequest>,
+    /// Core → frontend frames (agent events, tool picker requests, snapshots),
+    /// delivered through the `FrontendHub`'s `LocalTuiPort`.
+    outbound: mpsc::Receiver<Outbound>,
+    /// Frontend → core commands. Used here only to answer a tool-initiated
+    /// picker with a `ClientCommand::Reply` (see `keys::reply_picker`).
+    commands: mpsc::Sender<ClientCommand>,
+    /// Frontend-originated picker requests (`/connect`, `/afk`, `/telemetry`),
+    /// opened locally with a oneshot reply — distinct from the core boundary.
+    local_picker_rx: mpsc::Receiver<crate::console::picker::PickerRequest>,
     notice_rx: mpsc::Receiver<String>,
     update_check_rx:
         Option<tokio::sync::oneshot::Receiver<Option<crate::cli::upgrade::UpdateNotice>>>,
     render_hook_queue: mpsc::Sender<RenderJob>,
     prompt_tx: mpsc::Sender<AgentRequest>,
-    cancel_tx: mpsc::Sender<()>,
-    picker_tx: mpsc::Sender<crate::console::picker::PickerRequest>,
+    /// Sender half of [`Self::local_picker_rx`] — handed to the key handlers so
+    /// `/connect`'s multi-step flow can open its next picker locally.
+    local_picker_tx: mpsc::Sender<crate::console::picker::PickerRequest>,
     notice_tx: mpsc::Sender<String>,
-    active_inject: ActiveInject,
     ui_storage_dir: PathBuf,
 }
 
@@ -547,18 +843,30 @@ impl ConsoleLoop {
         Ok(())
     }
 
-    /// Park until there's work: the next frame deadline, an agent event, or an
-    /// `ask_user` picker request from a tool.
+    /// Park until there's work: the next frame deadline, a core frame, or a
+    /// frontend-originated picker request.
     async fn wake(&mut self) {
         let wake = tokio::select! {
             _ = tokio::time::sleep(FRAME) => Wake::Tick,
-            Some(ev) = self.agent_rx.recv() => Wake::Event(ev),
-            Some(req) = self.picker_rx.recv() => Wake::Picker(req),
+            Some(frame) = self.outbound.recv() => Wake::Frame(frame),
+            Some(req) = self.local_picker_rx.recv() => Wake::LocalPicker(req),
         };
         match wake {
             Wake::Tick => {}
-            Wake::Event(ev) => self.on_agent_event(ev),
-            Wake::Picker(req) => self.open_picker(req),
+            Wake::Frame(frame) => self.on_frame(frame),
+            Wake::LocalPicker(req) => self.open_local_picker(req),
+        }
+    }
+
+    /// Apply one core → frontend frame to the UI model.
+    fn on_frame(&mut self, frame: Outbound) {
+        match frame {
+            Outbound::Event(ev) => self.on_agent_event(*ev),
+            Outbound::Request(req) => self.open_request(req),
+            // A snapshot only arrives on a FIFO handover to a freshly-promoted
+            // frontend. With a single in-process TUI there is no successor, so
+            // this is unreachable today; ignore it rather than invent state.
+            Outbound::Snapshot(_) => {}
         }
     }
 
@@ -573,23 +881,38 @@ impl ConsoleLoop {
         self.app.handle_event(ev);
     }
 
-    /// Open a tool-initiated picker — one at a time; a second request is
-    /// rejected so the tool returns an error instead of stalling.
-    fn open_picker(&mut self, req: crate::console::picker::PickerRequest) {
+    /// Open a tool-initiated picker delivered over the frontend protocol — one
+    /// at a time. A second request is refused with a `Cancelled` reply so the
+    /// blocked tool fails fast instead of stalling.
+    fn open_request(&mut self, req: ClientRequest) {
+        if self.app.inline_picker.is_some() {
+            let _ = self.commands.try_send(ClientCommand::Reply {
+                id: req.id,
+                answer: ReplyAnswer::Cancelled,
+            });
+        } else {
+            self.app.inline_picker = Some(inline_picker::InlinePickerState::from_request(req));
+        }
+    }
+
+    /// Open a frontend-originated picker (`/connect`, `/afk`, `/telemetry`),
+    /// which replies on its own oneshot. Same one-at-a-time rule as
+    /// [`Self::open_request`].
+    fn open_local_picker(&mut self, req: crate::console::picker::PickerRequest) {
         if self.app.inline_picker.is_some() {
             let _ = req
                 .reply
                 .send(crate::console::picker::PickerResponse::Cancelled);
         } else {
-            self.app.inline_picker = Some(inline_picker::InlinePickerState::new(req));
+            self.app.inline_picker = Some(inline_picker::InlinePickerState::local(req));
         }
     }
 
-    /// Drain everything else pending — agent events, picker-spawn notices, the
-    /// auto-update oneshot, queued picker requests. State only, no draw.
+    /// Drain everything else pending — core frames, picker-spawn notices, the
+    /// auto-update oneshot, queued local picker requests. State only, no draw.
     fn drain_events(&mut self) {
-        while let Ok(ev) = self.agent_rx.try_recv() {
-            self.on_agent_event(ev);
+        while let Ok(frame) = self.outbound.try_recv() {
+            self.on_frame(frame);
         }
         while let Ok(msg) = self.notice_rx.try_recv() {
             self.app.add_assistant_notice(msg);
@@ -608,8 +931,8 @@ impl ConsoleLoop {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
         }
-        while let Ok(req) = self.picker_rx.try_recv() {
-            self.open_picker(req);
+        while let Ok(req) = self.local_picker_rx.try_recv() {
+            self.open_local_picker(req);
         }
     }
 
@@ -630,8 +953,8 @@ impl ConsoleLoop {
                 crate::console::keys::submit_text(
                     &mut self.app,
                     text,
-                    &self.prompt_tx,
-                    &self.picker_tx,
+                    &self.commands,
+                    &self.local_picker_tx,
                     &self.notice_tx,
                     &self.ui_storage_dir,
                 )
@@ -649,11 +972,10 @@ impl ConsoleLoop {
                         &mut self.app,
                         key,
                         &self.prompt_tx,
-                        &self.cancel_tx,
-                        &self.active_inject,
                         &self.ui_storage_dir,
-                        &self.picker_tx,
+                        &self.local_picker_tx,
                         &self.notice_tx,
+                        &self.commands,
                     )
                     .await;
                 }
@@ -1105,6 +1427,179 @@ mod tests {
     use crate::{AgentEvent, Message};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    /// The core driver (PR #174, phase 1) end to end over the real
+    /// `LocalTuiPort`: an agent event reaches the frontend as `Outbound::Event`,
+    /// a tool picker request surfaces as `Outbound::Request`, and the frontend's
+    /// `ClientCommand::Reply` resolves the blocked tool's oneshot by id.
+    #[tokio::test]
+    async fn core_driver_forwards_events_and_resolves_picker_replies() {
+        use crate::console::picker::{PickerAnswer, PickerQuestion, PickerRequest, PickerResponse};
+
+        fn question() -> PickerQuestion {
+            PickerQuestion {
+                question: "proceed?".to_string(),
+                kind: "ask_user".to_string(),
+                header: "Q".to_string(),
+                multi_select: false,
+                options: vec![],
+                allow_other: true,
+                text_input: false,
+                mask: false,
+            }
+        }
+
+        let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (tool_tx, tool_rx) = mpsc::channel::<PickerRequest>(4);
+        let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
+        let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
+        // Stand in for a live prompt's inject source so we can assert Inject
+        // reaches it, the same way the agent task wires `set_inject_source`.
+        let (inj_tx, mut inj_rx) = mpsc::channel::<String>(8);
+        let active_inject: crate::console::keys::ActiveInject =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(inj_tx)));
+        let (local_port, mut handle) = local_tui(8);
+        let mut acceptor = Acceptor::new();
+        acceptor.attach(Box::new(local_port));
+        let hub = FrontendHub::new(
+            "s1".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            acceptor,
+            RequestBroker::new(),
+        );
+        let driver = tokio::spawn(drive_frontend_core(
+            hub,
+            agent_rx,
+            tool_rx,
+            cancel_tx,
+            active_inject,
+            prompt_tx,
+            "s1".to_string(),
+        ));
+
+        // 0) The driver greets the freshly-attached frontend with a snapshot.
+        assert!(matches!(
+            handle.outbound.recv().await,
+            Some(Outbound::Snapshot(s)) if s.session_id == "s1"
+        ));
+
+        // 1) An agent event reaches the frontend verbatim as `Outbound::Event`.
+        agent_tx.send(AgentEvent::TurnStart).await.unwrap();
+        assert!(matches!(
+            handle.outbound.recv().await,
+            Some(Outbound::Event(e)) if matches!(*e, AgentEvent::TurnStart)
+        ));
+
+        // 2) A tool picker request surfaces as `Outbound::Request`; the
+        //    frontend's `Reply` resolves the blocked tool's oneshot.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tool_tx
+            .send(PickerRequest {
+                questions: vec![question()],
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let id = match handle.outbound.recv().await {
+            Some(Outbound::Request(req)) => {
+                assert_eq!(req.questions.len(), 1);
+                req.id
+            }
+            other => panic!("expected Outbound::Request, got {other:?}"),
+        };
+        handle
+            .commands
+            .send(ClientCommand::Reply {
+                id,
+                answer: ReplyAnswer::Answered(vec![PickerAnswer::Single("ok".to_string())]),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            PickerResponse::Answered(v) if v == vec![PickerAnswer::Single("ok".to_string())]
+        ));
+
+        // 3) A `Cancel` command is forwarded to the agent task's cancel channel.
+        handle.commands.send(ClientCommand::Cancel).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), cancel_rx.recv())
+                .await
+                .expect("cancel forwarded within timeout")
+                .is_some(),
+            "ClientCommand::Cancel reaches the agent task's cancel channel"
+        );
+
+        // 4) An `Inject` command reaches the live prompt's inject source.
+        handle
+            .commands
+            .send(ClientCommand::Inject {
+                text: "steer".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), inj_rx.recv())
+                .await
+                .expect("inject forwarded within timeout"),
+            Some("steer".to_string()),
+            "ClientCommand::Inject reaches the turn's inject source"
+        );
+
+        // 5) A `Submit` maps to an AgentRequest against the current session id.
+        handle
+            .commands
+            .send(ClientCommand::Submit {
+                text: "hello".to_string(),
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), prompt_rx.recv())
+            .await
+            .expect("submit forwarded within timeout")
+        {
+            Some(AgentRequest::Prompt { session_id, prompt }) => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(prompt, "hello");
+            }
+            Some(AgentRequest::Compact { .. }) => panic!("expected Prompt, got Compact"),
+            None => panic!("expected Prompt, got nothing"),
+            _ => panic!("expected Prompt, got SetModel/ReloadConfig/ReloadSkills"),
+        }
+
+        // 6) SetSession retargets the id; a later Submit lands in the new
+        //    session, and "/compact" maps to Compact.
+        handle
+            .commands
+            .send(ClientCommand::SetSession {
+                session_id: "s2".to_string(),
+            })
+            .await
+            .unwrap();
+        handle
+            .commands
+            .send(ClientCommand::Submit {
+                text: "/compact".to_string(),
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), prompt_rx.recv())
+            .await
+            .expect("compact forwarded within timeout")
+        {
+            Some(AgentRequest::Compact { session_id }) => assert_eq!(session_id, "s2"),
+            Some(AgentRequest::Prompt { .. }) => panic!("expected Compact, got Prompt"),
+            None => panic!("expected Compact, got nothing"),
+            _ => panic!("expected Compact, got SetModel/ReloadConfig/ReloadSkills"),
+        }
+
+        // 7) Dropping the frontend ends the driver (disconnect, no successor).
+        drop(handle);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
+    }
 
     #[test]
     fn quote_session_id_keeps_generated_ids_bare_and_quotes_unsafe() {

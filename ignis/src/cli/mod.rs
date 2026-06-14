@@ -40,6 +40,12 @@ pub struct Cli {
     #[arg(long)]
     pub afk: bool,
 
+    /// Run as a headless protocol engine over stdin/stdout (NDJSON) with no
+    /// terminal UI — driven by an out-of-process frontend (the Ink `ignis-tui`)
+    /// that owns the terminal and spawns this process. Experimental.
+    #[arg(long, hide = true)]
+    pub engine: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -142,10 +148,63 @@ pub fn resolve_session_request(
     }
 }
 
+/// Which interactive frontend to launch for TUI mode (PR #174, topology ii).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Frontend {
+    /// The built-in ratatui TUI, rendered in-process. The default and the
+    /// fallback — always available, no external runtime.
+    Ratatui,
+    /// The out-of-process Ink frontend at `entry` (a `node` script). It owns the
+    /// terminal and spawns this binary as `--engine`. Opt-in until it reaches
+    /// parity with ratatui.
+    Ink { entry: String },
+}
+
+/// Resolve the frontend choice from the environment. Ratatui is the default;
+/// the Ink frontend is selected only when `IGNIS_FRONTEND=ink` AND a non-empty
+/// `IGNIS_TUI_ENTRY` (the path to `ignis-tui/src/cli.js`) is given. A missing
+/// entry falls back to ratatui rather than guessing an install layout — locating
+/// the Ink app is the deferred packaging decision (bundle Node vs require system
+/// Node; where `ignis-tui` ships).
+pub fn resolve_frontend(frontend: Option<&str>, entry: Option<&str>) -> Frontend {
+    match frontend {
+        Some("ink") => match entry {
+            Some(e) if !e.trim().is_empty() => Frontend::Ink {
+                entry: e.to_string(),
+            },
+            _ => Frontend::Ratatui,
+        },
+        _ => Frontend::Ratatui,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn frontend_defaults_to_ratatui_and_ink_needs_an_entry() {
+        // Default + anything that isn't a fully-specified Ink request → ratatui.
+        assert_eq!(resolve_frontend(None, None), Frontend::Ratatui);
+        assert_eq!(resolve_frontend(Some("tui"), Some("/x")), Frontend::Ratatui);
+        assert_eq!(
+            resolve_frontend(Some("ink"), None),
+            Frontend::Ratatui,
+            "ink without an entry falls back rather than guessing"
+        );
+        assert_eq!(
+            resolve_frontend(Some("ink"), Some("   ")),
+            Frontend::Ratatui
+        );
+        // Fully-specified Ink request.
+        assert_eq!(
+            resolve_frontend(Some("ink"), Some("/path/cli.js")),
+            Frontend::Ink {
+                entry: "/path/cli.js".to_string()
+            }
+        );
+    }
 
     fn parse(argv: &[&str]) -> Cli {
         // clap's argv[0] is the program name.
