@@ -45,7 +45,8 @@ pub fn control_signal(cmd: &ClientCommand) -> Option<ControlSignal> {
         ClientCommand::Submit { .. }
         | ClientCommand::Reply { .. }
         | ClientCommand::SetSession { .. }
-        | ClientCommand::NewSession => None,
+        | ClientCommand::NewSession
+        | ClientCommand::SetModel { .. } => None,
     }
 }
 

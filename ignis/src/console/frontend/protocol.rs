@@ -59,6 +59,13 @@ pub struct ClientRequest {
 /// layer — the rich transcript model lives in `App`; this is the seam a
 /// transport serializes. Carries the in-flight request (if any) so a handover
 /// never strands a blocked tool.
+/// A selectable provider/model pair, for the frontend's `/model` picker.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelRef {
+    pub provider: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub session_id: String,
@@ -67,6 +74,8 @@ pub struct Snapshot {
     pub provider: String,
     pub model: String,
     pub cwd: String,
+    /// The configured models, for the `/model` picker (the engine owns the list).
+    pub models: Vec<ModelRef>,
     /// Request awaiting an answer at activation time, if a tool was blocked
     /// when this frontend took over.
     pub pending_request: Option<ClientRequest>,
@@ -105,6 +114,10 @@ pub enum ClientCommand {
     /// [`ClientCommand::SetSession`]).
     #[serde(rename = "new_session")]
     NewSession,
+    /// Switch the active provider/model (`/model`). The core applies it to
+    /// subsequent prompts and re-snapshots so the statusline updates.
+    #[serde(rename = "set_model")]
+    SetModel { provider: String, model: String },
     /// Answer a [`ClientRequest`]. `id` must match the outstanding request; a
     /// stale or unknown id is dropped by the broker.
     #[serde(rename = "reply")]

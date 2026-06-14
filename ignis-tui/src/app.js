@@ -20,6 +20,7 @@ import {
   inject,
   reply,
   newSession,
+  setModel,
   parseSlash,
   pickSingle,
   pickMulti,
@@ -40,6 +41,7 @@ export default function App({ engine }) {
   const [comp, setComp] = useState({ text: '', cursor: 0 });
   const [history, setHistory] = useState([]);
   const [histIdx, setHistIdx] = useState(-1); // -1 = editing live (not recalling)
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
 
   useEffect(() => {
     engine.onFrame((frame) => setState((s) => reduceOutbound(s, frame)));
@@ -62,14 +64,18 @@ export default function App({ engine }) {
         // Clear the local transcript; the engine re-snapshots with the new id.
         setState((s) => ({ ...s, blocks: [], stream: null, turns: 0, usage: null }));
         return true;
+      case 'model':
+        setModelPickerOpen(true);
+        return true;
       default:
         return false; // /compact + unknown → submit (engine / LLM handles)
     }
   };
 
   useInput((ch, key) => {
-    // While a picker is open it owns all keys (PickerFlow has its own useInput).
-    if (req) return;
+    // While a picker is open it owns all keys (PickerFlow / ModelPicker each
+    // have their own useInput).
+    if (req || modelPickerOpen) return;
 
     if (key.ctrl && ch === 'c') {
       if (state.status !== 'idle') engine.send(cancel());
@@ -164,12 +170,25 @@ export default function App({ engine }) {
   }
   state.blocks.forEach((b, i) => children.push(e(Block, { key: `b${i}`, block: b })));
   if (state.stream != null) children.push(e(Markdown, { key: 'stream', text: state.stream }));
-  children.push(
-    req
-      ? // Key by request id so a fresh request resets the flow's internal state.
-        e(PickerFlow, { key: `picker-${req.id}`, req, engine, onDone: clearRequest })
-      : e(Composer, { key: 'composer', text: comp.text, cursor: comp.cursor, status: state.status }),
-  );
+  if (req) {
+    // Key by request id so a fresh request resets the flow's internal state.
+    children.push(e(PickerFlow, { key: `picker-${req.id}`, req, engine, onDone: clearRequest }));
+  } else if (modelPickerOpen) {
+    children.push(
+      e(ModelPicker, {
+        key: 'model-picker',
+        models: state.models,
+        current: { provider: state.provider, model: state.model },
+        onPick: (m) => {
+          engine.send(setModel(m.provider, m.model));
+          setModelPickerOpen(false);
+        },
+        onCancel: () => setModelPickerOpen(false),
+      }),
+    );
+  } else {
+    children.push(e(Composer, { key: 'composer', text: comp.text, cursor: comp.cursor, status: state.status }));
+  }
   children.push(e(Footer, { key: 'footer', state }));
   return e(Box, { flexDirection: 'column' }, children);
 }
@@ -348,6 +367,43 @@ function PickerFlow({ req, engine, onDone }) {
       q.multi_select ? '↑/↓ move · space toggle · enter confirm · esc cancel' : '↑/↓ select · enter confirm · esc cancel',
     ),
   );
+  return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
+}
+
+// Local `/model` picker: single-select over the engine-supplied model list.
+function ModelPicker({ models, current, onPick, onCancel }) {
+  const start = Math.max(
+    0,
+    models.findIndex((m) => m.provider === current.provider && m.model === current.model),
+  );
+  const [cursor, setCursor] = useState(start);
+
+  useInput((ch, key) => {
+    if (key.escape) {
+      onCancel();
+      return;
+    }
+    if (key.upArrow) {
+      setCursor((c) => Math.max(0, c - 1));
+      return;
+    }
+    if (key.downArrow) {
+      setCursor((c) => Math.min(Math.max(models.length - 1, 0), c + 1));
+      return;
+    }
+    if (key.return && models[cursor]) onPick(models[cursor]);
+  });
+
+  const rows = [e(Text, { key: 'q', bold: true }, 'Switch model')];
+  if (!models.length) {
+    rows.push(e(Text, { key: 'empty', dimColor: true }, 'No models configured.'));
+  }
+  models.forEach((m, i) =>
+    rows.push(
+      e(PickerRow, { key: `m${i}`, label: `${m.provider}/${m.model}`, focused: i === cursor, checked: false, multi: false }),
+    ),
+  );
+  rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ select · enter switch · esc cancel'));
   return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
 }
 

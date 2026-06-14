@@ -471,6 +471,9 @@ pub async fn run_console(
         app.provider.clone(),
         app.model.clone(),
         app.cwd.to_string_lossy().to_string(),
+        // The ratatui frontend ignores snapshots (its /model picker reads App
+        // directly), so the wire model list is unused here.
+        Vec::new(),
         acceptor,
         RequestBroker::new(),
     );
@@ -573,10 +576,20 @@ pub async fn run_engine(
         mpsc::channel::<crate::console::picker::PickerRequest>(4);
     let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
 
-    // Capture the statusline meta before `config`/`cwd` move into the agent loop.
+    // Capture the statusline + /model-picker meta before `config`/`cwd` move
+    // into the agent loop.
     let provider = config.active_provider().unwrap_or_default();
     let model = config.active_model().unwrap_or_default();
     let cwd_str = cwd.to_string_lossy().to_string();
+    let catalog = crate::llm::catalog::load();
+    let models: Vec<crate::console::frontend::protocol::ModelRef> = config
+        .model_options(&catalog)
+        .into_iter()
+        .map(|o| crate::console::frontend::protocol::ModelRef {
+            provider: o.provider,
+            model: o.model,
+        })
+        .collect();
 
     tokio::spawn(agent_loop(
         prompt_rx,
@@ -604,6 +617,7 @@ pub async fn run_engine(
         provider,
         model,
         cwd_str,
+        models,
         acceptor,
         RequestBroker::new(),
     );
@@ -688,6 +702,19 @@ async fn drive_frontend_core(
                     let new_id = crate::session::SessionManager::create_id();
                     current_session_id = new_id.clone();
                     hub.set_session_id(new_id);
+                    hub.send_snapshot().await;
+                }
+                // `/model`: apply the switch to subsequent prompts and re-snapshot
+                // so the frontend's statusline reflects the new model.
+                CommandOutcome::SetModel { provider, model } => {
+                    let _ = prompt_tx
+                        .send(AgentRequest::SetModel {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            effort: None,
+                        })
+                        .await;
+                    hub.set_active_model(provider, model);
                     hub.send_snapshot().await;
                 }
                 // The agent task drains stale cancels at each prompt's start, so
@@ -1439,6 +1466,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            Vec::new(),
             acceptor,
             RequestBroker::new(),
         );

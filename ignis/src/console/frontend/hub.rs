@@ -18,7 +18,9 @@
 
 use crate::console::frontend::command::{control_signal, ControlSignal};
 use crate::console::frontend::port::Acceptor;
-use crate::console::frontend::protocol::{ClientCommand, ClientRequest, Outbound, Snapshot};
+use crate::console::frontend::protocol::{
+    ClientCommand, ClientRequest, ModelRef, Outbound, Snapshot,
+};
 use crate::console::frontend::RequestBroker;
 use crate::console::picker::{PickerRequest, PickerResponse};
 
@@ -35,6 +37,9 @@ pub enum CommandOutcome {
     /// Start a fresh session (`/clear`): the core mints a new id, retargets, and
     /// re-snapshots the frontend with it.
     NewSession,
+    /// Switch the active provider/model (`/model`): the core applies it to the
+    /// next prompt and re-snapshots so the statusline updates.
+    SetModel { provider: String, model: String },
     /// A mechanical control signal (cancel / inject / shutdown).
     Control(ControlSignal),
     /// A `Reply` the hub already resolved against the broker — nothing left for
@@ -49,6 +54,8 @@ pub struct FrontendHub {
     provider: String,
     model: String,
     cwd: String,
+    /// The configured models, surfaced to the frontend's `/model` picker.
+    models: Vec<ModelRef>,
     acceptor: Acceptor,
     broker: RequestBroker,
     /// The single picker awaiting an answer, if any. The console opens pickers
@@ -63,6 +70,7 @@ impl FrontendHub {
         provider: String,
         model: String,
         cwd: String,
+        models: Vec<ModelRef>,
         acceptor: Acceptor,
         broker: RequestBroker,
     ) -> Self {
@@ -71,6 +79,7 @@ impl FrontendHub {
             provider,
             model,
             cwd,
+            models,
             acceptor,
             broker,
             pending: None,
@@ -87,6 +96,7 @@ impl FrontendHub {
             provider: self.provider.clone(),
             model: self.model.clone(),
             cwd: self.cwd.clone(),
+            models: self.models.clone(),
             pending_request: self.pending.clone(),
         }
     }
@@ -94,6 +104,12 @@ impl FrontendHub {
     /// Retarget the session this hub reports in snapshots (after `/clear`).
     pub fn set_session_id(&mut self, session_id: String) {
         self.session_id = session_id;
+    }
+
+    /// Update the active provider/model the hub reports (after `/model`).
+    pub fn set_active_model(&mut self, provider: String, model: String) {
+        self.provider = provider;
+        self.model = model;
     }
 
     /// Emit the current session snapshot to the active frontend. Sent once when
@@ -137,6 +153,9 @@ impl FrontendHub {
         }
         if matches!(cmd, ClientCommand::NewSession) {
             return CommandOutcome::NewSession;
+        }
+        if let ClientCommand::SetModel { provider, model } = cmd {
+            return CommandOutcome::SetModel { provider, model };
         }
         // Remaining variants are mechanical control signals.
         match control_signal(&cmd) {
@@ -286,6 +305,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            Vec::new(),
             acc,
             RequestBroker::new(),
         )
@@ -343,6 +363,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            Vec::new(),
             acc,
             RequestBroker::new(),
         );
@@ -374,6 +395,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            Vec::new(),
             acc,
             RequestBroker::new(),
         );

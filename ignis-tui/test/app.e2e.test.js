@@ -252,6 +252,59 @@ test('/clear sends new_session and clears the local transcript', async () => {
   assert.match(f, /Type a message/, 'welcome banner returns on the empty transcript');
 });
 
+test('/model opens a picker of engine-supplied models; selection sends set_model', async () => {
+  const { engine, lastFrame, stdin } = renderApp();
+  await tick();
+  engine.emit(
+    snapshot({
+      session_id: 's1',
+      provider: 'deepseek',
+      model: 'v4',
+      cwd: '/p',
+      models: [
+        { provider: 'deepseek', model: 'v4' },
+        { provider: 'minimax', model: 'M3' },
+        { provider: 'kimi', model: 'k2' },
+      ],
+    }),
+  );
+  await tick();
+  stdin.write('/model');
+  await tick();
+  stdin.write(KEY.enter);
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /Switch model/);
+  assert.match(f, /deepseek\/v4/);
+  assert.match(f, /minimax\/M3/);
+  // Cursor starts on the active model (deepseek/v4); move down twice → kimi/k2.
+  stdin.write(KEY.down);
+  await tick();
+  stdin.write(KEY.down);
+  await tick();
+  stdin.write(KEY.enter);
+  await tick();
+  assert.deepEqual(engine.last(), { kind: 'set_model', data: { provider: 'kimi', model: 'k2' } });
+  // Picker closed → composer back.
+  assert.doesNotMatch(plain(lastFrame()), /Switch model/);
+});
+
+test('/model picker cancels on Esc without sending a command', async () => {
+  const { engine, lastFrame, stdin } = renderApp();
+  await tick();
+  engine.emit(snapshot({ session_id: 's1', models: [{ provider: 'a', model: 'b' }] }));
+  await tick();
+  stdin.write('/model');
+  await tick();
+  stdin.write(KEY.enter);
+  await tick();
+  assert.match(plain(lastFrame()), /Switch model/);
+  stdin.write(KEY.esc);
+  await tick();
+  assert.doesNotMatch(plain(lastFrame()), /Switch model/);
+  assert.equal(engine.sent.filter((c) => c.kind === 'set_model').length, 0);
+});
+
 test('a non-handled slash (/compact) and plain text both submit', async () => {
   const { engine, stdin } = renderApp();
   await tick();
