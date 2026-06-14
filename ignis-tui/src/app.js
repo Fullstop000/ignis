@@ -19,6 +19,8 @@ import {
   cancel,
   inject,
   reply,
+  newSession,
+  parseSlash,
   pickSingle,
   pickMulti,
   answered,
@@ -51,6 +53,20 @@ export default function App({ engine }) {
     setHistIdx(-1);
   };
 
+  // Locally-handled slash commands. Returns true if handled here (so the line
+  // is NOT submitted to the engine); false falls through to a normal submit.
+  const handleSlash = (slash) => {
+    switch (slash.name) {
+      case 'clear':
+        engine.send(newSession());
+        // Clear the local transcript; the engine re-snapshots with the new id.
+        setState((s) => ({ ...s, blocks: [], stream: null, turns: 0, usage: null }));
+        return true;
+      default:
+        return false; // /compact + unknown → submit (engine / LLM handles)
+    }
+  };
+
   useInput((ch, key) => {
     // While a picker is open it owns all keys (PickerFlow has its own useInput).
     if (req) return;
@@ -72,11 +88,17 @@ export default function App({ engine }) {
     }
     if (key.return) {
       const t = comp.text;
-      if (t.trim()) {
-        engine.send(submit(t));
-        setHistory((h) => [...h, t]);
+      if (!t.trim()) return;
+      // Slash dispatch: a few commands are handled locally; everything else
+      // (plain prompts, /compact, unknown slashes) is submitted to the engine.
+      const slash = parseSlash(t);
+      if (slash && handleSlash(slash)) {
         resetComposer();
+        return;
       }
+      engine.send(submit(t));
+      setHistory((h) => [...h, t]);
+      resetComposer();
       return;
     }
     // History recall (↑/↓), matching ratatui.

@@ -679,8 +679,17 @@ async fn drive_frontend_core(
                     // pressure here is correct, matching the pre-seam behavior.
                     let _ = prompt_tx.send(request).await;
                 }
-                // The frontend switched sessions (/clear, /resume); retarget.
+                // The frontend switched sessions (/resume); retarget.
                 CommandOutcome::SetSession(id) => current_session_id = id,
+                // `/clear`: the core mints a fresh session id, retargets the next
+                // submit at it, and re-snapshots the frontend with the new id
+                // (engine owns session creation for out-of-process frontends).
+                CommandOutcome::NewSession => {
+                    let new_id = crate::session::SessionManager::create_id();
+                    current_session_id = new_id.clone();
+                    hub.set_session_id(new_id);
+                    hub.send_snapshot().await;
+                }
                 // The agent task drains stale cancels at each prompt's start, so
                 // an inter-turn cancel is harmless — no gating needed here.
                 CommandOutcome::Control(ControlSignal::Cancel) => {

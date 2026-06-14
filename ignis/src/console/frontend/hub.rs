@@ -32,6 +32,9 @@ pub enum CommandOutcome {
     /// subsequent submits at it (local-frontend session sync — see
     /// [`ClientCommand::SetSession`]).
     SetSession(String),
+    /// Start a fresh session (`/clear`): the core mints a new id, retargets, and
+    /// re-snapshots the frontend with it.
+    NewSession,
     /// A mechanical control signal (cancel / inject / shutdown).
     Control(ControlSignal),
     /// A `Reply` the hub already resolved against the broker — nothing left for
@@ -88,6 +91,11 @@ impl FrontendHub {
         }
     }
 
+    /// Retarget the session this hub reports in snapshots (after `/clear`).
+    pub fn set_session_id(&mut self, session_id: String) {
+        self.session_id = session_id;
+    }
+
     /// Emit the current session snapshot to the active frontend. Sent once when
     /// the core driver starts so a fresh frontend can render its statusline.
     pub async fn send_snapshot(&mut self) {
@@ -126,6 +134,9 @@ impl FrontendHub {
         }
         if let ClientCommand::SetSession { session_id } = &cmd {
             return CommandOutcome::SetSession(session_id.clone());
+        }
+        if matches!(cmd, ClientCommand::NewSession) {
+            return CommandOutcome::NewSession;
         }
         // Remaining variants are mechanical control signals.
         match control_signal(&cmd) {

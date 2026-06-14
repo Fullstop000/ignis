@@ -233,6 +233,35 @@ test('no React warnings (e.g. missing keys) leak to stderr while rendering rich 
   assert.deepEqual(errs, [], `unexpected console.error output: ${errs.join(' | ')}`);
 });
 
+test('/clear sends new_session and clears the local transcript', async () => {
+  const { engine, lastFrame, stdin } = renderApp();
+  await tick();
+  engine.emit(ev('user_prompt_committed', { text: 'earlier message' }));
+  engine.emit(ev('message_end', { message: { content: 'earlier reply' } }));
+  await tick();
+  assert.match(plain(lastFrame()), /earlier message/);
+
+  stdin.write('/clear');
+  await tick();
+  stdin.write(KEY.enter);
+  await tick();
+  assert.deepEqual(engine.last(), { kind: 'new_session' });
+  const f = plain(lastFrame());
+  assert.doesNotMatch(f, /earlier message/, 'transcript cleared');
+  assert.doesNotMatch(f, /earlier reply/);
+  assert.match(f, /Type a message/, 'welcome banner returns on the empty transcript');
+});
+
+test('a non-handled slash (/compact) and plain text both submit', async () => {
+  const { engine, stdin } = renderApp();
+  await tick();
+  stdin.write('/compact');
+  await tick();
+  stdin.write(KEY.enter);
+  await tick();
+  assert.deepEqual(engine.last(), { kind: 'submit', data: { text: '/compact' } });
+});
+
 test('statusline footer shows model, cwd, turns, and context tokens', async () => {
   const { engine, lastFrame } = renderApp();
   await tick();

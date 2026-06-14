@@ -156,7 +156,20 @@ export const submit = (text) => ({ kind: 'submit', data: { text } });
 export const inject = (text) => ({ kind: 'inject', data: { text } });
 export const cancel = () => ({ kind: 'cancel' });
 export const setSession = (sessionId) => ({ kind: 'set_session', data: { session_id: sessionId } });
+export const newSession = () => ({ kind: 'new_session' });
 export const reply = (id, answer) => ({ kind: 'reply', data: { id, answer } });
+
+/**
+ * Classify a submitted line. Returns `null` for a normal prompt, or `{ name }`
+ * for a slash command (lowercased, no leading slash). The app decides which
+ * commands it handles locally; `/compact` and unknown ones fall through to a
+ * normal submit (the engine special-cases `/compact`).
+ */
+export function parseSlash(text) {
+  const t = (text ?? '').trim();
+  if (!t.startsWith('/')) return null;
+  return { name: t.slice(1).split(/\s+/)[0].toLowerCase() };
+}
 
 // ReplyAnswer shapes (externally-tagged, matching the Rust enum):
 //   Answered(vec) → {Answered:[…]} ; Cancelled → "Cancelled"

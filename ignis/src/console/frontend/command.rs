@@ -40,11 +40,12 @@ pub fn control_signal(cmd: &ClientCommand) -> Option<ControlSignal> {
         ClientCommand::Inject { text } => Some(ControlSignal::Inject(text.clone())),
         ClientCommand::Cancel => Some(ControlSignal::Cancel),
         ClientCommand::Shutdown => Some(ControlSignal::Shutdown),
-        // Submit / Reply / SetSession carry session state and are routed by the
-        // hub (dispatcher / broker / session retarget), not as mechanical signals.
+        // Submit / Reply / SetSession / NewSession carry session state and are
+        // routed by the hub (dispatcher / broker / session ops), not as signals.
         ClientCommand::Submit { .. }
         | ClientCommand::Reply { .. }
-        | ClientCommand::SetSession { .. } => None,
+        | ClientCommand::SetSession { .. }
+        | ClientCommand::NewSession => None,
     }
 }
 
@@ -96,6 +97,8 @@ mod tests {
             }),
             None
         );
+        // NewSession is a session op routed by the hub, not a mechanical signal.
+        assert_eq!(control_signal(&ClientCommand::NewSession), None);
     }
 
     #[test]

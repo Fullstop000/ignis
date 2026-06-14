@@ -99,6 +99,12 @@ pub enum ClientCommand {
     /// Cancel the current turn (Ctrl-C / ESC).
     #[serde(rename = "cancel")]
     Cancel,
+    /// Start a fresh session (`/clear`). The core mints a new session id,
+    /// retargets subsequent submits at it, and re-snapshots the frontend with
+    /// the new id — the engine owns session creation (unlike the local-frontend
+    /// [`ClientCommand::SetSession`]).
+    #[serde(rename = "new_session")]
+    NewSession,
     /// Answer a [`ClientRequest`]. `id` must match the outstanding request; a
     /// stale or unknown id is dropped by the broker.
     #[serde(rename = "reply")]

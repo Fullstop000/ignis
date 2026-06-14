@@ -10,6 +10,8 @@ import {
   inject,
   reply,
   setSession,
+  newSession,
+  parseSlash,
   answerSingle,
   answerCancelled,
   toolArgsSummary,
@@ -77,6 +79,15 @@ test('command builders match the Rust ClientCommand wire shapes', () => {
     data: { id: 7, answer: { Answered: [{ Single: 'Yes' }] } },
   });
   assert.deepEqual(reply(7, answerCancelled()), { kind: 'reply', data: { id: 7, answer: 'Cancelled' } });
+  assert.deepEqual(newSession(), { kind: 'new_session' });
+});
+
+test('parseSlash recognizes slash commands, ignores normal prompts', () => {
+  assert.equal(parseSlash('hello world'), null);
+  assert.equal(parseSlash('  not /a slash'), null);
+  assert.deepEqual(parseSlash('/clear'), { name: 'clear' });
+  assert.deepEqual(parseSlash('  /Model gpt '), { name: 'model' });
+  assert.deepEqual(parseSlash('/compact'), { name: 'compact' });
 });
 
 test('toolArgsSummary shows values only, never param names', () => {
