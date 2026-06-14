@@ -200,7 +200,11 @@ impl Rule {
                 return false;
             };
             return match extract_host(url) {
-                Some(host) => simple_glob(host_pat, &host),
+                // Lowercase both sides so an uppercase rule like `domain:EVIL.com`
+                // still matches the normalized host `evil.com`.
+                Some(host) => {
+                    simple_glob(&host_pat.to_ascii_lowercase(), &host.to_ascii_lowercase())
+                }
                 None => false,
             };
         }
@@ -424,23 +428,16 @@ fn regex_matches(re: &str, candidate: &str) -> bool {
     }
 }
 
-/// Pull the host out of an http(s) URL. Strip the scheme, isolate the authority
-/// (up to the first `/`, `?`, or `#`), drop any `user[:pass]@` userinfo, then
-/// drop the `:port`. Skipping userinfo matters: `https://trusted.com@evil.com/`
-/// connects to `evil.com`, so a `domain:` rule must see `evil.com`.
+/// Pull the host out of an http(s) URL using the same parser `reqwest` will use
+/// when the request is actually sent. This prevents hand-rolled normalization
+/// from diverging from the real fetcher (e.g. percent-encoded dots, uppercase
+/// letters, or IDN mappings that the URL crate resolves differently).
 fn extract_host(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // Userinfo ends at the last `@`; the host[:port] is whatever follows.
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host_port.split(':').next().unwrap_or(host_port);
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
     }
+    parsed.host_str().map(|h| h.to_string())
 }
 
 #[cfg(test)]
@@ -753,6 +750,52 @@ mod tests {
         assert_eq!(
             set.decide("web_fetch", &json!({"url": "http://anything.example/y"})),
             Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn domain_deny_normalizes_percent_encoded_host() {
+        // Regression (#183): `reqwest` parses `%2e` as `.`, so a hand-rolled
+        // extractor that keeps the raw authority would bypass `domain:evil.com`.
+        let set = rs(&[], &[], &["web_fetch(domain:evil.com)"]);
+        assert!(matches!(
+            set.decide("web_fetch", &json!({"url": "https://evil%2ecom/x"})),
+            Some(Decision::Deny { .. })
+        ));
+    }
+
+    #[test]
+    fn domain_deny_normalizes_uppercase_host() {
+        // Regression (#183): the URL crate lowercases domains; the old extractor
+        // returned the literal casing, so `EVIL.com` could slip past `evil.com`.
+        let set = rs(&[], &[], &["web_fetch(domain:evil.com)"]);
+        assert!(matches!(
+            set.decide("web_fetch", &json!({"url": "https://EVIL.com/x"})),
+            Some(Decision::Deny { .. })
+        ));
+    }
+
+    #[test]
+    fn domain_rule_is_case_insensitive_for_existing_uppercase_rules() {
+        // A previously-suggested or hand-authored uppercase rule must still match
+        // after we normalize the fetched URL to lowercase.
+        let set = rs(&[], &[], &["web_fetch(domain:EVIL.com)"]);
+        assert!(matches!(
+            set.decide("web_fetch", &json!({"url": "https://EVIL.com/x"})),
+            Some(Decision::Deny { .. })
+        ));
+        assert!(matches!(
+            set.decide("web_fetch", &json!({"url": "https://evil.com/x"})),
+            Some(Decision::Deny { .. })
+        ));
+    }
+
+    #[test]
+    fn suggest_grant_normalizes_percent_encoded_host() {
+        // Suggestions must use the same normalized host the deny rule will see.
+        assert_eq!(
+            suggest_grant("web_fetch", &json!({"url": "https://evil%2ecom/x"})),
+            Some("web_fetch(domain:evil.com)".to_string())
         );
     }
 

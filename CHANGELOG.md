@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reliability — permission/MCP/skill lock poisoning no longer panics; the runtime recovers safely. ([#187](https://github.com/Fullstop000/ignis/pull/187))
 - MCP — shutdown escalates from SIGTERM to SIGKILL only after confirming the process group is still alive. ([#187](https://github.com/Fullstop000/ignis/pull/187))
 - Tools — `bash` now rejects a missing or non-directory `cwd` before spawning the shell. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+- Security — `web_fetch` `domain:` permission rules now parse the URL with the same `reqwest` URL parser used for the actual request, closing bypasses where percent-encoded dots (`evil%2ecom`) or uppercase hosts (`EVIL.com`) slipped past a `domain:evil.com` deny rule. ([#188](https://github.com/Fullstop000/ignis/pull/188))
 - Tests — the flaky pty-timing integration test `inline_resize_replays_stable_rows_from_an_active_stream` is now `#[ignore]`d under parallel load; run it in isolation with `--ignored`. ([#187](https://github.com/Fullstop000/ignis/pull/187))
 
 ## [0.38.1] - 2026-06-12
