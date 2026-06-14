@@ -35,7 +35,7 @@ import {
   toolArgsSummary,
   toolOutputPreview,
 } from './protocol.js';
-import { parseMarkdown } from './markdown.js';
+import { parseMarkdown, parseInline } from './markdown.js';
 
 const e = React.createElement;
 
@@ -669,25 +669,65 @@ function spanEls(spans) {
   );
 }
 
-// Markdown table: columns padded to content width (capped), header bold, a
-// dim rule under it. (Plain cells; no per-cell markdown or CJK width-fit yet.)
+// Markdown table: per-cell inline markdown (bold/italic/code), columns padded
+// to the VISIBLE (markdown-stripped) content width (capped), header bold, a dim
+// rule under it. (No CJK width-fit yet.)
 function MdTable({ header, rows }) {
   const cols = header.length;
+  const cellSpans = (cell) => parseInline(cell ?? '');
+  const visLen = (cell) => cellSpans(cell).reduce((n, s) => n + s.text.length, 0);
   const widths = [];
   for (let c = 0; c < cols; c++) {
-    let w = (header[c] ?? '').length;
-    for (const r of rows) w = Math.max(w, (r[c] ?? '').length);
+    let w = visLen(header[c]);
+    for (const r of rows) w = Math.max(w, visLen(r[c]));
     widths[c] = Math.min(w, 30);
   }
-  const pad = (s, w) => (s.length >= w ? s.slice(0, w) : s + ' '.repeat(w - s.length));
-  const fmt = (cells) => widths.map((w, c) => pad(cells[c] ?? '', w)).join(' │ ');
+  // One row → flat list of <Text> segments: ` │ ` separators, each cell's
+  // styled spans, then padding to the column width (computed from visible len).
+  const rowEls = (cells, forceBold) => {
+    const segs = [];
+    widths.forEach((w, c) => {
+      if (c > 0) segs.push(e(Text, { key: `sep${c}` }, ' │ '));
+      const spans = truncateSpans(cellSpans(cells[c] ?? ''), w);
+      const used = spans.reduce((n, s) => n + s.text.length, 0);
+      spans.forEach((s, j) =>
+        segs.push(
+          e(
+            Text,
+            { key: `c${c}s${j}`, bold: forceBold || s.bold || undefined, italic: s.italic || undefined, color: s.code ? 'cyan' : undefined },
+            s.text,
+          ),
+        ),
+      );
+      if (used < w) segs.push(e(Text, { key: `pad${c}` }, ' '.repeat(w - used)));
+    });
+    return segs;
+  };
   const sep = widths.map((w) => '─'.repeat(w)).join('─┼─');
   const lines = [
-    e(Text, { key: 'h', bold: true }, fmt(header)),
+    e(Text, { key: 'h' }, rowEls(header, true)),
     e(Text, { key: 's', dimColor: true }, sep),
-    ...rows.map((r, i) => e(Text, { key: `r${i}` }, fmt(r))),
+    ...rows.map((r, i) => e(Text, { key: `r${i}` }, rowEls(r, false))),
   ];
   return e(Box, { flexDirection: 'column' }, lines);
+}
+
+/** Trim styled spans to at most `max` visible chars (slicing the last span). */
+function truncateSpans(spans, max) {
+  const out = [];
+  let used = 0;
+  for (const s of spans) {
+    if (used >= max) break;
+    const room = max - used;
+    if (s.text.length <= room) {
+      out.push(s);
+      used += s.text.length;
+    } else {
+      out.push({ ...s, text: s.text.slice(0, room) });
+      used = max;
+    }
+  }
+  return out;
 }
 
 function MdBlock({ block }) {

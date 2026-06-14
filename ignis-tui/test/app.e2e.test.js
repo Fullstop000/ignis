@@ -72,6 +72,23 @@ test('assistant markdown table renders aligned header + rows', async () => {
   assert.match(f, /─/, 'header rule rendered');
 });
 
+test('table cells render inline markdown (no literal ** markers)', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  engine.emit(
+    ev('message_end', {
+      message: { content: '| Prime | Divisible? |\n|---|---|\n| **7** | **Yes** |\n| `5` | No |' },
+    }),
+  );
+  await tick();
+  const f = plain(lastFrame());
+  // The bold/code markers are consumed by the inline parser, not shown raw.
+  assert.match(f, /7.*Yes/);
+  assert.match(f, /5.*No/);
+  assert.doesNotMatch(f, /\*\*/, 'no literal ** in cells');
+  assert.doesNotMatch(f, /`/, 'no literal backtick in cells');
+});
+
 test('picker shows the focused option preview pane', async () => {
   const { engine, lastFrame, stdin } = renderApp();
   await tick();
