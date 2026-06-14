@@ -16,6 +16,7 @@ import {
   toggleSkill,
   toggleMcp,
   parseSlash,
+  expandPastes,
   answerSingle,
   answerCancelled,
   toolArgsSummary,
@@ -96,6 +97,14 @@ test('parseSlash recognizes slash commands, ignores normal prompts', () => {
   assert.deepEqual(parseSlash('/clear'), { name: 'clear' });
   assert.deepEqual(parseSlash('  /Model gpt '), { name: 'model' });
   assert.deepEqual(parseSlash('/compact'), { name: 'compact' });
+});
+
+test('expandPastes replaces chips with stored contents, leaves text otherwise', () => {
+  const pastes = ['line1\nline2\nline3'];
+  assert.equal(expandPastes('see [paste #1 · 3 lines] ok', pastes), 'see line1\nline2\nline3 ok');
+  assert.equal(expandPastes('no chips here', pastes), 'no chips here');
+  // Unknown index left as-is.
+  assert.equal(expandPastes('[paste #9 · 2 lines]', pastes), '[paste #9 · 2 lines]');
 });
 
 test('toolArgsSummary shows values only, never param names', () => {

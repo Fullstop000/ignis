@@ -77,6 +77,21 @@ test('Ctrl+A / Ctrl+E jump caret to start / end for insertion', async () => {
   assert.deepEqual(engine.last(), { kind: 'submit', data: { text: '>middle<' } });
 });
 
+test('a multi-line paste collapses to a chip and expands on submit', async () => {
+  const { engine, lastFrame, stdin } = renderApp();
+  await tick();
+  stdin.write('before ');
+  await tick();
+  stdin.write('def f():\n    return 1\n'); // a multi-line paste (one chunk)
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /before \[paste #1 · 3 lines\]/, 'paste collapsed to a chip');
+  assert.doesNotMatch(f, /def f\(\)/, 'raw paste not shown inline');
+  stdin.write(KEY.enter);
+  await tick();
+  assert.deepEqual(engine.last(), { kind: 'submit', data: { text: 'before def f():\n    return 1\n' } });
+});
+
 test('↑/↓ recall submitted input from history', async () => {
   const { stdin, lastFrame } = renderApp();
   await tick();

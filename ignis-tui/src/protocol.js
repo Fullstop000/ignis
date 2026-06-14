@@ -183,6 +183,11 @@ export function parseSlash(text) {
   return { name: t.slice(1).split(/\s+/)[0].toLowerCase() };
 }
 
+/** Expand `[paste #N · M lines]` chips back to their stored paste contents. */
+export function expandPastes(text, pastes) {
+  return String(text ?? '').replace(/\[paste #(\d+) · [^\]]*\]/g, (m, n) => pastes[Number(n) - 1] ?? m);
+}
+
 // ReplyAnswer shapes (externally-tagged, matching the Rust enum):
 //   Answered(vec) → {Answered:[…]} ; Cancelled → "Cancelled"
 // Each element of the vec is one question's PickerAnswer:

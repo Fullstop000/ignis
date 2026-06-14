@@ -25,6 +25,7 @@ import {
   toggleSkill,
   toggleMcp,
   parseSlash,
+  expandPastes,
   pickSingle,
   pickMulti,
   answered,
@@ -51,7 +52,8 @@ export default function App({ engine }) {
   const [comp, setComp] = useState({ text: '', cursor: 0 });
   const [history, setHistory] = useState([]);
   const [histIdx, setHistIdx] = useState(-1); // -1 = editing live (not recalling)
-  const [localPicker, setLocalPicker] = useState(null); // null | 'model' | 'afk'
+  const [localPicker, setLocalPicker] = useState(null); // null | 'model' | 'afk' | 'skills' | 'mcp'
+  const [pastes, setPastes] = useState([]); // multi-line paste contents, shown as [paste #N] chips
 
   useEffect(() => {
     engine.onFrame((frame) => setState((s) => reduceOutbound(s, frame)));
@@ -63,6 +65,7 @@ export default function App({ engine }) {
   const resetComposer = () => {
     setComp({ text: '', cursor: 0 });
     setHistIdx(-1);
+    setPastes([]);
   };
 
   // Locally-handled slash commands. Returns true if handled here (so the line
@@ -106,23 +109,23 @@ export default function App({ engine }) {
     }
     if (key.ctrl && ch === 's') {
       if (comp.text.trim()) {
-        engine.send(inject(comp.text));
+        engine.send(inject(expandPastes(comp.text, pastes)));
         resetComposer();
       }
       return;
     }
     if (key.return) {
-      const t = comp.text;
-      if (!t.trim()) return;
+      const raw = comp.text;
+      if (!raw.trim()) return;
       // Slash dispatch: a few commands are handled locally; everything else
       // (plain prompts, /compact, unknown slashes) is submitted to the engine.
-      const slash = parseSlash(t);
+      const slash = parseSlash(raw);
       if (slash && handleSlash(slash)) {
         resetComposer();
         return;
       }
-      engine.send(submit(t));
-      setHistory((h) => [...h, t]);
+      engine.send(submit(expandPastes(raw, pastes)));
+      setHistory((h) => [...h, raw]);
       resetComposer();
       return;
     }
@@ -179,6 +182,15 @@ export default function App({ engine }) {
       return;
     }
     if (ch && !key.ctrl && !key.meta) {
+      // A multi-line chunk is a paste — collapse it to a `[paste #N · M lines]`
+      // chip so it doesn't break the single-line composer; expanded at send.
+      if (ch.includes('\n')) {
+        const idx = pastes.length + 1;
+        const chip = `[paste #${idx} · ${ch.split('\n').length} lines]`;
+        setPastes((ps) => [...ps, ch]);
+        setComp((c) => ({ text: c.text.slice(0, c.cursor) + chip + c.text.slice(c.cursor), cursor: c.cursor + chip.length }));
+        return;
+      }
       setComp((c) => ({ text: c.text.slice(0, c.cursor) + ch + c.text.slice(c.cursor), cursor: c.cursor + ch.length }));
     }
   });
