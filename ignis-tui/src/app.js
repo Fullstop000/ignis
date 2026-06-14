@@ -196,10 +196,17 @@ export default function App({ engine }) {
       );
       return;
     }
+    // Ctrl+J inserts a newline (Ink delivers it as a lone '\n' with key.return
+    // false — Enter is '\r'). Handled before the paste branch so a single
+    // newline isn't mistaken for a multi-line paste.
+    if (ch === '\n') {
+      setComp((c) => ({ text: c.text.slice(0, c.cursor) + '\n' + c.text.slice(c.cursor), cursor: c.cursor + 1 }));
+      return;
+    }
     if (ch && !key.ctrl && !key.meta) {
-      // A multi-line chunk is a paste — collapse it to a `[paste #N · M lines]`
-      // chip so it doesn't break the single-line composer; expanded at send.
-      if (ch.includes('\n')) {
+      // A multi-CHARACTER chunk containing newlines is a paste — collapse it to
+      // a `[paste #N · M lines]` chip; expanded at send.
+      if (ch.length > 1 && ch.includes('\n')) {
         const idx = pastes.length + 1;
         const chip = `[paste #${idx} · ${ch.split('\n').length} lines]`;
         setPastes((ps) => [...ps, ch]);
@@ -397,18 +404,25 @@ function Welcome() {
 }
 
 function Composer({ text, cursor, status }) {
-  // Faux block caret at the cursor position — Ink hides the real cursor inline.
-  const before = text.slice(0, cursor);
-  const at = text.slice(cursor, cursor + 1) || ' ';
-  const after = text.slice(cursor + 1);
-  return e(
-    Box,
-    { marginTop: 1 },
-    e(Text, { color: 'gray' }, status === 'idle' ? '› ' : '… '),
-    e(Text, null, before),
-    e(Text, { inverse: true }, at),
-    e(Text, null, after),
-  );
+  // Multi-line aware: ❯ on the first line, 2-space indent on continuations
+  // (Ctrl+J inserts newlines), with a faux block caret on the caret's line —
+  // Ink hides the real cursor inline. The box grows with the line count.
+  const prefix = status === 'idle' ? '› ' : '… ';
+  const head = text.slice(0, cursor);
+  const caretLine = head.split('\n').length - 1;
+  const caretCol = cursor - (head.lastIndexOf('\n') + 1);
+  const lines = text.split('\n');
+  const rows = lines.map((ln, li) => {
+    const lead = e(Text, { key: 'lead', color: 'gray' }, li === 0 ? prefix : '  ');
+    if (li !== caretLine) {
+      return e(Box, { key: `l${li}` }, lead, e(Text, { key: 't' }, ln));
+    }
+    const b = ln.slice(0, caretCol);
+    const at = ln.slice(caretCol, caretCol + 1) || ' ';
+    const a = ln.slice(caretCol + 1);
+    return e(Box, { key: `l${li}` }, lead, e(Text, { key: 'b' }, b), e(Text, { key: 'at', inverse: true }, at), e(Text, { key: 'a' }, a));
+  });
+  return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
 }
 
 // ── Picker (ask_user): single/multi-select, free-text "Other", multi-question ──

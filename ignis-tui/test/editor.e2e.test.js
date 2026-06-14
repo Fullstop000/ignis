@@ -92,6 +92,24 @@ test('a multi-line paste collapses to a chip and expands on submit', async () =>
   assert.deepEqual(engine.last(), { kind: 'submit', data: { text: 'before def f():\n    return 1\n' } });
 });
 
+test('Ctrl+J inserts a newline; Enter submits the multi-line text', async () => {
+  const { engine, stdin, lastFrame } = renderApp();
+  await tick();
+  stdin.write('line one');
+  await tick();
+  stdin.write(KEY.ctrlJ); // Ctrl+J → newline, NOT submit, NOT a paste chip
+  await tick();
+  stdin.write('line two');
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /line one/);
+  assert.match(f, /line two/);
+  assert.doesNotMatch(f, /paste #/, 'a lone newline is not a paste chip');
+  stdin.write(KEY.enter); // Enter ('\r') submits
+  await tick();
+  assert.deepEqual(engine.last(), { kind: 'submit', data: { text: 'line one\nline two' } });
+});
+
 test('↑/↓ recall submitted input from history', async () => {
   const { stdin, lastFrame } = renderApp();
   await tick();

@@ -54,6 +54,7 @@ export const KEY = {
   ctrlE: '\x05',
   ctrlW: '\x17',
   ctrlO: '\x0f',
+  ctrlJ: '\n', // Ink delivers Ctrl+J / LF as a lone '\n' (Enter is '\r')
   space: ' ',
 };
 
