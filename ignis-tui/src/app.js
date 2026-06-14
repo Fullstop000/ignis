@@ -360,6 +360,19 @@ function PickerFlow({ req, engine, onDone }) {
     const label = other ? `Other: ${other}` : 'Other (type custom)…';
     rows.push(e(PickerRow, { key: 'other', label, focused: cursor === otherIdx, checked: selected.includes(otherIdx), multi: q.multi_select }));
   }
+  // Preview pane for the focused option (code/ASCII), if it carries one.
+  const focusedPreview = opts[cursor]?.preview;
+  if (focusedPreview) {
+    rows.push(
+      e(
+        Box,
+        { key: 'preview', flexDirection: 'column', marginTop: 1 },
+        String(focusedPreview)
+          .split('\n')
+          .map((ln, i) => e(Text, { key: `pv${i}`, color: 'cyan' }, ln.length ? ln : ' ')),
+      ),
+    );
+  }
   rows.push(
     e(
       Text,
@@ -434,6 +447,27 @@ function spanEls(spans) {
   );
 }
 
+// Markdown table: columns padded to content width (capped), header bold, a
+// dim rule under it. (Plain cells; no per-cell markdown or CJK width-fit yet.)
+function MdTable({ header, rows }) {
+  const cols = header.length;
+  const widths = [];
+  for (let c = 0; c < cols; c++) {
+    let w = (header[c] ?? '').length;
+    for (const r of rows) w = Math.max(w, (r[c] ?? '').length);
+    widths[c] = Math.min(w, 30);
+  }
+  const pad = (s, w) => (s.length >= w ? s.slice(0, w) : s + ' '.repeat(w - s.length));
+  const fmt = (cells) => widths.map((w, c) => pad(cells[c] ?? '', w)).join(' │ ');
+  const sep = widths.map((w) => '─'.repeat(w)).join('─┼─');
+  const lines = [
+    e(Text, { key: 'h', bold: true }, fmt(header)),
+    e(Text, { key: 's', dimColor: true }, sep),
+    ...rows.map((r, i) => e(Text, { key: `r${i}` }, fmt(r))),
+  ];
+  return e(Box, { flexDirection: 'column' }, lines);
+}
+
 function MdBlock({ block }) {
   switch (block.type) {
     case 'heading':
@@ -448,6 +482,8 @@ function MdBlock({ block }) {
         { flexDirection: 'column', paddingLeft: 2 },
         block.lines.map((ln, i) => e(Text, { key: `c${i}`, color: 'green' }, ln.length ? ln : ' ')),
       );
+    case 'table':
+      return e(MdTable, { header: block.header, rows: block.rows });
     case 'rule':
       return e(Text, { dimColor: true }, '─'.repeat(40));
     case 'blank':

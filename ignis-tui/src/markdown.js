@@ -79,6 +79,19 @@ export function parseMarkdown(text) {
       fenceLang = fence[1].trim();
       continue;
     }
+    // Table: a `| … |` row followed by a `|---|:--:|` separator, then body rows.
+    if (isTableRow(line) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      const header = splitRow(line);
+      const rows = [];
+      i += 2; // skip header + separator
+      while (i < lines.length && isTableRow(lines[i])) {
+        rows.push(splitRow(lines[i]));
+        i++;
+      }
+      i--; // the for-loop will ++ past the last consumed row
+      blocks.push({ type: 'table', header, rows });
+      continue;
+    }
     if (/^\s*$/.test(line)) {
       blocks.push({ type: 'blank' });
       continue;
@@ -107,4 +120,13 @@ export function parseMarkdown(text) {
   // A fence still open at end-of-input (streaming, or malformed) renders as code.
   if (inFence) blocks.push({ type: 'code', lang: fenceLang, lines: fenceLines });
   return blocks;
+}
+
+const isTableRow = (line) => /\|/.test(line) && /\S/.test(line);
+const isTableSep = (line) => /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line) && /-/.test(line);
+
+/** Split a `| a | b |` row into trimmed cells, dropping the outer-pipe empties. */
+function splitRow(line) {
+  const cells = line.trim().replace(/^\||\|$/g, '').split('|');
+  return cells.map((c) => c.trim());
 }

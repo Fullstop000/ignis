@@ -60,6 +60,41 @@ test('assistant markdown: heading, bold, inline code, list, fence', async () => 
   assert.doesNotMatch(f, /\*\*/, 'no literal bold markers');
 });
 
+test('assistant markdown table renders aligned header + rows', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  engine.emit(ev('message_end', { message: { content: '| Name | Age |\n|---|---|\n| Ann | 30 |\n| Bob | 25 |' } }));
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /Name.*Age/);
+  assert.match(f, /Ann.*30/);
+  assert.match(f, /Bob.*25/);
+  assert.match(f, /─/, 'header rule rendered');
+});
+
+test('picker shows the focused option preview pane', async () => {
+  const { engine, lastFrame, stdin } = renderApp();
+  await tick();
+  engine.emit(
+    request(8, [
+      {
+        question: 'Pick a layout',
+        multi_select: false,
+        allow_other: false,
+        options: [
+          { label: 'A', preview: 'AAAA\nAAAA' },
+          { label: 'B', preview: 'BBBB\nBBBB' },
+        ],
+      },
+    ]),
+  );
+  await tick();
+  assert.match(plain(lastFrame()), /AAAA/, 'preview of the focused option (A)');
+  stdin.write(KEY.down);
+  await tick();
+  assert.match(plain(lastFrame()), /BBBB/, 'preview follows focus to B');
+});
+
 test('tool block: pending shows …, done drops it, values-only args', async () => {
   const { engine, lastFrame } = renderApp();
   await tick();

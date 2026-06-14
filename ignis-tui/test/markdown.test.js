@@ -35,6 +35,20 @@ test('parseMarkdown captures fenced code, including unterminated (streaming)', (
   assert.deepEqual(open[0].lines, ['half streamed']);
 });
 
+test('parseMarkdown recognizes a table (header + separator + rows)', () => {
+  const blocks = parseMarkdown('| Name | Age |\n|------|-----|\n| Ann | 30 |\n| Bob | 25 |\n\nafter');
+  assert.equal(blocks[0].type, 'table');
+  assert.deepEqual(blocks[0].header, ['Name', 'Age']);
+  assert.deepEqual(blocks[0].rows, [['Ann', '30'], ['Bob', '25']]);
+  // The paragraph after the blank line is not swallowed by the table.
+  assert.equal(blocks.at(-1).type, 'paragraph');
+});
+
+test('a |pipe| line without a separator is not a table', () => {
+  const blocks = parseMarkdown('a | b not a table');
+  assert.equal(blocks[0].type, 'paragraph');
+});
+
 test('heading spans are inline-parsed', () => {
   const [h] = parseMarkdown('## A **bold** head');
   assert.equal(h.type, 'heading');
