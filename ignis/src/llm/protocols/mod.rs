@@ -355,13 +355,11 @@ pub struct HistoryPolicy {
 
 /// Config-supplied override for the default history policy. Set once at
 /// startup by [`set_history_policy`] when the user's `~/.ignis/config.toml`
-/// includes a `[settings] strip-think = ...` line. The `IGNIS_HISTORY_TRIM`
-/// env var still trumps it (`off` disables, anything else enables).
+/// includes a `[settings] strip-think = ...` line.
 static HISTORY_POLICY_FROM_CONFIG: std::sync::OnceLock<HistoryPolicy> = std::sync::OnceLock::new();
 
 /// Set the config-derived default [`HistoryPolicy`]. Called once at startup
-/// from `load_config()`. First call wins; subsequent calls are no-ops. The
-/// `IGNIS_HISTORY_TRIM` env var still takes precedence at the per-call site.
+/// from `load_config()`. First call wins; subsequent calls are no-ops.
 pub fn set_history_policy(policy: HistoryPolicy) {
     let _ = HISTORY_POLICY_FROM_CONFIG.set(policy);
 }
@@ -369,25 +367,15 @@ pub fn set_history_policy(policy: HistoryPolicy) {
 impl Default for HistoryPolicy {
     /// Resolved in precedence order, highest first:
     ///
-    /// 1. `IGNIS_HISTORY_TRIM` env var (runtime A/B knob — wins over config).
-    ///    `off` disables; any other value (or absent) leaves the strip on.
-    /// 2. `[settings] strip-think = ...` from `~/.ignis/config.toml`, plumbed in
+    /// 1. `[settings] strip-think = ...` from `~/.ignis/config.toml`, plumbed in
     ///    once at startup via [`set_history_policy`].
-    /// 3. Built-in fallback: strip on. Cache-stable; never regressed in the
+    /// 2. Built-in fallback: strip on. Cache-stable; never regressed in the
     ///    validation A/B series that led to this default (PR #123).
-    ///
-    /// Env is re-read on every call so a single shell can flip arms between
-    /// trials by toggling the var, without restarting any long-lived process.
     fn default() -> Self {
-        if let Ok(v) = std::env::var("IGNIS_HISTORY_TRIM") {
-            return Self {
-                strip_think: v != "off",
-            };
-        }
-        if let Some(p) = HISTORY_POLICY_FROM_CONFIG.get() {
-            return *p;
-        }
-        Self { strip_think: true }
+        HISTORY_POLICY_FROM_CONFIG
+            .get()
+            .copied()
+            .unwrap_or(Self { strip_think: true })
     }
 }
 
@@ -800,41 +788,5 @@ mod tests {
     #[test]
     fn prep_history_identity_on_empty_input() {
         assert!(prep_outbound_history(&[], &HistoryPolicy { strip_think: true }).is_empty());
-    }
-
-    /// Env-var override read by `HistoryPolicy::default`. Uses a `Mutex` to
-    /// serialize the test (process env is global) and a guard to restore the
-    /// prior value so an aborted test doesn't poison sibling tests in the same
-    /// binary.
-    #[test]
-    fn history_policy_default_honors_env_off_switch() {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prior = std::env::var("IGNIS_HISTORY_TRIM").ok();
-
-        // SAFETY: env mutation; the static Mutex above serializes every test
-        // in this module that touches IGNIS_HISTORY_TRIM, so no concurrent
-        // get/set in this process can race.
-        unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", "off") };
-        assert!(!HistoryPolicy::default().strip_think);
-
-        // Any non-"off" value enables the strip.
-        unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", "on") };
-        assert!(HistoryPolicy::default().strip_think);
-
-        unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", "garbage") };
-        assert!(HistoryPolicy::default().strip_think);
-
-        // Env unset + no config override (the OnceLock is private to this
-        // module and untouched by tests here) → built-in fallback: strip on.
-        unsafe { std::env::remove_var("IGNIS_HISTORY_TRIM") };
-        assert!(HistoryPolicy::default().strip_think);
-
-        // Restore the prior value, if any.
-        match prior {
-            Some(v) => unsafe { std::env::set_var("IGNIS_HISTORY_TRIM", v) },
-            None => unsafe { std::env::remove_var("IGNIS_HISTORY_TRIM") },
-        }
     }
 }

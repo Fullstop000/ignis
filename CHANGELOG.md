@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Telemetry — OpenTelemetry export is now **off** by default; opt in with `[telemetry] enabled = true` or `IGNIS_ENABLE_TELEMETRY=1`. ([#187](https://github.com/Fullstop000/ignis/pull/187))
 - Sessions — project session directories now use a cleaner slug (no leading dash from the root separator) and legacy directories are migrated automatically while keeping each `.usage.json` sidecar with its session file. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+- LLM — removed the speculative `IGNIS_HISTORY_TRIM` runtime A/B env knob. Outbound history trimming is now controlled only by `[settings] strip-think` in `~/.ignis/config.toml`; the default remains `true`. ([#189](https://github.com/Fullstop000/ignis/pull/189))
 
 ### Fixed
 - TUI — resizing or splitting a terminal pane no longer leaves stale copies of the input bar in native scrollback; Ignis coalesces each resize burst into one settled purge, then replays its welcome, resumed/mid-session conversation, and active stream rows at the new width. ([#173](https://github.com/Fullstop000/ignis/pull/173))
