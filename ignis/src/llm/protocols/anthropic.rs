@@ -1,6 +1,6 @@
 use super::{
     bytes_to_lines, prep_outbound_history, Auth, HistoryPolicy, LlmProvider, LlmResponseDelta,
-    Resolved,
+    Resolved, Usage,
 };
 use crate::Message;
 use async_trait::async_trait;
@@ -55,7 +55,9 @@ struct AnthropicMessagesRequest {
 #[serde(tag = "type")]
 enum AnthropicEvent {
     #[serde(rename = "message_start")]
-    MessageStart,
+    MessageStart { message: AnthropicMessageStart },
+    #[serde(rename = "message_delta")]
+    MessageDelta { usage: AnthropicUsage },
     #[serde(rename = "content_block_start")]
     ContentBlockStart {
         index: usize,
@@ -67,6 +69,29 @@ enum AnthropicEvent {
     ContentBlockStop,
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Deserialize, Debug)]
+struct AnthropicMessageStart {
+    #[serde(default)]
+    usage: AnthropicUsage,
+}
+
+/// Anthropic streams the input-side counts on `message_start` and the final
+/// cumulative output count on `message_delta`. `input_tokens` here excludes
+/// cached tokens (reported separately), so we fold the cache fields back in to
+/// match the OpenAI-compatible convention where `input_tokens` is the full
+/// prompt size and `total()` = input + output.
+#[derive(Deserialize, Debug, Default)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -239,6 +264,10 @@ struct ParserState {
     /// accumulator `push_str`s `Some(name)` per delta — emitting them on every
     /// chunk produced `bashbashbash`-style tripled names).
     active_tool_calls: HashMap<usize, (String, String)>,
+    /// Input-side token counts captured from `message_start`, merged with the
+    /// `message_delta` output count into a single `Usage` delta (#175). Emitting
+    /// once avoids the agent's `Usage::add` double-counting the input side.
+    input_usage: Option<Usage>,
 }
 
 /// Translates one SSE line into at most one `LlmResponseDelta`.
@@ -255,6 +284,29 @@ fn parse_line(
     let data_part = line.strip_prefix("data:")?.trim();
     let event: AnthropicEvent = serde_json::from_str(data_part).ok()?;
     match event {
+        AnthropicEvent::MessageStart { message } => {
+            // Stash the input side; the output count arrives on message_delta.
+            // `input_tokens` excludes cache, so fold cache read+creation back in
+            // (the OpenAI path's `input_tokens` already includes cached tokens).
+            let u = &message.usage;
+            state.input_usage = Some(Usage {
+                input_tokens: u.input_tokens
+                    + u.cache_read_input_tokens
+                    + u.cache_creation_input_tokens,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                cache_read_tokens: u.cache_read_input_tokens,
+                cache_write_tokens: u.cache_creation_input_tokens,
+            });
+            None
+        }
+        AnthropicEvent::MessageDelta { usage } => {
+            // One Usage delta for the whole turn: input from message_start +
+            // the final cumulative output count here.
+            let mut combined = state.input_usage.take().unwrap_or_default();
+            combined.output_tokens = usage.output_tokens;
+            Some(Ok(LlmResponseDelta::Usage(combined)))
+        }
         AnthropicEvent::ContentBlockStart {
             index,
             content_block: AnthropicContentBlock::ToolUse { id, name },
@@ -346,6 +398,41 @@ mod tests {
             "tool id must not be duplicated across chunks"
         );
         assert_eq!(args, r#"{"command":"ls -la /home/zht/ignis"}"#);
+    }
+
+    #[test]
+    fn usage_is_parsed_from_message_start_and_delta() {
+        // Regression for #175: the Anthropic protocol dropped usage entirely
+        // (`_ => None`), so the context meter + telemetry read zero on the
+        // default provider. Input arrives on message_start (cache split out),
+        // the final output on message_delta — emit exactly one Usage delta.
+        let mut state = ParserState::default();
+        let sse = [
+            r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","usage":{"input_tokens":100,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":1}}}"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#,
+        ];
+        let deltas: Vec<_> = sse
+            .iter()
+            .filter_map(|l| parse_line(&mut state, l))
+            .map(|r| r.unwrap())
+            .collect();
+
+        let usages: Vec<&Usage> = deltas
+            .iter()
+            .filter_map(|d| match d {
+                LlmResponseDelta::Usage(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usages.len(), 1, "exactly one Usage delta per turn");
+        let u = usages[0];
+        assert_eq!(u.input_tokens, 125, "input folds in cache read + creation");
+        assert_eq!(u.output_tokens, 42);
+        assert_eq!(u.cache_read_tokens, 20);
+        assert_eq!(u.cache_write_tokens, 5);
+        assert_eq!(u.total(), 167);
     }
 
     #[test]

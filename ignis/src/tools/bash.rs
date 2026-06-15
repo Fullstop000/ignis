@@ -46,22 +46,53 @@ impl StaticTool for BashTool {
             Err(e) => return Err(format!("cwd '{}': {e}", self.cwd.display())),
         }
 
-        let child = tokio::process::Command::new("bash")
+        let mut builder = tokio::process::Command::new("bash");
+        builder
             .arg("-c")
             .arg(command)
             .current_dir(&self.cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // Backstop: dropping the wait future on timeout SIGKILLs the bash
+            // wrapper. The process group below is what actually reaps the
+            // command's descendants (#176).
+            .kill_on_drop(true);
+        // Put the shell in its own process group (PGID == its PID) so a timeout
+        // can SIGKILL the *whole group*. `kill_on_drop` alone only kills the
+        // `bash -c` wrapper; a compound command (`a; b`, pipes, redirections)
+        // forks children that bash does not `exec`, which would otherwise be
+        // orphaned into the next Sequential bash call.
+        #[cfg(unix)]
+        builder.process_group(0);
+
+        let child = builder
             .spawn()
             .map_err(|e| format!("Failed to spawn command: {e}"))?;
+        #[cfg(unix)]
+        let child_pid = child.id();
 
-        let output = tokio::time::timeout(
+        let output = match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             child.wait_with_output(),
         )
         .await
-        .map_err(|_| "Command timed out".to_string())?
-        .map_err(|e| format!("Command failed: {e}"))?;
+        {
+            Ok(result) => result.map_err(|e| format!("Command failed: {e}"))?,
+            Err(_elapsed) => {
+                // SIGKILL the whole process group to reap any descendants the
+                // shell forked; the wrapper itself is already dying via
+                // kill_on_drop (the wait future was just dropped).
+                #[cfg(unix)]
+                if let Some(pid) = child_pid {
+                    // SAFETY: async-signal-safe; negative pid targets the group.
+                    // ESRCH (already dead) is harmless.
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                }
+                return Err("Command timed out".to_string());
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -147,6 +178,89 @@ mod tests {
 
         assert!(res.is_error);
         assert!(res.content.contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_bash_timeout_kills_child() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("ignis-bash-kill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let tool = BashTool::new(&dir);
+
+        // `exec sleep` makes the spawned bash *become* the sleep process, so the
+        // `$$` written before exec is exactly the PID tokio holds — the one
+        // `kill_on_drop` must kill on timeout.
+        let cmd = format!("echo $$ > '{}'; exec sleep 30", pidfile.display());
+        let res = tool
+            .call(json!({ "command": cmd, "timeout_secs": 1 }))
+            .await;
+        assert!(res.is_error);
+        assert!(res.content.contains("timed out"), "got: {}", res.content);
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Poll for the SIGKILL to land and the zombie to be reaped (each sleep
+        // yields to tokio's orphan reaper). Before the fix the process lingered.
+        let mut alive = true;
+        for _ in 0..40 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !alive,
+            "bash child pid {pid} survived the timeout (orphaned)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_bash_timeout_kills_forked_descendants() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("ignis-bash-killgrp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let tool = BashTool::new(&dir);
+
+        // Compound command: bash does NOT exec — it forks `sleep` (whose PID is
+        // recorded via `$!`) and stays alive in `wait`. `kill_on_drop` would
+        // only kill the bash wrapper; the process-group SIGKILL must reap the
+        // forked sleep too.
+        let cmd = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
+        let res = tool
+            .call(json!({ "command": cmd, "timeout_secs": 1 }))
+            .await;
+        assert!(res.is_error);
+        assert!(res.content.contains("timed out"), "got: {}", res.content);
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut alive = true;
+        for _ in 0..40 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !alive,
+            "forked sleep pid {pid} survived the timeout (process group not killed)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

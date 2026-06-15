@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tools — `bash` now rejects a missing or non-directory `cwd` before spawning the shell. ([#187](https://github.com/Fullstop000/ignis/pull/187))
 - Security — `web_fetch` `domain:` permission rules now parse the URL with the same `reqwest` URL parser used for the actual request, closing bypasses where percent-encoded dots (`evil%2ecom`) or uppercase hosts (`EVIL.com`) slipped past a `domain:evil.com` deny rule. ([#188](https://github.com/Fullstop000/ignis/pull/188))
 - Tests — the flaky pty-timing integration test `inline_resize_replays_stable_rows_from_an_active_stream` is now `#[ignore]`d under parallel load; run it in isolation with `--ignored`. ([#187](https://github.com/Fullstop000/ignis/pull/187))
+- Sessions — a corrupt legacy `.json` transcript (partial write, hand-edit, truncation) no longer aborts startup for that directory; it degrades to empty history with a warning so you can still reach the TUI. ([#190](https://github.com/Fullstop000/ignis/pull/190))
+- Sessions — `/sessions`, `--resume`, and auto-resume no longer panic when a session's first message starts with a CJK/emoji character that straddles the preview cut-off; truncation is now character-based. ([#190](https://github.com/Fullstop000/ignis/pull/190))
+- Sessions — compaction no longer silently keeps a truncated summary when the summarization request drops mid-stream; the error now surfaces and your real history is left intact. ([#190](https://github.com/Fullstop000/ignis/pull/190))
+- LLM — the Anthropic protocol now reports token usage, so the context-% meter, `/settings` stats, and cost telemetry are no longer stuck at zero on Claude and the MiniMax default endpoint. ([#190](https://github.com/Fullstop000/ignis/pull/190))
+- Tools — `bash` kills a timed-out command's process instead of leaving it running to race the next bash call. ([#190](https://github.com/Fullstop000/ignis/pull/190))
+- Tools — `edit_file` now errors when `old_text` matches more than one place in the file instead of silently editing the first; add surrounding context or set `global_replace=true`. ([#190](https://github.com/Fullstop000/ignis/pull/190))
+- Tools — `read_file` no longer prints `... [truncated]` on a file it read completely (off-by-one), and hints when an `offset` lands past the end of the file. ([#190](https://github.com/Fullstop000/ignis/pull/190))
+- Sessions — the cumulative-token sidecar (`.usage.json`) is now written atomically, so a crash mid-write can no longer reset your token counters to zero. ([#190](https://github.com/Fullstop000/ignis/pull/190))
 
 ## [0.38.1] - 2026-06-12
 

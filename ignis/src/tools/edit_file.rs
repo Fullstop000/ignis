@@ -62,12 +62,22 @@ impl StaticTool for EditFileTool {
             .await
             .map_err(|e| format!("Failed to read file: {e}"))?;
 
-        if !content.contains(old_text) {
+        let occurrences = content.matches(old_text).count();
+        if occurrences == 0 {
             return Err("old_text not found in file".to_string());
         }
 
         let new_content = if global_replace {
             content.replace(old_text, new_text)
+        } else if occurrences > 1 {
+            // Refuse to silently edit the first of several matches — the wrong
+            // site could change. Mirror Claude Code / aider: ask for a unique
+            // anchor or an explicit global_replace (#177).
+            return Err(format!(
+                "old_text is not unique ({occurrences} occurrences); add more \
+                 surrounding context to identify a single match, or set \
+                 global_replace=true to replace every occurrence"
+            ));
         } else {
             content.replacen(old_text, new_text, 1)
         };
@@ -160,6 +170,31 @@ mod tests {
 
         assert!(res.is_error);
         assert!(res.content.contains("old_text not found"));
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_non_unique_match_errors_and_leaves_file_untouched() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_edit_nonunique.txt");
+        tokio::fs::write(&file_path, "foo bar foo").await.unwrap();
+
+        let tool = EditFileTool::new(&temp_dir);
+        let res = tool
+            .call(json!({
+                "path": "test_edit_nonunique.txt",
+                "old_text": "foo",
+                "new_text": "qux"
+            }))
+            .await;
+
+        assert!(res.is_error);
+        assert!(res.content.contains("not unique"), "got: {}", res.content);
+
+        // No silent first-match edit — the file is unchanged.
+        let after = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(after, "foo bar foo");
 
         let _ = tokio::fs::remove_file(&file_path).await;
     }

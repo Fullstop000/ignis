@@ -2,7 +2,7 @@ use crate::{Message, Usage};
 use async_trait::async_trait;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
@@ -167,6 +167,32 @@ impl FileStorage {
 
         Ok(out.into_bytes())
     }
+
+    /// Durably replace `path` with `bytes`: write to a sibling temp file
+    /// (fsync'd), rename over `path`, then fsync the directory on Unix so the
+    /// rename itself survives a crash. A reader therefore sees either the old
+    /// file or the complete new one — never a torn write. Callers hold
+    /// `write_lock` and must have created `path`'s parent directory.
+    async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), anyhow::Error> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("no parent directory for {}", path.display()))?;
+        let temp_path = parent.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+        {
+            let mut file = tokio::fs::File::create(&temp_path).await?;
+            file.write_all(bytes).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+        }
+        tokio::fs::rename(&temp_path, path).await?;
+        #[cfg(unix)]
+        {
+            if let Ok(dir) = tokio::fs::File::open(parent).await {
+                let _ = dir.sync_all().await;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -178,7 +204,18 @@ impl SessionStorage for FileStorage {
             if legacy_path.exists() {
                 let _lock = self.write_lock.read().await;
                 let file_content = tokio::fs::read_to_string(&legacy_path).await?;
-                let messages: Vec<Message> = serde_json::from_str(&file_content)?;
+                // Mirror the tolerant JSONL path: a corrupt legacy `.json`
+                // (partial write, hand-edit, truncation) must not abort startup
+                // for this cwd — degrade to empty history with a warning so the
+                // user can still reach the TUI.
+                let messages: Vec<Message> =
+                    serde_json::from_str(&file_content).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "ignoring corrupt legacy session file {}: {e}",
+                            legacy_path.display()
+                        );
+                        Vec::new()
+                    });
                 return Ok(messages);
             }
             return Ok(Vec::new());
@@ -205,27 +242,8 @@ impl SessionStorage for FileStorage {
 
         let _lock = self.write_lock.write().await;
 
-        // Atomic write procedure: write to a temp file, fsync, then rename.
-        let temp_filename = format!("{}.json.tmp", uuid::Uuid::new_v4());
-        let temp_path = parent.join(temp_filename);
         let serialized = Self::serialize_jsonl_session(session_id, messages, start_dir)?;
-        {
-            let mut file = tokio::fs::File::create(&temp_path).await?;
-            file.write_all(&serialized).await?;
-            file.flush().await?;
-            file.sync_all().await?;
-        }
-
-        // Atomic rename
-        tokio::fs::rename(&temp_path, &path).await?;
-
-        // Directory sync (Linux/Unix durability)
-        #[cfg(unix)]
-        {
-            if let Ok(dir) = tokio::fs::File::open(parent).await {
-                let _ = dir.sync_all().await;
-            }
-        }
+        Self::atomic_write(&path, &serialized).await?;
 
         Ok(())
     }
@@ -237,7 +255,10 @@ impl SessionStorage for FileStorage {
             tokio::fs::create_dir_all(parent).await?;
         }
         let _lock = self.write_lock.write().await;
-        tokio::fs::write(&path, serde_json::to_string(usage)?).await?;
+        // Atomic so a crash mid-write can't leave a truncated `.usage.json`
+        // (which `load_usage` would silently reset to zero).
+        let bytes = serde_json::to_vec(usage)?;
+        Self::atomic_write(&path, &bytes).await?;
         Ok(())
     }
 
@@ -334,6 +355,61 @@ mod tests {
                 "tool_result".to_string()
             ]
         );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A corrupt legacy `.json` transcript (partial write / truncation) must
+    /// degrade to empty history instead of aborting `load_session` — otherwise
+    /// ignis fails to launch for that cwd (#180).
+    #[tokio::test]
+    async fn corrupt_legacy_json_session_loads_as_empty_not_error() {
+        let tmp = crate::util::unique_temp_dir("ignis-storage-corrupt");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let storage = FileStorage::new(tmp.clone());
+
+        // Pure-alphanumeric id so the on-disk name matches verbatim. No `.jsonl`
+        // exists, so load_session falls through to the legacy `.json` branch.
+        let id = "legacycorrupt";
+        std::fs::write(tmp.join(format!("{id}.json")), b"[{\"role\":\"user\",").unwrap();
+
+        let loaded = storage.load_session(id).await.unwrap();
+        assert!(
+            loaded.is_empty(),
+            "corrupt legacy json should degrade to empty history, not error"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// `save_usage` must be atomic (tmp + rename) so a crash mid-write can't
+    /// leave a truncated `.usage.json` that resets token counters to zero (#184).
+    #[tokio::test]
+    async fn save_usage_is_atomic_and_round_trips() {
+        let tmp = crate::util::unique_temp_dir("ignis-storage-usage");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let storage = FileStorage::new(tmp.clone());
+
+        let usage = Usage {
+            input_tokens: 1234,
+            output_tokens: 56,
+            reasoning_tokens: 7,
+            cache_read_tokens: 8,
+            cache_write_tokens: 9,
+        };
+        storage.save_usage("sess-u", &usage).await.unwrap();
+
+        let loaded = storage.load_usage("sess-u").await.unwrap();
+        assert_eq!(loaded.input_tokens, 1234);
+        assert_eq!(loaded.output_tokens, 56);
+        assert_eq!(loaded.cache_read_tokens, 8);
+
+        // A successful atomic write leaves no temp file behind.
+        let leftover_tmp = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp, "atomic write left a temp file behind");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
