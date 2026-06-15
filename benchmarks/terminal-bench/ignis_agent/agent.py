@@ -203,15 +203,6 @@ class IgnisAgent(BaseInstalledAgent):
 
         log_path = (EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME).as_posix()
         sessions_dst = (EnvironmentPaths.agent_dir / "ignis-projects").as_posix()
-        # Optional knobs forwarded from the harbor host env into the sandbox
-        # process env. Used for A/B benchmarking ignis-internal behaviors that
-        # are gated by an env var (e.g. IGNIS_HISTORY_TRIM for the outbound
-        # history trim — set `off` to disable, anything else to enable).
-        env_prefix = ""
-        for var in ("IGNIS_HISTORY_TRIM",):
-            val = self._get_env(var)
-            if val is not None:
-                env_prefix += f"{var}={shlex.quote(val)} "
         try:
             await self.exec_as_agent(
                 environment,
@@ -220,7 +211,7 @@ class IgnisAgent(BaseInstalledAgent):
                     # begins with `-` (clap otherwise rejects it as an unknown
                     # flag and the run dies before any tool call) is passed as
                     # the positional prompt.
-                    f"{env_prefix}ignis -- {shlex.quote(instruction)} "
+                    f"ignis -- {shlex.quote(instruction)} "
                     f"2>&1 | stdbuf -oL tee {shlex.quote(log_path)}"
                 ),
             )
