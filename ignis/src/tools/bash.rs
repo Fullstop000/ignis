@@ -52,6 +52,11 @@ impl StaticTool for BashTool {
             .current_dir(&self.cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // On timeout the `wait_with_output` future below is dropped, which
+            // drops the `Child`; `kill_on_drop` then SIGKILLs it instead of
+            // orphaning a still-running process that the next Sequential bash
+            // call could race (e.g. a lingering server or runaway loop) (#176).
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("Failed to spawn command: {e}"))?;
 
@@ -147,6 +152,48 @@ mod tests {
 
         assert!(res.is_error);
         assert!(res.content.contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_bash_timeout_kills_child() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("ignis-bash-kill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let tool = BashTool::new(&dir);
+
+        // `exec sleep` makes the spawned bash *become* the sleep process, so the
+        // `$$` written before exec is exactly the PID tokio holds — the one
+        // `kill_on_drop` must kill on timeout.
+        let cmd = format!("echo $$ > '{}'; exec sleep 30", pidfile.display());
+        let res = tool
+            .call(json!({ "command": cmd, "timeout_secs": 1 }))
+            .await;
+        assert!(res.is_error);
+        assert!(res.content.contains("timed out"), "got: {}", res.content);
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Poll for the SIGKILL to land and the zombie to be reaped (each sleep
+        // yields to tokio's orphan reaper). Before the fix the process lingered.
+        let mut alive = true;
+        for _ in 0..40 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !alive,
+            "bash child pid {pid} survived the timeout (orphaned)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

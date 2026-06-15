@@ -742,8 +742,14 @@ impl Agent {
             .await?;
         let mut out = String::new();
         while let Some(delta) = stream.next().await {
-            if let Ok(LlmResponseDelta::Text(text)) = delta {
-                out.push_str(&text);
+            match delta {
+                Ok(LlmResponseDelta::Text(text)) => out.push_str(&text),
+                // A mid-stream transport drop must surface, not silently
+                // truncate: `Session::compact` replaces real history with this
+                // text, so a partial summary would permanently lose context
+                // (#182). Non-text deltas (reasoning/usage/tool) are ignored.
+                Err(e) => return Err(e),
+                Ok(_) => {}
             }
         }
         Ok(out)
@@ -1330,6 +1336,49 @@ mod tests {
         assert_eq!(result.assistant_content, "hello world");
         assert!(result.stream_error.is_none());
         assert!(!result.is_empty(), "non-empty content => is_empty()==false");
+    }
+
+    #[tokio::test]
+    async fn complete_surfaces_mid_stream_error_instead_of_truncating() {
+        // A provider that emits a partial summary then drops mid-stream.
+        // `complete()` (used by `Session::compact`) must return Err so the
+        // partial text never permanently replaces real history (#182).
+        struct DropMidStream;
+        #[async_trait::async_trait]
+        impl LlmProvider for DropMidStream {
+            fn model_id(&self) -> &str {
+                "mock"
+            }
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+            async fn chat_stream(
+                &self,
+                _system_prompt: &str,
+                _messages: &[Message],
+                _tools: &[serde_json::Value],
+            ) -> Result<
+                futures_util::stream::BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
+                anyhow::Error,
+            > {
+                use futures_util::stream::StreamExt;
+                let items: Vec<Result<LlmResponseDelta, anyhow::Error>> = vec![
+                    Ok(LlmResponseDelta::Text("partial sum".to_string())),
+                    Err(anyhow::anyhow!(
+                        "error reading a body from connection: connection reset"
+                    )),
+                ];
+                Ok(futures_util::stream::iter(items).boxed())
+            }
+        }
+
+        let agent = Agent::new("system".to_string(), Box::new(DropMidStream));
+        let res = agent.complete("system", &[]).await;
+        assert!(
+            res.is_err(),
+            "mid-stream error must surface as Err, got Ok({:?})",
+            res.ok()
+        );
     }
 
     #[test]

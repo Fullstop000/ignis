@@ -782,14 +782,7 @@ impl SessionManager {
             .iter()
             .find(|m| m.role == "user")
             .and_then(|m| m.content.as_ref())
-            .map(|c| {
-                let trimmed = c.trim();
-                if trimmed.len() > 80 {
-                    format!("{}…", &trimmed[..80])
-                } else {
-                    trimmed.to_string()
-                }
-            })
+            .map(|c| truncate_preview(c.trim(), 80))
             .unwrap_or_default();
 
         // Extract start_dir from session_meta line
@@ -816,6 +809,17 @@ impl SessionManager {
     }
 }
 
+/// Truncate `s` to at most `max` characters (not bytes), appending `…` when it
+/// was shortened. Char-based so a multibyte first message (CJK/emoji) can't
+/// panic the `/sessions` list by slicing mid-codepoint (#181).
+fn truncate_preview(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
 /// Print a formatted table of sessions to stdout
 pub fn print_sessions(sessions: &[SessionMeta]) {
     if sessions.is_empty() {
@@ -831,11 +835,7 @@ pub fn print_sessions(sessions: &[SessionMeta]) {
     println!("{}", "─".repeat(90));
 
     for s in sessions {
-        let preview = if s.preview.len() > 40 {
-            format!("{}…", &s.preview[..40])
-        } else {
-            s.preview.clone()
-        };
+        let preview = truncate_preview(&s.preview, 40);
         println!(
             "{:<30} {:>6}  {:<15}  {}",
             s.id,
@@ -1224,5 +1224,55 @@ mod tests {
         let before_len = history.len();
         heal_interrupted_tool_calls(&mut history);
         assert_eq!(history.len(), before_len);
+    }
+
+    #[test]
+    fn truncate_preview_is_char_safe_on_multibyte() {
+        // 100 CJK chars (3 bytes each = 300 bytes); a byte slice at 80 would
+        // land mid-codepoint and panic.
+        let s = "中".repeat(100);
+        let out = truncate_preview(&s, 80);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 81, "80 chars plus the ellipsis");
+        // An emoji straddling the boundary is likewise safe.
+        let emoji = "😀".repeat(50);
+        let out2 = truncate_preview(&emoji, 40);
+        assert_eq!(out2.chars().filter(|&c| c == '😀').count(), 40);
+        // Short input passes through unchanged with no ellipsis.
+        assert_eq!(truncate_preview("hi", 80), "hi");
+    }
+
+    /// End-to-end: a session whose first user message is multibyte-heavy must
+    /// list without panicking the byte-slice in `read_session_meta`/`print_sessions`
+    /// (#181) — the same class as the fixed `get_git_diff` startup crash.
+    #[tokio::test]
+    async fn list_does_not_panic_on_multibyte_first_message() {
+        let dir = crate::util::unique_temp_dir("ignis-sessions-multibyte");
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = FileStorage::new(dir.clone());
+
+        let msg = Message {
+            role: "user".to_string(),
+            content: Some("中".repeat(100)),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: Some(1_000_000),
+        };
+        storage
+            .save_session("multibyte-sess", &[msg], Some("/proj"))
+            .await
+            .unwrap();
+
+        let manager = SessionManager::new(dir.clone());
+        let sessions = manager.list(); // would panic before the fix
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].preview.chars().count() <= 81);
+
+        // The CLI table re-truncates the preview at 40 — also byte-sliced before.
+        print_sessions(&sessions);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
