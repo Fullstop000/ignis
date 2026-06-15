@@ -50,8 +50,13 @@ impl StaticTool for ReadFileTool {
 
         // Peek one extra line so truncation is flagged only when content was
         // actually cut — a file with exactly `limit` lines remaining is
-        // complete, not truncated (#179).
-        let mut lines: Vec<&str> = content.lines().skip(offset).take(limit + 1).collect();
+        // complete, not truncated (#179). `saturating_add` guards a
+        // model-supplied `limit` near `usize::MAX` from overflowing.
+        let mut lines: Vec<&str> = content
+            .lines()
+            .skip(offset)
+            .take(limit.saturating_add(1))
+            .collect();
         let truncated = lines.len() > limit;
         if truncated {
             lines.truncate(limit);
@@ -137,6 +142,26 @@ mod tests {
             res.content, "a\nb\nc",
             "a complete file must not look truncated"
         );
+        assert!(!res.content.contains("[truncated]"));
+
+        let _ = tokio::fs::remove_file(file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_file_huge_limit_does_not_overflow() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_read_huge_limit.txt");
+        tokio::fs::write(&file_path, "a\nb\nc").await.unwrap();
+
+        let tool = ReadFileTool::new(&temp_dir);
+        // A model-supplied limit near usize::MAX must not overflow `limit + 1`
+        // (debug panic / release wrap-to-zero).
+        let res = tool
+            .call(json!({ "path": "test_read_huge_limit.txt", "limit": u64::MAX }))
+            .await;
+
+        assert!(!res.is_error);
+        assert_eq!(res.content, "a\nb\nc");
         assert!(!res.content.contains("[truncated]"));
 
         let _ = tokio::fs::remove_file(file_path).await;
