@@ -5,10 +5,11 @@
 //! Keeping these types in a module independent of `console::picker` means
 //! headless tools, tests, and permission logic can construct and receive
 //! picker requests without depending on the TUI layer.
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 /// A single selectable option within a question.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PickerOption {
     /// 1-5 word display text shown in the list.
     pub label: String,
@@ -21,7 +22,7 @@ pub struct PickerOption {
 
 /// One question with its options. The console renders these one at a time,
 /// advancing on ENTER, finishing the request on the last question.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PickerQuestion {
     /// The complete question text.
     pub question: String,
@@ -60,7 +61,7 @@ pub struct PickerRequest {
 }
 
 /// What the console returns to the tool when the picker closes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PickerResponse {
     /// One answer per question, in the same order as `questions`.
     Answered(Vec<PickerAnswer>),
@@ -69,7 +70,7 @@ pub enum PickerResponse {
 }
 
 /// One question's answer. Shape mirrors what the tool returns to the model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PickerAnswer {
     /// Single-select pick (the option's label, or the user's text for "Other").
     Single(String),

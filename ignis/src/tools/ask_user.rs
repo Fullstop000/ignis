@@ -499,11 +499,20 @@ mod tests {
 #[cfg(test)]
 mod end_to_end {
     use super::*;
-    use crate::console::inline_picker::{InlinePickerState, KeyOutcome};
+    use crate::console::inline_picker::{InlinePickerState, KeyOutcome, PickerReply};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// These tests build the picker with [`InlinePickerState::local`], so the
+    /// reply is always a local oneshot — pull it out, asserting that.
+    fn expect_local_reply(reply: PickerReply) -> tokio::sync::oneshot::Sender<PickerResponse> {
+        match reply {
+            PickerReply::Local(tx) => tx,
+            PickerReply::Request(_) => panic!("test picker must be local"),
+        }
     }
 
     /// Drive the picker by feeding `keys` until it terminates; reply on the
@@ -513,14 +522,12 @@ mod end_to_end {
             match state.on_key(*k) {
                 KeyOutcome::Continue => {}
                 KeyOutcome::Cancel => {
-                    let reply = state.reply.take().expect("reply present");
-                    let _ = reply.send(PickerResponse::Cancelled);
+                    let _ = expect_local_reply(state.reply).send(PickerResponse::Cancelled);
                     return PickerResponse::Cancelled;
                 }
                 KeyOutcome::Done(answers) => {
                     let resp = PickerResponse::Answered(answers);
-                    let reply = state.reply.take().expect("reply present");
-                    let _ = reply.send(resp.clone());
+                    let _ = expect_local_reply(state.reply).send(resp.clone());
                     return resp;
                 }
             }
@@ -543,7 +550,7 @@ mod end_to_end {
             }]}))
             .await
         });
-        let state = InlinePickerState::new(rx.recv().await.unwrap());
+        let state = InlinePickerState::local(rx.recv().await.unwrap());
         drive(state, &[key(KeyCode::Down), key(KeyCode::Enter)]);
         let result = call.await.unwrap();
         assert!(!result.is_error, "{}", result.content);
@@ -568,7 +575,7 @@ mod end_to_end {
             }]}))
             .await
         });
-        let state = InlinePickerState::new(rx.recv().await.unwrap());
+        let state = InlinePickerState::local(rx.recv().await.unwrap());
         drive(
             state,
             &[
@@ -599,7 +606,7 @@ mod end_to_end {
             }]}))
             .await
         });
-        let state = InlinePickerState::new(rx.recv().await.unwrap());
+        let state = InlinePickerState::local(rx.recv().await.unwrap());
         let mut keys = vec![key(KeyCode::Down), key(KeyCode::Down)];
         for c in "my custom thing".chars() {
             keys.push(key(KeyCode::Char(c)));
@@ -627,7 +634,7 @@ mod end_to_end {
             }]}))
             .await
         });
-        let state = InlinePickerState::new(rx.recv().await.unwrap());
+        let state = InlinePickerState::local(rx.recv().await.unwrap());
         drive(state, &[key(KeyCode::Esc)]);
         let result = call.await.unwrap();
         assert!(result.is_error);
@@ -651,7 +658,7 @@ mod end_to_end {
             ]}))
             .await
         });
-        let state = InlinePickerState::new(rx.recv().await.unwrap());
+        let state = InlinePickerState::local(rx.recv().await.unwrap());
         // Q1 Enter → serde_json; Q2 Down+Enter → lax → review; final Enter
         // submits the batch from the review-and-submit screen (multi-question
         // batches stop at review before returning).

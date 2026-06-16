@@ -73,6 +73,11 @@ pub enum AgentEvent {
     /// to surface a soft failure without breaking the turn.
     #[serde(rename = "warning")]
     Warning { source: String, message: String },
+    /// Neutral out-of-band message (e.g. `/connect`'s "✓ Connected" / failure
+    /// lines). Like [`AgentEvent::Warning`] but without the soft-failure framing
+    /// — rendered as a plain notice line, never as `[warn]`.
+    #[serde(rename = "notice")]
+    Notice { message: String },
 }
 
 /// Build the system prompt for an interactive/one-shot run: the static agent
