@@ -48,6 +48,12 @@ impl StaticTool for ReadFileTool {
             .await
             .map_err(|e| format!("Failed to read file: {e}"))?;
 
+        // Explicit sentinel so the model can tell an empty file from a tool that
+        // returned nothing (a bare "").
+        if content.is_empty() {
+            return Ok("(empty file)".to_string());
+        }
+
         // Peek one extra line so truncation is flagged only when content was
         // actually cut — a file with exactly `limit` lines remaining is
         // complete, not truncated (#179). `saturating_add` guards a
@@ -73,7 +79,8 @@ impl StaticTool for ReadFileTool {
 
         let mut result = lines.join("\n");
         if truncated {
-            result.push_str("\n... [truncated]");
+            result.push('\n');
+            result.push_str(crate::tools::util::TRUNCATION_MARKER);
         }
         Ok(result)
     }
@@ -121,6 +128,23 @@ mod tests {
 
         assert!(!res.is_error);
         assert_eq!(res.content, "line 2\nline 3\n... [truncated]");
+
+        let _ = tokio::fs::remove_file(file_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_file_empty_file_returns_sentinel() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_read_empty_file.txt");
+        tokio::fs::write(&file_path, "").await.unwrap();
+
+        let tool = ReadFileTool::new(&temp_dir);
+        let res = tool
+            .call(json!({ "path": "test_read_empty_file.txt" }))
+            .await;
+
+        assert!(!res.is_error);
+        assert_eq!(res.content, "(empty file)");
 
         let _ = tokio::fs::remove_file(file_path).await;
     }

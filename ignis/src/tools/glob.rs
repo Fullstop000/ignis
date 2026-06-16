@@ -81,7 +81,7 @@ impl StaticTool for GlobTool {
             return Ok("No files matched.".to_string());
         }
         if truncated {
-            paths.push(format!("… (truncated at {MAX_PATHS} files)"));
+            paths.push(format!("... [truncated at {MAX_PATHS} files]"));
         }
         Ok(paths.join("\n"))
     }

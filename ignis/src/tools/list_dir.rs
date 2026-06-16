@@ -48,6 +48,11 @@ impl StaticTool for ListDirTool {
         }
 
         lines.sort();
+        // Explicit sentinel so the model can tell an empty directory from a
+        // tool that returned nothing (a bare "").
+        if lines.is_empty() {
+            return Ok("(empty directory)".to_string());
+        }
         Ok(lines.join("\n"))
     }
 }
@@ -81,5 +86,23 @@ mod tests {
         let _ = tokio::fs::remove_file(file_path).await;
         let _ = tokio::fs::remove_dir(sub_subdir).await;
         let _ = tokio::fs::remove_dir(test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_empty_returns_sentinel() {
+        let temp_dir = std::env::temp_dir();
+        let empty_dir = temp_dir.join("test_list_dir_empty_subdir");
+        let _ = tokio::fs::remove_dir_all(&empty_dir).await;
+        tokio::fs::create_dir_all(&empty_dir).await.unwrap();
+
+        let tool = ListDirTool::new(&temp_dir);
+        let res = tool
+            .call(json!({ "path": "test_list_dir_empty_subdir" }))
+            .await;
+
+        assert!(!res.is_error);
+        assert_eq!(res.content, "(empty directory)");
+
+        let _ = tokio::fs::remove_dir(empty_dir).await;
     }
 }

@@ -168,7 +168,7 @@ fn extract_result(snippet_field: &str) -> impl Fn(&serde_json::Value) -> SearchR
 
 /// Truncate an error body so a failed request doesn't flood the context.
 fn truncate(body: &str) -> String {
-    body.chars().take(300).collect()
+    crate::tools::util::truncate_chars(body, 300)
 }
 
 #[cfg(test)]

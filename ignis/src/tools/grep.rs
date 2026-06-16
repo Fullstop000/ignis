@@ -103,7 +103,7 @@ impl StaticTool for GrepTool {
             return Ok("No matches.".to_string());
         }
         if truncated {
-            lines.push(format!("… (truncated at {MAX_MATCHES} matches)"));
+            lines.push(format!("... [truncated at {MAX_MATCHES} matches]"));
         }
         Ok(lines.join("\n"))
     }

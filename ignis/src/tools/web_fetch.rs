@@ -74,13 +74,7 @@ impl StaticTool for WebFetchTool {
         if text.is_empty() {
             return Ok("(empty response)".to_string());
         }
-        let out: String = text.chars().take(MAX_OUTPUT_CHARS).collect();
-        let suffix = if text.chars().count() > MAX_OUTPUT_CHARS {
-            "\n… (truncated)"
-        } else {
-            ""
-        };
-        Ok(format!("{out}{suffix}"))
+        Ok(crate::tools::util::truncate_chars(text, MAX_OUTPUT_CHARS))
     }
 }
 
