@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-06-16
+
 ### Added
+- TUI — an experimental opt-in Ink frontend (set `IGNIS_FRONTEND=ink`, requires Node) renders at parity with the native terminal UI and falls back to it when Node is unavailable. ([#174](https://github.com/Fullstop000/ignis/pull/174))
 - Tools — `edit_file` accepts an optional `global_replace=true` parameter to replace every occurrence of `old_text` instead of only the first. ([#187](https://github.com/Fullstop000/ignis/pull/187))
 - Tools — `web_fetch` and `web_search` now retry transient failures (timeouts, connection drops, and 5xx responses) with exponential backoff. ([#187](https://github.com/Fullstop000/ignis/pull/187))
 - Hooks — hook executables can now be bare command names resolved on `$PATH`, and invalid env-var names are rejected at config load time. ([#187](https://github.com/Fullstop000/ignis/pull/187))
