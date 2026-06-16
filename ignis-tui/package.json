@@ -1,0 +1,24 @@
+{
+  "name": "ignis-tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ink frontend for ignis — owns the terminal and drives `ignis --engine` over the NDJSON protocol (PR #174, topology ii).",
+  "bin": {
+    "ignis-tui": "src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ink": "^5.0.1",
+    "react": "^18.3.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "ink-testing-library": "^4.0.0"
+  }
+}
