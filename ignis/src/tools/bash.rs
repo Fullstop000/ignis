@@ -112,7 +112,8 @@ impl StaticTool for BashTool {
 
         if combined.len() > BASH_OUTPUT_LIMIT {
             truncate_on_char_boundary(&mut combined, BASH_OUTPUT_LIMIT);
-            combined.push_str("\n... [truncated]");
+            combined.push('\n');
+            combined.push_str(crate::tools::util::TRUNCATION_MARKER);
         }
 
         if !output.status.success() {
