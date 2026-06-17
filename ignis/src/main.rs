@@ -146,20 +146,21 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {
-        // Frontend selection (PR #174, topology ii). Ratatui in-process is the
-        // default + always-available fallback; the Ink frontend is opt-in via
-        // IGNIS_FRONTEND=ink + IGNIS_TUI_ENTRY=<path to ignis-tui/src/cli.js>.
-        // When selected, the Ink host owns the terminal and spawns THIS binary
-        // as `--engine` (IGNIS_ENGINE_BIN below). Any failure — Node missing,
-        // entry unset, spawn error — falls through to the built-in TUI.
+        // Frontend selection (PR #174, topology ii). When the Ink frontend can be
+        // located — `ignis-tui/src/cli.js` next to the binary (source/dev layout)
+        // or an explicit IGNIS_TUI_ENTRY — it is the default; the Ink host owns the
+        // terminal and spawns THIS binary as `--engine` (IGNIS_ENGINE_BIN below).
+        // `IGNIS_FRONTEND=native` forces the built-in ratatui TUI. Any failure —
+        // Node missing, no entry, spawn error — falls through to the built-in TUI.
         //
-        // PACKAGING (deferred, needs sign-off): a real install must decide how
-        // `ignis-tui` + a Node runtime ship — bundle Node, require system Node,
-        // or vendor the JS — and only then can the entry be auto-located instead
-        // of passed via IGNIS_TUI_ENTRY. Not finalized here; release.yml unchanged.
+        // PACKAGING (deferred, needs sign-off): released binaries ship no
+        // `ignis-tui`, so auto-location finds nothing and they stay on ratatui. A
+        // real install still has to decide how the JS + a Node runtime ship.
+        let ink_entry =
+            ignis::cli::locate_ink_entry(std::env::var("IGNIS_TUI_ENTRY").ok().as_deref());
         if let ignis::cli::Frontend::Ink { entry } = ignis::cli::resolve_frontend(
             std::env::var("IGNIS_FRONTEND").ok().as_deref(),
-            std::env::var("IGNIS_TUI_ENTRY").ok().as_deref(),
+            ink_entry.as_deref(),
         ) {
             match launch_ink_frontend(&entry).await {
                 Ok(code) => {

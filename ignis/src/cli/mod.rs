@@ -160,22 +160,79 @@ pub enum Frontend {
     Ink { entry: String },
 }
 
-/// Resolve the frontend choice from the environment. Ratatui is the default;
-/// the Ink frontend is selected only when `IGNIS_FRONTEND=ink` AND a non-empty
-/// `IGNIS_TUI_ENTRY` (the path to `ignis-tui/src/cli.js`) is given. A missing
-/// entry falls back to ratatui rather than guessing an install layout — locating
-/// the Ink app is the deferred packaging decision (bundle Node vs require system
-/// Node; where `ignis-tui` ships).
+/// Resolve the frontend choice. When an Ink `entry` is available, Ink is the
+/// default — `IGNIS_FRONTEND` unset or `=ink` both select it. `IGNIS_FRONTEND`
+/// of `native`/`ratatui`/`tui` forces the built-in TUI even when Ink is present.
+/// With no entry — released binaries ship no `ignis-tui` — we always fall back to
+/// ratatui, so Ink only engages where its JS is actually located.
 pub fn resolve_frontend(frontend: Option<&str>, entry: Option<&str>) -> Frontend {
-    match frontend {
-        Some("ink") => match entry {
-            Some(e) if !e.trim().is_empty() => Frontend::Ink {
-                entry: e.to_string(),
-            },
-            _ => Frontend::Ratatui,
+    // Explicit opt-out always wins, even when an Ink entry exists.
+    if matches!(frontend, Some("native") | Some("ratatui") | Some("tui")) {
+        return Frontend::Ratatui;
+    }
+    match entry {
+        Some(e) if !e.trim().is_empty() => Frontend::Ink {
+            entry: e.to_string(),
         },
         _ => Frontend::Ratatui,
     }
+}
+
+/// A bundled `ignis-tui` is only *runnable* if its deps are installed: a bare
+/// source checkout (or a fresh CI clone) has `src/cli.js` but no `node_modules`,
+/// and launching it would crash on a missing `ink` import instead of falling back
+/// to the built-in TUI. Require both so "Ink is available" stays honest. Installs
+/// always bundle `node_modules`, so this only filters out un-`npm install`ed
+/// checkouts.
+fn runnable_ink_entry(tui_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let cli = tui_dir.join("src").join("cli.js");
+    let deps = tui_dir.join("node_modules");
+    (cli.is_file() && deps.is_dir()).then_some(cli)
+}
+
+/// Walk up from `start` (inclusive), returning the first runnable `ignis-tui`
+/// found. `cargo run` puts the binary under `target/<profile>/`, two levels below
+/// the repo root that holds `ignis-tui/`, so a shallow walk finds it.
+fn find_ink_entry_from(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = Some(start);
+    for _ in 0..6 {
+        let d = dir?;
+        if let Some(cli) = runnable_ink_entry(&d.join("ignis-tui")) {
+            return Some(cli);
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The Ink entry an `install.sh` / `ignis upgrade` install lays down. The JS
+/// ships to `~/.ignis/ignis-tui/` regardless of where the binary itself was
+/// installed (the install dir is configurable), so this is checked independently
+/// of the executable's location.
+fn ink_entry_in_ignis_home(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    runnable_ink_entry(&home.join(".ignis").join("ignis-tui"))
+}
+
+/// Locate the Ink frontend entry script. Order: an explicit non-empty
+/// `IGNIS_TUI_ENTRY` wins; then the source-layout `ignis-tui/src/cli.js` found by
+/// walking up from the running binary (`cargo run`); then the installed copy at
+/// `~/.ignis/ignis-tui/src/cli.js` that releases lay down. Returns `None` when
+/// none exist, so the caller falls back to the built-in TUI.
+pub fn locate_ink_entry(explicit: Option<&str>) -> Option<String> {
+    if let Some(e) = explicit {
+        if !e.trim().is_empty() {
+            return Some(e.to_string());
+        }
+    }
+    if let Some(found) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().and_then(find_ink_entry_from))
+    {
+        return Some(found.to_string_lossy().into_owned());
+    }
+    dirs::home_dir()
+        .and_then(|h| ink_entry_in_ignis_home(&h))
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -184,26 +241,72 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn frontend_defaults_to_ratatui_and_ink_needs_an_entry() {
-        // Default + anything that isn't a fully-specified Ink request → ratatui.
+    fn ink_is_the_default_when_an_entry_is_available() {
+        let ink = Frontend::Ink {
+            entry: "/path/cli.js".to_string(),
+        };
+        // No entry → ratatui no matter what IGNIS_FRONTEND says.
         assert_eq!(resolve_frontend(None, None), Frontend::Ratatui);
-        assert_eq!(resolve_frontend(Some("tui"), Some("/x")), Frontend::Ratatui);
-        assert_eq!(
-            resolve_frontend(Some("ink"), None),
-            Frontend::Ratatui,
-            "ink without an entry falls back rather than guessing"
-        );
+        assert_eq!(resolve_frontend(Some("ink"), None), Frontend::Ratatui);
         assert_eq!(
             resolve_frontend(Some("ink"), Some("   ")),
             Frontend::Ratatui
         );
-        // Fully-specified Ink request.
+        // Entry present → Ink is the default (unset) and the explicit choice.
+        assert_eq!(resolve_frontend(None, Some("/path/cli.js")), ink);
+        assert_eq!(resolve_frontend(Some("ink"), Some("/path/cli.js")), ink);
+        // Opt-out forces ratatui even with an entry available.
+        for opt_out in ["native", "ratatui", "tui"] {
+            assert_eq!(
+                resolve_frontend(Some(opt_out), Some("/path/cli.js")),
+                Frontend::Ratatui,
+                "IGNIS_FRONTEND={opt_out} must force the built-in TUI"
+            );
+        }
+    }
+
+    #[test]
+    fn locate_ink_entry_prefers_explicit_then_walks_up() {
+        // Explicit non-empty wins outright (no filesystem touch).
         assert_eq!(
-            resolve_frontend(Some("ink"), Some("/path/cli.js")),
-            Frontend::Ink {
-                entry: "/path/cli.js".to_string()
-            }
+            locate_ink_entry(Some("/explicit/cli.js")),
+            Some("/explicit/cli.js".to_string())
         );
+        // Empty/whitespace explicit is ignored.
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("target").join("debug");
+        std::fs::create_dir_all(&nested).unwrap();
+        // No ignis-tui anywhere up the tree → None.
+        assert_eq!(find_ink_entry_from(&nested), None);
+        // Plant a source layout with cli.js but NO node_modules → not runnable.
+        let tui = dir.path().join("ignis-tui");
+        let cli = tui.join("src").join("cli.js");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "").unwrap();
+        assert_eq!(
+            find_ink_entry_from(&nested),
+            None,
+            "cli.js without node_modules must not count as available"
+        );
+        // Install the deps → now runnable, found by walking up from deep below.
+        std::fs::create_dir_all(tui.join("node_modules")).unwrap();
+        assert_eq!(find_ink_entry_from(&nested), Some(cli));
+    }
+
+    #[test]
+    fn ink_entry_found_in_installed_ignis_home() {
+        let home = tempfile::tempdir().unwrap();
+        // Nothing laid down yet.
+        assert_eq!(ink_entry_in_ignis_home(home.path()), None);
+        // An install drops the JS + deps at ~/.ignis/ignis-tui/.
+        let tui = home.path().join(".ignis").join("ignis-tui");
+        let cli = tui.join("src").join("cli.js");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "").unwrap();
+        // cli.js alone isn't enough.
+        assert_eq!(ink_entry_in_ignis_home(home.path()), None);
+        std::fs::create_dir_all(tui.join("node_modules")).unwrap();
+        assert_eq!(ink_entry_in_ignis_home(home.path()), Some(cli));
     }
 
     fn parse(argv: &[&str]) -> Cli {
