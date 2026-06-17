@@ -104,12 +104,35 @@ mkdir -p "$INSTALL_DIR"
 # `install` copies in place and can leave a half-written binary on signal /
 # ENOSPC. `mv` within the same directory uses rename(2) — all-or-nothing.
 staged="$INSTALL_DIR/.ignis.install.$$"
-trap 'rm -f "$staged"; rm -rf "$tmp"' EXIT INT TERM
+tui_staged="$HOME/.ignis/.ignis-tui.install.$$"
+trap 'rm -f "$staged"; rm -rf "$tui_staged" "$tmp"' EXIT INT TERM
 cp "$src" "$staged"
 chmod 0755 "$staged"
 mv -f "$staged" "$INSTALL_DIR/ignis"
 
 echo "ignis ${VERSION} installed to ${INSTALL_DIR}/ignis"
+
+# Optional Ink frontend: releases bundle `ignis-tui/` (the Node frontend with its
+# deps) next to the binary. Lay it down at ~/.ignis/ignis-tui so `ignis` finds it
+# regardless of the install dir; `ignis` runs it by default when Node >=18 is on
+# PATH and falls back to the built-in TUI otherwise. Older tarballs omit it.
+tui_src="$tmp/ignis-${VERSION}-${target}/ignis-tui"
+if [ -d "$tui_src" ]; then
+    mkdir -p "$HOME/.ignis"
+    rm -rf "$tui_staged"
+    cp -R "$tui_src" "$tui_staged"
+    rm -rf "$HOME/.ignis/ignis-tui"
+    mv -f "$tui_staged" "$HOME/.ignis/ignis-tui"
+    # ink 5 / react 18 need Node >=18; older or missing Node falls back to the
+    # built-in TUI at runtime, so only advertise Ink when the version is right.
+    node_major=$(node --version 2>/dev/null | sed 's/^v//; s/\..*//')
+    if [ -n "$node_major" ] && [ "$node_major" -ge 18 ] 2>/dev/null; then
+        echo "Ink frontend installed (default UI). Set IGNIS_FRONTEND=native for the built-in TUI."
+    else
+        echo "Ink frontend installed, but Node >=18 was not found — ignis will use the"
+        echo "built-in TUI until Node (>=18) is on your PATH."
+    fi
+fi
 
 case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;

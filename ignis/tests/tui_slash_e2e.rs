@@ -50,6 +50,9 @@ impl TuiProcess {
         command.env("HOME", home.as_os_str());
         command.env("TERM", "xterm-256color");
         command.env("NO_COLOR", "1");
+        // This suite drives the built-in ratatui TUI; pin it so a developer with
+        // ignis-tui deps installed doesn't auto-launch the Ink frontend instead.
+        command.env("IGNIS_FRONTEND", "native");
 
         let child = pair.slave.spawn_command(command).unwrap();
         let mut reader = pair.master.try_clone_reader().unwrap();

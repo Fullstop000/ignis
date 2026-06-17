@@ -30,6 +30,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
       # musl needs its linker; statically-linked binaries are portable across
       # Linux distros (TB2 sandboxes, older base images, etc).
@@ -40,6 +43,13 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p ignis --target ${{ matrix.target }}
 
+      # Production deps only (ink + react): pure JS + base64 wasm, no native
+      # addons, so the node_modules is portable and one copy ships per archive.
+      # Installs default to this Ink frontend when `node` is present.
+      - name: Build Ink frontend
+        working-directory: ignis-tui
+        run: npm ci --omit=dev
+
       - name: Package
         shell: bash
         run: |
@@ -48,6 +58,10 @@ jobs:
           mkdir "$dir"
           cp "$bin" "$dir/"
           cp README.md LICENSE "$dir/"
+          # Bundle the Ink frontend next to the binary; install.sh / `ignis
+          # upgrade` lay it down at ~/.ignis/ignis-tui so `ignis` auto-locates it.
+          mkdir -p "$dir/ignis-tui"
+          cp -R ignis-tui/src ignis-tui/package.json ignis-tui/package-lock.json ignis-tui/node_modules "$dir/ignis-tui/"
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             7z a "$dir.zip" "$dir" >/dev/null
             echo "ASSET=$dir.zip" >> "$GITHUB_ENV"

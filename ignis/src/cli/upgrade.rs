@@ -106,15 +106,19 @@ pub async fn run(cmd: UpgradeCmd) -> Result<()> {
     download(&url, &tarball).await?;
 
     extract_tar_gz(&tarball, &tmp)?;
-    let extracted = tmp
-        .join(format!("ignis-{}-{}", desired_tag, target))
-        .join("ignis");
+    let root = tmp.join(format!("ignis-{}-{}", desired_tag, target));
+    let extracted = root.join("ignis");
     if !extracted.is_file() {
         bail!(
             "tarball layout unexpected — expected {} after extract",
             extracted.display()
         );
     }
+
+    // Lay down the bundled Ink frontend (if this release ships one) BEFORE
+    // swapping the binary, so a copy failure aborts with the old install intact.
+    // Keeping the JS in lockstep with the binary avoids protocol drift.
+    install_bundled_frontend(&root)?;
 
     let dest = std::env::current_exe().context("locate current executable")?;
     atomic_replace(&extracted, &dest)?;
@@ -246,6 +250,57 @@ fn atomic_replace(src: &Path, dest: &Path) -> Result<()> {
             dest.display()
         )
     })?;
+    Ok(())
+}
+
+/// Lay down the bundled Ink frontend at `~/.ignis/ignis-tui` if `root` (the
+/// extracted release dir) contains one. Releases bundle `ignis-tui/` (the Node
+/// frontend with its deps), and the installed `ignis` defaults to it when `node`
+/// is present; a release without the bundle (an older pinned tag) is a no-op.
+fn install_bundled_frontend(root: &Path) -> Result<()> {
+    let src = root.join("ignis-tui");
+    if !src.is_dir() {
+        return Ok(());
+    }
+    let base = dirs::home_dir()
+        .ok_or_else(|| anyhow!("could not locate home directory"))?
+        .join(".ignis");
+    install_frontend_into(&src, &base)
+}
+
+/// Replace `<base>/ignis-tui` with a fresh copy of `src` (full replace, not a
+/// merge, so files dropped between releases don't linger). Stages into a sibling
+/// then renames over the destination — same dir, so the rename is atomic.
+fn install_frontend_into(src: &Path, base: &Path) -> Result<()> {
+    std::fs::create_dir_all(base).with_context(|| format!("create {}", base.display()))?;
+    let dest = base.join("ignis-tui");
+    let staged = base.join(format!(".ignis-tui.upgrade.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staged);
+    copy_dir(src, &staged)
+        .with_context(|| format!("stage Ink frontend into {}", staged.display()))?;
+    // rename(2) won't replace a non-empty dir, so clear the old tree first. The
+    // window is brief and only affects the Ink frontend, never the binary.
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::rename(&staged, &dest)
+        .with_context(|| format!("install Ink frontend to {}", dest.display()))
+}
+
+/// Recursively copy `src` into `dst`, skipping symlinks — the only symlinks in a
+/// vendored `node_modules` are `.bin` CLI shims, which are unused at runtime.
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ft.is_symlink() {
+            continue;
+        } else if ft.is_dir() {
+            copy_dir(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
     Ok(())
 }
 
@@ -457,6 +512,50 @@ impl Drop for TmpDir {
 mod tests {
     use super::*;
     use crate::state::UpdateCheckState;
+
+    #[test]
+    fn install_frontend_into_fully_replaces_existing_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Fake freshly-extracted bundle with a nested file under node_modules.
+        let src = tmp.path().join("extracted").join("ignis-tui");
+        std::fs::create_dir_all(src.join("src")).unwrap();
+        std::fs::create_dir_all(src.join("node_modules").join("ink")).unwrap();
+        std::fs::write(src.join("src").join("cli.js"), "v2").unwrap();
+        std::fs::write(src.join("node_modules").join("ink").join("index.js"), "ink").unwrap();
+
+        // A stale prior install that must be wiped, not merged.
+        let base = tmp.path().join("home").join(".ignis");
+        std::fs::create_dir_all(base.join("ignis-tui").join("src")).unwrap();
+        std::fs::write(base.join("ignis-tui").join("src").join("cli.js"), "v1").unwrap();
+        std::fs::write(base.join("ignis-tui").join("dropped.js"), "old").unwrap();
+
+        install_frontend_into(&src, &base).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(base.join("ignis-tui").join("src").join("cli.js")).unwrap(),
+            "v2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                base.join("ignis-tui")
+                    .join("node_modules")
+                    .join("ink")
+                    .join("index.js")
+            )
+            .unwrap(),
+            "ink"
+        );
+        // Full replace: a file gone in the new release must not linger.
+        assert!(!base.join("ignis-tui").join("dropped.js").exists());
+    }
+
+    #[test]
+    fn install_bundled_frontend_is_noop_without_bundle() {
+        // An older tarball ships no ignis-tui/ — must not error.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ignis-v0.1.0-x")).unwrap();
+        install_bundled_frontend(&tmp.path().join("ignis-v0.1.0-x")).unwrap();
+    }
 
     // ── Auto-update-check tests ──
 
