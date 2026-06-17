@@ -147,15 +147,12 @@ async fn main() -> Result<(), anyhow::Error> {
     // Route: TUI mode (default when no args, or explicit --tui)
     if session_request.is_tui || !is_oneshot {
         // Frontend selection (PR #174, topology ii). When the Ink frontend can be
-        // located — `ignis-tui/src/cli.js` next to the binary (source/dev layout)
-        // or an explicit IGNIS_TUI_ENTRY — it is the default; the Ink host owns the
-        // terminal and spawns THIS binary as `--engine` (IGNIS_ENGINE_BIN below).
-        // `IGNIS_FRONTEND=native` forces the built-in ratatui TUI. Any failure —
-        // Node missing, no entry, spawn error — falls through to the built-in TUI.
-        //
-        // PACKAGING (deferred, needs sign-off): released binaries ship no
-        // `ignis-tui`, so auto-location finds nothing and they stay on ratatui. A
-        // real install still has to decide how the JS + a Node runtime ship.
+        // located — a source-checkout `ignis-tui/` next to the binary, the
+        // `~/.ignis/ignis-tui` an install lays down, or an explicit IGNIS_TUI_ENTRY
+        // — it is the default; the Ink host owns the terminal and spawns THIS
+        // binary as `--engine` (IGNIS_ENGINE_BIN below). `IGNIS_FRONTEND=native`
+        // forces the built-in ratatui TUI. Any failure — Node missing or <18, no
+        // entry, spawn/launch error — falls through to the built-in TUI.
         let ink_entry =
             ignis::cli::locate_ink_entry(std::env::var("IGNIS_TUI_ENTRY").ok().as_deref());
         if let ignis::cli::Frontend::Ink { entry } = ignis::cli::resolve_frontend(
@@ -310,6 +307,21 @@ async fn main() -> Result<(), anyhow::Error> {
 /// the built-in ratatui TUI.
 async fn launch_ink_frontend(entry: &str) -> std::io::Result<i32> {
     let exe = std::env::current_exe()?;
+    // Ink is now the default UI, so a too-old Node must NOT crash the user: ink 5
+    // / react 18 throw at module load on Node <18. Probe the version first and
+    // bubble an error so the caller falls back to the built-in TUI instead.
+    let version = tokio::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .await?;
+    if !version.status.success()
+        || !node_version_supported(&String::from_utf8_lossy(&version.stdout))
+    {
+        return Err(std::io::Error::other(format!(
+            "Node >=18 required (found {:?})",
+            String::from_utf8_lossy(&version.stdout).trim()
+        )));
+    }
     // `status()` inherits stdin/stdout/stderr — Ink renders to the real terminal.
     let status = tokio::process::Command::new("node")
         .arg(entry)
@@ -317,4 +329,33 @@ async fn launch_ink_frontend(entry: &str) -> std::io::Result<i32> {
         .status()
         .await?;
     Ok(status.code().unwrap_or(0))
+}
+
+/// Does `node --version` output (e.g. `"v20.11.1\n"`) report a major >= 18?
+/// Unparseable output is treated as unsupported — better to fall back than risk
+/// a module-load crash.
+fn node_version_supported(version_output: &str) -> bool {
+    version_output
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= 18)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::node_version_supported;
+
+    #[test]
+    fn node_version_gate() {
+        assert!(node_version_supported("v18.0.0\n"));
+        assert!(node_version_supported("v20.11.1"));
+        assert!(node_version_supported("v22.22.0\n"));
+        assert!(!node_version_supported("v16.20.2\n"));
+        assert!(!node_version_supported("v12.0.0"));
+        assert!(!node_version_supported("")); // node missing / empty
+        assert!(!node_version_supported("not-a-version"));
+    }
 }
