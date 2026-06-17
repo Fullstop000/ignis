@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-06-17
+
+### Changed
+- TUI — releases now bundle the Ink frontend and `ignis` uses it by default when Node >=18 is available, falling back to the built-in `ratatui` TUI otherwise (`IGNIS_FRONTEND=native` forces it). ([#192](https://github.com/Fullstop000/ignis/pull/192))
+
 ## [0.39.0] - 2026-06-16
 
 ### Added
