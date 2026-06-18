@@ -278,32 +278,37 @@ fn diff_file_ext(args_json: &str) -> String {
 
 /// Render one diff line under the tool gutter. Added (`+`) and removed (`-`)
 /// lines get a solid background filling the row and syntax-highlighted code;
-/// other lines render plain. `width` is the messages-area width (for the
+/// context lines render plain. `width` is the messages-area width (for the
 /// full-row background). The 4-space prefix aligns the hunk under the `╰`.
 fn push_diff_line(lines: &mut Vec<Line<'static>>, raw: &str, ext: &str, width: u16) {
     let prefix = Span::raw("    ");
+    // Gutter is one cell wide: a sign for +/-, or a space for context/hunk
+    // headers. Content therefore starts at column 5 (4-space prefix + gutter).
+    let content_w = (width as usize).saturating_sub(5).max(8);
+
     let (sign, bg, sign_fg) = match raw.as_bytes().first() {
         Some(b'+') => ('+', DIFF_ADD_BG, GREEN),
         Some(b'-') => ('-', DIFF_DEL_BG, RED),
         _ => {
+            // Context lines and hunk headers. Context rows carry a leading space
+            // that is the unified-diff prefix, not part of the source line.
+            let body = truncate(&sanitize(raw.get(1..).unwrap_or("")), 200);
             lines.push(Line::from(vec![
                 prefix,
-                Span::styled(truncate(&sanitize(raw), 200), Style::default().fg(TEXT_DIM)),
+                Span::styled(format!(" {body}"), Style::default().fg(TEXT_DIM)),
             ]));
             return;
         }
     };
 
-    // Content area = width − 4-space prefix − "± " (2); fill it so bg spans the row.
-    let content_w = (width as usize).saturating_sub(6).max(8);
     // `truncate` appends `…` past its limit, so cap at content_w − 1: a truncated
     // line is then exactly content_w cells and never wraps off the bg bar.
-    let code = truncate(&sanitize(raw.get(2..).unwrap_or("")), content_w - 1);
+    let code = truncate(&sanitize(raw.get(1..).unwrap_or("")), content_w - 1);
 
     let mut spans = vec![
         prefix,
         Span::styled(
-            format!("{sign} "),
+            sign.to_string(),
             Style::default()
                 .fg(sign_fg)
                 .bg(bg)

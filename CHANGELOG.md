@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Tools — `edit_file` now returns a real unified diff (`@@ -a,b +c,d @@` hunks with context) and the Ink frontend renders it as a line-numbered `◆ Edited <path> (+a -d)` view with `⋮` separators between non-contiguous hunks. ([#200](https://github.com/Fullstop000/ignis/pull/200))
+
 ### Changed
 - TUI — slash-command suggestions now render below the input bar (was above), capped at 8 visible rows; both Ink and ratatui frontends are now flush with no blank rows above or below the input. ([#197](https://github.com/Fullstop000/ignis/pull/197))
 

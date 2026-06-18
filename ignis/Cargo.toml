@@ -36,6 +36,13 @@ http = "1"
 toml_edit = "0.22"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+# `diffy` produces the git-style unified-diff that `edit_file` returns to the
+# UI: `@@ -a,b +c,d @@` headers + context lines, exactly the shape the Ink
+# frontend's line-numbered diff view expects. `default-features = false`
+# disables the optional `anstyle` (ANSI coloring — we color in the UI) and
+# `zlib-rs` (binary-patch support — unused) deps; the only normal dep that
+# remains is `hashbrown`, which is already in the tree via other crates.
+diffy = { version = "0.5", default-features = false, features = ["std"] }
 
 # `tracing` is always compiled — its `info_span!`/`#[instrument]` macros expand
 # to no-ops without a subscriber, so instrumentation lives next to the code with

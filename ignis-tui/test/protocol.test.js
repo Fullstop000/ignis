@@ -238,23 +238,79 @@ test('toolOutputPreview caps lines (3 ok / 5 error) and counts the rest', () => 
   assert.deepEqual(toolOutputPreview('only\n\n'), { lines: ['only'], more: 0 });
 });
 
-test('toolDiffPreview counts and caps edit_file diff hunks', () => {
+test('toolDiffPreview parses unified-diff hunks with line numbers', () => {
+  // Empty body: no rows, nothing to count.
   assert.deepEqual(toolDiffPreview(''), { adds: 0, dels: 0, lines: [], more: 0 });
-  assert.deepEqual(toolDiffPreview('- old\n+ new\n context'), {
+
+  // Single hunk: each row carries the source-file line number from the `@@`
+  // header, the leading sign is stripped from `text`, and the `kind` is
+  // exactly one of add | del | ctx.
+  const single = '@@ -7,3 +7,4 @@\n let selectedContext = null;\n+let selectedChatId = null;\n let feedStream = null;\n let a = 1;\n';
+  assert.deepEqual(toolDiffPreview(single), {
     adds: 1,
-    dels: 1,
+    dels: 0,
     lines: [
-      { text: '- old', kind: 'del' },
-      { text: '+ new', kind: 'add' },
-      { text: ' context', kind: 'ctx' },
+      { kind: 'ctx', text: 'let selectedContext = null;', lineNo: 7 },
+      { kind: 'add', text: 'let selectedChatId = null;', lineNo: 8 },
+      { kind: 'ctx', text: 'let feedStream = null;', lineNo: 9 },
+      { kind: 'ctx', text: 'let a = 1;', lineNo: 10 },
     ],
     more: 0,
   });
-  const many = Array.from({ length: 32 }, (_, i) => `+ line ${i}`).join('\n');
-  assert.deepEqual(toolDiffPreview(many), {
-    adds: 32,
-    dels: 0,
-    lines: Array.from({ length: 30 }, (_, i) => ({ text: `+ line ${i}`, kind: 'add' })),
-    more: 2,
-  });
+
+  // Two non-contiguous hunks: a `'gap'` row is synthesized between them so
+  // the view can render `⋮`. Line numbers reset to each hunk header.
+  const twoHunks =
+    '@@ -1,2 +1,2 @@\n a\n-b\n+B\n@@ -10,2 +10,2 @@\n y\n-z\n+Z\n';
+  const out = toolDiffPreview(twoHunks);
+  assert.equal(out.adds, 2);
+  assert.equal(out.dels, 2);
+  // First hunk rows.
+  assert.deepEqual(out.lines[0], { kind: 'ctx', text: 'a', lineNo: 1 });
+  assert.deepEqual(out.lines[1], { kind: 'del', text: 'b', lineNo: 2 });
+  assert.deepEqual(out.lines[2], { kind: 'add', text: 'B', lineNo: 2 });
+  // The synthesized gap separating the two hunks.
+  assert.deepEqual(out.lines[3], { kind: 'gap', text: '', lineNo: null });
+  // Second hunk rows.
+  assert.deepEqual(out.lines[4], { kind: 'ctx', text: 'y', lineNo: 10 });
+  assert.deepEqual(out.lines[5], { kind: 'del', text: 'z', lineNo: 11 });
+  assert.deepEqual(out.lines[6], { kind: 'add', text: 'Z', lineNo: 11 });
+
+  // Cap at 30 rows; the rest spill into `more`. Construct one giant hunk so
+  // the cap is exercised on a single hunk.
+  const adds = Array.from({ length: 32 }, (_, i) => `+line ${i}`).join('\n');
+  const giant = `@@ -1,0 +1,32 @@\n${adds}\n`;
+  const big = toolDiffPreview(giant);
+  assert.equal(big.adds, 32);
+  assert.equal(big.lines.length, 30);
+  assert.equal(big.more, 2);
+  assert.equal(big.lines[0].kind, 'add');
+  assert.equal(big.lines[0].lineNo, 1);
+  assert.equal(big.lines[29].lineNo, 30);
+
+  // `\ No newline at end of file` is metadata, not a real diff row, and must
+  // not show up in the output.
+  const trailer = '@@ -1,1 +1,1 @@\n-old\n\\ No newline at end of file\n+new\n';
+  const tr = toolDiffPreview(trailer);
+  assert.equal(tr.lines.length, 2);
+  assert.equal(tr.lines[0].kind, 'del');
+  assert.equal(tr.lines[1].kind, 'add');
+
+  // Defensive fallback: a body without any `@@` header still classifies by
+  // sign so the view renders something. `lineNo` stays null in this path.
+  const headerless = '+a\n-b\n c';
+  const hl = toolDiffPreview(headerless);
+  assert.equal(hl.adds, 1);
+  assert.equal(hl.dels, 1);
+  assert.equal(hl.lines.length, 3);
+  assert.equal(hl.lines[0].lineNo, null);
+
+  // The ratatui engine appends a `… N more diff lines truncated` notice after
+  // the real diff body when it exceeds its internal cap. It must not be parsed
+  // as a context line with a synthesized line number.
+  const truncated = '@@ -1,2 +1,2 @@\n-old\n+new\n… 5 more diff lines truncated';
+  const trunc = toolDiffPreview(truncated);
+  assert.equal(trunc.adds, 1);
+  assert.equal(trunc.dels, 1);
+  assert.equal(trunc.lines.length, 2);
 });

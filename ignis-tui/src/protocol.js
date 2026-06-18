@@ -280,26 +280,95 @@ export function toolOutputPreview(content, isError = false) {
   return { lines: all.slice(0, cap), more: Math.max(0, all.length - cap) };
 }
 
-/** Diff preview for edit_file results, matching the native TUI's larger cap. */
+/**
+ * Parse the unified-diff body that `edit_file` returns into a render-ready
+ * sequence of rows for the Ink ToolBlock view. Each non-header row carries:
+ *   - `kind`: `'add' | 'del' | 'ctx' | 'gap'`
+ *   - `text`: the line content with the leading `+`/`-`/` ` sign stripped
+ *   - `lineNo`: the source-file line number to show in the gutter (the
+ *     **new-file** line for `add`/`ctx`, the **old-file** line for `del`).
+ *     `null` for `'gap'` rows.
+ *
+ * `'gap'` rows are synthesized between consecutive hunks so the view can
+ * render a `⋮` separator (the unified diff itself just emits a fresh
+ * `@@ … @@` header without an explicit gap marker).
+ *
+ * Hunk headers (`@@ -a,b +c,d @@`) seed line counters; an absent `,N` count
+ * defaults to 1 per the unidiff spec. Lines outside any hunk are ignored
+ * (shouldn't appear in our output, but be defensive — the engine sometimes
+ * splices in an `\\ No newline at end of file` marker which is not a hunk
+ * line and shouldn't carry a line number).
+ *
+ * `cap = 30` matches the native TUI; overflow is reported as `more`.
+ */
 export function toolDiffPreview(content) {
   const text = (content ?? '').replace(/\s+$/, '');
   if (!text) return { adds: 0, dels: 0, lines: [], more: 0 };
-  const all = text.split('\n');
+  const HUNK_RE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
   let adds = 0;
   let dels = 0;
-  const classified = all.map((line) => {
-    if (line.startsWith('+')) {
+  let oldLn = 0;
+  let newLn = 0;
+  let inHunk = false;
+  let sawAnyHunk = false;
+  const classified = [];
+  for (const raw of text.split('\n')) {
+    const m = raw.match(HUNK_RE);
+    if (m) {
+      if (sawAnyHunk) classified.push({ kind: 'gap', text: '', lineNo: null });
+      oldLn = parseInt(m[1], 10);
+      newLn = parseInt(m[2], 10);
+      inHunk = true;
+      sawAnyHunk = true;
+      continue;
+    }
+    // Skip the `\ No newline at end of file` marker (`\\` is the unidiff
+    // convention) — it's metadata, not a real diff line.
+    if (raw.startsWith('\\')) continue;
+    // Skip the ratatui-engine truncation notice (`… N more diff lines truncated`);
+    // it is appended after the real diff body and should not carry a line number.
+    if (raw.startsWith('…')) continue;
+    if (!inHunk) continue;
+    const sign = raw[0];
+    const body = raw.slice(1);
+    if (sign === '+') {
       adds += 1;
-      return { text: line, kind: 'add' };
-    }
-    if (line.startsWith('-')) {
+      classified.push({ kind: 'add', text: body, lineNo: newLn });
+      newLn += 1;
+    } else if (sign === '-') {
       dels += 1;
-      return { text: line, kind: 'del' };
+      classified.push({ kind: 'del', text: body, lineNo: oldLn });
+      oldLn += 1;
+    } else {
+      // Context line: leading space (or empty line in the diff body).
+      classified.push({ kind: 'ctx', text: body, lineNo: newLn });
+      oldLn += 1;
+      newLn += 1;
     }
-    return { text: line, kind: 'ctx' };
-  });
+  }
+  // Fallback: if the body had no `@@` header at all (e.g. a stub `(no
+  // changes)` payload, or an old format), classify each row by its sign so
+  // the view still renders something useful — `lineNo` stays null.
+  if (!sawAnyHunk) {
+    for (const raw of text.split('\n')) {
+      if (raw.startsWith('+')) {
+        adds += 1;
+        classified.push({ kind: 'add', text: raw.slice(1), lineNo: null });
+      } else if (raw.startsWith('-')) {
+        dels += 1;
+        classified.push({ kind: 'del', text: raw.slice(1), lineNo: null });
+      } else {
+        classified.push({ kind: 'ctx', text: raw, lineNo: null });
+      }
+    }
+  }
   const cap = 30;
-  return { adds, dels, lines: classified.slice(0, cap), more: Math.max(0, classified.length - cap) };
+  return {
+    adds,
+    dels,
+    lines: classified.slice(0, cap),
+    more: Math.max(0, classified.length - cap),
+  };
 }
 
 // ── ClientCommand builders (return objects to JSON.stringify onto the wire) ──

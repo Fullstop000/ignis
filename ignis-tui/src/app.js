@@ -517,8 +517,16 @@ function ReasoningView({ text, done, expanded }) {
 
 // Tool call: a `● name(args)` header (yellow pending / green done / red error),
 // with the result preview indented under a `╰` gutter once it completes.
+//
+// The `edit_file` result gets a dedicated treatment: its header reads
+// `◆ Edited <path> (+adds -dels)` and the body is a line-numbered unified-diff
+// view (gutter shows real source line numbers, `⋮` separates non-contiguous
+// hunks, foreground-only red/green for `-`/`+` rows — no background bars).
 function ToolBlock({ block }) {
   const isError = block.result?.is_error;
+  if (!isError && block.name === 'edit_file') {
+    return e(EditFileBlock, { block });
+  }
   const headerColor = !block.done ? 'yellow' : isError ? 'red' : 'green';
   const header = e(
     Text,
@@ -526,17 +534,6 @@ function ToolBlock({ block }) {
     `● ${block.name}(${toolArgsSummary(block.args)})${block.done ? '' : ' …'}`,
   );
   if (!block.done || !block.result) return header;
-  if (!isError && block.name === 'edit_file') {
-    const { adds, dels, lines, more } = toolDiffPreview(block.result.content);
-    if (!lines.length) return header;
-    const body = [e(Text, { key: 'sum', color: 'gray' }, `    +${adds} -${dels}`)];
-    for (const [i, line] of lines.entries()) {
-      const color = line.kind === 'add' ? 'green' : line.kind === 'del' ? 'red' : 'gray';
-      body.push(e(Text, { key: `d${i}`, color }, `  ${i === 0 ? '╰ ' : '  '}${line.text}`));
-    }
-    if (more) body.push(e(Text, { key: 'more', dimColor: true }, `    … +${more} more lines`));
-    return e(Box, { flexDirection: 'column' }, [header, ...body]);
-  }
   const { lines, more } = toolOutputPreview(block.result.content, isError);
   if (!lines.length) return header;
   const body = lines.map((ln, i) =>
@@ -544,6 +541,100 @@ function ToolBlock({ block }) {
   );
   if (more) body.push(e(Text, { key: 'more', dimColor: true }, `    … +${more} more lines`));
   return e(Box, { flexDirection: 'column' }, [header, ...body]);
+}
+
+/**
+ * Render an `edit_file` tool call as a Claude-Code / Codex-style diff view:
+ *
+ *     ◆ Edited <path> (+54 -3)
+ *        7    let selectedContext = null;
+ *        8  + let selectedChatId = null;
+ *        9    let feedStream = null;
+ *        ⋮
+ *       59    $("feedMeta").textContent = `…`;
+ *       60  + if (!selectedChatId && feedItems[0]) selectedChatId = feedItems[0].chatId;
+ *
+ * - The gutter shows the real source-file line number (right-aligned to the
+ *   widest line number in the visible window). For `-` rows that's the
+ *   **old**-file number; for `+` and context rows it's the **new**-file one.
+ * - Color: foreground only — `+` rows green, `-` rows red, context dim.
+ *   No background fills (the user wanted clean text on the terminal bg).
+ * - Hunk separator: a `gap` row from `toolDiffPreview` becomes a `⋮` line
+ *   so the eye sees that lines were skipped between hunks.
+ * - While the call is in flight (no `block.result` yet) we still show the
+ *   header, swapping the diamond for a spinner-flavored ellipsis.
+ */
+function EditFileBlock({ block }) {
+  const path = parseEditPath(block.args);
+  const inFlight = !block.done || !block.result;
+  if (inFlight) {
+    return e(
+      Text,
+      { color: 'yellow' },
+      `◆ Editing ${path || block.name} …`,
+    );
+  }
+  const { adds, dels, lines, more } = toolDiffPreview(block.result.content);
+  const headerColor = 'green';
+  const header = e(
+    Text,
+    { key: 'h', color: headerColor },
+    `◆ Edited ${path || ''} (+${adds} -${dels})`,
+  );
+  if (!lines.length) return header;
+  // Right-align line numbers to the widest one we'll show, so the body lines
+  // up under the header — same shape Claude Code / aider use.
+  const maxLn = lines.reduce(
+    (m, ln) => (ln.lineNo != null && ln.lineNo > m ? ln.lineNo : m),
+    0,
+  );
+  const gutterW = Math.max(2, String(maxLn).length);
+  const body = lines.map((ln, i) => {
+    if (ln.kind === 'gap') {
+      // A `⋮` aligned with the gutter — visually the same column as the line
+      // numbers, so the diff reads as a single column of marks down the side.
+      return e(
+        Text,
+        { key: `d${i}`, dimColor: true },
+        `  ${'⋮'.padStart(gutterW)}     `,
+      );
+    }
+    const num = ln.lineNo == null ? ''.padStart(gutterW) : String(ln.lineNo).padStart(gutterW);
+    const sign = ln.kind === 'add' ? '+' : ln.kind === 'del' ? '-' : ' ';
+    const color = ln.kind === 'add' ? 'green' : ln.kind === 'del' ? 'red' : undefined;
+    const dim = ln.kind === 'ctx';
+    // Two leading spaces match the `◆ Edited …` header indentation.
+    return e(
+      Text,
+      { key: `d${i}`, color, dimColor: dim },
+      `  ${num}  ${sign}  ${ln.text}`,
+    );
+  });
+  if (more) {
+    body.push(
+      e(
+        Text,
+        { key: 'more', dimColor: true },
+        `  ${''.padStart(gutterW)}     … +${more} more lines`,
+      ),
+    );
+  }
+  return e(Box, { flexDirection: 'column' }, [header, ...body]);
+}
+
+/** Pull `path` (or `file_path`) out of a tool-args JSON blob. */
+function parseEditPath(argsJson) {
+  if (!argsJson) return '';
+  try {
+    const obj = JSON.parse(argsJson);
+    if (obj && typeof obj === 'object') {
+      return obj.path || obj.file_path || '';
+    }
+  } catch {
+    // Malformed JSON — fall through to the empty path; the header still
+    // reads `◆ Edited  (+a -d)` which is ugly but never breaks the layout.
+  }
+  return '';
 }
 
 // Statusline footer: provider/model · cwd · turns · context tokens — fed by the
