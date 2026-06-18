@@ -68,11 +68,13 @@ export default function App({ engine, onExit }) {
   const [followFocus, setFollowFocus] = useState(-1); // focused follow-up index, -1 = composer
   const [error, setError] = useState(null); // fatal engine error to display before exit
   const closing = useRef(false); // true while the frontend is intentionally shutting down
+  const fatal = useRef(false); // true once an engine failure has been handled
 
   useEffect(() => {
     engine.onFrame((frame) => setState((s) => reduceOutbound(s, frame)));
     engine.onError((err) => {
-      if (closing.current) return;
+      if (closing.current || fatal.current) return;
+      fatal.current = true;
       setError(`Engine failed: ${err.message || String(err)}`);
     });
     engine.onClose((code) => {
@@ -80,8 +82,13 @@ export default function App({ engine, onExit }) {
         exit();
         return;
       }
-      if (code !== 0) setError(`Engine exited unexpectedly (code ${code})`);
-      else exit();
+      if (fatal.current) return; // onError already handled it
+      if (code !== 0) {
+        fatal.current = true;
+        setError(`Engine exited unexpectedly (code ${code})`);
+      } else {
+        exit();
+      }
     });
   }, [engine, exit]);
 
