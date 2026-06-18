@@ -96,3 +96,14 @@ api_key = "sk-cp-your-key"
 #                      # assistant turns before each model call. Cache-stable;
 #                      # DeepSeek- and Anthropic-safe. Set false to send the
 #                      # full history every turn.
+
+# Permission rules + bash sandbox (optional).
+# [permissions]
+# allow = ["bash(ls *)"]      # auto-allow these tool calls
+# ask   = ["bash(git push *)"]
+# deny  = ["bash(rm -rf *)"]
+# In unattended modes (hands-free / AFK), bash commands auto-run inside a
+# Landlock write-sandbox that confines writes to the project (cwd) + temp dirs.
+# Reads stay broad. Add directories a build needs to write to here, or commands
+# that write home caches (cargo/npm/pip/go) will fail with "permission denied".
+# sandbox_write_paths = ["~/.cargo", "~/.npm", "~/.cache"]
