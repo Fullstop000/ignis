@@ -818,6 +818,7 @@ async fn user_prompt_submit_block_short_circuits_turn() {
             ..HookSpec::default()
         }],
         assistant_message_render: vec![],
+        ..Default::default()
     }));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);

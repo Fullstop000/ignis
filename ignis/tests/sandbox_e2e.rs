@@ -74,6 +74,7 @@ fn spec_with(program: PathBuf, sandbox: bool, env: Vec<String>) -> HookSpec {
         timeout_ms: 30_000,
         env,
         sandbox,
+        ..Default::default()
     }
 }
 
@@ -97,6 +98,7 @@ async fn run_dispatch(spec: HookSpec, payload: &str) -> (HookOutcome, Vec<ignis:
         &DispatchContext {
             session_id: "s",
             cwd: "/tmp",
+            tool: None,
         },
         Some(&tx),
     )
@@ -115,6 +117,7 @@ async fn run_dispatch(spec: HookSpec, payload: &str) -> (HookOutcome, Vec<ignis:
             &DispatchContext {
                 session_id: "s",
                 cwd: "/tmp",
+                tool: None,
             },
             Some(&tx),
         )

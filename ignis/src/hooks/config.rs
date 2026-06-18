@@ -46,6 +46,10 @@ pub struct HookSpec {
     /// that legitimately needs broad read access). On non-Linux platforms
     /// the flag has no effect — see `super::sandbox`.
     pub sandbox: bool,
+    /// Tool-name glob for the per-tool events (`PreToolUse`/`PostToolUse`):
+    /// `bash`, `mcp__*`, `*`, etc. `None` = all tools. Ignored by the
+    /// prompt/render events. See [`matches_tool`].
+    pub matcher: Option<String>,
 }
 
 impl Default for HookSpec {
@@ -57,7 +61,22 @@ impl Default for HookSpec {
             env: Vec::new(),
             // Secure-by-default — see the type-level doc-comment.
             sandbox: true,
+            matcher: None,
         }
+    }
+}
+
+/// Does a tool-event spec's `matcher` apply to `tool_name`? Absent matcher and
+/// `*` match everything; otherwise a single trailing `*` is a prefix match
+/// (`mcp__*`), and anything else is exact. Kept deliberately tiny — full glob
+/// is YAGNI for tool names.
+pub fn matches_tool(matcher: Option<&str>, tool_name: &str) -> bool {
+    match matcher {
+        None | Some("*") => true,
+        Some(pat) => match pat.strip_suffix('*') {
+            Some(prefix) => tool_name.starts_with(prefix),
+            None => pat == tool_name,
+        },
     }
 }
 
@@ -80,21 +99,31 @@ impl HookSpec {
 pub struct HooksConfig {
     pub user_prompt_submit: Vec<HookSpec>,
     pub assistant_message_render: Vec<HookSpec>,
+    pub pre_tool_use: Vec<HookSpec>,
+    pub post_tool_use: Vec<HookSpec>,
 }
 
 impl HooksConfig {
     pub fn is_empty(&self) -> bool {
-        self.user_prompt_submit.is_empty() && self.assistant_message_render.is_empty()
+        self.user_prompt_submit.is_empty()
+            && self.assistant_message_render.is_empty()
+            && self.pre_tool_use.is_empty()
+            && self.post_tool_use.is_empty()
     }
 
     pub fn total_len(&self) -> usize {
-        self.user_prompt_submit.len() + self.assistant_message_render.len()
+        self.user_prompt_submit.len()
+            + self.assistant_message_render.len()
+            + self.pre_tool_use.len()
+            + self.post_tool_use.len()
     }
 
     pub fn for_event(&self, event: HookEvent) -> &[HookSpec] {
         match event {
             HookEvent::UserPromptSubmit => &self.user_prompt_submit,
             HookEvent::AssistantMessageRender => &self.assistant_message_render,
+            HookEvent::PreToolUse => &self.pre_tool_use,
+            HookEvent::PostToolUse => &self.post_tool_use,
         }
     }
 
@@ -121,6 +150,8 @@ impl HooksConfig {
             let event = match event_name.as_str() {
                 "UserPromptSubmit" => HookEvent::UserPromptSubmit,
                 "AssistantMessageRender" => HookEvent::AssistantMessageRender,
+                "PreToolUse" => HookEvent::PreToolUse,
+                "PostToolUse" => HookEvent::PostToolUse,
                 other => {
                     // Forward-compat: unknown events ignored with a warning.
                     // Lets a single hooks.json work across ignis versions.
@@ -131,6 +162,8 @@ impl HooksConfig {
             let bucket = match event {
                 HookEvent::UserPromptSubmit => &mut out.user_prompt_submit,
                 HookEvent::AssistantMessageRender => &mut out.assistant_message_render,
+                HookEvent::PreToolUse => &mut out.pre_tool_use,
+                HookEvent::PostToolUse => &mut out.post_tool_use,
             };
             for entry in entries {
                 bucket.push(parse_entry(entry, home)?);
@@ -172,6 +205,7 @@ fn parse_entry(entry: HookJsonEntry, home: &Path) -> Result<HookSpec> {
                 timeout_ms,
                 env,
                 sandbox,
+                matcher: None,
             })
         }
         (None, Some(argv)) => {
@@ -190,10 +224,13 @@ fn parse_entry(entry: HookJsonEntry, home: &Path) -> Result<HookSpec> {
                 timeout_ms,
                 env,
                 sandbox,
+                matcher: None,
             })
         }
     }?;
 
+    // Tool-name matcher (PreToolUse/PostToolUse). Ignored by other events.
+    spec.matcher = entry.matcher.filter(|m| !m.trim().is_empty());
     spec.program = resolve_program_path(&spec.program)?;
     for name in &spec.env {
         validate_env_var_name(name)?;
@@ -340,11 +377,50 @@ struct HookJsonEntry {
     /// platforms ignore it.
     #[serde(default)]
     sandbox: Option<bool>,
+    /// Tool-name glob for `PreToolUse`/`PostToolUse` (`bash`, `mcp__*`, `*`).
+    /// Absent = all tools. Ignored by the prompt/render events.
+    #[serde(default)]
+    matcher: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_tool_handles_exact_prefix_and_wildcard() {
+        assert!(matches_tool(None, "bash"));
+        assert!(matches_tool(Some("*"), "anything"));
+        assert!(matches_tool(Some("bash"), "bash"));
+        assert!(!matches_tool(Some("bash"), "read_file"));
+        assert!(matches_tool(Some("mcp__*"), "mcp__server__tool"));
+        assert!(!matches_tool(Some("mcp__*"), "bash"));
+        assert!(matches_tool(Some("edit_*"), "edit_file"));
+    }
+
+    #[test]
+    fn parses_tool_events_with_matcher() {
+        let home = PathBuf::from("/home/me");
+        let raw = r#"{
+            "hooks": {
+                "PreToolUse": [
+                    {"command": "~/.ignis/hooks/redact.sh", "matcher": "bash"}
+                ],
+                "PostToolUse": [
+                    {"command": "~/.ignis/hooks/translate.sh", "matcher": "*"},
+                    {"command": "~/.ignis/hooks/observe.sh"}
+                ]
+            }
+        }"#;
+        let cfg = HooksConfig::from_str(raw, &home).unwrap();
+        assert_eq!(cfg.pre_tool_use.len(), 1);
+        assert_eq!(cfg.pre_tool_use[0].matcher.as_deref(), Some("bash"));
+        assert_eq!(cfg.post_tool_use.len(), 2);
+        assert_eq!(cfg.post_tool_use[0].matcher.as_deref(), Some("*"));
+        // Absent matcher parses as None (matches all tools).
+        assert_eq!(cfg.post_tool_use[1].matcher, None);
+        assert_eq!(cfg.total_len(), 3);
+    }
 
     #[test]
     fn parses_two_events_with_tilde_expansion() {

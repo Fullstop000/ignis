@@ -128,6 +128,147 @@ impl HookRegistry {
         self.run_render_chain(content, ctx, tx).await
     }
 
+    /// Run the `PreToolUse` chain for a tool call. Hooks see the tool name +
+    /// args and may rewrite the args (`updatedInput`, parsed back to JSON) or
+    /// block the call (`continue:false` / exit 2). Runs BEFORE the permission
+    /// gate, so a rewrite is what both the gate and the tool see. A malformed
+    /// rewrite or any failure degrades to the prior args + a Warning (never
+    /// blocks). Only specs whose `matcher` matches `tool_name` run.
+    pub async fn run_pre_tool_use(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        ctx: HookContext<'_>,
+        tx: &EventSender,
+    ) -> PreToolOutcome {
+        let event = HookEvent::PreToolUse;
+        let specs = self.matching_tool_specs(event, tool_name).await;
+        if specs.is_empty() {
+            return PreToolOutcome::Proceed(args.clone());
+        }
+        let mut current_val = args.clone();
+        let mut current_str = serde_json::to_string(args).unwrap_or_default();
+        for spec in &specs {
+            let dctx = DispatchContext {
+                session_id: ctx.session_id,
+                cwd: ctx.cwd,
+                tool: Some(dispatch::ToolDispatch {
+                    tool_name,
+                    tool_input: &current_val,
+                    tool_result: None,
+                    is_error: None,
+                }),
+            };
+            match dispatch::run_hook(spec, event, &current_str, &dctx, Some(tx)).await {
+                HookOutcome::Mutated { updated, .. } => {
+                    // `updatedInput` must parse back into a JSON args object;
+                    // a malformed rewrite is a soft failure (keep prior args).
+                    match serde_json::from_str::<serde_json::Value>(&updated) {
+                        Ok(v) => {
+                            current_val = v;
+                            current_str = updated;
+                        }
+                        Err(e) => {
+                            emit_warning(
+                                tx,
+                                event,
+                                &format!(
+                                    "{}: ignoring malformed updatedInput ({e})",
+                                    spec.display_name()
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                HookOutcome::PassThrough { .. } => {}
+                HookOutcome::Blocked { stderr, .. } => {
+                    let trimmed = trim_one_line(&stderr);
+                    emit_warning(
+                        tx,
+                        event,
+                        &format!("{} blocked {tool_name}: {trimmed}", spec.display_name()),
+                    )
+                    .await;
+                    return PreToolOutcome::Block(trimmed);
+                }
+                HookOutcome::SoftFailed { reason, .. } => {
+                    emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
+                    break;
+                }
+            }
+        }
+        PreToolOutcome::Proceed(current_val)
+    }
+
+    /// Run the `PostToolUse` chain after a tool ran (success or error). Hooks
+    /// may rewrite the result the model sees (`updatedOutput`) or just observe.
+    /// Cannot block — a `continue:false` degrades to a Warning (the tool already
+    /// ran). Returns the possibly-rewritten result. Matcher applies.
+    pub async fn run_post_tool_use(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        result: &str,
+        is_error: bool,
+        ctx: HookContext<'_>,
+        tx: &EventSender,
+    ) -> String {
+        let event = HookEvent::PostToolUse;
+        let specs = self.matching_tool_specs(event, tool_name).await;
+        if specs.is_empty() {
+            return result.to_string();
+        }
+        let mut current = result.to_string();
+        for spec in &specs {
+            let dctx = DispatchContext {
+                session_id: ctx.session_id,
+                cwd: ctx.cwd,
+                tool: Some(dispatch::ToolDispatch {
+                    tool_name,
+                    tool_input: args,
+                    tool_result: Some(&current),
+                    is_error: Some(is_error),
+                }),
+            };
+            match dispatch::run_hook(spec, event, &current, &dctx, Some(tx)).await {
+                HookOutcome::Mutated { updated, .. } => current = updated,
+                HookOutcome::PassThrough { .. } => {}
+                HookOutcome::Blocked { stderr, .. } => {
+                    // PostToolUse cannot block (the tool already ran); surface
+                    // the attempt as a Warning and keep the current result.
+                    emit_warning(
+                        tx,
+                        event,
+                        &format!(
+                            "{}: PostToolUse cannot block ({})",
+                            spec.display_name(),
+                            trim_one_line(&stderr)
+                        ),
+                    )
+                    .await;
+                    break;
+                }
+                HookOutcome::SoftFailed { reason, .. } => {
+                    emit_warning(tx, event, &format!("{} ({})", reason, spec.display_name())).await;
+                    break;
+                }
+            }
+        }
+        current
+    }
+
+    /// The specs for a tool `event` whose `matcher` applies to `tool_name`.
+    async fn matching_tool_specs(&self, event: HookEvent, tool_name: &str) -> Vec<HookSpec> {
+        let guard = self.inner.read().await;
+        guard
+            .for_event(event)
+            .iter()
+            .filter(|s| config::matches_tool(s.matcher.as_deref(), tool_name))
+            .cloned()
+            .collect()
+    }
+
     /// Are any hooks declared for `event`? Fast path the render seam uses
     /// to skip task-spawn when there's nothing to do.
     pub async fn has_hooks(&self, event: HookEvent) -> bool {
@@ -173,10 +314,7 @@ impl HookRegistry {
             return PromptHookResult::Continue(initial.to_string());
         }
 
-        let dispatch_ctx = DispatchContext {
-            session_id: ctx.session_id,
-            cwd: ctx.cwd,
-        };
+        let dispatch_ctx = DispatchContext::new(ctx.session_id, ctx.cwd);
 
         let mut current = initial.to_string();
         for spec in &specs {
@@ -225,10 +363,7 @@ impl HookRegistry {
             return initial.to_string();
         }
 
-        let dispatch_ctx = DispatchContext {
-            session_id: ctx.session_id,
-            cwd: ctx.cwd,
-        };
+        let dispatch_ctx = DispatchContext::new(ctx.session_id, ctx.cwd);
 
         let mut current = initial.to_string();
         for spec in &specs {
@@ -271,6 +406,16 @@ pub enum PromptHookResult {
     /// MUST NOT push the prompt to history or call the agent.
     Blocked { stderr: String },
 }
+
+/// Outcome of the `PreToolUse` chain. `Proceed` carries the (possibly
+/// rewritten) args the permission gate + the tool then use; `Block` skips the
+/// tool with a "blocked by hook" result. The warning is already emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreToolOutcome {
+    Proceed(serde_json::Value),
+    Block(String),
+}
+
 async fn emit_warning(tx: &EventSender, event: HookEvent, message: &str) {
     let _ = tx
         .send(AgentEvent::Warning {
@@ -429,6 +574,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 },
             ],
             assistant_message_render: vec![],
+            ..Default::default()
         };
         let reg = HookRegistry::from_config(cfg);
         let (tx, _rx) = mpsc::channel(8);
@@ -469,6 +615,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 },
             ],
             assistant_message_render: vec![],
+            ..Default::default()
         };
         let reg = HookRegistry::from_config(cfg);
         let (tx, mut rx) = mpsc::channel(8);
@@ -507,6 +654,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 ..HookSpec::default()
             }],
             assistant_message_render: vec![],
+            ..Default::default()
         };
         let reg = HookRegistry::from_config(cfg);
         let (tx, mut rx) = mpsc::channel(8);
@@ -547,6 +695,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 timeout_ms: 5_000,
                 ..HookSpec::default()
             }],
+            ..Default::default()
         };
         let reg = HookRegistry::from_config(cfg);
         let (tx, mut rx) = mpsc::channel(8);
@@ -615,6 +764,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 ..HookSpec::default()
             }],
             assistant_message_render: vec![],
+            ..Default::default()
         };
         let reg = HookRegistry::from_config(cfg.clone());
         let snap = reg.snapshot().await;
@@ -642,6 +792,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 ..HookSpec::default()
             }],
             assistant_message_render: vec![],
+            ..Default::default()
         };
         let out = format_list(&cfg);
         assert!(out.contains("1 hook registered "), "got: {out}");
@@ -677,6 +828,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 timeout_ms: 10_000,
                 ..HookSpec::default()
             }],
+            ..Default::default()
         };
         let out = format_list(&cfg);
         // Plural wording, both event headers, both hooks in the prompt
@@ -702,6 +854,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 timeout_ms: 1_000,
                 ..HookSpec::default()
             }],
+            ..Default::default()
         };
         let out = format_list(&cfg);
         assert!(!out.contains("UserPromptSubmit"));
@@ -739,6 +892,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 },
             ],
             assistant_message_render: vec![],
+            ..Default::default()
         };
         let out = format_list(&cfg);
         // Expected max name width: "translate-to-french-v2" == 22 chars.
@@ -768,7 +922,7 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         // slice the registry is typed against, so adding a new event
         // variant to `HookEvent::ALL` automatically appears in the
         // listing without touching this function.
-        assert_eq!(HookEvent::ALL.len(), 2);
+        assert_eq!(HookEvent::ALL.len(), 4);
         let cfg = HooksConfig {
             user_prompt_submit: vec![HookSpec {
                 program: PathBuf::from("/a"),
@@ -782,9 +936,17 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
                 timeout_ms: 1_000,
                 ..HookSpec::default()
             }],
+            pre_tool_use: vec![HookSpec {
+                program: PathBuf::from("/c"),
+                args: vec![],
+                timeout_ms: 1_000,
+                ..HookSpec::default()
+            }],
+            ..Default::default()
         };
         let out = format_list(&cfg);
         assert!(out.contains("UserPromptSubmit (1):"));
         assert!(out.contains("AssistantMessageRender (1):"));
+        assert!(out.contains("PreToolUse (1):"));
     }
 }

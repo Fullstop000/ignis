@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 pub enum HookEvent {
     UserPromptSubmit,
     AssistantMessageRender,
+    /// Before a tool runs (and before the permission gate). Can block the call
+    /// or rewrite its args (`updatedInput`). Tool-name `matcher` applies.
+    PreToolUse,
+    /// After a tool runs (success or error). Can rewrite the result the model
+    /// sees (`updatedOutput`) or just observe. Cannot block. Matcher applies.
+    PostToolUse,
 }
 
 impl HookEvent {
@@ -20,7 +26,15 @@ impl HookEvent {
         match self {
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
             HookEvent::AssistantMessageRender => "AssistantMessageRender",
+            HookEvent::PreToolUse => "PreToolUse",
+            HookEvent::PostToolUse => "PostToolUse",
         }
+    }
+
+    /// `true` for the per-tool events, which carry a `tool_name` the spec's
+    /// optional `matcher` filters on (the prompt/render events ignore it).
+    pub fn is_tool_event(self) -> bool {
+        matches!(self, HookEvent::PreToolUse | HookEvent::PostToolUse)
     }
 
     /// Stable declaration order for the `/hooks` listing and any other
@@ -30,6 +44,8 @@ impl HookEvent {
     pub const ALL: &'static [HookEvent] = &[
         HookEvent::UserPromptSubmit,
         HookEvent::AssistantMessageRender,
+        HookEvent::PreToolUse,
+        HookEvent::PostToolUse,
     ];
 }
 
@@ -46,6 +62,22 @@ pub struct HookInput {
     /// Present for `AssistantMessageRender`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub content: Option<String>,
+    /// Present for `PreToolUse` / `PostToolUse`: the tool being invoked.
+    #[serde(rename = "toolName", skip_serializing_if = "Option::is_none", default)]
+    pub tool_name: Option<String>,
+    /// Present for `PreToolUse` / `PostToolUse`: the tool's argument object.
+    #[serde(rename = "toolInput", skip_serializing_if = "Option::is_none", default)]
+    pub tool_input: Option<serde_json::Value>,
+    /// Present for `PostToolUse`: the tool's result text.
+    #[serde(
+        rename = "toolResult",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub tool_result: Option<String>,
+    /// Present for `PostToolUse`: whether the tool returned an error.
+    #[serde(rename = "isError", skip_serializing_if = "Option::is_none", default)]
+    pub is_error: Option<bool>,
 }
 
 /// JSON the hook subprocess writes back on stdout. All fields are optional;
@@ -92,6 +124,10 @@ mod tests {
             cwd: "/tmp".to_string(),
             prompt: Some("hello".to_string()),
             content: None,
+            tool_name: None,
+            tool_input: None,
+            tool_result: None,
+            is_error: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         // Pass-through "content" is omitted in the wire shape.
@@ -138,5 +174,37 @@ mod tests {
     fn empty_object_is_a_valid_passthrough() {
         let out: HookOutput = serde_json::from_str("{}").unwrap();
         assert_eq!(out, HookOutput::default());
+    }
+
+    #[test]
+    fn input_carries_tool_fields_in_camelcase() {
+        let input = HookInput {
+            hook_event_name: "PostToolUse".to_string(),
+            session_id: "s1".to_string(),
+            cwd: "/tmp".to_string(),
+            prompt: None,
+            content: None,
+            tool_name: Some("bash".to_string()),
+            tool_input: Some(serde_json::json!({"command": "ls"})),
+            tool_result: Some("file.txt".to_string()),
+            is_error: Some(false),
+        };
+        let v: serde_json::Value = serde_json::to_value(&input).unwrap();
+        assert_eq!(v["toolName"], "bash");
+        assert_eq!(v["toolInput"]["command"], "ls");
+        assert_eq!(v["toolResult"], "file.txt");
+        assert_eq!(v["isError"], false);
+        // Pass-through prompt/content omitted.
+        assert!(v.get("prompt").is_none());
+        let back: HookInput = serde_json::from_value(v).unwrap();
+        assert_eq!(back, input);
+    }
+
+    #[test]
+    fn is_tool_event_classifies_correctly() {
+        assert!(HookEvent::PreToolUse.is_tool_event());
+        assert!(HookEvent::PostToolUse.is_tool_event());
+        assert!(!HookEvent::UserPromptSubmit.is_tool_event());
+        assert!(!HookEvent::AssistantMessageRender.is_tool_event());
     }
 }

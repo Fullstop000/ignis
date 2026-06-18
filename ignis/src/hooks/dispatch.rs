@@ -118,6 +118,31 @@ pub enum HookOutcome {
 pub struct DispatchContext<'a> {
     pub session_id: &'a str,
     pub cwd: &'a str,
+    /// Set for the per-tool events (`PreToolUse`/`PostToolUse`) — carries the
+    /// tool name/args/result that ride the envelope. `None` for the others.
+    pub tool: Option<ToolDispatch<'a>>,
+}
+
+impl<'a> DispatchContext<'a> {
+    /// A non-tool dispatch context (UserPromptSubmit / AssistantMessageRender).
+    pub fn new(session_id: &'a str, cwd: &'a str) -> Self {
+        Self {
+            session_id,
+            cwd,
+            tool: None,
+        }
+    }
+}
+
+/// The tool fields carried in the envelope for `PreToolUse`/`PostToolUse`.
+#[derive(Debug, Clone)]
+pub struct ToolDispatch<'a> {
+    pub tool_name: &'a str,
+    pub tool_input: &'a serde_json::Value,
+    /// `PostToolUse` only.
+    pub tool_result: Option<&'a str>,
+    /// `PostToolUse` only.
+    pub is_error: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -129,6 +154,14 @@ struct WireEnvelope<'a> {
     prompt: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<&'a str>,
+    #[serde(rename = "toolName", skip_serializing_if = "Option::is_none")]
+    tool_name: Option<&'a str>,
+    #[serde(rename = "toolInput", skip_serializing_if = "Option::is_none")]
+    tool_input: Option<&'a serde_json::Value>,
+    #[serde(rename = "toolResult", skip_serializing_if = "Option::is_none")]
+    tool_result: Option<&'a str>,
+    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
+    is_error: Option<bool>,
 }
 
 /// Run one hook and return the outcome. Never returns an Err — every
@@ -192,12 +225,17 @@ pub async fn run_hook(
         cwd: ctx.cwd,
         prompt: match event {
             HookEvent::UserPromptSubmit => Some(payload),
-            HookEvent::AssistantMessageRender => None,
+            _ => None,
         },
         content: match event {
             HookEvent::AssistantMessageRender => Some(payload),
-            HookEvent::UserPromptSubmit => None,
+            _ => None,
         },
+        // Tool events carry their data in the dedicated fields, not prompt/content.
+        tool_name: ctx.tool.as_ref().map(|t| t.tool_name),
+        tool_input: ctx.tool.as_ref().map(|t| t.tool_input),
+        tool_result: ctx.tool.as_ref().and_then(|t| t.tool_result),
+        is_error: ctx.tool.as_ref().and_then(|t| t.is_error),
     };
     let stdin_bytes = match serde_json::to_vec(&envelope) {
         Ok(b) => b,
@@ -546,8 +584,10 @@ pub async fn run_hook(
     }
 
     let rewrite = parsed.hook_specific_output.and_then(|s| match event {
-        HookEvent::UserPromptSubmit => s.updated_input,
-        HookEvent::AssistantMessageRender => s.updated_output,
+        // PreToolUse rewrites the tool's args (updatedInput); the others that
+        // mutate text use their respective field.
+        HookEvent::UserPromptSubmit | HookEvent::PreToolUse => s.updated_input,
+        HookEvent::AssistantMessageRender | HookEvent::PostToolUse => s.updated_output,
     });
     match rewrite {
         Some(updated) => record(
@@ -626,6 +666,7 @@ mod tests {
         DispatchContext {
             session_id: "sess",
             cwd: "/tmp",
+            tool: None,
         }
     }
 
@@ -852,6 +893,7 @@ printf '%s' "{\"hookSpecificOutput\":{\"updatedInput\":\"$out\"}}"
             timeout_ms: 5_000,
             env: vec![],
             sandbox: false,
+            ..Default::default()
         };
         let out = run_hook(&spec_no_env, HookEvent::UserPromptSubmit, "x", &ctx(), None).await;
         let body = match out {
@@ -874,6 +916,7 @@ printf '%s' "{\"hookSpecificOutput\":{\"updatedInput\":\"$out\"}}"
             timeout_ms: 5_000,
             env: vec!["IGNIS_HOOK_TEST_SECRET".to_string()],
             sandbox: false,
+            ..Default::default()
         };
         let out2 = run_hook(
             &spec_with_env,
