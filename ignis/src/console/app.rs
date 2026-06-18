@@ -812,6 +812,12 @@ impl App {
                 // same way.
                 self.add_assistant_notice(message);
             }
+            AgentEvent::Todos { .. } => {
+                // The agent task list is an Ink-frontend panel. The native TUI
+                // does not render it (kept as the comparison baseline); the
+                // `todo_write` tool still works and persists here, it just isn't
+                // surfaced in this frontend.
+            }
         }
     }
 

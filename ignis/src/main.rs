@@ -231,6 +231,9 @@ async fn main() -> Result<(), anyhow::Error> {
         mcp_for_subagent,
         None,
         Some(permissions.clone()),
+        // One-shot CLI has no live frontend to render a todo panel; the tool
+        // still updates the persisted list, it just isn't surfaced.
+        None,
     );
 
     // Permission gate. AFK is on for one-shot CLI so most Ask decisions

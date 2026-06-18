@@ -10,6 +10,7 @@ mod grep;
 mod list_dir;
 mod read_file;
 mod skill;
+mod todo_write;
 mod util;
 mod web_fetch;
 mod web_search;
@@ -24,6 +25,7 @@ pub use grep::GrepTool;
 pub use list_dir::ListDirTool;
 pub use read_file::ReadFileTool;
 pub use skill::SkillTool;
+pub use todo_write::{new_store as new_todo_store, Todo, TodoStatus, TodoStore, TodoWriteTool};
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 
@@ -55,7 +57,7 @@ pub fn register_native_tools(
     cwd: &Path,
     config: &crate::config::Config,
 ) {
-    register_native_tools_with_mcp(session, cwd, config, None, None, None)
+    register_native_tools_with_mcp(session, cwd, config, None, None, None, None)
 }
 
 /// Same as `register_native_tools` but threads a shared MCP registry into the
@@ -64,7 +66,8 @@ pub fn register_native_tools(
 /// and an optional shared `PermissionState` so `ask_user` honors AFK mode.
 /// `picker_tx = None` in headless contexts disables `ask_user` cleanly;
 /// `permissions = None` skips the AFK guard (e.g. tests with no permission
-/// system attached).
+/// system attached). `events = None` leaves `todo_write` un-surfaced (the
+/// write still updates the persisted store) — used by headless/one-shot runs.
 pub fn register_native_tools_with_mcp(
     session: &mut crate::Session,
     cwd: &Path,
@@ -72,6 +75,7 @@ pub fn register_native_tools_with_mcp(
     mcp: Option<Arc<crate::mcp::McpRegistry>>,
     picker_tx: Option<tokio::sync::mpsc::Sender<crate::interaction::PickerRequest>>,
     permissions: Option<Arc<crate::permissions::runtime::PermissionState>>,
+    events: Option<tokio::sync::mpsc::Sender<crate::AgentEvent>>,
 ) {
     for tool in native_tools(cwd, config.web_search.clone()) {
         session.register_tool(tool);
@@ -90,6 +94,11 @@ pub fn register_native_tools_with_mcp(
         ask_user = ask_user.with_permissions(p);
     }
     session.register_tool(Arc::new(ask_user));
+    // The `todo_write` tool shares the session's persisted task list and emits
+    // `Todos` events over `events`. Top-level only — a sub-agent's task list
+    // would be invisible and serves no purpose.
+    let todo_store = session.todos_handle();
+    session.register_tool(Arc::new(TodoWriteTool::new(todo_store, events)));
 }
 
 /// Register every tool exposed by a connected MCP server as an `AgentTool`.

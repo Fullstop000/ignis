@@ -27,6 +27,25 @@ pub trait SessionStorage: Send + Sync + 'static {
     async fn load_usage(&self, _session_id: &str) -> Result<Usage, anyhow::Error> {
         Ok(Usage::default())
     }
+
+    /// Persist the session's `todo_write` task list. An empty list clears any
+    /// previously-saved file so a cleared list doesn't reappear on reload.
+    /// Default no-op for backends that don't track it (e.g. in-memory tests).
+    async fn save_todos(
+        &self,
+        _session_id: &str,
+        _todos: &[crate::tools::Todo],
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    /// Load a session's persisted task list (default: empty).
+    async fn load_todos(
+        &self,
+        _session_id: &str,
+    ) -> Result<Vec<crate::tools::Todo>, anyhow::Error> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Clone)]
@@ -270,6 +289,43 @@ impl SessionStorage for FileStorage {
             Err(_) => Ok(Usage::default()),
         }
     }
+
+    async fn save_todos(
+        &self,
+        session_id: &str,
+        todos: &[crate::tools::Todo],
+    ) -> Result<(), anyhow::Error> {
+        let clean_id = self.sanitize_session_id(session_id)?;
+        let path = self.base_dir.join(format!("{}.todos.json", clean_id));
+        let _lock = self.write_lock.write().await;
+        if todos.is_empty() {
+            // Clear: a cleared list must not reappear on the next load. Removing
+            // the file is the empty state (load returns `[]` when absent).
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        } else {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            // Atomic (tmp + rename) so a crash mid-write can't leave a truncated
+            // `.todos.json` that fails to parse and silently drops the list.
+            let bytes = serde_json::to_vec(todos)?;
+            Self::atomic_write(&path, &bytes).await?;
+            Ok(())
+        }
+    }
+
+    async fn load_todos(&self, session_id: &str) -> Result<Vec<crate::tools::Todo>, anyhow::Error> {
+        let clean_id = self.sanitize_session_id(session_id)?;
+        let path = self.base_dir.join(format!("{}.todos.json", clean_id));
+        match tokio::fs::read_to_string(&path).await {
+            Ok(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -410,6 +466,45 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!leftover_tmp, "atomic write left a temp file behind");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The task list round-trips through `save_todos`/`load_todos`, and saving an
+    /// empty list clears the file so a cleared list does not reappear on reload.
+    #[tokio::test]
+    async fn save_todos_round_trips_and_empty_clears() {
+        use crate::tools::{Todo, TodoStatus};
+        let tmp = crate::util::unique_temp_dir("ignis-storage-todos");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let storage = FileStorage::new(tmp.clone());
+
+        // Absent file → empty.
+        assert!(storage.load_todos("sess-t").await.unwrap().is_empty());
+
+        let todos = vec![
+            Todo {
+                content: "build it".into(),
+                status: TodoStatus::InProgress,
+                active_form: Some("Building it".into()),
+            },
+            Todo {
+                content: "test it".into(),
+                status: TodoStatus::Pending,
+                active_form: None,
+            },
+        ];
+        storage.save_todos("sess-t", &todos).await.unwrap();
+        let loaded = storage.load_todos("sess-t").await.unwrap();
+        assert_eq!(loaded, todos);
+
+        // Clearing (empty list) removes the sidecar so it loads back as empty.
+        storage.save_todos("sess-t", &[]).await.unwrap();
+        assert!(storage.load_todos("sess-t").await.unwrap().is_empty());
+        assert!(
+            !tmp.join("sess-t.todos.json").exists(),
+            "empty save should remove the sidecar"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
