@@ -1029,6 +1029,54 @@ mod tests {
     }
 
     #[test]
+    fn diff_context_lines_align_with_changed_lines() {
+        // Regression: context rows preserved the unified-diff leading space while
+        // +/- rows stripped the sign (and optional space), so the code body was
+        // shifted one column to the left compared with added/removed lines.
+        let mut app = App::new(
+            Some("p".to_string()),
+            Some("m".to_string()),
+            "default".to_string(),
+            PathBuf::from("."),
+        );
+        // Unified-diff rows: context lines carry a leading space prefix that is
+        // NOT part of the source text; +/- lines carry the sign. The source lines
+        // themselves are indented two spaces, so each context row has three spaces
+        // before `const`.
+        let diff = "@@ -15,3 +15,3 @@\n   const feedPath = '/api/feed';\n-  const larkFeedDb = null;\n+  const larkLiveDb = null;\n   const feedStream = null;";
+        app.blocks.push(UIBlock::Tool(ToolCallEntry {
+            id: "c".to_string(),
+            name: "edit_file".to_string(),
+            arguments: r#"{"path":"src/app.js"}"#.to_string(),
+            status: ToolStatus::Success(diff.to_string()),
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 5,
+        }));
+
+        // `block_lines` is the canonical transcript-line builder; inspect its
+        // output directly so the test is independent of `Paragraph` wrap behavior.
+        let direct: Vec<String> = block_lines(&app.blocks[0], app.tick, &app.cwd, 100)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let ctx_feed = direct.iter().find(|l| l.contains("feedPath")).unwrap();
+        let add = direct.iter().find(|l| l.contains("larkLiveDb")).unwrap();
+        let ctx_stream = direct.iter().find(|l| l.contains("feedStream")).unwrap();
+        // Every body line starts at the same column: 4-space prefix +
+        // 1-cell gutter/sign + 2-space source indent = 7 spaces before `const`.
+        assert_eq!(
+            ctx_feed.find("const"),
+            add.find("const"),
+            "context and added lines should align; ctx={ctx_feed:?} add={add:?}"
+        );
+        assert_eq!(
+            ctx_stream.find("const"),
+            add.find("const"),
+            "context and added lines should align"
+        );
+    }
+
+    #[test]
     fn long_diff_line_stays_on_one_row() {
         // Regression: truncation appended `…` past the width, making the line one
         // cell too wide so its solid bg wrapped onto a second row.

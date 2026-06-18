@@ -304,4 +304,13 @@ test('toolDiffPreview parses unified-diff hunks with line numbers', () => {
   assert.equal(hl.dels, 1);
   assert.equal(hl.lines.length, 3);
   assert.equal(hl.lines[0].lineNo, null);
+
+  // The ratatui engine appends a `… N more diff lines truncated` notice after
+  // the real diff body when it exceeds its internal cap. It must not be parsed
+  // as a context line with a synthesized line number.
+  const truncated = '@@ -1,2 +1,2 @@\n-old\n+new\n… 5 more diff lines truncated';
+  const trunc = toolDiffPreview(truncated);
+  assert.equal(trunc.adds, 1);
+  assert.equal(trunc.dels, 1);
+  assert.equal(trunc.lines.length, 2);
 });

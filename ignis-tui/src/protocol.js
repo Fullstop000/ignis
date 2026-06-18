@@ -325,6 +325,9 @@ export function toolDiffPreview(content) {
     // Skip the `\ No newline at end of file` marker (`\\` is the unidiff
     // convention) — it's metadata, not a real diff line.
     if (raw.startsWith('\\')) continue;
+    // Skip the ratatui-engine truncation notice (`… N more diff lines truncated`);
+    // it is appended after the real diff body and should not carry a line number.
+    if (raw.startsWith('…')) continue;
     if (!inHunk) continue;
     const sign = raw[0];
     const body = raw.slice(1);
