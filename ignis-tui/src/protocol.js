@@ -83,6 +83,11 @@ export function initialState() {
     sessions: [],
     turns: 0,
     usage: null,
+    // Monotonic count of turn-end events. The waiting-queue drain keys on this
+    // (the turn-end EVENT, like the native runner's turn_in_flight flag) rather
+    // than a busy→idle status change, so a queued message still drains after a
+    // turn that failed before turn_start (a lone turn_end leaves status idle).
+    turnEnds: 0,
     // Chars streamed this turn (reset at turn_start), for a live output-token
     // estimate in the running status bar — mirrors the native TUI's chars/4.
     streamChars: 0,
@@ -151,7 +156,7 @@ function reduceEvent(state, ev) {
     case EVENT.TURN_START:
       return { ...state, status: 'busy', turns: state.turns + 1, streamChars: 0 };
     case EVENT.TURN_END:
-      return { ...state, status: 'idle' };
+      return { ...state, status: 'idle', turnEnds: state.turnEnds + 1 };
     case EVENT.MESSAGE_START: {
       // A reasoning block opens as { reasoning_content: "", content: null };
       // a reply opens with content. Track which the stream is so its deltas

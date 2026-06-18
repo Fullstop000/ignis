@@ -61,6 +61,34 @@ test('turn_end drains exactly one queued message as a submit', async () => {
   assert.equal(submits(engine)[1].data.text, 'second');
 });
 
+test('a queued message still drains after a turn that fails before turn_start', async () => {
+  // Provider/session errors emit a LONE turn_end (no turn_start), so status goes
+  // idle→idle. The drain must key on the turn-end EVENT, not a status change, or
+  // the next queued message stalls forever (native keys on turn_in_flight).
+  const { engine, stdin, lastFrame } = renderApp();
+  await tick();
+  engine.emit(ev('turn_start'));
+  await tick();
+  for (const m of ['q1', 'q2']) {
+    stdin.write(m);
+    await tick();
+    stdin.write(KEY.enter);
+    await tick();
+  }
+  // Real turn ends → q1 drains + submits.
+  engine.emit(ev('turn_end'));
+  await tick();
+  assert.equal(submits(engine).length, 1, 'q1 drained');
+  assert.equal(submits(engine)[0].data.text, 'q1');
+
+  // q1's turn fails before any turn_start: a LONE turn_end (status stays idle).
+  engine.emit(ev('turn_end'));
+  await tick();
+  assert.equal(submits(engine).length, 2, 'q2 must still drain on a lone turn_end');
+  assert.equal(submits(engine)[1].data.text, 'q2');
+  assert.doesNotMatch(plain(lastFrame()), /⏳/, 'queue is empty (no stranded strip)');
+});
+
 test('an idle Enter still submits immediately (unchanged)', async () => {
   const { engine, stdin } = renderApp();
   await tick();

@@ -64,7 +64,6 @@ export default function App({ engine, onExit }) {
   const [spin, setSpin] = useState(0); // running-spinner frame
   const turnStart = useRef(0); // ms timestamp the current turn began (0 = idle)
   const [queue, setQueue] = useState([]); // messages typed while busy, drained 1/turn-end
-  const prevStatus = useRef('idle'); // edge-trigger the queue drain on busy→idle
 
   useEffect(() => {
     engine.onFrame((frame) => setState((s) => reduceOutbound(s, frame)));
@@ -160,20 +159,18 @@ export default function App({ engine, onExit }) {
     }
   };
 
-  // Drain exactly ONE queued message when a turn ends (busy→idle), mirroring the
-  // native runner's edge-triggered `pump_queued`. Submitting it flips the engine
-  // back to busy, so the next item waits for the following turn-end. The
-  // status-change render always carries the latest `queue`, so a stale closure
-  // can't drop a message queued mid-turn.
+  // Drain exactly ONE queued message on each turn-end, mirroring the native
+  // runner's edge-triggered `pump_queued`. Keyed on the turn-end EVENT
+  // (`state.turnEnds`), NOT a busy→idle status change: several engine paths
+  // (provider/session errors) emit a lone turn_end that leaves status `idle`, so
+  // a status-keyed effect would strand the next queued message. Submitting flips
+  // the engine back to busy; the next item waits for the following turn-end.
   useEffect(() => {
-    const was = prevStatus.current;
-    prevStatus.current = state.status;
-    if (was === 'busy' && state.status === 'idle' && queue.length > 0 && !req && !localPicker) {
-      const [next, ...rest] = queue;
-      setQueue(rest);
-      dispatchResolved(next);
-    }
-  }, [state.status]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (state.turnEnds === 0 || queue.length === 0) return;
+    const [next, ...rest] = queue;
+    setQueue(rest);
+    dispatchResolved(next);
+  }, [state.turnEnds]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useInput((ch, key) => {
     // While a picker is open it owns all keys (PickerFlow / ChoicePicker each
