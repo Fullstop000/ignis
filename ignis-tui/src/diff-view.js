@@ -1,15 +1,24 @@
 // Standalone diff view for the Ink frontend.
 //
 // Parses the unified-diff body returned by `edit_file` and renders it as a
-// line-numbered, word-level diff. The entire +/- row is tinted green/red;
-// the exact changed words are also bold so the eye can see *what* changed
-// without reading both lines side by side.
+// line-numbered, word-level diff. +/- rows get full-width green/red
+// background bars; the exact changed words are bold with a stronger background
+// so they stand out from the surrounding tinted row.
 import React from 'react';
-import { Box, Text } from 'ink';
+import { Box, Text, useStdout } from 'ink';
 import { diffWords } from 'diff';
 import { toolDiffPreview } from './protocol.js';
 
 const e = React.createElement;
+
+const COLORS = {
+  addFg: 'green',
+  delFg: 'red',
+  addBg: '#1d3b2e',
+  delBg: '#3b1d28',
+  addWordBg: '#2d5a44',
+  delWordBg: '#5a2d3a',
+};
 
 /**
  * Render an `edit_file` result as a Claude-Code-style diff view.
@@ -27,6 +36,7 @@ export default function DiffView({ content, path }) {
   );
   if (!lines.length) return header;
 
+  const cols = useTerminalWidth();
   const maxLn = lines.reduce(
     (m, ln) => (ln.lineNo != null && ln.lineNo > m ? ln.lineNo : m),
     0,
@@ -50,12 +60,22 @@ export default function DiffView({ content, path }) {
     const prefix = `  ${num}  ${sign}  `;
 
     if (ln.kind === 'add' || ln.kind === 'del') {
+      const isAdd = ln.kind === 'add';
       const pair = pairs.get(i);
-      const baseColor = ln.kind === 'add' ? 'green' : 'red';
+      const baseColor = isAdd ? COLORS.addFg : COLORS.delFg;
+      const bgColor = isAdd ? COLORS.addBg : COLORS.delBg;
       const children = pair
-        ? renderWordDiff(pair.oldText, pair.newText, ln.kind === 'add', baseColor)
+        ? renderWordDiff(pair.oldText, pair.newText, isAdd, baseColor)
         : [ln.text];
-      return e(Text, { key: `d${i}`, color: baseColor }, prefix, ...children);
+      // Pad to the terminal width so the background fills the whole row.
+      const pad = ' '.repeat(Math.max(0, cols - prefix.length - ln.text.length));
+      return e(
+        Text,
+        { key: `d${i}`, color: baseColor, backgroundColor: bgColor },
+        prefix,
+        ...children,
+        pad,
+      );
     }
 
     return e(
@@ -76,6 +96,12 @@ export default function DiffView({ content, path }) {
   }
 
   return e(Box, { flexDirection: 'column' }, [header, ...body]);
+}
+
+/** Read the terminal width from Ink's stdout context; default to 80 in tests. */
+function useTerminalWidth() {
+  const { stdout } = useStdout();
+  return stdout?.columns || 80;
 }
 
 /**
@@ -110,11 +136,12 @@ function pairRows(lines) {
 
 /**
  * Convert a word diff between an old and new line into Ink `<Text>` children.
- * Equal parts inherit the base row color; added/removed parts are bold so the
- * changed words pop.
+ * Equal parts inherit the base row color/background; added/removed parts are
+ * bold with a stronger background so the changed words pop.
  */
 function renderWordDiff(oldText, newText, isAdd, baseColor) {
   const changes = diffWords(oldText, newText);
+  const wordBg = isAdd ? COLORS.addWordBg : COLORS.delWordBg;
   return changes
     .map((part, idx) => {
       // For an addition row we render unchanged + inserted text; for a deletion
@@ -124,10 +151,14 @@ function renderWordDiff(oldText, newText, isAdd, baseColor) {
       if (!part.value) return null;
       const changed = isAdd ? part.added : part.removed;
       if (!changed) {
-        // Unchanged segment: just a string so it inherits the parent color.
+        // Unchanged segment: just a string so it inherits the parent styles.
         return part.value;
       }
-      return e(Text, { key: `w${idx}`, bold: true, color: baseColor }, part.value);
+      return e(
+        Text,
+        { key: `w${idx}`, bold: true, color: baseColor, backgroundColor: wordBg },
+        part.value,
+      );
     })
     .filter(Boolean);
 }
