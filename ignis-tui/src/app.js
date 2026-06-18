@@ -63,6 +63,7 @@ export default function App({ engine, onExit }) {
   const [slashSel, setSlashSel] = useState(0); // selected row in the slash-command suggestions
   const [spin, setSpin] = useState(0); // running-spinner frame
   const turnStart = useRef(0); // ms timestamp the current turn began (0 = idle)
+  const [queue, setQueue] = useState([]); // messages typed while busy, drained 1/turn-end
 
   useEffect(() => {
     engine.onFrame((frame) => setState((s) => reduceOutbound(s, frame)));
@@ -145,6 +146,32 @@ export default function App({ engine, onExit }) {
     }
   };
 
+  // Dispatch one fully-resolved (paste-expanded) line as if Enter were pressed
+  // while idle: run locally-handled slash commands, else submit to the engine
+  // with an optimistic user block. Shared by the idle Enter path and the
+  // queue drain.
+  const dispatchResolved = (text) => {
+    const slash = parseSlash(text);
+    if (slash && handleSlash(slash)) return;
+    engine.send(submit(text));
+    if (!slash) {
+      setState((s) => ({ ...s, blocks: [...s.blocks, { kind: 'user', text, pending: true }] }));
+    }
+  };
+
+  // Drain exactly ONE queued message on each turn-end, mirroring the native
+  // runner's edge-triggered `pump_queued`. Keyed on the turn-end EVENT
+  // (`state.turnEnds`), NOT a busy→idle status change: several engine paths
+  // (provider/session errors) emit a lone turn_end that leaves status `idle`, so
+  // a status-keyed effect would strand the next queued message. Submitting flips
+  // the engine back to busy; the next item waits for the following turn-end.
+  useEffect(() => {
+    if (state.turnEnds === 0 || queue.length === 0) return;
+    const [next, ...rest] = queue;
+    setQueue(rest);
+    dispatchResolved(next);
+  }, [state.turnEnds]); // eslint-disable-line react-hooks/exhaustive-deps
+
   useInput((ch, key) => {
     // While a picker is open it owns all keys (PickerFlow / ChoicePicker each
     // have their own useInput).
@@ -182,18 +209,17 @@ export default function App({ engine, onExit }) {
       // If the slash-suggestion list is open, Enter runs the selected command.
       const sugg = slashSuggestions(raw);
       const line = sugg.length ? sugg[Math.min(slashSel, sugg.length - 1)].name : raw;
-      // Slash dispatch: a few commands are handled locally; everything else
-      // (plain prompts, /compact, unknown slashes) is submitted to the engine.
-      const slash = parseSlash(line);
-      if (slash && handleSlash(slash)) {
-        resetComposer();
-        return;
-      }
+      // Resolve pastes now: the composer clears on Enter, so a queued line must
+      // already carry its expanded content.
       const sent = expandPastes(line, pastes);
-      engine.send(submit(sent));
-      // Optimistic user block (plain prompts only) so the message shows
-      // instantly over the pipe; `user_prompt_committed` reconciles it.
-      if (!slash) setState((s) => ({ ...s, blocks: [...s.blocks, { kind: 'user', text: sent, pending: true }] }));
+      if (state.status === 'busy') {
+        // Busy: hold it in the waiting queue (no submit, no transcript block).
+        // It drains one-per-turn at turn-end. Ctrl+S sends now, ↑ edits last.
+        setQueue((q) => [...q, sent]);
+      } else {
+        // Idle: dispatch immediately (local slash command, or submit + block).
+        dispatchResolved(sent);
+      }
       setHistory((h) => [...h, raw]);
       resetComposer();
       return;
@@ -202,6 +228,14 @@ export default function App({ engine, onExit }) {
     if (key.upArrow) {
       if (slashSuggestions(comp.text).length) {
         setSlashSel((s) => Math.max(0, s - 1));
+        return;
+      }
+      // While busy with a queue, ↑ pulls the most recent queued message back
+      // into the composer to edit (matches the native TUI's "edit last").
+      if (state.status === 'busy' && queue.length > 0 && !comp.text) {
+        const last = queue[queue.length - 1];
+        setQueue((q) => q.slice(0, -1));
+        setComp({ text: last, cursor: last.length });
         return;
       }
       if (!history.length) return;
@@ -364,6 +398,10 @@ export default function App({ engine, onExit }) {
     // Running status bar above the composer while a turn is in flight.
     if (state.status === 'busy') {
       children.push(e(RunningBar, { key: 'running', state, spin, startedAt: turnStart.current }));
+    }
+    // Waiting queue: messages typed while busy, drained one per turn-end.
+    if (queue.length > 0) {
+      children.push(e(QueuedStrip, { key: 'queued', queue }));
     }
     // Slash-command suggestions above the composer while typing a `/command`.
     const sugg = comp.text ? slashSuggestions(comp.text) : [];
@@ -554,6 +592,21 @@ function RunningBar({ state, spin, startedAt }) {
     e(Text, { color: 'gray' }, `Working… ${elapsed}s`),
     e(Text, { dimColor: true }, tail),
   );
+}
+
+// Waiting-queue strip: messages typed while a turn is in flight, drained one per
+// turn-end. Mirrors the native TUI's queued strip (cap + overflow + hint).
+const MAX_QUEUE_ROWS = 5;
+function QueuedStrip({ queue }) {
+  const shown = queue.slice(0, MAX_QUEUE_ROWS);
+  const overflow = queue.length - shown.length;
+  const rows = shown.map((t, i) =>
+    e(Text, { key: `q${i}`, dimColor: true }, `  ⏳ ${t.split('\n')[0]}`));
+  if (overflow > 0) {
+    rows.push(e(Text, { key: 'of', dimColor: true }, `  +${overflow} more queued`));
+  }
+  rows.push(e(Text, { key: 'hint', dimColor: true }, '  ↑ edit last · Enter queue · Ctrl+S send now'));
+  return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
 }
 
 // Slash-command autocomplete dropdown (above the composer). The selected row is

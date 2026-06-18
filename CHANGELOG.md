@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.1] - 2026-06-18
+
+### Fixed
+- Ink frontend — messages typed while the agent is busy now wait in a queue and send one per turn instead of submitting immediately, matching the built-in TUI. ([#193](https://github.com/Fullstop000/ignis/pull/193))
+
 ## [0.40.0] - 2026-06-17
 
 ### Changed
