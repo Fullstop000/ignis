@@ -6,7 +6,7 @@
 // so they stand out from the surrounding tinted row.
 import React from 'react';
 import { Box, Text, useStdout } from 'ink';
-import { diffWords } from 'diff';
+import { diffWordsWithSpace } from 'diff';
 import { toolDiffPreview } from './protocol.js';
 
 const e = React.createElement;
@@ -140,7 +140,7 @@ function pairRows(lines) {
  * bold with a stronger background so the changed words pop.
  */
 function renderWordDiff(oldText, newText, isAdd, baseColor) {
-  const changes = diffWords(oldText, newText);
+  const changes = diffWordsWithSpace(oldText, newText);
   const wordBg = isAdd ? COLORS.addWordBg : COLORS.delWordBg;
   return changes
     .map((part, idx) => {

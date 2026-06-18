@@ -48,6 +48,16 @@ test('DiffView reconstructs each row with its own line content', () => {
   assert.match(f, /\+\s+added$/m, 'second added row contains only added text');
 });
 
+test('DiffView preserves whitespace-only edits', () => {
+  // diffWords ignores whitespace by default, which would make both rows render
+  // the same text. diffWordsWithSpace keeps the original spacing on each side.
+  const content = '@@ -1,1 +1,1 @@\n-old line\n+old  line\n';
+  const { lastFrame } = render(e(DiffView, { content, path: 'ws.rs' }));
+  const f = plain(lastFrame());
+  assert.match(f, /-\s+old line$/m, 'deleted row keeps single space');
+  assert.match(f, /\+\s+old  line$/m, 'added row keeps double space');
+});
+
 test('DiffView reports overflow when diff exceeds the cap', () => {
   // toolDiffPreview caps at 30 lines; build a 32-line diff.
   const lines = [];
