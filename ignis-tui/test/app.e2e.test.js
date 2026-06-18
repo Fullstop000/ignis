@@ -144,6 +144,30 @@ test('tool error output renders red, up to 5 lines', async () => {
   assert.match(f, /\+1 more lines/);
 });
 
+test('edit_file tool result renders a diff summary and hunk instead of generic preview', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  engine.emit(
+    ev('tool_execution_start', {
+      tool_call_id: 'd1',
+      tool_name: 'edit_file',
+      arguments: '{"path":"src/main.rs","old_text":"old","new_text":"new"}',
+    }),
+  );
+  engine.emit(
+    ev('tool_execution_end', {
+      tool_call_id: 'd1',
+      result: { content: '- old\n+ new\n- removed\n+ added', is_error: false },
+    }),
+  );
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /\+2 -2/, 'shows added/deleted line summary');
+  assert.match(f, /╰ - old/, 'shows removed diff line');
+  assert.match(f, /\+ added/, 'shows added diff line');
+  assert.doesNotMatch(f, /more lines/, 'edit diffs use the larger diff cap, not the generic 3-line cap');
+});
+
 test('inject + warning + reconnecting render their own blocks', async () => {
   const { engine, lastFrame } = renderApp();
   await tick();

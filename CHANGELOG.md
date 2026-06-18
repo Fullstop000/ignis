@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Providers — Ark Coding Plan now includes `glm-5.2` with a 1M context window. ([#194](https://github.com/Fullstop000/ignis/pull/194))
+
+### Fixed
+- TUI — the Ink frontend now renders `edit_file` results as red/green diffs instead of generic tool output. ([#194](https://github.com/Fullstop000/ignis/pull/194))
+
 ## [0.40.1] - 2026-06-18
 
 ### Fixed

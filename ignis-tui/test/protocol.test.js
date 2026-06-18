@@ -26,6 +26,7 @@ import {
   answerCancelled,
   toolArgsSummary,
   toolOutputPreview,
+  toolDiffPreview,
 } from '../src/protocol.js';
 
 test('a streaming assistant message accumulates deltas then finalizes', () => {
@@ -235,4 +236,25 @@ test('toolOutputPreview caps lines (3 ok / 5 error) and counts the rest', () => 
   assert.deepEqual(toolOutputPreview('a\nb\nc\nd\ne\nf\ng', true), { lines: ['a', 'b', 'c', 'd', 'e'], more: 2 });
   // Trailing whitespace trimmed before counting.
   assert.deepEqual(toolOutputPreview('only\n\n'), { lines: ['only'], more: 0 });
+});
+
+test('toolDiffPreview counts and caps edit_file diff hunks', () => {
+  assert.deepEqual(toolDiffPreview(''), { adds: 0, dels: 0, lines: [], more: 0 });
+  assert.deepEqual(toolDiffPreview('- old\n+ new\n context'), {
+    adds: 1,
+    dels: 1,
+    lines: [
+      { text: '- old', kind: 'del' },
+      { text: '+ new', kind: 'add' },
+      { text: ' context', kind: 'ctx' },
+    ],
+    more: 0,
+  });
+  const many = Array.from({ length: 32 }, (_, i) => `+ line ${i}`).join('\n');
+  assert.deepEqual(toolDiffPreview(many), {
+    adds: 32,
+    dels: 0,
+    lines: Array.from({ length: 30 }, (_, i) => ({ text: `+ line ${i}`, kind: 'add' })),
+    more: 2,
+  });
 });

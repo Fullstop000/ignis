@@ -275,6 +275,28 @@ export function toolOutputPreview(content, isError = false) {
   return { lines: all.slice(0, cap), more: Math.max(0, all.length - cap) };
 }
 
+/** Diff preview for edit_file results, matching the native TUI's larger cap. */
+export function toolDiffPreview(content) {
+  const text = (content ?? '').replace(/\s+$/, '');
+  if (!text) return { adds: 0, dels: 0, lines: [], more: 0 };
+  const all = text.split('\n');
+  let adds = 0;
+  let dels = 0;
+  const classified = all.map((line) => {
+    if (line.startsWith('+')) {
+      adds += 1;
+      return { text: line, kind: 'add' };
+    }
+    if (line.startsWith('-')) {
+      dels += 1;
+      return { text: line, kind: 'del' };
+    }
+    return { text: line, kind: 'ctx' };
+  });
+  const cap = 30;
+  return { adds, dels, lines: classified.slice(0, cap), more: Math.max(0, classified.length - cap) };
+}
+
 // ── ClientCommand builders (return objects to JSON.stringify onto the wire) ──
 export const submit = (text) => ({ kind: CMD.SUBMIT, data: { text } });
 export const inject = (text) => ({ kind: CMD.INJECT, data: { text } });
