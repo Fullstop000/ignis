@@ -20,6 +20,11 @@ const COLORS = {
   delWordBg: '#5a2d3a',
 };
 
+// Word-level diffing is synchronous and can freeze the TUI on very long lines
+// (e.g., minified JSON, lockfiles). Fall back to plain row rendering above
+// this combined old+new character threshold.
+const MAX_WORD_DIFF_CHARS = 400;
+
 /**
  * Render an `edit_file` result as a Claude-Code-style diff view.
  *
@@ -140,6 +145,10 @@ function pairRows(lines) {
  * bold with a stronger background so the changed words pop.
  */
 function renderWordDiff(oldText, newText, isAdd, baseColor) {
+  if (oldText.length + newText.length > MAX_WORD_DIFF_CHARS) {
+    // Avoid a synchronous word-diff freeze; render the row as plain text.
+    return [isAdd ? newText : oldText];
+  }
   const changes = diffWordsWithSpace(oldText, newText);
   const wordBg = isAdd ? COLORS.addWordBg : COLORS.delWordBg;
   return changes

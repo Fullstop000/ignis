@@ -48,6 +48,18 @@ test('DiffView reconstructs each row with its own line content', () => {
   assert.match(f, /\+\s+added$/m, 'second added row contains only added text');
 });
 
+test('DiffView falls back to plain rendering for very long changed lines', () => {
+  // Above MAX_WORD_DIFF_CHARS the component skips the synchronous word diff
+  // to avoid freezing the TUI; the row should still contain its own text.
+  const oldLine = 'a'.repeat(250);
+  const newLine = 'b'.repeat(250);
+  const content = `@@ -1,1 +1,1 @@\n-${oldLine}\n+${newLine}\n`;
+  const { lastFrame } = render(e(DiffView, { content, path: 'long.rs' }));
+  const f = plain(lastFrame()).replace(/\n/g, '');
+  assert.ok(f.includes(`-  ${oldLine}`), 'deleted row shows the long old text');
+  assert.ok(f.includes(`+  ${newLine}`), 'added row shows the long new text');
+});
+
 test('DiffView preserves whitespace-only edits', () => {
   // diffWords ignores whitespace by default, which would make both rows render
   // the same text. diffWordsWithSpace keeps the original spacing on each side.
