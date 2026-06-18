@@ -211,6 +211,10 @@ pub fn default_policy_for_tool(tool_name: &str) -> Decision {
         // an internal sidecar) — no filesystem/network/exec reach. Gating it
         // would prompt on every plan update; allow like other state reads.
         "todo_write" => Decision::Allow,
+        // Background-shell management: reading output is a pure read; killing
+        // only ever targets a shell ignis itself started. (Starting one rides
+        // the `bash` gate.)
+        "bash_output" | "kill_shell" => Decision::Allow,
         // Network + writes + execution + agent spawn → ask by default.
         "web_fetch" => Decision::ask("network fetch"),
         "bash" => Decision::ask("shell command"),
@@ -264,6 +268,8 @@ mod tests {
             "skill",
             "ask_user",
             "todo_write",
+            "bash_output",
+            "kill_shell",
             "web_fetch",
             "bash",
             "edit_file",
@@ -278,6 +284,12 @@ mod tests {
     #[test]
     fn todo_write_allows_by_default() {
         assert_eq!(default_policy_for_tool("todo_write"), Decision::Allow);
+    }
+
+    #[test]
+    fn background_shell_tools_allow_by_default() {
+        assert_eq!(default_policy_for_tool("bash_output"), Decision::Allow);
+        assert_eq!(default_policy_for_tool("kill_shell"), Decision::Allow);
     }
 
     #[test]

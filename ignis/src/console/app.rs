@@ -818,6 +818,11 @@ impl App {
                 // `todo_write` tool still works and persists here, it just isn't
                 // surfaced in this frontend.
             }
+            AgentEvent::BackgroundShells { .. } => {
+                // Background-shell footer indicator is an Ink-frontend panel; the
+                // native TUI doesn't surface it (kept as the comparison
+                // baseline). The background tools still work here.
+            }
         }
     }
 

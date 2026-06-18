@@ -39,6 +39,7 @@ export const EVENT = Object.freeze({
   RECONNECTING: 'reconnecting',
   USAGE: 'usage',
   TODOS: 'todos',
+  BACKGROUND_SHELLS: 'background_shells',
 });
 
 /** `ClientCommand` kinds (frontend → engine). */
@@ -87,6 +88,9 @@ export function initialState() {
     // The agent's task list (`todo_write`). Rendered as a checklist panel above
     // the composer while non-empty; set by the `todos` event, reset on resume.
     todos: [],
+    // Number of live background shells (bash run_in_background); the footer shows
+    // `⚙ N bg` while > 0. Updated by the `background_shells` event.
+    bgShells: 0,
     // Monotonic count of turn-end events. The waiting-queue drain keys on this
     // (the turn-end EVENT, like the native runner's turn_in_flight flag) rather
     // than a busy→idle status change, so a queued message still drains after a
@@ -240,6 +244,9 @@ function reduceEvent(state, ev) {
     case EVENT.TODOS:
       // AgentEvent::Todos { items } — the complete task list (full replace).
       return { ...state, todos: p.items ?? [] };
+    case EVENT.BACKGROUND_SHELLS:
+      // AgentEvent::BackgroundShells { running } — live background-shell count.
+      return { ...state, bgShells: p.running ?? 0 };
     default:
       // run_start / run_end — not surfaced in the minimal UI.
       return state;
