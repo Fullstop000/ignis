@@ -37,6 +37,7 @@ import {
   answerCancelled,
   toolArgsSummary,
   toolOutputPreview,
+  toolDiffPreview,
 } from './protocol.js';
 import { parseMarkdown, parseInline } from './markdown.js';
 
@@ -480,6 +481,17 @@ function ToolBlock({ block }) {
     `● ${block.name}(${toolArgsSummary(block.args)})${block.done ? '' : ' …'}`,
   );
   if (!block.done || !block.result) return header;
+  if (!isError && block.name === 'edit_file') {
+    const { adds, dels, lines, more } = toolDiffPreview(block.result.content);
+    if (!lines.length) return header;
+    const body = [e(Text, { key: 'sum', color: 'gray' }, `    +${adds} -${dels}`)];
+    for (const [i, line] of lines.entries()) {
+      const color = line.kind === 'add' ? 'green' : line.kind === 'del' ? 'red' : 'gray';
+      body.push(e(Text, { key: `d${i}`, color }, `  ${i === 0 ? '╰ ' : '  '}${line.text}`));
+    }
+    if (more) body.push(e(Text, { key: 'more', dimColor: true }, `    … +${more} more lines`));
+    return e(Box, { flexDirection: 'column' }, [header, ...body]);
+  }
   const { lines, more } = toolOutputPreview(block.result.content, isError);
   if (!lines.length) return header;
   const body = lines.map((ln, i) =>

@@ -194,6 +194,13 @@ static SPECS: &[ProviderSpec] = &[
                 reasoning_effort: &[],
             },
             ModelSpec {
+                // Ark exposes GLM-5.2 with a 1M context window; reasoning_effort
+                // is not supported through the Ark Coding Plan endpoint.
+                name: "glm-5.2",
+                context: Some(1_000_000),
+                reasoning_effort: &[],
+            },
+            ModelSpec {
                 name: "deepseek-v4-flash",
                 context: None,
                 reasoning_effort: &[],
@@ -417,6 +424,7 @@ mod tests {
         // vendor cluster to catch accidental removals from the curated list.
         for name in &[
             "glm-5.1",
+            "glm-5.2",
             "minimax-m3",
             "deepseek-v4-flash",
             "kimi-k2.6",
@@ -427,6 +435,9 @@ mod tests {
                 "ark-coding missing model {name}"
             );
         }
+        let glm52 = ark.models.iter().find(|m| m.name == "glm-5.2").unwrap();
+        assert_eq!(glm52.context, Some(1_000_000));
+        assert!(glm52.reasoning_effort.is_empty());
     }
 
     #[test]
