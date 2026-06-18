@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.2] - 2026-06-18
+
 ### Added
 - Providers — Ark Coding Plan now includes `glm-5.2` with a 1M context window. ([#194](https://github.com/Fullstop000/ignis/pull/194))
 
