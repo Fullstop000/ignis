@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - TUI — slash-command suggestions now render below the input bar (was above), capped at 8 visible rows; both Ink and ratatui frontends are now flush with no blank rows above or below the input. ([#197](https://github.com/Fullstop000/ignis/pull/197))
 
+### Fixed
+- TUI — the Ink frontend now pins picker boxes to the terminal width so resizing the window no longer draws stale or overflowing rounded borders. ([#199](https://github.com/Fullstop000/ignis/pull/199))
+
 ## [0.40.2] - 2026-06-18
 
 ### Added

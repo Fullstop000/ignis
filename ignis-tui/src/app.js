@@ -732,7 +732,23 @@ function Composer({ text, cursor, status }) {
 
 // ── Picker (ask_user): single/multi-select, free-text "Other", multi-question ──
 
+/** Current terminal width in columns; defaults to 80 when stdout is unavailable
+ *  (tests) so picker borders still have a stable geometry. Listens for the
+ *  terminal `resize` event so picker borders update when the window changes. */
+function useTerminalWidth() {
+  const { stdout } = useStdout();
+  const [cols, setCols] = useState(stdout?.columns || 80);
+  useEffect(() => {
+    if (!stdout) return;
+    const onResize = () => setCols(stdout.columns || 80);
+    stdout.on('resize', onResize);
+    return () => stdout.off('resize', onResize);
+  }, [stdout]);
+  return cols;
+}
+
 function PickerFlow({ req, engine, onDone }) {
+  const cols = useTerminalWidth();
   const [qIdx, setQIdx] = useState(0);
   const [cursor, setCursor] = useState(0);
   const [selected, setSelected] = useState([]); // selection-order indices (multi)
@@ -853,12 +869,13 @@ function PickerFlow({ req, engine, onDone }) {
       ? '↑/↓ move · space toggle · enter confirm · esc cancel'
       : '↑/↓ select · enter confirm · esc cancel';
   rows.push(e(Text, { key: 'hint', dimColor: true }, hint));
-  return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
+  return e(Box, { flexDirection: 'column', width: cols, marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
 }
 
 // Generic single-select local picker (used by /model, /afk). The cursor
 // preselects the current item via `isCurrent`.
 function ChoicePicker({ title, items, labelOf, isCurrent, onPick, onCancel }) {
+  const cols = useTerminalWidth();
   const [cursor, setCursor] = useState(Math.max(0, items.findIndex((it) => isCurrent && isCurrent(it))));
 
   useInput((ch, key) => {
@@ -883,13 +900,14 @@ function ChoicePicker({ title, items, labelOf, isCurrent, onPick, onCancel }) {
     rows.push(e(PickerRow, { key: `i${i}`, label: labelOf(it), focused: i === cursor, checked: false, multi: false })),
   );
   rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ select · enter confirm · esc cancel'));
-  return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
+  return e(Box, { flexDirection: 'column', width: cols, marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
 }
 
 // `/model` picker: ↑/↓ picks the model, ←/→ cycles that model's reasoning-effort
 // levels (mirrors the native ratatui picker). Enter applies (model, effort) —
 // effort is `null` for a model with no levels. Preselects the active model+effort.
 function ModelPicker({ models, provider, model, effort, onPick, onCancel }) {
+  const cols = useTerminalWidth();
   const curIdx = Math.max(0, models.findIndex((m) => m.provider === provider && m.model === model));
   const [cursor, setCursor] = useState(curIdx);
   const initLevels = models[curIdx]?.effort_levels || [];
@@ -912,7 +930,7 @@ function ModelPicker({ models, provider, model, effort, onPick, onCancel }) {
   const rows = [e(Text, { key: 'q', bold: true }, 'Switch model')];
   if (!models.length) {
     rows.push(e(Text, { key: 'empty', dimColor: true }, 'No models configured.'));
-    return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
+    return e(Box, { flexDirection: 'column', width: cols, marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
   }
   if (levels.length) {
     rows.push(
@@ -934,12 +952,13 @@ function ModelPicker({ models, provider, model, effort, onPick, onCancel }) {
     rows.push(e(PickerRow, { key: `i${i}`, label, focused: i === cursor, checked: false, multi: false }));
   });
   rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ model · ←/→ effort · enter apply · esc cancel'));
-  return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
+  return e(Box, { flexDirection: 'column', width: cols, marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
 }
 
 // Local multi-toggle picker (used by /skills, /mcp). Each space sends a toggle
 // command; the engine re-snapshots and `items` reflects the new enabled state.
 function TogglePicker({ title, items, onToggle, onClose }) {
+  const cols = useTerminalWidth();
   const [cursor, setCursor] = useState(0);
   useInput((ch, key) => {
     if (key.escape) {
@@ -962,7 +981,7 @@ function TogglePicker({ title, items, onToggle, onClose }) {
     rows.push(e(PickerRow, { key: `i${i}`, label: it.name, focused: i === cursor, checked: it.enabled, multi: true })),
   );
   rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ move · space toggle · esc close'));
-  return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
+  return e(Box, { flexDirection: 'column', width: cols, marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
 }
 
 function PickerRow({ label, focused, checked, multi }) {
@@ -974,6 +993,7 @@ function PickerRow({ label, focused, checked, multi }) {
 // via the 'sessions' frame, so `items` starts empty and fills in. Two-line
 // rows like the ratatui picker: derived title + a dim age·id·count meta line.
 function SessionPicker({ items, onPick, onCancel }) {
+  const cols = useTerminalWidth();
   const [cursor, setCursor] = useState(0);
   useInput((ch, key) => {
     if (key.escape) {
@@ -1021,7 +1041,7 @@ function SessionPicker({ items, onPick, onCancel }) {
     if (below > 0) rows.push(e(Text, { key: 'below', dimColor: true }, `  ↓ ${below} more`));
   }
   rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ select · enter resume · esc cancel'));
-  return e(Box, { flexDirection: 'column', marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
+  return e(Box, { flexDirection: 'column', width: cols, marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
 }
 
 // Relative age from a Unix-seconds timestamp, mirroring SessionMeta::age_str.
