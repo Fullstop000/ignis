@@ -60,6 +60,11 @@ def main():
     if pid == 0:
         os.environ.setdefault("TERM", "xterm-256color")
         os.environ["COLORTERM"] = "truecolor"
+        # PTY screenshot harnesses inherit the parent shell env; if the parent has
+        # NO_COLOR/CI set, the captured TUI will be monochrome. Remove those so
+        # screenshots reflect the real user-facing colors.
+        os.environ.pop("NO_COLOR", None)
+        os.environ.pop("CI", None)
         os.chdir(cwd)
         os.execv(bin_path, [bin_path, *args.args.split()])
 

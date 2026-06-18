@@ -12,6 +12,7 @@
     "test": "node --test"
   },
   "dependencies": {
+    "diff": "^9.0.0",
     "ink": "^5.0.1",
     "react": "^18.3.1"
   },

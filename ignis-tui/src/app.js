@@ -37,8 +37,8 @@ import {
   answerCancelled,
   toolArgsSummary,
   toolOutputPreview,
-  toolDiffPreview,
 } from './protocol.js';
+import DiffView from './diff-view.js';
 import { parseMarkdown, parseInline } from './markdown.js';
 
 const e = React.createElement;
@@ -544,25 +544,9 @@ function ToolBlock({ block }) {
 }
 
 /**
- * Render an `edit_file` tool call as a Claude-Code / Codex-style diff view:
- *
- *     ◆ Edited <path> (+54 -3)
- *        7    let selectedContext = null;
- *        8  + let selectedChatId = null;
- *        9    let feedStream = null;
- *        ⋮
- *       59    $("feedMeta").textContent = `…`;
- *       60  + if (!selectedChatId && feedItems[0]) selectedChatId = feedItems[0].chatId;
- *
- * - The gutter shows the real source-file line number (right-aligned to the
- *   widest line number in the visible window). For `-` rows that's the
- *   **old**-file number; for `+` and context rows it's the **new**-file one.
- * - Color: foreground only — `+` rows green, `-` rows red, context dim.
- *   No background fills (the user wanted clean text on the terminal bg).
- * - Hunk separator: a `gap` row from `toolDiffPreview` becomes a `⋮` line
- *   so the eye sees that lines were skipped between hunks.
- * - While the call is in flight (no `block.result` yet) we still show the
- *   header, swapping the diamond for a spinner-flavored ellipsis.
+ * Render an `edit_file` tool call as a Claude-Code / Codex-style diff view.
+ * The heavy lifting lives in `<DiffView>`; this wrapper just handles the
+ * in-flight spinner header and the path extraction.
  */
 function EditFileBlock({ block }) {
   const path = parseEditPath(block.args);
@@ -574,52 +558,7 @@ function EditFileBlock({ block }) {
       `◆ Editing ${path || block.name} …`,
     );
   }
-  const { adds, dels, lines, more } = toolDiffPreview(block.result.content);
-  const headerColor = 'green';
-  const header = e(
-    Text,
-    { key: 'h', color: headerColor },
-    `◆ Edited ${path || ''} (+${adds} -${dels})`,
-  );
-  if (!lines.length) return header;
-  // Right-align line numbers to the widest one we'll show, so the body lines
-  // up under the header — same shape Claude Code / aider use.
-  const maxLn = lines.reduce(
-    (m, ln) => (ln.lineNo != null && ln.lineNo > m ? ln.lineNo : m),
-    0,
-  );
-  const gutterW = Math.max(2, String(maxLn).length);
-  const body = lines.map((ln, i) => {
-    if (ln.kind === 'gap') {
-      // A `⋮` aligned with the gutter — visually the same column as the line
-      // numbers, so the diff reads as a single column of marks down the side.
-      return e(
-        Text,
-        { key: `d${i}`, dimColor: true },
-        `  ${'⋮'.padStart(gutterW)}     `,
-      );
-    }
-    const num = ln.lineNo == null ? ''.padStart(gutterW) : String(ln.lineNo).padStart(gutterW);
-    const sign = ln.kind === 'add' ? '+' : ln.kind === 'del' ? '-' : ' ';
-    const color = ln.kind === 'add' ? 'green' : ln.kind === 'del' ? 'red' : undefined;
-    const dim = ln.kind === 'ctx';
-    // Two leading spaces match the `◆ Edited …` header indentation.
-    return e(
-      Text,
-      { key: `d${i}`, color, dimColor: dim },
-      `  ${num}  ${sign}  ${ln.text}`,
-    );
-  });
-  if (more) {
-    body.push(
-      e(
-        Text,
-        { key: 'more', dimColor: true },
-        `  ${''.padStart(gutterW)}     … +${more} more lines`,
-      ),
-    );
-  }
-  return e(Box, { flexDirection: 'column' }, [header, ...body]);
+  return e(DiffView, { content: block.result.content, path });
 }
 
 /** Pull `path` (or `file_path`) out of a tool-args JSON blob. */
