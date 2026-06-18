@@ -447,12 +447,14 @@ export default function App({ engine, onExit }) {
     if (queue.length > 0) {
       children.push(e(QueuedStrip, { key: 'queued', queue }));
     }
-    // Slash-command suggestions above the composer while typing a `/command`.
+    // Slash-command suggestions sit *under* the composer while typing a
+    // `/command` (Claude-Code / shell-completion style) so the list grows
+    // downward as you type and never pushes the cursor.
     const sugg = comp.text ? slashSuggestions(comp.text) : [];
+    children.push(e(Composer, { key: 'composer', text: comp.text, cursor: comp.cursor, status: state.status }));
     if (sugg.length) {
       children.push(e(SlashSuggestions, { key: 'slash', items: sugg, selected: Math.min(slashSel, sugg.length - 1) }));
     }
-    children.push(e(Composer, { key: 'composer', text: comp.text, cursor: comp.cursor, status: state.status }));
   }
   children.push(e(Footer, { key: 'footer', state }));
   return e(Box, { flexDirection: 'column' }, children);
@@ -569,7 +571,7 @@ function Footer({ state }) {
         ? e(Text, { color: 'red' }, ' AFK ')
         : null;
   if (!segs.length && !badge) return null;
-  return e(Box, { marginTop: 1 }, e(Text, { dimColor: true }, segs.join('  ·  ')), badge ? e(Text, null, '  ') : null, badge);
+  return e(Box, null, e(Text, { dimColor: true }, segs.join('  ·  ')), badge ? e(Text, null, '  ') : null, badge);
 }
 
 function baseName(p) {
@@ -664,18 +666,29 @@ function QueuedStrip({ queue }) {
   return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
 }
 
-// Slash-command autocomplete dropdown (above the composer). The selected row is
-// highlighted; ↑/↓ move, Enter runs it. Mirrors the native TUI's suggestions.
+// Slash-command autocomplete dropdown — sits *under* the composer, mirroring
+// the native TUI. Capped at MAX_SLASH_ROWS=8 visible rows and scrolls so the
+// selected entry stays in view (relevant once skills + `/skills` push the list
+// past 8 entries). ↑/↓ move, Enter runs the highlighted command.
+const MAX_SLASH_ROWS = 8;
 function SlashSuggestions({ items, selected }) {
+  const sel = Math.min(selected, items.length - 1);
+  // Window math mirrors ratatui's `slash_window_start`: keep `sel` inside
+  // `[start, start+visible)` so a long list scrolls instead of clipping the
+  // selection.
+  const visible = Math.min(items.length, MAX_SLASH_ROWS);
+  const start = sel >= visible ? sel - visible + 1 : 0;
+  const end = Math.min(start + visible, items.length);
   return e(
     Box,
-    { flexDirection: 'column', marginTop: 1 },
-    items.map((c, i) => {
-      const sel = i === selected;
+    { flexDirection: 'column' },
+    items.slice(start, end).map((c, i) => {
+      const idx = start + i;
+      const isSel = idx === sel;
       return e(
         Text,
-        { key: c.name, color: sel ? 'cyan' : undefined, dimColor: !sel },
-        `${sel ? '❯ ' : '  '}${c.name.padEnd(11)} ${c.description}`,
+        { key: c.name, color: isSel ? 'cyan' : undefined, dimColor: !isSel },
+        `${isSel ? '❯ ' : '  '}${c.name.padEnd(11)} ${c.description}`,
       );
     }),
   );
@@ -714,7 +727,7 @@ function Composer({ text, cursor, status }) {
       return e(Box, { key: `l${li}` }, lead, e(Text, { key: 'b' }, b), e(Text, { key: 'at', inverse: true }, at), e(Text, { key: 'a' }, a));
     });
   }
-  return e(Box, { flexDirection: 'column', borderStyle: 'round', borderColor: accent, paddingX: 1, marginTop: 1 }, rows);
+  return e(Box, { flexDirection: 'column', borderStyle: 'round', borderColor: accent, paddingX: 1 }, rows);
 }
 
 // ── Picker (ask_user): single/multi-select, free-text "Other", multi-question ──
