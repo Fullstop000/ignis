@@ -298,7 +298,15 @@ fn push_diff_line(lines: &mut Vec<Line<'static>>, raw: &str, ext: &str, width: u
     let content_w = (width as usize).saturating_sub(6).max(8);
     // `truncate` appends `…` past its limit, so cap at content_w − 1: a truncated
     // line is then exactly content_w cells and never wraps off the bg bar.
-    let code = truncate(&sanitize(raw.get(2..).unwrap_or("")), content_w - 1);
+    //
+    // Strip the leading sign byte (1 char, ASCII so byte == char) and any
+    // immediate space that follows. Real unified-diff output has no space after
+    // the `+`/`-`, but some callers/tests include one; normalizing here keeps the
+    // rendered gutter a single space wide in both cases.
+    let code = truncate(
+        &sanitize(raw.get(1..).unwrap_or("").strip_prefix(' ').unwrap_or("")),
+        content_w - 1,
+    );
 
     let mut spans = vec![
         prefix,

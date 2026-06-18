@@ -88,6 +88,14 @@ impl StaticTool for EditFileTool {
     }
 }
 
+/// Hard cap on rows returned in a single `edit_file` diff. The `ToolResult.content`
+/// flows back to the model on the next request, so a `global_replace` of a
+/// common token across a long file could otherwise spend kilobytes of context
+/// on a single tool result. The legacy formatter capped at 25 lines per side;
+/// this cap covers both sides plus context + hunk headers and stays in roughly
+/// the same ballpark.
+const MAX_DIFF_OUTPUT_ROWS: usize = 60;
+
 /// Render the edit as a git-style unified diff with `@@ -a,b +c,d @@` hunk
 /// headers and 3 lines of context, computed against the **whole-file** before
 /// and after states. The Ink frontend parses these hunks to render line numbers
@@ -97,17 +105,35 @@ impl StaticTool for EditFileTool {
 /// The leading `--- original` / `+++ modified` file headers that diffy emits
 /// are stripped — the surrounding tool block already shows the path, and
 /// keeping them just spends two scrollback rows on a redundant title.
+///
+/// Capped at [`MAX_DIFF_OUTPUT_ROWS`] rows so the result we feed back to the
+/// model on the next request stays bounded; oversize diffs end with a single
+/// `… N more diff lines truncated` line so the LLM (and the user) know the
+/// hunk continued.
 fn render_edit_diff(old_content: &str, new_content: &str) -> String {
     if old_content == new_content {
         return "(no changes)".to_string();
     }
     let patch = diffy::create_patch(old_content, new_content);
-    let body: String = patch
-        .to_string()
-        .lines()
-        .filter(|l| !l.starts_with("--- ") && !l.starts_with("+++ "))
+    // Diffy's `Display` always emits exactly two file-header lines first
+    // (`--- original\n+++ modified\n`), then the hunks. Skip by **position**
+    // rather than by content prefix — a removed line that happens to start
+    // with `-- ` would otherwise be rendered as `--- …` and silently dropped
+    // by a substring filter, undercounting the change (#200 review).
+    let rendered = patch.to_string();
+    let mut rows: Vec<&str> = rendered.lines().skip(2).collect();
+    let total = rows.len();
+    let truncated = total.saturating_sub(MAX_DIFF_OUTPUT_ROWS);
+    if truncated > 0 {
+        rows.truncate(MAX_DIFF_OUTPUT_ROWS);
+    }
+    let mut body = rows
+        .into_iter()
         .map(|l| format!("{l}\n"))
-        .collect();
+        .collect::<String>();
+    if truncated > 0 {
+        body.push_str(&format!("… {truncated} more diff lines truncated\n"));
+    }
     if body.is_empty() {
         // create_patch produced no hunks — only possible if the inputs are
         // textually equal under diffy's eyes (shouldn't happen given the guard
@@ -328,6 +354,45 @@ mod tests {
             !res.content.contains("line 6") && !res.content.contains("line 8"),
             "non-changed mid-file lines must be outside any hunk: {}",
             res.content
+        );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+    }
+
+    /// Long diffs are capped so the tool result we feed back to the model stays
+    /// bounded. A 70-line all-changed file produces >60 diff rows; verify we keep
+    /// exactly the cap and append the truncation notice.
+    #[tokio::test]
+    async fn diff_is_truncated_at_max_output_rows() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_edit_truncated.txt");
+        let initial = (0..70).map(|i| format!("line {i}\n")).collect::<String>();
+        tokio::fs::write(&file_path, &initial).await.unwrap();
+
+        let tool = EditFileTool::new(&temp_dir);
+        let res = tool
+            .call(json!({
+                "path": "test_edit_truncated.txt",
+                "old_text": "line ",
+                "new_text": "LINE ",
+                "global_replace": true,
+            }))
+            .await;
+        assert!(!res.is_error, "got: {}", res.content);
+
+        let rendered_lines: Vec<&str> = res.content.lines().collect();
+        assert!(
+            rendered_lines.len() == MAX_DIFF_OUTPUT_ROWS + 1,
+            "expected {} rendered rows plus one truncation line, got {}: {:?}",
+            MAX_DIFF_OUTPUT_ROWS,
+            rendered_lines.len(),
+            rendered_lines
+        );
+        let last = rendered_lines.last().unwrap();
+        assert!(
+            last.contains("more diff lines truncated"),
+            "last line should be the truncation notice, got: {}",
+            last
         );
 
         let _ = tokio::fs::remove_file(&file_path).await;
