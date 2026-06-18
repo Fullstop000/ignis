@@ -58,6 +58,19 @@ pub fn native_tools(
     ]
 }
 
+/// The read-only subset of native tools: file reads + search, with no write,
+/// execution, or network reach. Used by the read-only sub-agent types
+/// (`explore`, `review`). Read-only here is enforced by tool selection, not a
+/// sandbox — the permission pipeline remains the hard gate underneath.
+pub fn read_only_tools(cwd: &Path) -> Vec<Arc<dyn AgentTool>> {
+    vec![
+        Arc::new(ReadFileTool::new(cwd)) as Arc<dyn AgentTool>,
+        Arc::new(ListDirTool::new(cwd)),
+        Arc::new(GrepTool::new(cwd)),
+        Arc::new(GlobTool::new(cwd)),
+    ]
+}
+
 pub fn register_native_tools(
     session: &mut crate::Session,
     cwd: &Path,
