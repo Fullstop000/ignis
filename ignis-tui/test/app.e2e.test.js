@@ -144,7 +144,7 @@ test('tool error output renders red, up to 5 lines', async () => {
   assert.match(f, /\+1 more lines/);
 });
 
-test('edit_file tool result renders a diff summary and hunk instead of generic preview', async () => {
+test('edit_file tool result renders the new line-numbered diff view', async () => {
   const { engine, lastFrame } = renderApp();
   await tick();
   engine.emit(
@@ -154,18 +154,35 @@ test('edit_file tool result renders a diff summary and hunk instead of generic p
       arguments: '{"path":"src/main.rs","old_text":"old","new_text":"new"}',
     }),
   );
+  // Real unified-diff body (what the upgraded edit_file tool now returns):
+  // a `@@ -a,b +c,d @@` header seeds the line counters, context lines have
+  // a leading space, additions `+`, deletions `-`. A second hunk separated
+  // from the first triggers the `⋮` separator.
   engine.emit(
     ev('tool_execution_end', {
       tool_call_id: 'd1',
-      result: { content: '- old\n+ new\n- removed\n+ added', is_error: false },
+      result: {
+        content:
+          '@@ -1,3 +1,3 @@\n keep me\n-old\n+new\n@@ -10,2 +10,2 @@\n-removed\n+added\n',
+        is_error: false,
+      },
     }),
   );
   await tick();
   const f = plain(lastFrame());
-  assert.match(f, /\+2 -2/, 'shows added/deleted line summary');
-  assert.match(f, /╰ - old/, 'shows removed diff line');
-  assert.match(f, /\+ added/, 'shows added diff line');
-  assert.doesNotMatch(f, /more lines/, 'edit diffs use the larger diff cap, not the generic 3-line cap');
+  // New header reads `◆ Edited <path> (+adds -dels)` — replaces the legacy
+  // `● edit_file({...})` line and the separate `+a -d` summary.
+  assert.match(f, /◆ Edited src\/main\.rs \(\+2 -2\)/, 'new diff header');
+  // The body shows real source line numbers from the `@@` header, the diff
+  // sign as a separate column, and the line content with no leading sign.
+  assert.match(f, /1\s+keep me/, 'context line carries its source line number');
+  assert.match(f, /2\s+-\s+old/, 'removed line shows old-file line number 2');
+  assert.match(f, /2\s+\+\s+new/, 'added line shows new-file line number 2');
+  // A `⋮` row separates non-contiguous hunks.
+  assert.match(f, /⋮/, 'gap row between hunks renders as ⋮');
+  // The legacy `╰ ` gutter glyph is gone for edit_file.
+  assert.doesNotMatch(f, /╰ /, 'no legacy gutter on edit_file diffs');
+  assert.doesNotMatch(f, /more lines/, 'short diff has no overflow row');
 });
 
 test('inject + warning + reconnecting render their own blocks', async () => {
