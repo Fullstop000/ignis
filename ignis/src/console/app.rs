@@ -823,6 +823,10 @@ impl App {
                 // native TUI doesn't surface it (kept as the comparison
                 // baseline). The background tools still work here.
             }
+            AgentEvent::FollowUps { .. } => {
+                // Suggested-next-prompt strip is an Ink-frontend affordance; the
+                // native TUI doesn't surface it (kept as the comparison baseline).
+            }
         }
     }
 

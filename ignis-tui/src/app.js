@@ -65,6 +65,7 @@ export default function App({ engine, onExit }) {
   const [spin, setSpin] = useState(0); // running-spinner frame
   const turnStart = useRef(0); // ms timestamp the current turn began (0 = idle)
   const [queue, setQueue] = useState([]); // messages typed while busy, drained 1/turn-end
+  const [followFocus, setFollowFocus] = useState(-1); // focused follow-up index, -1 = composer
 
   useEffect(() => {
     engine.onFrame((frame) => setState((s) => reduceOutbound(s, frame)));
@@ -99,6 +100,13 @@ export default function App({ engine, onExit }) {
     prevGen.current = state.generation;
     stdout?.write?.('\x1b[2J\x1b[3J\x1b[H');
   }
+
+  // The follow-up strip is idle-only and ephemeral; drop focus whenever it's
+  // not showing (turn started, suggestions cleared, or none arrived).
+  const showFollowUps = state.status === 'idle' && state.followUps.length > 0;
+  useEffect(() => {
+    if (!showFollowUps) setFollowFocus(-1);
+  }, [showFollowUps]);
 
   const req = state.request;
   const clearRequest = () => setState((s) => ({ ...s, request: null }));
@@ -193,6 +201,39 @@ export default function App({ engine, onExit }) {
     // While a picker is open it owns all keys (PickerFlow / ChoicePicker each
     // have their own useInput).
     if (req || localPicker) return;
+
+    // Follow-up suggestions: Tab focuses the strip, ↑/↓ select, Enter submits the
+    // selected prompt, Esc unfocuses. Typing any character drops focus and falls
+    // through to the composer. Only active while the idle strip is shown and the
+    // slash-suggestion dropdown isn't (which owns ↑/↓/Enter/Tab itself).
+    if (key.tab && showFollowUps && !slashSuggestions(comp.text).length) {
+      setFollowFocus((f) => (f < 0 ? 0 : -1));
+      return;
+    }
+    if (followFocus >= 0 && showFollowUps) {
+      if (key.upArrow) {
+        setFollowFocus((f) => Math.max(0, f - 1));
+        return;
+      }
+      if (key.downArrow) {
+        setFollowFocus((f) => Math.min(state.followUps.length - 1, f + 1));
+        return;
+      }
+      if (key.escape) {
+        setFollowFocus(-1);
+        return;
+      }
+      if (key.return) {
+        const pick = state.followUps[Math.min(followFocus, state.followUps.length - 1)];
+        setFollowFocus(-1);
+        dispatchResolved(pick);
+        setHistory((h) => [...h, pick]);
+        return;
+      }
+      // Anything else (a typed character, backspace, …): leave the strip and let
+      // the keystroke reach the composer below.
+      setFollowFocus(-1);
+    }
 
     if (key.ctrl && ch === 'c') {
       if (state.status !== 'idle') engine.send(cancel());
@@ -451,6 +492,10 @@ export default function App({ engine, onExit }) {
     // Waiting queue: messages typed while busy, drained one per turn-end.
     if (queue.length > 0) {
       children.push(e(QueuedStrip, { key: 'queued', queue }));
+    }
+    // Suggested next prompts (idle-only). Tab focuses; ↑/↓ select; Enter submits.
+    if (showFollowUps) {
+      children.push(e(FollowUpsStrip, { key: 'followups', items: state.followUps, focus: followFocus }));
     }
     // Slash-command suggestions sit *under* the composer while typing a
     // `/command` (Claude-Code / shell-completion style) so the list grows
@@ -726,6 +771,27 @@ function QueuedStrip({ queue }) {
     rows.push(e(Text, { key: 'of', dimColor: true }, `  +${overflow} more queued`));
   }
   rows.push(e(Text, { key: 'hint', dimColor: true }, '  ↑ edit last · Enter queue · Ctrl+S send now'));
+  return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
+}
+
+// Suggested-next-prompt strip (idle-only). Unfocused: a dim hint row + dim
+// suggestions. Focused (Tab): the selected row is highlighted (mauve `❯`), the
+// rest dim — ↑/↓ move, Enter submits, Esc cancels.
+function FollowUpsStrip({ items, focus }) {
+  const focused = focus >= 0;
+  const rows = items.map((t, i) => {
+    const sel = focused && i === focus;
+    const line = `${sel ? '❯' : ' '} ${t.split('\n')[0]}`;
+    return e(
+      Text,
+      { key: `f${i}`, color: sel ? 'magenta' : undefined, dimColor: !sel, bold: sel },
+      `  ${line}`,
+    );
+  });
+  const hint = focused
+    ? '  ↑/↓ select · Enter send · Esc cancel'
+    : '  Tab to pick a suggestion';
+  rows.unshift(e(Text, { key: 'hdr', dimColor: true }, hint));
   return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
 }
 

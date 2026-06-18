@@ -231,6 +231,32 @@ mod tests {
         assert_eq!(v["data"]["payload"]["running"], 3);
     }
 
+    /// The `FollowUps` event serializes to the wire shape the Ink reducer reads:
+    /// `{kind:"event", data:{type:"follow_ups", payload:{items:[…]}}}`.
+    #[tokio::test]
+    async fn emit_serializes_follow_ups_event_for_ink() {
+        let (to_frontend, frontend_reads) = tokio::io::duplex(4096);
+        let (cmd_read, _cmd_feed) = tokio::io::duplex(64);
+        let mut port = StdioPort::new(to_frontend, cmd_read);
+        let mut reader = BufReader::new(frontend_reads).lines();
+
+        port.emit(Outbound::Event(Box::new(crate::AgentEvent::FollowUps {
+            items: vec![
+                "Run the tests".to_string(),
+                "Add error handling".to_string(),
+            ],
+        })))
+        .await
+        .unwrap();
+
+        let line = reader.next_line().await.unwrap().expect("follow_ups line");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["kind"], "event");
+        assert_eq!(v["data"]["type"], "follow_ups");
+        assert_eq!(v["data"]["payload"]["items"][0], "Run the tests");
+        assert_eq!(v["data"]["payload"]["items"][1], "Add error handling");
+    }
+
     /// next_command() decodes one ClientCommand per line and skips blanks.
     #[tokio::test]
     async fn next_command_decodes_lines_and_skips_blanks() {

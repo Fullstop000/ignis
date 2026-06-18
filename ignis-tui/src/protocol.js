@@ -40,6 +40,7 @@ export const EVENT = Object.freeze({
   USAGE: 'usage',
   TODOS: 'todos',
   BACKGROUND_SHELLS: 'background_shells',
+  FOLLOW_UPS: 'follow_ups',
 });
 
 /** `ClientCommand` kinds (frontend → engine). */
@@ -91,6 +92,9 @@ export function initialState() {
     // Number of live background shells (bash run_in_background); the footer shows
     // `⚙ N bg` while > 0. Updated by the `background_shells` event.
     bgShells: 0,
+    // Suggested next prompts for the just-ended turn (from the model's stripped
+    // <follow_ups> block). Ephemeral: shown idle-only, cleared on the next turn.
+    followUps: [],
     // Monotonic count of turn-end events. The waiting-queue drain keys on this
     // (the turn-end EVENT, like the native runner's turn_in_flight flag) rather
     // than a busy→idle status change, so a queued message still drains after a
@@ -147,6 +151,7 @@ export function reduceOutbound(state, frame) {
         // Resume/clear replaces the whole context; the resumed session's todos
         // (if any) re-emit on its next prompt.
         todos: [],
+        followUps: [],
         generation: state.generation + 1,
       };
     default:
@@ -170,7 +175,8 @@ function reduceEvent(state, ev) {
   const p = ev.payload || {};
   switch (ev.type) {
     case EVENT.TURN_START:
-      return { ...state, status: 'busy', turns: state.turns + 1, streamChars: 0 };
+      // A new turn invalidates the previous turn's suggestions.
+      return { ...state, status: 'busy', turns: state.turns + 1, streamChars: 0, followUps: [] };
     case EVENT.TURN_END:
       return { ...state, status: 'idle', turnEnds: state.turnEnds + 1 };
     case EVENT.MESSAGE_START: {
@@ -247,6 +253,9 @@ function reduceEvent(state, ev) {
     case EVENT.BACKGROUND_SHELLS:
       // AgentEvent::BackgroundShells { running } — live background-shell count.
       return { ...state, bgShells: p.running ?? 0 };
+    case EVENT.FOLLOW_UPS:
+      // AgentEvent::FollowUps { items } — suggested next prompts for this turn.
+      return { ...state, followUps: p.items ?? [] };
     default:
       // run_start / run_end — not surfaced in the minimal UI.
       return state;
