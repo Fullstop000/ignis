@@ -374,23 +374,26 @@ test('/connect is submitted to the engine (engine owns the wizard)', async () =>
   assert.deepEqual(engine.last(), { kind: 'submit', data: { text: '/connect' } });
 });
 
-test('/clear sends new_session and clears the local transcript', async () => {
-  const { engine, lastFrame, stdin } = renderApp();
+test('/clear sends new_session, wipes the screen, and shows the empty welcome', async () => {
+  const { engine, lastFrame, frames, stdin } = renderApp();
   await tick();
   engine.emit(ev('user_prompt_committed', { text: 'earlier message' }));
   engine.emit(ev('message_end', { message: { content: 'earlier reply' } }));
   await tick();
   assert.match(plain(lastFrame()), /earlier message/);
 
+  const clearsBefore = frames.filter((f) => f.includes('\x1b[2J')).length;
   stdin.write('/clear');
   await tick();
   stdin.write(KEY.enter);
   await tick();
   assert.deepEqual(engine.last(), { kind: 'new_session' });
-  const f = plain(lastFrame());
-  assert.doesNotMatch(f, /earlier message/, 'transcript cleared');
-  assert.doesNotMatch(f, /earlier reply/);
-  assert.match(f, /Type a message/, 'welcome banner returns on the empty transcript');
+  // The committed transcript was flushed to <Static> (permanent scrollback), so
+  // /clear can't unwrite it in-buffer — it emits a screen+scrollback wipe and
+  // re-shows the empty welcome. (Debug-mode lastFrame retains flushed static
+  // output, so the visual clear is asserted via the wipe escape, not text absence.)
+  assert.ok(frames.filter((f) => f.includes('\x1b[2J')).length > clearsBefore, 'screen wiped on /clear');
+  assert.match(plain(lastFrame()), /Type a message/, 'welcome banner returns on the empty transcript');
 });
 
 test('/model opens a picker of engine-supplied models; selection sends set_model', async () => {

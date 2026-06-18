@@ -91,6 +91,10 @@ export function initialState() {
     // Chars streamed this turn (reset at turn_start), for a live output-token
     // estimate in the running status bar — mirrors the native TUI's chars/4.
     streamChars: 0,
+    // Bumped whenever the transcript is replaced wholesale (/clear, resume) so
+    // the committed <Static> scrollback region remounts and re-renders from
+    // scratch — Ink's <Static> is append-only and won't otherwise reset.
+    generation: 0,
   };
 }
 
@@ -132,6 +136,7 @@ export function reduceOutbound(state, frame) {
         sessionId: frame.data?.session_id ?? state.sessionId,
         turns: 0,
         usage: null,
+        generation: state.generation + 1,
       };
     default:
       return state;

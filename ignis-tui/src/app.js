@@ -11,7 +11,7 @@
 // command/answer builders, and the markdown parser — lives in protocol.js /
 // markdown.js and is unit-tested via `node --test`.
 import React, { useState, useEffect, useRef } from 'react';
-import { Box, Text, useInput, useApp } from 'ink';
+import { Box, Text, Static, useInput, useApp, useStdout } from 'ink';
 import {
   initialState,
   reduceOutbound,
@@ -86,6 +86,20 @@ export default function App({ engine, onExit }) {
     return () => clearInterval(id);
   }, [state.status]);
 
+  // /clear, resume and Ctrl+O replace or repaint the transcript wholesale and
+  // bump `generation`. The committed blocks live in <Static> (already flushed to
+  // scrollback), so a remount alone would leave the stale rows on screen — wipe
+  // screen+scrollback so the fresh transcript starts clean. This runs in the
+  // render body (ref-guarded, once per generation) so the wipe precedes Ink's
+  // frame write; doing it in an effect would clear the screen *after* the new
+  // frame was painted, blanking it until the next render.
+  const { stdout } = useStdout();
+  const prevGen = useRef(0);
+  if (state.generation !== prevGen.current) {
+    prevGen.current = state.generation;
+    stdout?.write?.('\x1b[2J\x1b[3J\x1b[H');
+  }
+
   const req = state.request;
   const clearRequest = () => setState((s) => ({ ...s, request: null }));
   const resetComposer = () => {
@@ -111,7 +125,9 @@ export default function App({ engine, onExit }) {
       case 'clear':
         engine.send(newSession());
         // Clear the local transcript; the engine re-snapshots with the new id.
-        setState((s) => ({ ...s, blocks: [], stream: null, turns: 0, usage: null }));
+        // Bump `generation` so the committed <Static> region remounts (and the
+        // screen is wiped) instead of leaving the old transcript flushed.
+        setState((s) => ({ ...s, blocks: [], stream: null, turns: 0, usage: null, generation: s.generation + 1 }));
         return true;
       case 'model':
         setLocalPicker('model');
@@ -200,8 +216,12 @@ export default function App({ engine, onExit }) {
       return;
     }
     // Ctrl+O expands/collapses ✻ Thinking (reasoning) blocks, like ratatui.
+    // Committed reasoning lives in <Static> (frozen once flushed), so bump
+    // `generation` to remount + repaint with the new expand state — the same
+    // full-repaint the native TUI does via its re-anchor.
     if (key.ctrl && ch === 'o') {
       setReasoningExpanded((x) => !x);
+      setState((s) => ({ ...s, generation: s.generation + 1 }));
       return;
     }
     if (key.return) {
@@ -317,10 +337,33 @@ export default function App({ engine, onExit }) {
   });
 
   const children = [];
+  // Commit the *settled* prefix of the transcript to <Static>: Ink prints each
+  // Static item to the terminal exactly once (real scrollback) and never
+  // re-renders it, so the live region below stays short and Ink never falls back
+  // to its full-screen-clear path (the flicker) once the transcript outgrows the
+  // window. A still-mutating tail — a pending tool, or the optimistic user block
+  // before `user_prompt_committed` — must stay dynamic until it reaches final
+  // form, so the boundary is the first such block. Committed reasoning is frozen
+  // at its current expand state; live/tail reasoning still honours Ctrl+O.
+  let firstLive = state.blocks.length;
+  for (let i = 0; i < state.blocks.length; i++) {
+    const b = state.blocks[i];
+    if ((b.kind === 'tool' && !b.done) || (b.kind === 'user' && b.pending)) {
+      firstLive = i;
+      break;
+    }
+  }
+  const settled = state.blocks.slice(0, firstLive);
+  const tail = state.blocks.slice(firstLive);
+  children.push(
+    e(Static, { key: `tx-${state.generation}`, items: settled }, (b, i) =>
+      e(Block, { key: i, block: b, expanded: reasoningExpanded }),
+    ),
+  );
   if (state.blocks.length === 0 && state.stream == null && !req) {
     children.push(e(Welcome, { key: 'welcome', version: state.version, cwd: state.cwd }));
   }
-  state.blocks.forEach((b, i) => children.push(e(Block, { key: `b${i}`, block: b, expanded: reasoningExpanded })));
+  tail.forEach((b, i) => children.push(e(Block, { key: `t${i}`, block: b, expanded: reasoningExpanded })));
   if (state.stream != null) {
     // The in-flight stream renders as live reasoning (rolling ✻ Thinking) or
     // streaming markdown, depending on what the engine opened.
