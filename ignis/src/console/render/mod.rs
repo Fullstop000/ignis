@@ -265,8 +265,13 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Band: laid out from the top of `band_area` down. Order is the same as
-    // the legacy inline band — status, queued, slash, input, footer.
+    // Band: laid out from the top of `band_area` down. Order is
+    // status, queued, input, slash, footer — the slash-suggestions popup sits
+    // *under* the input bar (Claude-Code / shell-completion style) so the
+    // command list grows downward as you type and never pushes the cursor.
+    // The status row collapses to 0 rows while idle so the input box doesn't
+    // hang under a blank line between turns.
+    let loading_h = loading::loading_height(app);
     let input_h = input_height(app, band_area.height);
     let sugg = app.slash_suggestions();
     let sugg_h = if !sugg.is_empty() {
@@ -281,22 +286,24 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let band_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(loading_h),
             Constraint::Length(queued_h),
-            Constraint::Length(sugg_h),
             Constraint::Length(input_h),
+            Constraint::Length(sugg_h),
             Constraint::Length(1),
         ])
         .split(band_area);
 
-    draw_loading(f, band_layout[0], app);
+    if loading_h > 0 {
+        draw_loading(f, band_layout[0], app);
+    }
     if queued_h > 0 {
         draw_queued(f, band_layout[1], app);
     }
+    draw_input(f, band_layout[2], app);
     if sugg_h > 0 {
-        draw_slash_suggestions(f, band_layout[2], app);
+        draw_slash_suggestions(f, band_layout[3], app);
     }
-    draw_input(f, band_layout[3], app);
     draw_footer(f, band_layout[4], app);
 }
 

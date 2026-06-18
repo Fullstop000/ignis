@@ -102,6 +102,20 @@ pub(crate) fn draw_loading(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(LoadingProps::from(app), area);
 }
 
+/// Rows the loading/status line needs in the band layout: 1 when it has
+/// something to say (busy spinner, exit-pending prompt, or error flash), 0
+/// while idle so the input box sits flush against whatever is above it
+/// instead of hanging under a blank row.
+pub(crate) fn loading_height(app: &App) -> u16 {
+    let has_error = app.error_flash.is_some();
+    let busy = app.mode != Mode::Idle;
+    if app.exit_pending || has_error || busy {
+        1
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +189,51 @@ mod tests {
             out.contains("↑ 1.5k ↓ 800 tok · 40/s"),
             "stream stats: {out}"
         );
+    }
+
+    #[test]
+    fn loading_height_collapses_to_zero_when_idle() {
+        use crate::console::app::App;
+        use std::path::PathBuf;
+        let app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
+        // Fresh app: Mode::Idle, no exit-pending, no error flash.
+        assert_eq!(loading_height(&app), 0);
+    }
+
+    #[test]
+    fn loading_height_reserves_a_row_when_busy() {
+        use crate::console::app::{App, Mode};
+        use std::path::PathBuf;
+        let mut app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
+        app.mode = Mode::Thinking;
+        assert_eq!(loading_height(&app), 1);
+    }
+
+    #[test]
+    fn loading_height_reserves_a_row_for_exit_pending_and_error() {
+        use crate::console::app::App;
+        use std::path::PathBuf;
+        use std::time::Instant;
+        let mut app = App::new(
+            Some("p".into()),
+            Some("m".into()),
+            "s".into(),
+            PathBuf::from("/tmp"),
+        );
+        app.exit_pending = true;
+        assert_eq!(loading_height(&app), 1, "exit-pending must show");
+        app.exit_pending = false;
+        app.error_flash = Some(("boom".into(), Instant::now()));
+        assert_eq!(loading_height(&app), 1, "error flash must show");
     }
 }
