@@ -6,7 +6,6 @@
 use crate::console::app::App;
 
 use super::blocks::REASONING_PREVIEW_LINES;
-use super::loading::loading_height;
 use super::widgets::{queued_region_height, MAX_SLASH_ROWS};
 
 /// Rows reserved above the band for the live reasoning preview: the header +
@@ -37,8 +36,7 @@ pub(crate) fn band_height(app: &App, term_rows: u16) -> u16 {
         0
     };
     let queued_h = queued_region_height(app);
-    let loading_h = loading_height(app);
-    (loading_h + queued_h + sugg_h + input_h + 1).min(cap)
+    (1 + queued_h + sugg_h + input_h + 1).min(cap)
 }
 
 /// Input box height (incl. borders), growing with newline-separated lines.

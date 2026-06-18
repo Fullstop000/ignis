@@ -269,9 +269,6 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // status, queued, input, slash, footer — the slash-suggestions popup sits
     // *under* the input bar (Claude-Code / shell-completion style) so the
     // command list grows downward as you type and never pushes the cursor.
-    // The status row collapses to 0 rows while idle so the input box doesn't
-    // hang under a blank line between turns.
-    let loading_h = loading::loading_height(app);
     let input_h = input_height(app, band_area.height);
     let sugg = app.slash_suggestions();
     let sugg_h = if !sugg.is_empty() {
@@ -286,7 +283,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let band_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(loading_h),
+            Constraint::Length(1),
             Constraint::Length(queued_h),
             Constraint::Length(input_h),
             Constraint::Length(sugg_h),
@@ -294,9 +291,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         ])
         .split(band_area);
 
-    if loading_h > 0 {
-        draw_loading(f, band_layout[0], app);
-    }
+    draw_loading(f, band_layout[0], app);
     if queued_h > 0 {
         draw_queued(f, band_layout[1], app);
     }
