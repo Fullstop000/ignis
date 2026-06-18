@@ -66,10 +66,23 @@ export default function App({ engine, onExit }) {
   const turnStart = useRef(0); // ms timestamp the current turn began (0 = idle)
   const [queue, setQueue] = useState([]); // messages typed while busy, drained 1/turn-end
   const [followFocus, setFollowFocus] = useState(-1); // focused follow-up index, -1 = composer
+  const [error, setError] = useState(null); // fatal engine error to display before exit
+  const closing = useRef(false); // true while the frontend is intentionally shutting down
 
   useEffect(() => {
     engine.onFrame((frame) => setState((s) => reduceOutbound(s, frame)));
-    engine.onClose(() => exit());
+    engine.onError((err) => {
+      if (closing.current) return;
+      setError(`Engine failed: ${err.message || String(err)}`);
+    });
+    engine.onClose((code) => {
+      if (closing.current) {
+        exit();
+        return;
+      }
+      if (code !== 0) setError(`Engine exited unexpectedly (code ${code})`);
+      else exit();
+    });
   }, [engine, exit]);
 
   // Drive the running status bar while a turn is in flight: stamp the start and
@@ -120,6 +133,7 @@ export default function App({ engine, onExit }) {
   // Clean exit: hand the `ignis --resume <id>` hint to the launcher (printed
   // after Ink tears down), but only once there's a session worth resuming.
   const cleanExit = () => {
+    closing.current = true;
     const turns = state.blocks.filter((b) => b.kind === 'user').length;
     if (onExit && turns > 0 && state.sessionId) onExit(resumeHint(state.sessionId));
     engine.close();
@@ -212,6 +226,11 @@ export default function App({ engine, onExit }) {
   }, [state.turnEnds]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useInput((ch, key) => {
+    // A fatal engine error blocks the UI; any key dismisses the overlay.
+    if (error) {
+      exit();
+      return;
+    }
     // While a picker is open it owns all keys (PickerFlow / ChoicePicker each
     // have their own useInput).
     if (req || localPicker) return;
@@ -390,6 +409,23 @@ export default function App({ engine, onExit }) {
       setSlashSel(0); // a fresh keystroke re-tops the slash-suggestion selection
     }
   });
+
+  // Fatal engine error: render a blocking overlay instead of the normal UI so
+  // spawn/crash failures are visible in the TTY (stderr alone is hidden behind
+  // the alternate screen).
+  if (error) {
+    return e(
+      Box,
+      { flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
+      e(
+        Box,
+        { flexDirection: 'column', borderStyle: 'round', borderColor: 'red', paddingX: 2, paddingY: 1 },
+        e(Text, { color: 'red', bold: true }, 'Engine error'),
+        e(Box, { marginTop: 1 }, e(Text, null, error)),
+        e(Text, { dimColor: true, marginTop: 1 }, 'Press any key to exit.'),
+      ),
+    );
+  }
 
   const children = [];
   // Append-only render pipeline: every committed block goes into <Static>, so
