@@ -15,6 +15,7 @@ use crate::llm::{
 use crate::tools::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
 
 pub mod agents_md;
+pub mod follow_ups;
 
 /// Events emitted by the agent loop as it streams a turn.
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +89,12 @@ pub enum AgentEvent {
     /// The Ink footer renders `⚙ N bg` while `running > 0`; surfacing-only.
     #[serde(rename = "background_shells")]
     BackgroundShells { running: usize },
+    /// Suggested next prompts for the turn that just ended (parsed from the
+    /// model's trailing `<follow_ups>` block, already stripped from the reply).
+    /// The Ink frontend renders them as an ephemeral idle-only strip the user can
+    /// pick from; cleared on the next turn. Surfacing-only.
+    #[serde(rename = "follow_ups")]
+    FollowUps { items: Vec<String> },
 }
 
 /// Build the system prompt for an interactive/one-shot run: the static agent
@@ -122,6 +129,14 @@ pub fn build_system_prompt(cwd: &Path) -> String {
 # Task Tracking
  - For a task with several distinct steps, maintain a task list with `todo_write`: write the full list up front, keep exactly one item `in_progress` at a time, and mark items `completed` as soon as they are done. Send the complete list on every call — it replaces the previous one.
  - It is the user's live view of your plan and progress, so keep it current. Skip it for trivial single-step work.
+
+# Follow-ups
+ - When you finish a reply and useful next steps exist, you MAY end your message with a block of 2-4 suggested next prompts, each a short imperative the user could send next:
+   <follow_ups>
+   - Run the tests
+   - Add error handling for the parse failure
+   </follow_ups>
+ - Put it at the very end, only in your final reply (not when you are about to call tools). Omit it when nothing useful follows. The block is hidden from the transcript and shown to the user as quick-pick suggestions — so write each line as a prompt the user would send, not a description.
 
 # Environment Context
  - Operating System: {}
@@ -400,6 +415,9 @@ struct RunStream {
     /// The caller decides whether to retry or surface the error to the user;
     /// `consume_run_stream` itself does not emit `[Error in stream: …]`.
     stream_error: Option<String>,
+    /// Suggested next prompts parsed from a trailing `<follow_ups>` block (already
+    /// stripped from `assistant_content`). Empty when the model emitted none.
+    follow_ups: Vec<String>,
 }
 
 impl RunStream {
@@ -445,6 +463,10 @@ async fn consume_run_stream(
     let mut reasoning_streaming = false;
     let mut run_usage = Usage::default();
     let mut stream_error: Option<String> = None;
+    // Strips a trailing `<follow_ups>` block from the visible stream + history;
+    // the suggestions surface only as a `FollowUps` event. No marker → emits the
+    // text unchanged (byte-identical), so normal replies are unaffected.
+    let mut follow_ups = follow_ups::FollowUpStream::new();
 
     while let Some(delta_result) = stream.next().await {
         match delta_result {
@@ -495,8 +517,13 @@ async fn consume_run_stream(
                             .await;
                         message_started = true;
                     }
-                    assistant_content.push_str(&content);
-                    let _ = tx.send(AgentEvent::MessageUpdate { delta: content }).await;
+                    // Route through the follow-ups stripper: emit only the
+                    // visible portion (it holds back any partial `<follow_ups>`).
+                    let visible = follow_ups.push(&content);
+                    if !visible.is_empty() {
+                        assistant_content.push_str(&visible);
+                        let _ = tx.send(AgentEvent::MessageUpdate { delta: visible }).await;
+                    }
                 }
                 LlmResponseDelta::Reasoning(reasoning) => {
                     // Reasoning arrived. If text was mid-stream, close it so
@@ -505,6 +532,15 @@ async fn consume_run_stream(
                     // The renderer attaches a "✻ Thinking" header — no
                     // in-band prefix delta.
                     if message_started {
+                        // Release any held-back partial-marker tail before closing
+                        // the text block: a `<follow_ups>` block never spans a
+                        // reasoning interruption, so the hold can't be a real
+                        // marker — flushing keeps this MessageEnd snapshot faithful.
+                        let held = follow_ups.flush_held();
+                        if !held.is_empty() {
+                            assistant_content.push_str(&held);
+                            let _ = tx.send(AgentEvent::MessageUpdate { delta: held }).await;
+                        }
                         let _ = tx
                             .send(AgentEvent::MessageEnd {
                                 message: Message {
@@ -572,6 +608,24 @@ async fn consume_run_stream(
         }
     }
 
+    // Flush any held-back visible tail (a partial that never became a marker)
+    // and collect the parsed suggestions.
+    let fin = follow_ups.finish();
+    if !fin.flush.is_empty() {
+        assistant_content.push_str(&fin.flush);
+        let _ = tx
+            .send(AgentEvent::MessageUpdate { delta: fin.flush })
+            .await;
+    }
+    // When a block was suppressed, drop the trailing whitespace the model left
+    // before it so the stored/final reply doesn't dangle blank lines (the live
+    // deltas already showed them; MessageEnd collapses to this trimmed content).
+    // The no-marker common case is untouched.
+    if fin.had_block {
+        assistant_content.truncate(assistant_content.trim_end().len());
+    }
+    let follow_ups = fin.items;
+
     // BTreeMap keeps tool calls in index order without an explicit sort.
     let tool_calls: Vec<ToolCall> = pending_tool_calls
         .into_values()
@@ -593,6 +647,7 @@ async fn consume_run_stream(
         reasoning_streaming,
         run_usage,
         stream_error,
+        follow_ups,
     }
 }
 
@@ -939,6 +994,7 @@ impl Agent {
             reasoning_streaming,
             run_usage,
             stream_error,
+            follow_ups,
         } = run;
 
         // Mid-stream error AFTER partial UI state was produced (so retry was
@@ -1013,6 +1069,18 @@ impl Agent {
             }
 
             history.push(msg);
+        }
+
+        // Surface suggested next prompts only when this run ENDS the turn (no
+        // tool calls — otherwise the loop continues and the suggestions would be
+        // premature). Ephemeral: the frontend shows them while idle and clears
+        // them on the next turn.
+        if tool_calls.is_empty() && !follow_ups.is_empty() {
+            let _ = tx
+                .send(AgentEvent::FollowUps {
+                    items: follow_ups.clone(),
+                })
+                .await;
         }
 
         RunOutcome {
@@ -1410,6 +1478,7 @@ mod tests {
             reasoning_streaming: false,
             run_usage: crate::llm::Usage::default(),
             stream_error: None,
+            follow_ups: Vec::new(),
         };
         assert!(t.is_empty());
         // Any one of these means the user has already seen partial state, so
