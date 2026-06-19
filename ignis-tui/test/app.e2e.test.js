@@ -114,14 +114,25 @@ test('picker shows the focused option preview pane', async () => {
   assert.match(plain(lastFrame()), /BBBB/, 'preview follows focus to B');
 });
 
-test('tool block: pending shows …, done drops it, values-only args', async () => {
+test('tool block: only renders after _end, with values-only args + result preview', async () => {
+  // Append-only contract: a pending tool call does NOT push a block into the
+  // transcript on `_start`; the running status bar shows it inline. The full
+  // block — header + result preview — appears in scrollback at `_end`.
   const { engine, lastFrame } = renderApp();
   await tick();
+  // Open a turn so the running bar can show. Without `turn_start` the tool
+  // would still leave activeTools[id] dangling in state, but the bar wouldn't
+  // draw.
+  engine.emit(ev('turn_start'));
   engine.emit(ev('tool_execution_start', { tool_call_id: 't1', tool_name: 'bash', arguments: '{"command":"ls -l","timeout_secs":10}' }));
   await tick();
   let f = plain(lastFrame());
-  assert.match(f, /● bash\(ls -l, 10\) …/, 'pending: values-only + ellipsis');
+  // The pending tool is shown by the RunningBar's inline indicator, not as a
+  // transcript block. (Either form contains the bash signature; this assertion
+  // just pins that we DO surface it somewhere visible while it runs.)
+  assert.match(f, /bash\(ls -l, 10\)/, 'pending tool surfaced (running bar)');
   engine.emit(ev('tool_execution_end', { tool_call_id: 't1', result: { content: 'line1\nline2\nline3\nline4\nline5', is_error: false } }));
+  engine.emit(ev('turn_end'));
   await tick();
   f = plain(lastFrame());
   assert.match(f, /● bash\(ls -l, 10\)/);

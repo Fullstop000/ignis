@@ -11,16 +11,24 @@ const lastWith = (frames, re) => plain([...frames].reverse().find((f) => re.test
 
 const LONG = 'line1\nline2\nline3\nline4\nline5';
 
-test('a reasoning stream renders a live ✻ Thinking block (not assistant text)', async () => {
+test('a reasoning stream is suppressed mid-flight; the block lands on message_end', async () => {
+  // Append-only contract: reasoning deltas don't render to the screen — the
+  // RunningBar's spinner + token counter is the only mid-flight feedback. The
+  // committed reasoning block lands in <Static> at `message_end`, exactly
+  // once.
   const { engine, lastFrame } = renderApp();
   await tick();
   engine.emit(ev('turn_start'));
   engine.emit(ev('message_start', { message: { reasoning_content: '' } }));
   engine.emit(ev('message_update', { delta: 'pondering the problem' }));
   await tick();
-  const f = plain(lastFrame());
-  assert.match(f, /✻ Thinking…/);
-  assert.match(f, /pondering the problem/);
+  let f = plain(lastFrame());
+  assert.doesNotMatch(f, /pondering the problem/, 'reasoning text is suppressed mid-stream');
+  engine.emit(ev('message_end', { message: { reasoning_content: 'pondering the problem' } }));
+  await tick();
+  f = plain(lastFrame());
+  assert.match(f, /✻ Thinking/, 'committed reasoning header lands in scrollback');
+  assert.match(f, /pondering the problem/, 'committed reasoning body lands in scrollback');
 });
 
 test('a finished long reasoning collapses, and Ctrl+O expands it', async () => {

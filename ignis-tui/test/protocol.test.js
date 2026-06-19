@@ -72,6 +72,9 @@ test('a reasoning stream finalizes to a reasoning block, not an assistant one', 
 });
 
 test('user prompt and tool lifecycle render blocks', () => {
+  // Append-only contract: tool_execution_start does NOT enter `blocks` (it
+  // sets `state.activeTools[id]` for the running status bar instead);
+  // tool_execution_end is what pushes the completed tool block into `blocks`.
   let s = initialState();
   s = reduceOutbound(s, { kind: 'event', data: { type: 'user_prompt_committed', payload: { text: 'hi' } } });
   assert.deepEqual(s.blocks.at(-1), { kind: 'user', text: 'hi' });
@@ -79,13 +82,60 @@ test('user prompt and tool lifecycle render blocks', () => {
     kind: 'event',
     data: { type: 'tool_execution_start', payload: { tool_call_id: 't1', tool_name: 'bash', arguments: 'ls' } },
   });
-  assert.equal(s.blocks.at(-1).done, false);
-  assert.equal(s.blocks.at(-1).name, 'bash');
+  // Tool block is NOT in `blocks` yet — only `activeTools` carries it.
+  assert.equal(s.blocks.length, 1, 'tool start does not enter blocks');
+  assert.equal(s.activeTools.t1.name, 'bash');
+  assert.equal(s.activeTools.t1.args, 'ls');
   s = reduceOutbound(s, {
     kind: 'event',
     data: { type: 'tool_execution_end', payload: { tool_call_id: 't1', result: {} } },
   });
   assert.equal(s.blocks.at(-1).done, true);
+  assert.equal(s.blocks.at(-1).name, 'bash');
+  assert.equal(s.activeTools.t1, undefined, 'active tool cleared on _end');
+});
+
+test('parallel tool calls preserve each tool\'s name + args until its own _end', () => {
+  // The agent runs tools concurrently (`buffer_unordered` in agent/mod.rs):
+  // multiple `tool_execution_start` events fire before any `_end`. Each
+  // tool's name/args MUST survive to its own `_end` so the committed block
+  // carries the right header — single-slot `activeTool` previously dropped
+  // them, rendering committed blocks as `● ()`.
+  let s = initialState();
+  s = reduceOutbound(s, {
+    kind: 'event',
+    data: { type: 'tool_execution_start', payload: { tool_call_id: 'a', tool_name: 'bash', arguments: 'sleep 5' } },
+  });
+  s = reduceOutbound(s, {
+    kind: 'event',
+    data: { type: 'tool_execution_start', payload: { tool_call_id: 'b', tool_name: 'read_file', arguments: 'src/lib.rs' } },
+  });
+  s = reduceOutbound(s, {
+    kind: 'event',
+    data: { type: 'tool_execution_start', payload: { tool_call_id: 'c', tool_name: 'grep', arguments: 'TODO' } },
+  });
+  // Out-of-order ends: middle tool finishes first.
+  s = reduceOutbound(s, {
+    kind: 'event',
+    data: { type: 'tool_execution_end', payload: { tool_call_id: 'b', result: { content: 'x' } } },
+  });
+  let last = s.blocks.at(-1);
+  assert.equal(last.kind, 'tool');
+  assert.equal(last.id, 'b');
+  assert.equal(last.name, 'read_file', 'committed block carries B\'s name even after C\'s start');
+  assert.equal(last.args, 'src/lib.rs');
+  // First-started ends after the others have started.
+  s = reduceOutbound(s, {
+    kind: 'event',
+    data: { type: 'tool_execution_end', payload: { tool_call_id: 'a', result: { content: 'done' } } },
+  });
+  last = s.blocks.at(-1);
+  assert.equal(last.id, 'a');
+  assert.equal(last.name, 'bash', 'committed block carries A\'s name despite B and C overwriting in single-slot impl');
+  assert.equal(last.args, 'sleep 5');
+  // C still active.
+  assert.equal(Object.keys(s.activeTools).length, 1);
+  assert.equal(s.activeTools.c.name, 'grep');
 });
 
 test('a request frame sets a pending picker; snapshot hydrates session + clears it', () => {

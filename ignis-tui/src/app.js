@@ -134,8 +134,22 @@ export default function App({ engine, onExit }) {
         engine.send(newSession());
         // Clear the local transcript; the engine re-snapshots with the new id.
         // Bump `generation` so the committed <Static> region remounts (and the
-        // screen is wiped) instead of leaving the old transcript flushed.
-        setState((s) => ({ ...s, blocks: [], stream: null, turns: 0, usage: null, generation: s.generation + 1 }));
+        // screen is wiped) instead of leaving the old transcript flushed. Also
+        // drop any in-flight stream / running-tool indicators so the new
+        // session starts visually clean even if /clear lands mid-turn.
+        setState((s) => ({
+          ...s,
+          blocks: [],
+          stream: null,
+          streamKind: null,
+          streamChars: 0,
+          turns: 0,
+          usage: null,
+          activeTools: {},
+          followUps: [],
+          todos: [],
+          generation: s.generation + 1,
+        }));
         return true;
       case 'model':
         setLocalPicker('model');
@@ -378,41 +392,40 @@ export default function App({ engine, onExit }) {
   });
 
   const children = [];
-  // Commit the *settled* prefix of the transcript to <Static>: Ink prints each
-  // Static item to the terminal exactly once (real scrollback) and never
-  // re-renders it, so the live region below stays short and Ink never falls back
-  // to its full-screen-clear path (the flicker) once the transcript outgrows the
-  // window. A still-mutating tail — a pending tool, or the optimistic user block
-  // before `user_prompt_committed` — must stay dynamic until it reaches final
-  // form, so the boundary is the first such block. Committed reasoning is frozen
-  // at its current expand state; live/tail reasoning still honours Ctrl+O.
-  let firstLive = state.blocks.length;
-  for (let i = 0; i < state.blocks.length; i++) {
-    const b = state.blocks[i];
-    if ((b.kind === 'tool' && !b.done) || (b.kind === 'user' && b.pending)) {
-      firstLive = i;
-      break;
-    }
-  }
-  const settled = state.blocks.slice(0, firstLive);
-  const tail = state.blocks.slice(firstLive);
+  // Append-only render pipeline: every committed block goes into <Static>, so
+  // Ink writes it to the terminal's real scrollback exactly once and never
+  // re-renders it. The dynamic region below stays bounded — RunningBar +
+  // Composer + Footer + a few ephemeral strips — so Ink's full-screen-clear
+  // path (which fires when `outputHeight >= rows`) is never triggered.
+  //
+  // Two consequences vs. the old in-place-streaming pipeline:
+  //   * Streaming assistant replies and reasoning streams do not render their
+  //     deltas to the screen. The integrated text only appears in scrollback
+  //     after `message_end`. The RunningBar provides "in-flight" feedback (a
+  //     spinner, elapsed time, live token counters from `streamChars`).
+  //   * Tool calls are not rendered at `tool_execution_start`; the running
+  //     bar shows "● <name>(<args>)" inline via `state.activeTools[id]`. The
+  //     full tool block — header + result preview — appears in scrollback at
+  //     `tool_execution_end`.
+  //
+  // The optimistic user block (pushed at submit time before
+  // `user_prompt_committed` arrives) is the only block we hide from <Static>
+  // — once it lives in scrollback we can't rewrite it in case the prompt
+  // hook chain changes the text. The reducer replaces it with the committed
+  // version a frame later, and that version goes into <Static> on the next
+  // render.
+  const committed = state.blocks.filter((b) => !(b.kind === 'user' && b.pending));
+  const pendingUser = state.blocks.find((b) => b.kind === 'user' && b.pending);
   children.push(
-    e(Static, { key: `tx-${state.generation}`, items: settled }, (b, i) =>
+    e(Static, { key: `tx-${state.generation}`, items: committed }, (b, i) =>
       e(Block, { key: i, block: b, expanded: reasoningExpanded }),
     ),
   );
-  if (state.blocks.length === 0 && state.stream == null && !req) {
+  if (state.blocks.length === 0 && !req) {
     children.push(e(Welcome, { key: 'welcome', version: state.version, cwd: state.cwd }));
   }
-  tail.forEach((b, i) => children.push(e(Block, { key: `t${i}`, block: b, expanded: reasoningExpanded })));
-  if (state.stream != null) {
-    // The in-flight stream renders as live reasoning (rolling ✻ Thinking) or
-    // streaming markdown, depending on what the engine opened.
-    children.push(
-      state.streamKind === 'reasoning'
-        ? e(ReasoningView, { key: 'stream', text: state.stream, done: false, expanded: reasoningExpanded })
-        : e(Markdown, { key: 'stream', text: state.stream }),
-    );
+  if (pendingUser) {
+    children.push(e(Block, { key: 'pending-user', block: pendingUser, expanded: reasoningExpanded }));
   }
   if (req) {
     // Key by request id so a fresh request resets the flow's internal state.
@@ -565,8 +578,10 @@ function ReasoningView({ text, done, expanded }) {
   return e(Box, { flexDirection: 'column' }, [header, ...body]);
 }
 
-// Tool call: a `● name(args)` header (yellow pending / green done / red error),
-// with the result preview indented under a `╰` gutter once it completes.
+// Tool call: a `● name(args)` header (green done / red error), with the
+// result preview indented under a `╰` gutter. Always rendered with
+// `done: true` — under the append-only pipeline, pending tool calls live in
+// `state.activeTools` for the RunningBar, never in the transcript.
 //
 // The `edit_file` result gets a dedicated treatment: its header reads
 // `◆ Edited <path> (+adds -dels)` and the body is a line-numbered unified-diff
@@ -577,13 +592,13 @@ function ToolBlock({ block }) {
   if (!isError && block.name === 'edit_file') {
     return e(EditFileBlock, { block });
   }
-  const headerColor = !block.done ? 'yellow' : isError ? 'red' : 'green';
+  const headerColor = isError ? 'red' : 'green';
   const header = e(
     Text,
     { key: 'h', color: headerColor },
-    `● ${block.name}(${toolArgsSummary(block.args)})${block.done ? '' : ' …'}`,
+    `● ${block.name}(${toolArgsSummary(block.args)})`,
   );
-  if (!block.done || !block.result) return header;
+  if (!block.result) return header;
   const { lines, more } = toolOutputPreview(block.result.content, isError);
   if (!lines.length) return header;
   const body = lines.map((ln, i) =>
@@ -595,18 +610,14 @@ function ToolBlock({ block }) {
 
 /**
  * Render an `edit_file` tool call as a Claude-Code / Codex-style diff view.
- * The heavy lifting lives in `<DiffView>`; this wrapper just handles the
- * in-flight spinner header and the path extraction.
+ * Always called with a completed block under the append-only pipeline (live
+ * edits live in `state.activeTools`).
  */
 function EditFileBlock({ block }) {
   const path = parseEditPath(block.args);
-  const inFlight = !block.done || !block.result;
-  if (inFlight) {
-    return e(
-      Text,
-      { color: 'yellow' },
-      `◆ Editing ${path || block.name} …`,
-    );
+  if (!block.result) {
+    // Defensive: a malformed `_end` with no result. Keep the layout stable.
+    return e(Text, { color: 'gray' }, `◆ ${path || block.name}`);
   }
   return e(DiffView, { content: block.result.content, path });
 }
@@ -714,8 +725,12 @@ function fmtTokens(n) {
 }
 
 // Running status bar shown while a turn is in flight: animated spinner, elapsed
-// clock, and live ↑ input / ↓ output token counts (output estimated from the
-// streamed chars until the engine's usage event lands), + an interrupt hint.
+// clock, live ↑ input / ↓ output token counts (output estimated from the
+// streamed chars until the engine's usage event lands), an interrupt hint, and
+// — under the append-only render pipeline — an inline indicator of the
+// currently-running tool (since pending tool blocks no longer render in the
+// transcript). Stays at most 2 rows tall so the dynamic region never trips
+// Ink's full-screen-clear path.
 function RunningBar({ state, spin, startedAt }) {
   const frame = SPINNER[spin % SPINNER.length];
   const elapsed = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
@@ -725,13 +740,32 @@ function RunningBar({ state, spin, startedAt }) {
   if (inTok) toks.push(`↑ ${fmtTokens(inTok)}`);
   if (outTok) toks.push(`↓ ${fmtTokens(outTok)}`);
   const tail = `${toks.length ? `  ·  ${toks.join(' ')} tok` : ''}  ·  ctrl+c to interrupt`;
-  return e(
-    Box,
-    { marginTop: 1 },
-    e(Text, { color: 'cyan' }, `${frame} `),
-    e(Text, { color: 'gray' }, `Working… ${elapsed}s`),
-    e(Text, { dimColor: true }, tail),
-  );
+  const rows = [
+    e(
+      Box,
+      { key: 'main' },
+      e(Text, { color: 'cyan' }, `${frame} `),
+      e(Text, { color: 'gray' }, `Working… ${elapsed}s`),
+      e(Text, { dimColor: true }, tail),
+    ),
+  ];
+  if (state.activeTools) {
+    const ids = Object.keys(state.activeTools);
+    if (ids.length > 0) {
+      // Show the oldest still-running tool — that's the one most likely
+      // gating the turn. With parallel tools, the rest are summarised as
+      // a "+K more" suffix so the bar stays at most 2 rows tall (the
+      // dynamic region must remain bounded so Ink never trips its
+      // full-screen-clear path).
+      const oldest = state.activeTools[ids[0]];
+      const more = ids.length - 1;
+      const summary = toolArgsSummary(oldest.args, 60);
+      const tail = more > 0 ? `  +${more} more running` : ' running';
+      const label = `● ${oldest.name}(${summary})${tail}`;
+      rows.push(e(Box, { key: 'tool' }, e(Text, { color: 'yellow' }, label)));
+    }
+  }
+  return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
 }
 
 // Task-list panel (todo_write): a checklist the agent maintains for multi-step
