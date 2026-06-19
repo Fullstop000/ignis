@@ -63,3 +63,38 @@ test('resume clears the todo panel', async () => {
   await tick();
   assert.doesNotMatch(plain(lastFrame()), /stale/);
 });
+
+test('todo panel caps visible rows at 8 with a `+N more` overflow line', async () => {
+  // Long task lists shouldn't push the composer off the screen. Cap at 8
+  // visible rows; the header counter still reflects the full total.
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  const items = [];
+  for (let i = 1; i <= 12; i++) items.push(todo(`task ${i}`, 'pending'));
+  engine.emit(ev('todos', { items }));
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /Tasks 0\/12/, 'header reflects the full total');
+  // First 8 visible.
+  for (let i = 1; i <= 8; i++) {
+    assert.match(f, new RegExp(`◻ task ${i}\\b`), `task ${i} should be visible`);
+  }
+  // Tasks 9..12 elided.
+  for (let i = 9; i <= 12; i++) {
+    assert.doesNotMatch(f, new RegExp(`◻ task ${i}\\b`), `task ${i} should be hidden`);
+  }
+  assert.match(f, /\+4 more/, 'overflow line shows count of hidden tasks');
+});
+
+test('todo panel shows no overflow line at exactly 8 tasks', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  const items = [];
+  for (let i = 1; i <= 8; i++) items.push(todo(`task ${i}`, 'pending'));
+  engine.emit(ev('todos', { items }));
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /Tasks 0\/8/);
+  assert.match(f, /◻ task 8\b/);
+  assert.doesNotMatch(f, /\+\d+ more/, 'no overflow line at exactly the cap');
+});

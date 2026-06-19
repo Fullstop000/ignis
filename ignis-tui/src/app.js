@@ -772,13 +772,19 @@ function RunningBar({ state, spin, startedAt }) {
 // work. Shown above the composer whenever the list is non-empty, in every state
 // (persists across the turn). ✓ completed (dim), ◐ in_progress (highlighted),
 // ◻ pending (dim). In-progress rows prefer the present-continuous `activeForm`.
+// Capped at MAX_TODO_ROWS=8 visible rows to keep the strip from dwarfing the
+// composer on long task lists; overflow is shown as a `+N more` line. The
+// header counter (`Tasks done/total`) still reflects the full list.
 const TODO_GLYPH = { completed: '✓', in_progress: '◐', pending: '◻' };
+const MAX_TODO_ROWS = 8;
 function TodosStrip({ todos }) {
   const done = todos.filter((t) => t.status === 'completed').length;
+  const shown = todos.slice(0, MAX_TODO_ROWS);
+  const overflow = todos.length - shown.length;
   const rows = [
     e(Text, { key: 'hdr', dimColor: true }, `  Tasks ${done}/${todos.length}`),
   ];
-  todos.forEach((t, i) => {
+  shown.forEach((t, i) => {
     const glyph = TODO_GLYPH[t.status] ?? '◻';
     const label = t.status === 'in_progress' && t.activeForm ? t.activeForm : t.content;
     if (t.status === 'in_progress') {
@@ -790,6 +796,9 @@ function TodosStrip({ todos }) {
       );
     }
   });
+  if (overflow > 0) {
+    rows.push(e(Text, { key: 'of', dimColor: true }, `  +${overflow} more`));
+  }
   return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
 }
 
