@@ -240,7 +240,12 @@ mod tests {
             "read-only excludes writes"
         );
 
-        let general = names(crate::tools::native_tools(cwd, Default::default(), None, None));
+        let general = names(crate::tools::native_tools(
+            cwd,
+            Default::default(),
+            None,
+            None,
+        ));
         assert!(general.iter().any(|n| n == "bash"), "general includes bash");
     }
 }

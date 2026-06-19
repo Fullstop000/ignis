@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - TUI — the Ink frontend now pins picker boxes to the terminal width so resizing the window no longer draws stale or overflowing rounded borders. ([#199](https://github.com/Fullstop000/ignis/pull/199))
 
+### Security
+- Tools — in the unattended permission modes, auto-run `bash` commands are confined by a Landlock/Seatbelt write sandbox to the working directory and temp dirs (plus any configured `[permissions] sandbox_write_paths`); reads stay broad. ([#207](https://github.com/Fullstop000/ignis/pull/207))
+
 ## [0.40.2] - 2026-06-18
 
 ### Added
