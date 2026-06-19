@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tools — `edit_file` now returns a real unified diff (`@@ -a,b +c,d @@` hunks with context) and the Ink frontend renders it as a line-numbered `◆ Edited <path> (+a -d)` view with `⋮` separators between non-contiguous hunks. ([#200](https://github.com/Fullstop000/ignis/pull/200))
 - Tools — `todo_write` lets the model keep a live task checklist; the Ink frontend renders it as a ✓/◐/◻ panel that persists across `/resume`. ([#202](https://github.com/Fullstop000/ignis/pull/202))
 - Tools — `bash` can run a command in the background (`run_in_background`); read its streaming output with `bash_output` and stop it with `kill_shell`, and the Ink footer shows `⚙ N bg` while any are live. ([#203](https://github.com/Fullstop000/ignis/pull/203))
+- Tools — the `agent` tool accepts an `agent_type` (`general`/`explore`/`review`); `explore` and `review` run with a read-only toolset (no edits, shell, or network). ([#204](https://github.com/Fullstop000/ignis/pull/204))
 
 ### Changed
 - TUI — slash-command suggestions now render below the input bar (was above), capped at 8 visible rows; both Ink and ratatui frontends are now flush with no blank rows above or below the input. ([#197](https://github.com/Fullstop000/ignis/pull/197))
