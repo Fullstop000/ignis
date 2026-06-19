@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tools — `bash` can run a command in the background (`run_in_background`); read its streaming output with `bash_output` and stop it with `kill_shell`, and the Ink footer shows `⚙ N bg` while any are live. ([#203](https://github.com/Fullstop000/ignis/pull/203))
 - Tools — the `agent` tool accepts an `agent_type` (`general`/`explore`/`review`); `explore` and `review` run with a read-only toolset (no edits, shell, or network). ([#204](https://github.com/Fullstop000/ignis/pull/204))
 - TUI — the model can end a reply with 2–4 suggested follow-up prompts (a `<follow_ups>` block, stripped from the transcript); the Ink frontend renders them as a Tab-pickable strip. ([#205](https://github.com/Fullstop000/ignis/pull/205))
+- Hooks — `PreToolUse` and `PostToolUse` events let a configured hook block or rewrite a tool call before it runs and rewrite its result after, with an optional tool-name `matcher`. ([#206](https://github.com/Fullstop000/ignis/pull/206))
 
 ### Changed
 - TUI — slash-command suggestions now render below the input bar (was above), capped at 8 visible rows; both Ink and ratatui frontends are now flush with no blank rows above or below the input. ([#197](https://github.com/Fullstop000/ignis/pull/197))
