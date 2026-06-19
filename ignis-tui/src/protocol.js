@@ -95,11 +95,17 @@ export function initialState() {
     // Suggested next prompts for the just-ended turn (from the model's stripped
     // <follow_ups> block). Ephemeral: shown idle-only, cleared on the next turn.
     followUps: [],
-    // The currently-running tool call, if any, for the running status bar:
-    // { id, name, args }. Set on tool_execution_start and cleared on _end (when
-    // the completed block is pushed to `blocks`). Append-only: pending tool
-    // calls never enter the transcript.
-    activeTool: null,
+    // Currently-running tool calls, keyed by tool_call_id, for the running
+    // status bar's inline indicator. The agent runs tools concurrently
+    // (`buffer_unordered` in agent/mod.rs), so this is a map, not a single
+    // slot — overwriting on each `_start` would lose the name/args of the
+    // earlier tool by the time its `_end` arrived. Each entry is
+    // { name, args, startedAt }; insertion order is preserved (Map semantics
+    // via plain object + ECMAScript string-keyed insertion order). The
+    // committed tool block is pushed to `blocks` on `_end`, then committed to
+    // scrollback as a single <Static> item — pending tool calls never enter
+    // the transcript.
+    activeTools: {},
     // Monotonic count of turn-end events. The waiting-queue drain keys on this
     // (the turn-end EVENT, like the native runner's turn_in_flight flag) rather
     // than a busy→idle status change, so a queued message still drains after a
@@ -157,7 +163,7 @@ export function reduceOutbound(state, frame) {
         // (if any) re-emit on its next prompt.
         todos: [],
         followUps: [],
-        activeTool: null,
+        activeTools: {},
         generation: state.generation + 1,
       };
     default:
@@ -182,8 +188,9 @@ function reduceEvent(state, ev) {
   switch (ev.type) {
     case EVENT.TURN_START:
       // A new turn invalidates the previous turn's suggestions and any stale
-      // active-tool indicator (a turn that crashed mid-tool may have left one).
-      return { ...state, status: 'busy', turns: state.turns + 1, streamChars: 0, followUps: [], activeTool: null };
+      // active-tool indicators (a turn that crashed mid-tool may have left
+      // some).
+      return { ...state, status: 'busy', turns: state.turns + 1, streamChars: 0, followUps: [], activeTools: {} };
     case EVENT.TURN_END:
       return { ...state, status: 'idle', turnEnds: state.turnEnds + 1 };
     case EVENT.MESSAGE_START: {
@@ -225,28 +232,40 @@ function reduceEvent(state, ev) {
       return { ...state, blocks: [...state.blocks, { kind: 'inject', text: p.text ?? '' }] };
     case EVENT.TOOL_EXECUTION_START:
       // Append-only: the tool call is NOT added to `blocks` here. While it
-      // runs, the running status bar shows it inline ("● bash(...) running")
-      // via `state.activeTool`. The full block — header + result preview — is
-      // pushed to `blocks` on `_end`, then committed to scrollback as a single
-      // <Static> item. This keeps the dynamic region bounded so Ink never
-      // trips its `outputHeight >= rows` full-screen-clear path.
+      // runs, the running status bar shows it inline (`● bash(...) running`)
+      // via `state.activeTools[tool_call_id]`. The full block — header +
+      // result preview — is pushed to `blocks` on `_end`, then committed to
+      // scrollback as a single <Static> item. This keeps the dynamic region
+      // bounded so Ink never trips its `outputHeight >= rows`
+      // full-screen-clear path.
+      //
+      // The agent runs tools concurrently (buffer_unordered in
+      // agent/mod.rs), so the engine emits multiple Starts before the first
+      // End: every active tool's name/args must survive until ITS own End,
+      // not be overwritten by the next Start.
       return {
         ...state,
-        activeTool: { id: p.tool_call_id, name: p.tool_name, args: p.arguments },
+        activeTools: {
+          ...state.activeTools,
+          [p.tool_call_id]: { name: p.tool_name, args: p.arguments, startedAt: Date.now() },
+        },
       };
     case EVENT.TOOL_EXECUTION_END: {
-      const active = state.activeTool && state.activeTool.id === p.tool_call_id ? state.activeTool : null;
+      const id = p.tool_call_id;
+      const active = state.activeTools[id];
       // Use the active-tool name/args if we have them; otherwise the call may
       // pre-date this session (defensive — shouldn't happen).
       const name = active?.name ?? '';
       const args = active?.args ?? '';
+      const nextActive = { ...state.activeTools };
+      delete nextActive[id];
       return {
         ...state,
         blocks: [
           ...state.blocks,
-          { kind: 'tool', id: p.tool_call_id, name, args, done: true, result: p.result },
+          { kind: 'tool', id, name, args, done: true, result: p.result },
         ],
-        activeTool: state.activeTool && state.activeTool.id === p.tool_call_id ? null : state.activeTool,
+        activeTools: nextActive,
       };
     }
     case EVENT.WARNING:

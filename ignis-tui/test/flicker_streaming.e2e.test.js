@@ -104,7 +104,25 @@ test('streaming assistant reply taller than the terminal full-screen-clears on e
   assert.equal(during, 0, `expected 0 full-screen clears while streaming, got ${during}`);
 });
 
-test('a single unfinished tool pins later blocks dynamic and full-screen-clears on later events', async () => {
+test('parallel tool calls (one slow + many quick) never trip full-screen-clears', async () => {
+  // Original bug: `firstLive` walked from index 0 and stopped at the first
+  // pending tool, pinning every later block into the dynamic region. With
+  // `bash run_in_background` (or any slow tool) sitting at the top of the
+  // turn while several quick tools finished after it, the dynamic region
+  // grew unbounded and Ink's `outputHeight >= rows` fallback kicked in,
+  // full-screen-clearing on every later event.
+  //
+  // Under the append-only pipeline, tool starts no longer enter `blocks`;
+  // they live in `state.activeTools` (a Map keyed by tool_call_id, so
+  // parallel starts don't overwrite each other). Each tool's _end commits
+  // its full block — with the right name/args — to <Static>. The dynamic
+  // region stays bounded at RunningBar + Composer + Footer.
+  //
+  // We assert (a) zero full-screen clears across the whole sequence, AND
+  // (b) the six quick tools each committed with the correct name+args —
+  // the latter would have failed under the old single-slot `activeTool`
+  // (each later `_start` overwrote the previous one, so `_end` lookups
+  // missed and committed `● ()`).
   const engine = mockEngine();
   const stdout = fakeStdout(10); // 10-row terminal
   const stdin = fakeStdin();
@@ -113,9 +131,7 @@ test('a single unfinished tool pins later blocks dynamic and full-screen-clears 
   engine.emit(ev('user_prompt_committed', { text: 'go' }));
   engine.emit(ev('turn_start'));
 
-  // Open a slow tool that won't finish for the duration of the test. Per
-  // app.js:389–396 this pins firstLive at this index — every later block stays
-  // in the dynamic region instead of moving to <Static>.
+  // A slow tool that won't finish for the duration of the test.
   engine.emit(ev('tool_execution_start', {
     tool_call_id: 'slow',
     tool_name: 'bash',
@@ -123,20 +139,23 @@ test('a single unfinished tool pins later blocks dynamic and full-screen-clears 
   }));
   await sleep(20);
 
-  // Now run several quick tools to completion. Each pair (start + end) is
-  // small on its own, but they accumulate in the dynamic region (pinned by
-  // 'slow') and push the live output past the 10-row terminal. The slow tool
-  // is intentionally never marked done.
   const before = stdout.writes.filter((w) => w.includes(CLEAR)).length;
+  // Six quick tools, all started in parallel (true buffer_unordered shape:
+  // every Start arrives before any End). Under the old single-slot model,
+  // each later Start overwrote the prior one, so the first five `_end`
+  // events looked up a stale slot and committed `● ()`.
   for (let i = 0; i < 6; i++) {
-    const id = `q${i}`;
     engine.emit(ev('tool_execution_start', {
-      tool_call_id: id,
+      tool_call_id: `q${i}`,
       tool_name: 'read_file',
       arguments: `{"path":"file_${i}.txt"}`,
     }));
+  }
+  // Now drain the ends out of order (mirrors real concurrency: the longest
+  // file is rarely the first to finish).
+  for (const i of [3, 0, 5, 1, 4, 2]) {
     engine.emit(ev('tool_execution_end', {
-      tool_call_id: id,
+      tool_call_id: `q${i}`,
       result: { content: `content of file ${i}\nline 2\nline 3`, is_error: false },
     }));
     await sleep(20);
@@ -144,10 +163,19 @@ test('a single unfinished tool pins later blocks dynamic and full-screen-clears 
   await sleep(50);
   const during = stdout.writes.filter((w) => w.includes(CLEAR)).length - before;
 
+  // The flushed Static output should contain the six quick tools' headers
+  // with their real names and args (`read_file(file_N.txt)`), not the
+  // empty `● ()` the single-slot bug produced. We can read the cumulative
+  // stdout for this assertion since each Static commit is one write.
+  const flushed = stdout.writes.join('');
+
   inst.unmount();
-  // Today: each completed tool grows the dynamic region (because 'slow' pins
-  // firstLive at 0), so each tool_execution_end above the rows threshold
-  // triggers a full-screen clear. The fix should let already-`done:true`
-  // tools settle into <Static> even when an earlier tool is still pending.
-  assert.equal(during, 0, `expected 0 full-screen clears while later tools complete behind a pending one, got ${during}`);
+  assert.equal(during, 0, `expected 0 full-screen clears across parallel tool churn, got ${during}`);
+  // The single-slot bug committed `● ()` (empty name + empty args) for every
+  // tool whose `_end` arrived after another `_start` had clobbered its slot.
+  // Under the Map, every commit carries the right header.
+  assert.ok(
+    !/●\s*\(\)/.test(flushed),
+    'committed tool blocks must carry name+args; saw `● ()` (single-slot regression)',
+  );
 });

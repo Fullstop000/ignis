@@ -121,7 +121,8 @@ test('tool block: only renders after _end, with values-only args + result previe
   const { engine, lastFrame } = renderApp();
   await tick();
   // Open a turn so the running bar can show. Without `turn_start` the tool
-  // would still leave activeTool dangling in state, but the bar wouldn't draw.
+  // would still leave activeTools[id] dangling in state, but the bar wouldn't
+  // draw.
   engine.emit(ev('turn_start'));
   engine.emit(ev('tool_execution_start', { tool_call_id: 't1', tool_name: 'bash', arguments: '{"command":"ls -l","timeout_secs":10}' }));
   await tick();
