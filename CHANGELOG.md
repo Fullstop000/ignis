@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.1] - 2026-06-19
+
+### Added
+- TUI — the Ink task-list panel (`todo_write`) caps at 8 visible rows; on long lists the window anchors on the `in_progress` row so the active task stays visible. ([#211](https://github.com/Fullstop000/ignis/pull/211))
+
 ### Fixed
 - TUI — the Ink frontend no longer flickers when the rolling output exceeds the terminal height. ([#210](https://github.com/Fullstop000/ignis/pull/210))
 - Ink frontend — `ignis --resume <id>` now restores the prior conversation instead of starting an empty session. ([#208](https://github.com/Fullstop000/ignis/pull/208))
