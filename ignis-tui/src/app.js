@@ -772,32 +772,59 @@ function RunningBar({ state, spin, startedAt }) {
 // work. Shown above the composer whenever the list is non-empty, in every state
 // (persists across the turn). ✓ completed (dim), ◐ in_progress (highlighted),
 // ◻ pending (dim). In-progress rows prefer the present-continuous `activeForm`.
-// Capped at MAX_TODO_ROWS=8 visible rows to keep the strip from dwarfing the
-// composer on long task lists; overflow is shown as a `+N more` line. The
-// header counter (`Tasks done/total`) still reflects the full list.
+//
+// Capped at MAX_TODO_ROWS=8 visible rows so the panel can't dwarf the composer
+// on long task lists. The window is **anchored on the in_progress item** so a
+// 12-step plan still shows the active row when the cursor reaches step 9 —
+// the system prompt instructs the model to write the full list up front and
+// advance the in_progress cursor through it (agent/mod.rs:130,
+// tools/todo_write.rs:71-72), so position-based head-slicing would silently
+// hide the panel's primary signal at exactly the lists the cap is for.
+// Items above/below the window collapse into `… N before` / `+N more tasks`
+// lines. The header counter (`Tasks done/total`) always reflects the full list.
 const TODO_GLYPH = { completed: '✓', in_progress: '◐', pending: '◻' };
 const MAX_TODO_ROWS = 8;
 function TodosStrip({ todos }) {
   const done = todos.filter((t) => t.status === 'completed').length;
-  const shown = todos.slice(0, MAX_TODO_ROWS);
-  const overflow = todos.length - shown.length;
+  // Window math: keep `active` (the in_progress item, if any) inside
+  // [start, start+MAX_TODO_ROWS). Falls back to head-slice when no item is
+  // in_progress (all completed / all pending), preserving the simple case.
+  const total = todos.length;
+  const visible = Math.min(MAX_TODO_ROWS, total);
+  let start = 0;
+  if (total > MAX_TODO_ROWS) {
+    const active = todos.findIndex((t) => t.status === 'in_progress');
+    if (active >= 0 && active >= visible) {
+      // Pin the active row near the bottom of the window so upcoming pending
+      // items remain visible (matches what the user wants to see: "what's
+      // next"). Clamp so the window never overruns the list.
+      start = Math.min(active - visible + 2, total - visible);
+      start = Math.max(0, start);
+    }
+  }
+  const shown = todos.slice(start, start + visible);
+  const before = start;
+  const after = total - (start + visible);
   const rows = [
-    e(Text, { key: 'hdr', dimColor: true }, `  Tasks ${done}/${todos.length}`),
+    e(Text, { key: 'hdr', dimColor: true }, `  Tasks ${done}/${total}`),
   ];
+  if (before > 0) {
+    rows.push(e(Text, { key: 'before', dimColor: true }, `  … ${before} earlier`));
+  }
   shown.forEach((t, i) => {
     const glyph = TODO_GLYPH[t.status] ?? '◻';
     const label = t.status === 'in_progress' && t.activeForm ? t.activeForm : t.content;
     if (t.status === 'in_progress') {
-      rows.push(e(Text, { key: `t${i}`, color: 'cyan', bold: true }, `  ${glyph} ${label}`));
+      rows.push(e(Text, { key: `t${start + i}`, color: 'cyan', bold: true }, `  ${glyph} ${label}`));
     } else {
       const strike = t.status === 'completed';
       rows.push(
-        e(Text, { key: `t${i}`, dimColor: true, strikethrough: strike }, `  ${glyph} ${label}`),
+        e(Text, { key: `t${start + i}`, dimColor: true, strikethrough: strike }, `  ${glyph} ${label}`),
       );
     }
   });
-  if (overflow > 0) {
-    rows.push(e(Text, { key: 'of', dimColor: true }, `  +${overflow} more`));
+  if (after > 0) {
+    rows.push(e(Text, { key: 'after', dimColor: true }, `  +${after} more tasks`));
   }
   return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
 }
