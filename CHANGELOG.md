@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - TUI — the Ink `edit_file` diff view is now a reusable `<DiffView>` component; it highlights changed words and fills `+`/`-` rows with full-width green/red background bars. ([#201](https://github.com/Fullstop000/ignis/pull/201))
 - Tools — `edit_file` now returns a real unified diff (`@@ -a,b +c,d @@` hunks with context) and the Ink frontend renders it as a line-numbered `◆ Edited <path> (+a -d)` view with `⋮` separators between non-contiguous hunks. ([#200](https://github.com/Fullstop000/ignis/pull/200))
+- Tools — `todo_write` lets the model keep a live task checklist; the Ink frontend renders it as a ✓/◐/◻ panel that persists across `/resume`. ([#202](https://github.com/Fullstop000/ignis/pull/202))
 
 ### Changed
 - TUI — slash-command suggestions now render below the input bar (was above), capped at 8 visible rows; both Ink and ratatui frontends are now flush with no blank rows above or below the input. ([#197](https://github.com/Fullstop000/ignis/pull/197))
