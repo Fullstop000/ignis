@@ -95,6 +95,11 @@ export function initialState() {
     // Suggested next prompts for the just-ended turn (from the model's stripped
     // <follow_ups> block). Ephemeral: shown idle-only, cleared on the next turn.
     followUps: [],
+    // The currently-running tool call, if any, for the running status bar:
+    // { id, name, args }. Set on tool_execution_start and cleared on _end (when
+    // the completed block is pushed to `blocks`). Append-only: pending tool
+    // calls never enter the transcript.
+    activeTool: null,
     // Monotonic count of turn-end events. The waiting-queue drain keys on this
     // (the turn-end EVENT, like the native runner's turn_in_flight flag) rather
     // than a busy→idle status change, so a queued message still drains after a
@@ -152,6 +157,7 @@ export function reduceOutbound(state, frame) {
         // (if any) re-emit on its next prompt.
         todos: [],
         followUps: [],
+        activeTool: null,
         generation: state.generation + 1,
       };
     default:
@@ -175,8 +181,9 @@ function reduceEvent(state, ev) {
   const p = ev.payload || {};
   switch (ev.type) {
     case EVENT.TURN_START:
-      // A new turn invalidates the previous turn's suggestions.
-      return { ...state, status: 'busy', turns: state.turns + 1, streamChars: 0, followUps: [] };
+      // A new turn invalidates the previous turn's suggestions and any stale
+      // active-tool indicator (a turn that crashed mid-tool may have left one).
+      return { ...state, status: 'busy', turns: state.turns + 1, streamChars: 0, followUps: [], activeTool: null };
     case EVENT.TURN_END:
       return { ...state, status: 'idle', turnEnds: state.turnEnds + 1 };
     case EVENT.MESSAGE_START: {
@@ -217,20 +224,31 @@ function reduceEvent(state, ev) {
     case EVENT.USER_INJECTED:
       return { ...state, blocks: [...state.blocks, { kind: 'inject', text: p.text ?? '' }] };
     case EVENT.TOOL_EXECUTION_START:
+      // Append-only: the tool call is NOT added to `blocks` here. While it
+      // runs, the running status bar shows it inline ("● bash(...) running")
+      // via `state.activeTool`. The full block — header + result preview — is
+      // pushed to `blocks` on `_end`, then committed to scrollback as a single
+      // <Static> item. This keeps the dynamic region bounded so Ink never
+      // trips its `outputHeight >= rows` full-screen-clear path.
+      return {
+        ...state,
+        activeTool: { id: p.tool_call_id, name: p.tool_name, args: p.arguments },
+      };
+    case EVENT.TOOL_EXECUTION_END: {
+      const active = state.activeTool && state.activeTool.id === p.tool_call_id ? state.activeTool : null;
+      // Use the active-tool name/args if we have them; otherwise the call may
+      // pre-date this session (defensive — shouldn't happen).
+      const name = active?.name ?? '';
+      const args = active?.args ?? '';
       return {
         ...state,
         blocks: [
           ...state.blocks,
-          { kind: 'tool', id: p.tool_call_id, name: p.tool_name, args: p.arguments, done: false },
+          { kind: 'tool', id: p.tool_call_id, name, args, done: true, result: p.result },
         ],
+        activeTool: state.activeTool && state.activeTool.id === p.tool_call_id ? null : state.activeTool,
       };
-    case EVENT.TOOL_EXECUTION_END:
-      return {
-        ...state,
-        blocks: state.blocks.map((b) =>
-          b.kind === 'tool' && b.id === p.tool_call_id ? { ...b, done: true, result: p.result } : b,
-        ),
-      };
+    }
     case EVENT.WARNING:
       return {
         ...state,

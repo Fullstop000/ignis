@@ -72,6 +72,9 @@ test('a reasoning stream finalizes to a reasoning block, not an assistant one', 
 });
 
 test('user prompt and tool lifecycle render blocks', () => {
+  // Append-only contract: tool_execution_start does NOT enter `blocks` (it
+  // sets `state.activeTool` for the running status bar instead);
+  // tool_execution_end is what pushes the completed tool block into `blocks`.
   let s = initialState();
   s = reduceOutbound(s, { kind: 'event', data: { type: 'user_prompt_committed', payload: { text: 'hi' } } });
   assert.deepEqual(s.blocks.at(-1), { kind: 'user', text: 'hi' });
@@ -79,13 +82,16 @@ test('user prompt and tool lifecycle render blocks', () => {
     kind: 'event',
     data: { type: 'tool_execution_start', payload: { tool_call_id: 't1', tool_name: 'bash', arguments: 'ls' } },
   });
-  assert.equal(s.blocks.at(-1).done, false);
-  assert.equal(s.blocks.at(-1).name, 'bash');
+  // Tool block is NOT in `blocks` yet — only `activeTool` carries it.
+  assert.equal(s.blocks.length, 1, 'tool start does not enter blocks');
+  assert.deepEqual(s.activeTool, { id: 't1', name: 'bash', args: 'ls' });
   s = reduceOutbound(s, {
     kind: 'event',
     data: { type: 'tool_execution_end', payload: { tool_call_id: 't1', result: {} } },
   });
   assert.equal(s.blocks.at(-1).done, true);
+  assert.equal(s.blocks.at(-1).name, 'bash');
+  assert.equal(s.activeTool, null, 'active tool cleared on _end');
 });
 
 test('a request frame sets a pending picker; snapshot hydrates session + clears it', () => {

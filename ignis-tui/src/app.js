@@ -378,41 +378,40 @@ export default function App({ engine, onExit }) {
   });
 
   const children = [];
-  // Commit the *settled* prefix of the transcript to <Static>: Ink prints each
-  // Static item to the terminal exactly once (real scrollback) and never
-  // re-renders it, so the live region below stays short and Ink never falls back
-  // to its full-screen-clear path (the flicker) once the transcript outgrows the
-  // window. A still-mutating tail — a pending tool, or the optimistic user block
-  // before `user_prompt_committed` — must stay dynamic until it reaches final
-  // form, so the boundary is the first such block. Committed reasoning is frozen
-  // at its current expand state; live/tail reasoning still honours Ctrl+O.
-  let firstLive = state.blocks.length;
-  for (let i = 0; i < state.blocks.length; i++) {
-    const b = state.blocks[i];
-    if ((b.kind === 'tool' && !b.done) || (b.kind === 'user' && b.pending)) {
-      firstLive = i;
-      break;
-    }
-  }
-  const settled = state.blocks.slice(0, firstLive);
-  const tail = state.blocks.slice(firstLive);
+  // Append-only render pipeline: every committed block goes into <Static>, so
+  // Ink writes it to the terminal's real scrollback exactly once and never
+  // re-renders it. The dynamic region below stays bounded — RunningBar +
+  // Composer + Footer + a few ephemeral strips — so Ink's full-screen-clear
+  // path (which fires when `outputHeight >= rows`) is never triggered.
+  //
+  // Two consequences vs. the old in-place-streaming pipeline:
+  //   * Streaming assistant replies and reasoning streams do not render their
+  //     deltas to the screen. The integrated text only appears in scrollback
+  //     after `message_end`. The RunningBar provides "in-flight" feedback (a
+  //     spinner, elapsed time, live token counters from `streamChars`).
+  //   * Tool calls are not rendered at `tool_execution_start`; the running
+  //     bar shows "● <name>(<args>)" inline via `state.activeTool`. The full
+  //     tool block — header + result preview — appears in scrollback at
+  //     `tool_execution_end`.
+  //
+  // The optimistic user block (pushed at submit time before
+  // `user_prompt_committed` arrives) is the only block we hide from <Static>
+  // — once it lives in scrollback we can't rewrite it in case the prompt
+  // hook chain changes the text. The reducer replaces it with the committed
+  // version a frame later, and that version goes into <Static> on the next
+  // render.
+  const committed = state.blocks.filter((b) => !(b.kind === 'user' && b.pending));
+  const pendingUser = state.blocks.find((b) => b.kind === 'user' && b.pending);
   children.push(
-    e(Static, { key: `tx-${state.generation}`, items: settled }, (b, i) =>
+    e(Static, { key: `tx-${state.generation}`, items: committed }, (b, i) =>
       e(Block, { key: i, block: b, expanded: reasoningExpanded }),
     ),
   );
-  if (state.blocks.length === 0 && state.stream == null && !req) {
+  if (state.blocks.length === 0 && !req) {
     children.push(e(Welcome, { key: 'welcome', version: state.version, cwd: state.cwd }));
   }
-  tail.forEach((b, i) => children.push(e(Block, { key: `t${i}`, block: b, expanded: reasoningExpanded })));
-  if (state.stream != null) {
-    // The in-flight stream renders as live reasoning (rolling ✻ Thinking) or
-    // streaming markdown, depending on what the engine opened.
-    children.push(
-      state.streamKind === 'reasoning'
-        ? e(ReasoningView, { key: 'stream', text: state.stream, done: false, expanded: reasoningExpanded })
-        : e(Markdown, { key: 'stream', text: state.stream }),
-    );
+  if (pendingUser) {
+    children.push(e(Block, { key: 'pending-user', block: pendingUser, expanded: reasoningExpanded }));
   }
   if (req) {
     // Key by request id so a fresh request resets the flow's internal state.
@@ -714,8 +713,12 @@ function fmtTokens(n) {
 }
 
 // Running status bar shown while a turn is in flight: animated spinner, elapsed
-// clock, and live ↑ input / ↓ output token counts (output estimated from the
-// streamed chars until the engine's usage event lands), + an interrupt hint.
+// clock, live ↑ input / ↓ output token counts (output estimated from the
+// streamed chars until the engine's usage event lands), an interrupt hint, and
+// — under the append-only render pipeline — an inline indicator of the
+// currently-running tool (since pending tool blocks no longer render in the
+// transcript). Stays at most 2 rows tall so the dynamic region never trips
+// Ink's full-screen-clear path.
 function RunningBar({ state, spin, startedAt }) {
   const frame = SPINNER[spin % SPINNER.length];
   const elapsed = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
@@ -725,13 +728,21 @@ function RunningBar({ state, spin, startedAt }) {
   if (inTok) toks.push(`↑ ${fmtTokens(inTok)}`);
   if (outTok) toks.push(`↓ ${fmtTokens(outTok)}`);
   const tail = `${toks.length ? `  ·  ${toks.join(' ')} tok` : ''}  ·  ctrl+c to interrupt`;
-  return e(
-    Box,
-    { marginTop: 1 },
-    e(Text, { color: 'cyan' }, `${frame} `),
-    e(Text, { color: 'gray' }, `Working… ${elapsed}s`),
-    e(Text, { dimColor: true }, tail),
-  );
+  const rows = [
+    e(
+      Box,
+      { key: 'main' },
+      e(Text, { color: 'cyan' }, `${frame} `),
+      e(Text, { color: 'gray' }, `Working… ${elapsed}s`),
+      e(Text, { dimColor: true }, tail),
+    ),
+  ];
+  if (state.activeTool) {
+    const summary = toolArgsSummary(state.activeTool.args, 60);
+    const label = `● ${state.activeTool.name}(${summary}) running`;
+    rows.push(e(Box, { key: 'tool' }, e(Text, { color: 'yellow' }, label)));
+  }
+  return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
 }
 
 // Task-list panel (todo_write): a checklist the agent maintains for multi-step
