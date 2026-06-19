@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-06-19
+
 ### Added
 - TUI — the Ink `edit_file` diff view is now a reusable `<DiffView>` component; it highlights changed words and fills `+`/`-` rows with full-width green/red background bars. ([#201](https://github.com/Fullstop000/ignis/pull/201))
 - Tools — `edit_file` now returns a real unified diff (`@@ -a,b +c,d @@` hunks with context) and the Ink frontend renders it as a line-numbered `◆ Edited <path> (+a -d)` view with `⋮` separators between non-contiguous hunks. ([#200](https://github.com/Fullstop000/ignis/pull/200))
