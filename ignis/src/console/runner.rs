@@ -289,7 +289,13 @@ async fn agent_loop(
                             log::error!("Agent error: {}", e);
                         }
                     }
-                    _ = cancel_rx.recv() => {
+                    // Only a *real* cancel (`Some(())`) aborts the turn. When the
+                    // frontend disconnects, the driver drops `cancel_tx`, so
+                    // `recv()` resolves `None` — matching `_` here would cancel
+                    // the in-flight turn mid-`persist()` and lose it (the turn the
+                    // user just saw finish). Binding `Some(())` disables this arm
+                    // on channel-close, letting `session.prompt` run to its save.
+                    Some(()) = cancel_rx.recv() => {
                         let _ = agent_tx.send(AgentEvent::TurnEnd).await;
                     }
                 }
@@ -639,7 +645,7 @@ pub async fn run_engine(
         })
         .collect();
 
-    tokio::spawn(agent_loop(
+    let agent_handle = tokio::spawn(agent_loop(
         prompt_rx,
         cancel_rx,
         agent_tx,
@@ -674,6 +680,22 @@ pub async fn run_engine(
     // picker reflect it (provider/model/cwd ride `new`; effort updates on `/model`).
     hub.set_effort(effort);
 
+    // Startup resume parity with the native runner (#165): if this session id
+    // already has a persisted transcript, replay it so the frontend paints the
+    // prior conversation at launch — not just new turns. The id reaches us via
+    // `IGNIS_SESSION_ID` from the Ink launcher (see main.rs); a fresh id has no
+    // file, so this is a quick no-op on a normal launch. Sent before the driver's
+    // initial snapshot — transcript→snapshot mirrors the in-session `/resume`
+    // order the frontend already handles.
+    let resumed = FileStorage::new(storage_dir.clone())
+        .load_session(&session_id)
+        .await
+        .unwrap_or_default();
+    if !resumed.is_empty() {
+        hub.send_transcript(session_id.clone(), transcript_blocks(resumed))
+            .await;
+    }
+
     // Drive until the frontend closes our stdin (EOF = clean disconnect).
     drive_frontend_core(
         hub,
@@ -689,6 +711,17 @@ pub async fn run_engine(
         storage_dir,
     )
     .await;
+
+    // The driver returns the instant the frontend disconnects (stdin EOF /
+    // Shutdown), but the agent loop persists each turn AFTER emitting `TurnEnd`,
+    // on its own task. Returning here drops the tokio runtime, which would abort
+    // an in-flight `persist()` — silently losing the turn that just completed
+    // (a frontend that exits right after a reply hits this race). The driver
+    // dropped the sole `prompt_tx`, so the loop's next `recv()` returns `None`
+    // and it exits once any in-flight turn finishes; await it so that final save
+    // lands. Bounded — a turn still mid-flight at disconnect can't wedge exit.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), agent_handle).await;
+
     // Frontend disconnected: SIGKILL any live background shells so none are
     // orphaned. Reliable here (main awaits run_engine), unlike the detached
     // agent_loop's own best-effort cleanup.

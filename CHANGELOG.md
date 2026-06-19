@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - TUI — the Ink frontend no longer flickers when the rolling output exceeds the terminal height. ([#210](https://github.com/Fullstop000/ignis/pull/210))
+- Ink frontend — `ignis --resume <id>` now restores the prior conversation instead of starting an empty session. ([#208](https://github.com/Fullstop000/ignis/pull/208))
+- Sessions — the last turn before exit is no longer dropped, so resumed sessions keep their most recent messages. ([#208](https://github.com/Fullstop000/ignis/pull/208))
 
 ## [0.41.0] - 2026-06-19
 
