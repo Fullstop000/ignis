@@ -439,6 +439,11 @@ export default function App({ engine, onExit }) {
       }),
     );
   } else {
+    // Task list (todo_write) above everything — persists across the turn,
+    // unlike the idle-only / busy-only strips below.
+    if (state.todos && state.todos.length) {
+      children.push(e(TodosStrip, { key: 'todos', todos: state.todos }));
+    }
     // Running status bar above the composer while a turn is in flight.
     if (state.status === 'busy') {
       children.push(e(RunningBar, { key: 'running', state, spin, startedAt: turnStart.current }));
@@ -679,6 +684,31 @@ function RunningBar({ state, spin, startedAt }) {
     e(Text, { color: 'gray' }, `Working… ${elapsed}s`),
     e(Text, { dimColor: true }, tail),
   );
+}
+
+// Task-list panel (todo_write): a checklist the agent maintains for multi-step
+// work. Shown above the composer whenever the list is non-empty, in every state
+// (persists across the turn). ✓ completed (dim), ◐ in_progress (highlighted),
+// ◻ pending (dim). In-progress rows prefer the present-continuous `activeForm`.
+const TODO_GLYPH = { completed: '✓', in_progress: '◐', pending: '◻' };
+function TodosStrip({ todos }) {
+  const done = todos.filter((t) => t.status === 'completed').length;
+  const rows = [
+    e(Text, { key: 'hdr', dimColor: true }, `  Tasks ${done}/${todos.length}`),
+  ];
+  todos.forEach((t, i) => {
+    const glyph = TODO_GLYPH[t.status] ?? '◻';
+    const label = t.status === 'in_progress' && t.activeForm ? t.activeForm : t.content;
+    if (t.status === 'in_progress') {
+      rows.push(e(Text, { key: `t${i}`, color: 'cyan', bold: true }, `  ${glyph} ${label}`));
+    } else {
+      const strike = t.status === 'completed';
+      rows.push(
+        e(Text, { key: `t${i}`, dimColor: true, strikethrough: strike }, `  ${glyph} ${label}`),
+      );
+    }
+  });
+  return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
 }
 
 // Waiting-queue strip: messages typed while a turn is in flight, drained one per

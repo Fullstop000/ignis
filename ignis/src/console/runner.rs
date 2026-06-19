@@ -223,6 +223,7 @@ async fn agent_loop(
             mcp_for_subagent,
             Some(picker_tx_runner.clone()),
             Some(runner_permissions.clone()),
+            Some(agent_tx.clone()),
         );
         if !runner_skill_registry.is_empty() {
             session.set_skills(runner_skill_registry.clone());
@@ -254,6 +255,17 @@ async fn agent_loop(
             tool_calls: None,
             created_at_ms: None,
         };
+        // Re-sync the frontend's todo panel from the persisted list at the start
+        // of each turn. Within a run Ink already holds it, but after a /resume
+        // (or reconnect) the panel is empty until something re-emits — this keeps
+        // it in step with disk without a dedicated resume path. Skip when empty
+        // (nothing to show; the panel stays hidden).
+        {
+            let todos = session.todos_handle().lock().unwrap().clone();
+            if !todos.is_empty() {
+                let _ = agent_tx.send(AgentEvent::Todos { items: todos }).await;
+            }
+        }
         let tx = agent_tx.clone();
         match prompt {
             Some(prompt) => {

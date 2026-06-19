@@ -166,6 +166,48 @@ mod tests {
         assert!(l2.contains("turn_end"), "second line is the turn_end event");
     }
 
+    /// The `Todos` event serializes to the exact wire shape the Ink frontend's
+    /// reducer reads: `{kind:"event", data:{type:"todos", payload:{items:[…]}}}`
+    /// with snake_case status and a camelCase `activeForm`. Pins the engine→Ink
+    /// contract that the e2e harness assumes (it hand-builds these frames).
+    #[tokio::test]
+    async fn emit_serializes_todos_event_for_ink() {
+        use crate::tools::{Todo, TodoStatus};
+        let (to_frontend, frontend_reads) = tokio::io::duplex(4096);
+        let (cmd_read, _cmd_feed) = tokio::io::duplex(64);
+        let mut port = StdioPort::new(to_frontend, cmd_read);
+        let mut reader = BufReader::new(frontend_reads).lines();
+
+        port.emit(Outbound::Event(Box::new(crate::AgentEvent::Todos {
+            items: vec![
+                Todo {
+                    content: "build it".into(),
+                    status: TodoStatus::InProgress,
+                    active_form: Some("Building it".into()),
+                },
+                Todo {
+                    content: "test it".into(),
+                    status: TodoStatus::Pending,
+                    active_form: None,
+                },
+            ],
+        })))
+        .await
+        .unwrap();
+
+        let line = reader.next_line().await.unwrap().expect("todos line");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["kind"], "event");
+        assert_eq!(v["data"]["type"], "todos");
+        let items = &v["data"]["payload"]["items"];
+        assert_eq!(items[0]["content"], "build it");
+        assert_eq!(items[0]["status"], "in_progress");
+        assert_eq!(items[0]["activeForm"], "Building it");
+        assert_eq!(items[1]["status"], "pending");
+        // Absent activeForm is omitted (skip_serializing_if), not null.
+        assert!(items[1].get("activeForm").is_none());
+    }
+
     /// next_command() decodes one ClientCommand per line and skips blanks.
     #[tokio::test]
     async fn next_command_decodes_lines_and_skips_blanks() {

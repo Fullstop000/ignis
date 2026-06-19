@@ -207,6 +207,10 @@ pub fn default_policy_for_tool(tool_name: &str) -> Decision {
         // ask_user is gated separately (FullyUnattended auto-dismisses inside
         // the tool, before the gate sees it).
         "ask_user" => Decision::Allow,
+        // todo_write only updates the session's task list (in-memory state +
+        // an internal sidecar) — no filesystem/network/exec reach. Gating it
+        // would prompt on every plan update; allow like other state reads.
+        "todo_write" => Decision::Allow,
         // Network + writes + execution + agent spawn → ask by default.
         "web_fetch" => Decision::ask("network fetch"),
         "bash" => Decision::ask("shell command"),
@@ -259,6 +263,7 @@ mod tests {
             "web_search",
             "skill",
             "ask_user",
+            "todo_write",
             "web_fetch",
             "bash",
             "edit_file",
@@ -268,6 +273,11 @@ mod tests {
             // None of these may panic; each yields a concrete decision.
             let _ = default_policy_for_tool(tool);
         }
+    }
+
+    #[test]
+    fn todo_write_allows_by_default() {
+        assert_eq!(default_policy_for_tool("todo_write"), Decision::Allow);
     }
 
     #[test]

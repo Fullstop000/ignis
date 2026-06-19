@@ -38,6 +38,7 @@ export const EVENT = Object.freeze({
   NOTICE: 'notice',
   RECONNECTING: 'reconnecting',
   USAGE: 'usage',
+  TODOS: 'todos',
 });
 
 /** `ClientCommand` kinds (frontend → engine). */
@@ -83,6 +84,9 @@ export function initialState() {
     sessions: [],
     turns: 0,
     usage: null,
+    // The agent's task list (`todo_write`). Rendered as a checklist panel above
+    // the composer while non-empty; set by the `todos` event, reset on resume.
+    todos: [],
     // Monotonic count of turn-end events. The waiting-queue drain keys on this
     // (the turn-end EVENT, like the native runner's turn_in_flight flag) rather
     // than a busy→idle status change, so a queued message still drains after a
@@ -136,6 +140,9 @@ export function reduceOutbound(state, frame) {
         sessionId: frame.data?.session_id ?? state.sessionId,
         turns: 0,
         usage: null,
+        // Resume/clear replaces the whole context; the resumed session's todos
+        // (if any) re-emit on its next prompt.
+        todos: [],
         generation: state.generation + 1,
       };
     default:
@@ -230,6 +237,9 @@ function reduceEvent(state, ev) {
     case EVENT.USAGE:
       // AgentEvent::Usage(Usage) — the payload IS the Usage struct.
       return { ...state, usage: p };
+    case EVENT.TODOS:
+      // AgentEvent::Todos { items } — the complete task list (full replace).
+      return { ...state, todos: p.items ?? [] };
     default:
       // run_start / run_end — not surfaced in the minimal UI.
       return state;

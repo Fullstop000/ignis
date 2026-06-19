@@ -40,6 +40,10 @@ pub struct Session {
     /// so `/hooks reload` can swap the live config without rebuilding the
     /// session.
     hooks: HookRegistry,
+    /// The agent's task list (`todo_write`). Shared with the tool via the Arc;
+    /// persisted to a `.todos.json` sidecar on each prompt and reloaded here on
+    /// open, so it survives the per-prompt session rebuild and `/resume`.
+    todos: crate::tools::TodoStore,
 }
 
 impl Session {
@@ -62,6 +66,7 @@ impl Session {
     ) -> Result<Self, anyhow::Error> {
         let history = storage.load_session(&id).await?;
         let usage = storage.load_usage(&id).await.unwrap_or_default();
+        let todos = storage.load_todos(&id).await.unwrap_or_default();
         let mut agent = Agent::new(system_prompt, provider);
         agent.set_project_instructions(crate::agent::agents_md::load(
             Path::new(&start_dir),
@@ -88,7 +93,14 @@ impl Session {
             usage,
             inject_rx: None,
             hooks,
+            todos: Arc::new(std::sync::Mutex::new(todos)),
         })
+    }
+
+    /// Handle to the shared task list, for wiring the `todo_write` tool and for
+    /// re-emitting the persisted list to the frontend on resume.
+    pub fn todos_handle(&self) -> crate::tools::TodoStore {
+        Arc::clone(&self.todos)
     }
 
     /// Cumulative real token usage recorded for this session.
@@ -275,6 +287,11 @@ impl Session {
             self.usage.add(&run_usage);
             let _ = self.storage.save_usage(&self.id, &self.usage).await;
         }
+        // Persist the task list (a no-op-cheap sidecar write; clears the file
+        // when the list is empty). Snapshot out of the mutex first — never hold
+        // a std lock across the await.
+        let todos_snapshot = self.todos.lock().unwrap().clone();
+        let _ = self.storage.save_todos(&self.id, &todos_snapshot).await;
         // Order the checkpoint write before the final persist. Without this
         // join, the spawned task could be scheduled AFTER `self.persist()`
         // and stomp the full final history with the user-only snapshot. On
@@ -565,6 +582,15 @@ fn merge_legacy_sessions(legacy: &Path, new_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(new_dir)?;
     }
 
+    // Per-session sidecar suffixes (usage counters, todo lists): migrated as a
+    // unit with their session file, never on their own.
+    fn sidecar_base(name: &str) -> Option<&str> {
+        const SIDECAR_SUFFIXES: &[&str] = &[".usage.json", ".todos.json"];
+        SIDECAR_SUFFIXES
+            .iter()
+            .find_map(|sfx| name.strip_suffix(sfx))
+    }
+
     let entries: Vec<_> = std::fs::read_dir(legacy)?.collect::<Result<_, _>>()?;
     let mut migrated_stems = HashSet::new();
 
@@ -574,7 +600,7 @@ fn merge_legacy_sessions(legacy: &Path, new_dir: &Path) -> std::io::Result<()> {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        if name_str.ends_with(".usage.json") {
+        if sidecar_base(name_str).is_some() {
             continue;
         }
         let dst = new_dir.join(&name);
@@ -586,16 +612,15 @@ fn merge_legacy_sessions(legacy: &Path, new_dir: &Path) -> std::io::Result<()> {
         }
     }
 
-    // Second pass: migrate usage sidecars only when their session file moved too.
+    // Second pass: migrate sidecars only when their session file moved too.
     for entry in &entries {
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        if !name_str.ends_with(".usage.json") {
+        let Some(base) = sidecar_base(name_str) else {
             continue;
-        }
-        let base = &name_str[..name_str.len() - ".usage.json".len()];
+        };
         if !migrated_stems.contains(base) {
             continue;
         }
@@ -715,13 +740,16 @@ impl SessionManager {
             if ext != Some("jsonl") && ext != Some("json") {
                 continue;
             }
-            // Skip tmp files
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.contains(".tmp"))
-                .unwrap_or(false)
-            {
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Skip tmp files.
+            if file_name.contains(".tmp") {
+                continue;
+            }
+            // Skip per-session sidecars (`<id>.usage.json`, `<id>.todos.json`):
+            // their final extension is `json`, so they pass the filter above, but
+            // they are not sessions. Excluded explicitly rather than relying on
+            // them failing to parse as a transcript.
+            if file_name.ends_with(".usage.json") || file_name.ends_with(".todos.json") {
                 continue;
             }
 
@@ -1072,6 +1100,36 @@ mod tests {
         assert_eq!(sessions[0].id, "default");
         assert_eq!(sessions[0].message_count, 2);
         assert_eq!(sessions[0].preview, "first prompt");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Per-session sidecars (`.usage.json`, `.todos.json`) end in `.json` but
+    /// must never be listed as sessions — even alongside a real session.
+    #[test]
+    fn manager_excludes_usage_and_todos_sidecars() {
+        let dir = crate::util::unique_temp_dir("ignis-session-sidecars");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("s1.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":1,"payload":{"id":"s1"}}"#,
+                "\n",
+                r#"{"type":"message","timestamp":2,"payload":{"role":"user","content":"hi"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("s1.usage.json"), r#"{"input_tokens":5}"#).unwrap();
+        std::fs::write(
+            dir.join("s1.todos.json"),
+            r#"[{"content":"x","status":"pending"}]"#,
+        )
+        .unwrap();
+
+        let sessions = SessionManager::new(dir.clone()).list();
+        assert_eq!(sessions.len(), 1, "only the real session is listed");
+        assert_eq!(sessions[0].id, "s1");
 
         std::fs::remove_dir_all(dir).unwrap();
     }

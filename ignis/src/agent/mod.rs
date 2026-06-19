@@ -78,6 +78,12 @@ pub enum AgentEvent {
     /// — rendered as a plain notice line, never as `[warn]`.
     #[serde(rename = "notice")]
     Notice { message: String },
+    /// The agent's task list changed (via `todo_write`) or was restored from a
+    /// persisted session. Carries the complete list; the frontend renders it as
+    /// a checklist panel and hides it when empty. Surfacing-only — the model
+    /// sees just the tool's short ack, not this payload.
+    #[serde(rename = "todos")]
+    Todos { items: Vec<crate::tools::Todo> },
 }
 
 /// Build the system prompt for an interactive/one-shot run: the static agent
@@ -108,6 +114,10 @@ pub fn build_system_prompt(cwd: &Path) -> String {
  - Be concise. Start work immediately. No conversational fillers or preambles.
  - Answer directly without flattery or flippancy.
  - Don't summarize what you did unless asked. Don't explain your code unless asked.
+
+# Task Tracking
+ - For a task with several distinct steps, maintain a task list with `todo_write`: write the full list up front, keep exactly one item `in_progress` at a time, and mark items `completed` as soon as they are done. Send the complete list on every call — it replaces the previous one.
+ - It is the user's live view of your plan and progress, so keep it current. Skip it for trivial single-step work.
 
 # Environment Context
  - Operating System: {}
