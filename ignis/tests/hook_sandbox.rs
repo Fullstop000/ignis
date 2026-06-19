@@ -104,8 +104,10 @@ async fn run_leak_hook(sandbox: bool, leak_path: &Path) -> PromptHookResult {
             timeout_ms: 5_000,
             env: vec![],
             sandbox,
+            ..Default::default()
         }],
         assistant_message_render: vec![],
+        ..Default::default()
     };
     let reg = HookRegistry::from_config(cfg);
     let (tx, _rx) = mpsc::channel(8);

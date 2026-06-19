@@ -289,6 +289,10 @@ async fn execute_single_tool(
     tc: ToolCall,
     tools_map: HashMap<String, Arc<dyn AgentTool>>,
     tx_inner: tokio::sync::mpsc::Sender<AgentEvent>,
+    // PostToolUse subprocess hooks (main agent only; `None` for sub-agents).
+    // Owned so each parallel task carries its own; `(session_id, cwd)`.
+    post_hooks: Option<crate::hooks::HookRegistry>,
+    hook_ctx: Option<(String, String)>,
 ) -> Message {
     let tc_id = tc.id;
     let tool_name = tc.function.name;
@@ -321,6 +325,13 @@ async fn execute_single_tool(
     let parsed_args_res: Result<serde_json::Value, serde_json::Error> =
         serde_json::from_str(&arguments_str);
 
+    // Keep the parsed args for the PostToolUse envelope (defaulting to JSON null
+    // when the args didn't parse — the tool itself will have errored on them).
+    let args_value = parsed_args_res
+        .as_ref()
+        .ok()
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let result = match parsed_args_res {
         Err(e) => {
             let err_msg = Agent::sanitize_and_truncate_error(&e.to_string());
@@ -336,6 +347,31 @@ async fn execute_single_tool(
     tool_span.record("is_error", result.is_error);
     crate::telemetry::record_tool_call(&tool_name, tool_start.elapsed(), !result.is_error);
     drop(tool_span);
+
+    // PostToolUse: let hooks rewrite/observe the result (success or error)
+    // before the model and the frontend see it.
+    let result = match (post_hooks, hook_ctx) {
+        (Some(registry), Some((session_id, cwd))) => {
+            let rewritten = registry
+                .run_post_tool_use(
+                    &tool_name,
+                    &args_value,
+                    &result.content,
+                    result.is_error,
+                    crate::hooks::HookContext {
+                        session_id: &session_id,
+                        cwd: &cwd,
+                    },
+                    &tx_inner,
+                )
+                .await;
+            ToolResult {
+                content: rewritten,
+                is_error: result.is_error,
+            }
+        }
+        _ => result,
+    };
 
     let _ = tx_inner
         .send(AgentEvent::ToolExecutionEnd {
@@ -369,6 +405,56 @@ fn tool_result_message(name: &str, call_id: &str, result: &ToolResult) -> Messag
         tool_call_id: Some(call_id.to_string()),
         tool_calls: None,
         created_at_ms: Some(now_ms()),
+    }
+}
+
+/// Run the `PreToolUse` subprocess hook chain for `tc`, BEFORE the permission
+/// gate. Returns the (possibly arg-rewritten) call to proceed with, or — when a
+/// hook blocks — `Err(blocked message)` after emitting the start/end event pair
+/// so the blocked call renders. With no hooks/ctx it's a pass-through.
+async fn apply_pre_tool_use(
+    tc: ToolCall,
+    tool_hooks: Option<&crate::hooks::HookRegistry>,
+    hook_ctx: Option<crate::hooks::HookContext<'_>>,
+    tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) -> Result<ToolCall, Message> {
+    let (Some(hooks), Some(ctx)) = (tool_hooks, hook_ctx) else {
+        return Ok(tc);
+    };
+    let args: serde_json::Value =
+        serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
+    match hooks
+        .run_pre_tool_use(&tc.function.name, &args, ctx, tx)
+        .await
+    {
+        crate::hooks::PreToolOutcome::Proceed(new_args) => {
+            let mut tc = tc;
+            // Re-serialize only when the hook actually changed the args, so an
+            // untouched call keeps its exact original argument string.
+            if new_args != args {
+                if let Ok(s) = serde_json::to_string(&new_args) {
+                    tc.function.arguments = s;
+                }
+            }
+            Ok(tc)
+        }
+        crate::hooks::PreToolOutcome::Block(reason) => {
+            let blocked = ToolResult::error(format!("Blocked by hook: {reason}"));
+            let _ = tx
+                .send(AgentEvent::ToolExecutionStart {
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: tc.id.clone(),
+                    result: blocked.clone(),
+                })
+                .await;
+            Err(tool_result_message(&tc.function.name, &tc.id, &blocked))
+        }
     }
 }
 
@@ -1180,7 +1266,7 @@ impl Agent {
             total_usage.add(&outcome.usage);
 
             if !outcome.tool_calls.is_empty() {
-                self.execute_tool_calls(&outcome.tool_calls, history, &tx)
+                self.execute_tool_calls(&outcome.tool_calls, history, &tx, prompt_hooks, hook_ctx)
                     .await;
                 let _ = tx.send(AgentEvent::RunEnd).await;
                 // Continue the turn loop: tool results go back to the model.
@@ -1217,6 +1303,10 @@ impl Agent {
         tool_calls: &[ToolCall],
         history: &mut Vec<Message>,
         tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+        // Subprocess tool hooks (PreToolUse/PostToolUse). `None` for sub-agents
+        // (their tool calls are unhooked in v1) and when no registry is wired.
+        tool_hooks: Option<&crate::hooks::HookRegistry>,
+        hook_ctx: Option<crate::hooks::HookContext<'_>>,
     ) {
         use futures_util::stream::StreamExt;
         let tx_clone = tx.clone();
@@ -1225,6 +1315,10 @@ impl Agent {
             .iter()
             .map(|t| (t.name().to_string(), t.clone()))
             .collect();
+        // Owned PostToolUse context for the (possibly parallel) execute tasks.
+        let post_registry = tool_hooks.cloned();
+        let post_ctx: Option<(String, String)> =
+            hook_ctx.map(|c| (c.session_id.to_string(), c.cwd.to_string()));
 
         // Check if any tool requires sequential execution
         let force_sequential = tool_calls.iter().any(|tc| {
@@ -1237,42 +1331,56 @@ impl Agent {
         let hooks = &self.hooks;
         let tool_calls_owned = tool_calls.to_vec();
 
-        let results = if force_sequential {
-            // Sequential execution
-            let mut results = Vec::new();
-            for tc in tool_calls_owned {
-                match before_tool_call_block(&tc, hooks.as_deref(), &tx_clone).await {
-                    Some(blocked) => results.push(blocked),
-                    None => {
-                        results.push(
-                            execute_single_tool(tc, tools_map.clone(), tx_clone.clone()).await,
-                        );
-                    }
+        // Per-tool gating runs sequentially for BOTH modes (hook chains and the
+        // permission gate are sequential): PreToolUse (subprocess, may rewrite
+        // args or block) → permission gate on the rewritten args. Surviving
+        // calls then run (parallel or sequential). PostToolUse runs inside
+        // `execute_single_tool` after the call.
+        let mut allowed_calls: Vec<ToolCall> = Vec::new();
+        let mut blocked_results: Vec<Message> = Vec::new();
+        for tc in tool_calls_owned {
+            let tc = match apply_pre_tool_use(tc, tool_hooks, hook_ctx, &tx_clone).await {
+                Ok(tc) => tc,
+                Err(blocked) => {
+                    blocked_results.push(blocked);
+                    continue;
                 }
+            };
+            match before_tool_call_block(&tc, hooks.as_deref(), &tx_clone).await {
+                Some(blocked) => blocked_results.push(blocked),
+                None => allowed_calls.push(tc),
+            }
+        }
+
+        let results = if force_sequential {
+            let mut results = blocked_results;
+            for tc in allowed_calls {
+                results.push(
+                    execute_single_tool(
+                        tc,
+                        tools_map.clone(),
+                        tx_clone.clone(),
+                        post_registry.clone(),
+                        post_ctx.clone(),
+                    )
+                    .await,
+                );
             }
             results
         } else {
-            // Parallel execution — run before_tool_call hooks first
-            // sequentially, then fan out the allowed calls.
-            let mut allowed_calls = Vec::new();
-            let mut blocked_results: Vec<Message> = Vec::new();
-
-            for tc in &tool_calls_owned {
-                match before_tool_call_block(tc, hooks.as_deref(), &tx_clone).await {
-                    Some(blocked) => blocked_results.push(blocked),
-                    None => allowed_calls.push(tc.clone()),
-                }
-            }
-
-            let tool_futures = allowed_calls
-                .into_iter()
-                .map(|tc| execute_single_tool(tc, tools_map.clone(), tx_clone.clone()));
-
+            let tool_futures = allowed_calls.into_iter().map(|tc| {
+                execute_single_tool(
+                    tc,
+                    tools_map.clone(),
+                    tx_clone.clone(),
+                    post_registry.clone(),
+                    post_ctx.clone(),
+                )
+            });
             let mut parallel_results: Vec<Message> = futures_util::stream::iter(tool_futures)
                 .buffer_unordered(5)
                 .collect::<Vec<Message>>()
                 .await;
-
             parallel_results.append(&mut blocked_results);
             parallel_results
         };

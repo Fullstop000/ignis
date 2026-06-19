@@ -47,6 +47,7 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","updatedI
             ..HookSpec::default()
         }],
         assistant_message_render: vec![],
+        ..Default::default()
     };
     let reg = HookRegistry::from_config(cfg);
 
@@ -90,6 +91,7 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"AssistantMessageRender","up
             timeout_ms: 5_000,
             ..HookSpec::default()
         }],
+        ..Default::default()
     };
     let reg = HookRegistry::from_config(cfg);
     let (tx, mut rx) = mpsc::channel(8);
@@ -217,6 +219,7 @@ printf '{"hookSpecificOutput":{"updatedInput":"%s"}}' "$UPPER"
             ..HookSpec::default()
         }],
         assistant_message_render: vec![],
+        ..Default::default()
     };
     session.set_hook_registry(HookRegistry::from_config(cfg));
 
@@ -240,4 +243,174 @@ printf '{"hookSpecificOutput":{"updatedInput":"%s"}}' "$UPPER"
     // Both messages — the original prompt AND the inject — were
     // upper-cased by the hook before reaching history.
     assert_eq!(user_msgs, vec!["HI THERE", "STEER ME"]);
+}
+
+// ── PreToolUse / PostToolUse ────────────────────────────────────────────────
+
+use ignis::hooks::PreToolOutcome;
+
+#[tokio::test]
+async fn pre_tool_use_rewrites_tool_args() {
+    let dir = tempfile::tempdir().unwrap();
+    // Reads the envelope (which carries toolName/toolInput), returns a rewritten
+    // args object via updatedInput. Sanitizes a dangerous command to a safe one.
+    let hook = write_executable(
+        dir.path(),
+        "sanitize.sh",
+        r#"#!/bin/sh
+cat >/dev/null
+printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":"{\"command\":\"echo safe\"}"}}'
+"#,
+    );
+    let cfg = HooksConfig {
+        pre_tool_use: vec![HookSpec {
+            program: hook,
+            args: vec![],
+            timeout_ms: 5_000,
+            ..HookSpec::default()
+        }],
+        ..Default::default()
+    };
+    let reg = HookRegistry::from_config(cfg);
+    let (tx, _rx) = mpsc::channel(8);
+    let args = serde_json::json!({"command": "rm -rf /"});
+    let out = reg
+        .run_pre_tool_use(
+            "bash",
+            &args,
+            HookContext {
+                session_id: "s",
+                cwd: "/tmp",
+            },
+            &tx,
+        )
+        .await;
+    assert_eq!(
+        out,
+        PreToolOutcome::Proceed(serde_json::json!({"command": "echo safe"}))
+    );
+}
+
+#[tokio::test]
+async fn pre_tool_use_blocks_on_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let hook = write_executable(
+        dir.path(),
+        "veto.sh",
+        r#"#!/bin/sh
+cat >/dev/null
+echo "policy: bash not allowed" >&2
+exit 2
+"#,
+    );
+    let cfg = HooksConfig {
+        pre_tool_use: vec![HookSpec {
+            program: hook,
+            args: vec![],
+            timeout_ms: 5_000,
+            ..HookSpec::default()
+        }],
+        ..Default::default()
+    };
+    let reg = HookRegistry::from_config(cfg);
+    let (tx, _rx) = mpsc::channel(8);
+    let args = serde_json::json!({"command": "ls"});
+    let out = reg
+        .run_pre_tool_use(
+            "bash",
+            &args,
+            HookContext {
+                session_id: "s",
+                cwd: "/tmp",
+            },
+            &tx,
+        )
+        .await;
+    match out {
+        PreToolOutcome::Block(reason) => assert!(reason.contains("not allowed"), "got: {reason}"),
+        other => panic!("expected Block, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pre_tool_use_matcher_skips_non_matching_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    // A hook that would rewrite, but its matcher is "bash" — so a read_file
+    // call must NOT run it (args proceed unchanged).
+    let hook = write_executable(
+        dir.path(),
+        "bash_only.sh",
+        r#"#!/bin/sh
+cat >/dev/null
+printf '%s' '{"hookSpecificOutput":{"updatedInput":"{\"changed\":true}"}}'
+"#,
+    );
+    let cfg = HooksConfig {
+        pre_tool_use: vec![HookSpec {
+            program: hook,
+            args: vec![],
+            timeout_ms: 5_000,
+            matcher: Some("bash".to_string()),
+            ..HookSpec::default()
+        }],
+        ..Default::default()
+    };
+    let reg = HookRegistry::from_config(cfg);
+    let (tx, _rx) = mpsc::channel(8);
+    let args = serde_json::json!({"path": "x.rs"});
+    let out = reg
+        .run_pre_tool_use(
+            "read_file",
+            &args,
+            HookContext {
+                session_id: "s",
+                cwd: "/tmp",
+            },
+            &tx,
+        )
+        .await;
+    assert_eq!(
+        out,
+        PreToolOutcome::Proceed(args),
+        "non-matching tool: args unchanged"
+    );
+}
+
+#[tokio::test]
+async fn post_tool_use_rewrites_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let hook = write_executable(
+        dir.path(),
+        "redact.sh",
+        r#"#!/bin/sh
+cat >/dev/null
+printf '%s' '{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedOutput":"[redacted]"}}'
+"#,
+    );
+    let cfg = HooksConfig {
+        post_tool_use: vec![HookSpec {
+            program: hook,
+            args: vec![],
+            timeout_ms: 5_000,
+            ..HookSpec::default()
+        }],
+        ..Default::default()
+    };
+    let reg = HookRegistry::from_config(cfg);
+    let (tx, _rx) = mpsc::channel(8);
+    let args = serde_json::json!({"command": "cat secret"});
+    let out = reg
+        .run_post_tool_use(
+            "bash",
+            &args,
+            "AKIA-SECRET-KEY",
+            false,
+            HookContext {
+                session_id: "s",
+                cwd: "/tmp",
+            },
+            &tx,
+        )
+        .await;
+    assert_eq!(out, "[redacted]");
 }
