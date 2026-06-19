@@ -128,8 +128,18 @@ async fn main() -> Result<(), anyhow::Error> {
     // spawns this; it reads Outbound frames from our stdout and writes
     // ClientCommands to our stdin.
     if engine_mode {
+        // The Ink launcher resolves `--resume <id>` / auto-resume in the parent
+        // process, then spawns us with only `--engine` — so our own
+        // `resolve_session_request` above never sees the resume and would start
+        // fresh. It forwards the resolved id via `IGNIS_SESSION_ID`; adopt it so
+        // the engine continues the right session. Absent (engine run standalone,
+        // e.g. scripting/tests) we keep our own freshly-resolved id.
+        let session_id = std::env::var("IGNIS_SESSION_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(session_request.session_id);
         let res = ignis::console::run_engine(
-            session_request.session_id,
+            session_id,
             system_prompt,
             storage_dir,
             cwd,
@@ -159,7 +169,7 @@ async fn main() -> Result<(), anyhow::Error> {
             std::env::var("IGNIS_FRONTEND").ok().as_deref(),
             ink_entry.as_deref(),
         ) {
-            match launch_ink_frontend(&entry).await {
+            match launch_ink_frontend(&entry, &session_request.session_id).await {
                 Ok(code) => {
                     mcp_registry.shutdown().await;
                     std::process::exit(code);
@@ -311,7 +321,13 @@ async fn main() -> Result<(), anyhow::Error> {
 /// the NDJSON protocol over that child's pipes. Returns the child's exit code;
 /// any error (e.g. `node` not on PATH) bubbles up so the caller falls back to
 /// the built-in ratatui TUI.
-async fn launch_ink_frontend(entry: &str) -> std::io::Result<i32> {
+///
+/// `session_id` is the session this launch resolved (a `--resume`/auto-resume
+/// target, or a fresh id). It's forwarded as `IGNIS_SESSION_ID` and inherited
+/// down through `node` to the `--engine` child so the engine continues the same
+/// session instead of minting its own — without this, `ignis --resume <id>`
+/// silently starts fresh under Ink.
+async fn launch_ink_frontend(entry: &str, session_id: &str) -> std::io::Result<i32> {
     let exe = std::env::current_exe()?;
     // Ink is now the default UI, so a too-old Node must NOT crash the user: ink 5
     // / react 18 throw at module load on Node <18. Probe the version first and
@@ -332,6 +348,7 @@ async fn launch_ink_frontend(entry: &str) -> std::io::Result<i32> {
     let status = tokio::process::Command::new("node")
         .arg(entry)
         .env("IGNIS_ENGINE_BIN", exe)
+        .env("IGNIS_SESSION_ID", session_id)
         .status()
         .await?;
     Ok(status.code().unwrap_or(0))
