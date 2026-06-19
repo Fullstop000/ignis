@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- TUI — the Ink frontend no longer flickers when the rolling output exceeds the terminal height. ([#210](https://github.com/Fullstop000/ignis/pull/210))
+
 ## [0.41.0] - 2026-06-19
 
 ### Added
