@@ -84,6 +84,10 @@ pub enum AgentEvent {
     /// sees just the tool's short ack, not this payload.
     #[serde(rename = "todos")]
     Todos { items: Vec<crate::tools::Todo> },
+    /// The number of live background shells changed (one started or exited).
+    /// The Ink footer renders `⚙ N bg` while `running > 0`; surfacing-only.
+    #[serde(rename = "background_shells")]
+    BackgroundShells { running: usize },
 }
 
 /// Build the system prompt for an interactive/one-shot run: the static agent

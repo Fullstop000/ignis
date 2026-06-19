@@ -208,6 +208,29 @@ mod tests {
         assert!(items[1].get("activeForm").is_none());
     }
 
+    /// The `BackgroundShells` event serializes to the wire shape the Ink footer
+    /// reducer reads: `{kind:"event", data:{type:"background_shells",
+    /// payload:{running:N}}}`. Pins the engine→Ink contract.
+    #[tokio::test]
+    async fn emit_serializes_background_shells_event_for_ink() {
+        let (to_frontend, frontend_reads) = tokio::io::duplex(4096);
+        let (cmd_read, _cmd_feed) = tokio::io::duplex(64);
+        let mut port = StdioPort::new(to_frontend, cmd_read);
+        let mut reader = BufReader::new(frontend_reads).lines();
+
+        port.emit(Outbound::Event(Box::new(
+            crate::AgentEvent::BackgroundShells { running: 3 },
+        )))
+        .await
+        .unwrap();
+
+        let line = reader.next_line().await.unwrap().expect("bg line");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["kind"], "event");
+        assert_eq!(v["data"]["type"], "background_shells");
+        assert_eq!(v["data"]["payload"]["running"], 3);
+    }
+
     /// next_command() decodes one ClientCommand per line and skips blanks.
     #[tokio::test]
     async fn next_command_decodes_lines_and_skips_blanks() {

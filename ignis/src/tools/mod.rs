@@ -2,6 +2,7 @@ pub mod tool;
 
 mod agent;
 pub(crate) mod ask_user;
+mod background;
 mod bash;
 mod create_file;
 mod edit_file;
@@ -17,6 +18,7 @@ mod web_search;
 
 pub use agent::SubagentTool;
 pub use ask_user::AskUserTool;
+pub use background::{BackgroundCtx, BackgroundShells, BashOutputTool, KillShellTool};
 pub use bash::BashTool;
 pub use create_file::CreateFileTool;
 pub use edit_file::EditFileTool;
@@ -35,9 +37,13 @@ use std::sync::Arc;
 
 /// The base native toolset shared by the main agent and sub-agents (everything
 /// except the `agent` tool itself, so sub-agents don't nest).
+///
+/// `background` enables `bash`'s `run_in_background` flag (top-level only).
+/// Sub-agents pass `None` — they get plain blocking bash, no background shells.
 pub fn native_tools(
     cwd: &Path,
     web_search: crate::config::WebSearchConfig,
+    background: Option<background::BackgroundCtx>,
 ) -> Vec<Arc<dyn AgentTool>> {
     vec![
         Arc::new(ReadFileTool::new(cwd)) as Arc<dyn AgentTool>,
@@ -46,7 +52,7 @@ pub fn native_tools(
         Arc::new(ListDirTool::new(cwd)),
         Arc::new(GrepTool::new(cwd)),
         Arc::new(GlobTool::new(cwd)),
-        Arc::new(BashTool::new(cwd)),
+        Arc::new(BashTool::new(cwd).with_background(background)),
         Arc::new(WebFetchTool::new()),
         Arc::new(WebSearchTool::new(web_search.provider, web_search.api_key)),
     ]
@@ -57,7 +63,7 @@ pub fn register_native_tools(
     cwd: &Path,
     config: &crate::config::Config,
 ) {
-    register_native_tools_with_mcp(session, cwd, config, None, None, None, None)
+    register_native_tools_with_mcp(session, cwd, config, None, None, None, None, None)
 }
 
 /// Same as `register_native_tools` but threads a shared MCP registry into the
@@ -66,8 +72,11 @@ pub fn register_native_tools(
 /// and an optional shared `PermissionState` so `ask_user` honors AFK mode.
 /// `picker_tx = None` in headless contexts disables `ask_user` cleanly;
 /// `permissions = None` skips the AFK guard (e.g. tests with no permission
-/// system attached). `events = None` leaves `todo_write` un-surfaced (the
-/// write still updates the persisted store) — used by headless/one-shot runs.
+/// system attached). `bg_shells = Some` enables background bash + registers the
+/// `bash_output`/`kill_shell` tools (top-level only); `events` is the frontend
+/// channel for both the background-shell footer and `todo_write` surfacing
+/// (`events = None` leaves them un-surfaced — the writes still persist).
+#[allow(clippy::too_many_arguments)]
 pub fn register_native_tools_with_mcp(
     session: &mut crate::Session,
     cwd: &Path,
@@ -75,10 +84,21 @@ pub fn register_native_tools_with_mcp(
     mcp: Option<Arc<crate::mcp::McpRegistry>>,
     picker_tx: Option<tokio::sync::mpsc::Sender<crate::interaction::PickerRequest>>,
     permissions: Option<Arc<crate::permissions::runtime::PermissionState>>,
+    bg_shells: Option<Arc<background::BackgroundShells>>,
     events: Option<tokio::sync::mpsc::Sender<crate::AgentEvent>>,
 ) {
-    for tool in native_tools(cwd, config.web_search.clone()) {
+    let bg_ctx = bg_shells.clone().map(|shells| background::BackgroundCtx {
+        shells,
+        events: events.clone(),
+    });
+    for tool in native_tools(cwd, config.web_search.clone(), bg_ctx) {
         session.register_tool(tool);
+    }
+    // Background-shell polling tools — top-level only (sub-agents return one
+    // final answer; a background shell outliving them serves no purpose).
+    if let Some(shells) = bg_shells {
+        session.register_tool(Arc::new(BashOutputTool::new(shells.clone())));
+        session.register_tool(Arc::new(KillShellTool::new(shells, events.clone())));
     }
     // The `agent` tool builds sub-agents from the config; registered only at the
     // top level so sub-agents can't recurse.

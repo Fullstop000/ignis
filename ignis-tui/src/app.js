@@ -598,6 +598,9 @@ function Footer({ state }) {
   const ctxTokens = state.usage?.input_tokens > 0 ? state.usage.input_tokens : estimateContextTokens(state.blocks);
   const pct = window > 0 ? Math.min(100, Math.floor((ctxTokens * 100) / window)) : 0;
   segs.push(`${ctxTokens} tok (${pct}%)`);
+  // Background-shell indicator: `⚙ N bg` while any bash(run_in_background) shells
+  // are live (hidden at 0).
+  if (state.bgShells > 0) segs.push(`⚙ ${state.bgShells} bg`);
   // Permission-mode badge (HANDS-FREE peach / AFK red), like the ratatui footer.
   const badge =
     state.mode === 'hands_free'

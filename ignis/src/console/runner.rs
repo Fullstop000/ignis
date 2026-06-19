@@ -139,6 +139,11 @@ async fn agent_loop(
     mut runner_skill_registry: std::sync::Arc<crate::skills::SkillRegistry>,
     runner_mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
     runner_permissions: std::sync::Arc<crate::permissions::runtime::PermissionState>,
+    // Background-shell registry, owned by the caller (run_console / run_engine)
+    // so it can SIGKILL-all on the *reliable* shutdown path — this detached task
+    // is never joined, so its own kill_all (below) is only a best-effort early
+    // cleanup, not the guarantee.
+    bg_shells: std::sync::Arc<crate::tools::BackgroundShells>,
 ) {
     while let Some(request) = prompt_rx.recv().await {
         let (session_id, prompt) = match request {
@@ -223,6 +228,7 @@ async fn agent_loop(
             mcp_for_subagent,
             Some(picker_tx_runner.clone()),
             Some(runner_permissions.clone()),
+            Some(bg_shells.clone()),
             Some(agent_tx.clone()),
         );
         if !runner_skill_registry.is_empty() {
@@ -316,6 +322,10 @@ async fn agent_loop(
             }
         }
     }
+    // Best-effort early cleanup when the prompt channel closes. The reliable
+    // SIGKILL-all is in the caller (run_console / run_engine), which `main`
+    // actually awaits — this detached task may not be scheduled before teardown.
+    bg_shells.kill_all();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -393,6 +403,9 @@ pub async fn run_console(
     let (agent_tx, agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (prompt_tx, prompt_rx) = mpsc::channel::<AgentRequest>(8);
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>(8);
+    // Background-shell registry: owned here so we SIGKILL-all on the reliable
+    // shutdown path (main awaits run_console). agent_loop holds a clone.
+    let bg_shells = std::sync::Arc::new(crate::tools::BackgroundShells::new());
     // Two picker channels, split by origin (capacity 4 — pickers serialize, one
     // open at a time; the buffer just decouples send from drain):
     //   * `tool_picker_*` — the `ask_user` tool and the permission gate
@@ -471,6 +484,7 @@ pub async fn run_console(
         runner_skill_registry,
         runner_mcp_registry,
         runner_permissions,
+        bg_shells.clone(),
     ));
 
     // Frontend seam (PR #174, phase 1). The core drives a `FrontendHub` over a
@@ -540,7 +554,12 @@ pub async fn run_console(
         notice_tx,
         ui_storage_dir,
     };
-    console.run().await?;
+    let run_result = console.run().await;
+    // SIGKILL any live background shells before returning (success or error) so
+    // none are orphaned. Reliable here — main awaits run_console — unlike the
+    // detached agent_loop's best-effort cleanup.
+    bg_shells.kill_all();
+    run_result?;
 
     // Restore the cursor before the guard drops. The band stays in the normal
     // buffer, so the conversation remains in scrollback after exit. `_term_guard`
@@ -598,6 +617,9 @@ pub async fn run_engine(
     let (tool_picker_tx, tool_picker_rx) =
         mpsc::channel::<crate::console::picker::PickerRequest>(4);
     let active_inject: ActiveInject = std::sync::Arc::new(std::sync::Mutex::new(None));
+    // Background-shell registry: owned here so we can SIGKILL-all on the reliable
+    // shutdown path below (main awaits run_engine). agent_loop holds a clone.
+    let bg_shells = std::sync::Arc::new(crate::tools::BackgroundShells::new());
 
     // Capture the statusline + /model-picker meta before `config`/`cwd` move
     // into the agent loop.
@@ -631,6 +653,7 @@ pub async fn run_engine(
         skill_registry.clone(),
         mcp_registry.clone(),
         permissions.clone(),
+        bg_shells.clone(),
     ));
 
     // The frontend speaks NDJSON on our own stdio. emit() writes Outbound to
@@ -666,6 +689,10 @@ pub async fn run_engine(
         storage_dir,
     )
     .await;
+    // Frontend disconnected: SIGKILL any live background shells so none are
+    // orphaned. Reliable here (main awaits run_engine), unlike the detached
+    // agent_loop's own best-effort cleanup.
+    bg_shells.kill_all();
     Ok(())
 }
 

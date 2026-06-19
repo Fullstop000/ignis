@@ -1,15 +1,40 @@
+use crate::tools::background::{spawn_background, BackgroundCtx};
 use crate::{ExecutionMode, StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
 pub struct BashTool {
     cwd: PathBuf,
+    /// Background-execution context (registry + event channel). `None` for
+    /// sub-agents and headless one-shot — `run_in_background` is rejected there.
+    background: Option<BackgroundCtx>,
 }
 
 impl BashTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            background: None,
+        }
+    }
+
+    /// Enable `run_in_background` by wiring the shared shell registry. `None`
+    /// leaves the tool foreground-only (sub-agents, one-shot CLI).
+    pub fn with_background(mut self, background: Option<BackgroundCtx>) -> Self {
+        self.background = background;
+        self
+    }
+
+    /// Validate that `cwd` exists and is a directory. Shared by the foreground
+    /// and background spawn paths.
+    async fn check_cwd(&self) -> Result<(), String> {
+        match tokio::fs::metadata(&self.cwd).await {
+            Ok(meta) if meta.is_dir() => Ok(()),
+            Ok(_) => Err(format!("cwd '{}' is not a directory", self.cwd.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(format!("cwd '{}' does not exist", self.cwd.display()))
+            }
+            Err(e) => Err(format!("cwd '{}': {e}", self.cwd.display())),
         }
     }
 }
@@ -27,7 +52,14 @@ impl StaticTool for BashTool {
         ToolParam {
             name: "timeout_secs",
             ty: "integer",
-            description: "Timeout in seconds (default: 60)",
+            description: "Timeout in seconds (default: 60). Ignored when run_in_background is set.",
+        },
+        ToolParam {
+            name: "run_in_background",
+            ty: "boolean",
+            description: "Run without blocking and return a shell id immediately, for \
+                          long-running commands (dev servers, watchers). Read its output \
+                          later with bash_output and stop it with kill_shell. Default false.",
         },
     ];
     const REQUIRED: &'static [&'static str] = &["command"];
@@ -37,14 +69,22 @@ impl StaticTool for BashTool {
         let command = args.require_str("command")?;
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(60);
 
-        match tokio::fs::metadata(&self.cwd).await {
-            Ok(meta) if meta.is_dir() => {}
-            Ok(_) => return Err(format!("cwd '{}' is not a directory", self.cwd.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(format!("cwd '{}' does not exist", self.cwd.display()));
-            }
-            Err(e) => return Err(format!("cwd '{}': {e}", self.cwd.display())),
+        if args["run_in_background"].as_bool().unwrap_or(false) {
+            return match &self.background {
+                Some(ctx) => {
+                    // Validate cwd up front (matches the foreground path below).
+                    self.check_cwd().await?;
+                    spawn_background(ctx, &self.cwd, command).await
+                }
+                None => Err(
+                    "Background execution is not available here (sub-agents and one-shot runs \
+                     use blocking bash). Run the command in the foreground instead."
+                        .to_string(),
+                ),
+            };
         }
+
+        self.check_cwd().await?;
 
         let mut builder = tokio::process::Command::new("bash");
         builder

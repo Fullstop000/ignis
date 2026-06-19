@@ -231,8 +231,11 @@ async fn main() -> Result<(), anyhow::Error> {
         mcp_for_subagent,
         None,
         Some(permissions.clone()),
-        // One-shot CLI has no live frontend to render a todo panel; the tool
-        // still updates the persisted list, it just isn't surfaced.
+        // One-shot CLI is a single blocking turn then exit: background shells
+        // (which outlive a turn) and the footer make no sense, and there is no
+        // live frontend to render a todo panel. Both tools still update their
+        // persisted state here — it just isn't surfaced. (bg_shells, events)
+        None,
         None,
     );
 

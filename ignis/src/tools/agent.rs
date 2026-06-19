@@ -66,7 +66,8 @@ impl StaticTool for SubagentTool {
             .map_err(|e| format!("Could not build provider: {e}"))?;
         let mut agent = Agent::new(SUBAGENT_SYSTEM_PROMPT.to_string(), provider);
         // Same toolset as the main agent, minus `agent` itself — no recursion.
-        for tool in super::native_tools(&self.cwd, self.config.web_search.clone()) {
+        // No background context: sub-agents get plain blocking bash only.
+        for tool in super::native_tools(&self.cwd, self.config.web_search.clone(), None) {
             agent.register_tool(tool);
         }
         // Inherit MCP tools and their server-instructions from the parent.
