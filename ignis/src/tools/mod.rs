@@ -19,7 +19,7 @@ mod web_search;
 pub use agent::SubagentTool;
 pub use ask_user::AskUserTool;
 pub use background::{BackgroundCtx, BackgroundShells, BashOutputTool, KillShellTool};
-pub use bash::BashTool;
+pub use bash::{BashSandbox, BashTool};
 pub use create_file::CreateFileTool;
 pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
@@ -39,11 +39,13 @@ use std::sync::Arc;
 /// except the `agent` tool itself, so sub-agents don't nest).
 ///
 /// `background` enables `bash`'s `run_in_background` flag (top-level only).
-/// Sub-agents pass `None` — they get plain blocking bash, no background shells.
+/// `bash_sandbox` confines auto-run bash writes in unattended modes. Sub-agents
+/// pass `None` for both — plain blocking bash, no background shells, no sandbox.
 pub fn native_tools(
     cwd: &Path,
     web_search: crate::config::WebSearchConfig,
     background: Option<background::BackgroundCtx>,
+    bash_sandbox: Option<bash::BashSandbox>,
 ) -> Vec<Arc<dyn AgentTool>> {
     vec![
         Arc::new(ReadFileTool::new(cwd)) as Arc<dyn AgentTool>,
@@ -52,7 +54,11 @@ pub fn native_tools(
         Arc::new(ListDirTool::new(cwd)),
         Arc::new(GrepTool::new(cwd)),
         Arc::new(GlobTool::new(cwd)),
-        Arc::new(BashTool::new(cwd).with_background(background)),
+        Arc::new(
+            BashTool::new(cwd)
+                .with_background(background)
+                .with_sandbox(bash_sandbox),
+        ),
         Arc::new(WebFetchTool::new()),
         Arc::new(WebSearchTool::new(web_search.provider, web_search.api_key)),
     ]
@@ -77,6 +83,30 @@ pub fn register_native_tools(
     config: &crate::config::Config,
 ) {
     register_native_tools_with_mcp(session, cwd, config, None, None, None, None, None)
+}
+
+/// Resolve the bash write-sandbox for the top-level agent: active only in the
+/// auto-approve (unattended) modes; `None` in `Off` (the permission prompt is
+/// the gate there). The configured `sandbox_write_paths` are `~`-expanded.
+fn resolve_bash_sandbox(
+    config: &crate::config::Config,
+    permissions: Option<&Arc<crate::permissions::runtime::PermissionState>>,
+) -> Option<bash::BashSandbox> {
+    let p = permissions?;
+    if !p.mode().auto_approves_sensitive() {
+        return None;
+    }
+    let home = dirs::home_dir();
+    let extra_writes = config
+        .permissions
+        .sandbox_write_paths
+        .iter()
+        .map(|s| match (s.strip_prefix("~/"), &home) {
+            (Some(rest), Some(h)) => h.join(rest),
+            _ => std::path::PathBuf::from(s),
+        })
+        .collect();
+    Some(bash::BashSandbox { extra_writes })
 }
 
 /// Same as `register_native_tools` but threads a shared MCP registry into the
@@ -104,7 +134,8 @@ pub fn register_native_tools_with_mcp(
         shells,
         events: events.clone(),
     });
-    for tool in native_tools(cwd, config.web_search.clone(), bg_ctx) {
+    let bash_sandbox = resolve_bash_sandbox(config, permissions.as_ref());
+    for tool in native_tools(cwd, config.web_search.clone(), bg_ctx, bash_sandbox) {
         session.register_tool(tool);
     }
     // Background-shell polling tools — top-level only (sub-agents return one
@@ -139,5 +170,45 @@ pub fn register_native_tools_with_mcp(
 pub fn register_mcp_tools(session: &mut crate::Session, registry: &crate::mcp::McpRegistry) {
     for wrapper in registry.wrappers() {
         session.register_tool(wrapper as Arc<dyn AgentTool>);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permissions::runtime::PermissionState;
+    use crate::permissions::Mode;
+
+    #[test]
+    fn bash_sandbox_active_only_in_unattended_modes() {
+        let cfg = crate::config::Config::default();
+        // Off → no sandbox (the permission prompt is the gate there).
+        let off = PermissionState::new(Mode::Off);
+        assert!(resolve_bash_sandbox(&cfg, Some(&off)).is_none());
+        // HandsFree / FullyUnattended → sandbox active.
+        let hf = PermissionState::new(Mode::HandsFree);
+        assert!(resolve_bash_sandbox(&cfg, Some(&hf)).is_some());
+        let fu = PermissionState::new(Mode::FullyUnattended);
+        assert!(resolve_bash_sandbox(&cfg, Some(&fu)).is_some());
+        // No permission state (tests) → no sandbox.
+        assert!(resolve_bash_sandbox(&cfg, None).is_none());
+    }
+
+    #[test]
+    fn bash_sandbox_expands_configured_write_paths() {
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.sandbox_write_paths =
+            vec!["~/.cargo".to_string(), "/opt/cache".to_string()];
+        let fu = PermissionState::new(Mode::FullyUnattended);
+        let sb = resolve_bash_sandbox(&cfg, Some(&fu)).expect("sandbox active");
+        // The `~/` entry is home-expanded; the absolute one passes through.
+        assert!(sb.extra_writes.iter().any(|p| p.ends_with(".cargo")));
+        assert!(sb
+            .extra_writes
+            .iter()
+            .any(|p| p == std::path::Path::new("/opt/cache")));
+        if let Some(home) = dirs::home_dir() {
+            assert!(sb.extra_writes.contains(&home.join(".cargo")));
+        }
     }
 }

@@ -3,11 +3,24 @@ use crate::{ExecutionMode, StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
+/// Filesystem-sandbox config for auto-run bash (unattended modes only). Confines
+/// the spawned command's WRITES to the project + temp (+ configured extras);
+/// reads stay broad. `None` on `BashTool` = no sandbox (Off mode unchanged).
+#[derive(Debug, Clone)]
+pub struct BashSandbox {
+    /// Extra writable dirs beyond cwd + temp, from `[permissions]
+    /// sandbox_write_paths` (already `~`-expanded). Default empty.
+    pub extra_writes: Vec<PathBuf>,
+}
+
 pub struct BashTool {
     cwd: PathBuf,
     /// Background-execution context (registry + event channel). `None` for
     /// sub-agents and headless one-shot — `run_in_background` is rejected there.
     background: Option<BackgroundCtx>,
+    /// When set (unattended modes), each spawned command is confined by a
+    /// Landlock/Seatbelt write sandbox via `pre_exec`. `None` = no sandbox.
+    sandbox: Option<BashSandbox>,
 }
 
 impl BashTool {
@@ -15,6 +28,7 @@ impl BashTool {
         Self {
             cwd: cwd.to_path_buf(),
             background: None,
+            sandbox: None,
         }
     }
 
@@ -36,6 +50,31 @@ impl BashTool {
             }
             Err(e) => Err(format!("cwd '{}': {e}", self.cwd.display())),
         }
+    }
+
+    /// Enable the write sandbox (unattended modes). `None` leaves bash
+    /// unsandboxed (Off mode, sub-agents, one-shot).
+    pub fn with_sandbox(mut self, sandbox: Option<BashSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// The writable set for the sandbox: the project (cwd), the temp dirs, the
+    /// `/dev/null` sink, `$TMPDIR` if set, plus any configured extras. Reads are
+    /// granted broadly (`/`) so the command can still read libraries/sources.
+    fn sandbox_paths(&self, sb: &BashSandbox) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let reads = vec![PathBuf::from("/")];
+        let mut writes = vec![
+            self.cwd.clone(),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/var/tmp"),
+            PathBuf::from("/dev/null"),
+        ];
+        if let Some(tmp) = std::env::var_os("TMPDIR") {
+            writes.push(PathBuf::from(tmp));
+        }
+        writes.extend(sb.extra_writes.iter().cloned());
+        (reads, writes)
     }
 }
 
@@ -105,6 +144,23 @@ impl StaticTool for BashTool {
         #[cfg(unix)]
         builder.process_group(0);
 
+        // Write-sandbox the command in unattended modes (reuses the hook
+        // sandbox machinery). The policy is built in the parent (allocations
+        // here); `apply` runs in the forked child before exec and is
+        // allocation-free. Fail-open: on a kernel without Landlock the policy
+        // reports `NotEnforced` (Ok) and the command runs unconfined — a hard
+        // ruleset error fails the exec rather than running silently unconfined.
+        #[cfg(unix)]
+        if let Some(sb) = &self.sandbox {
+            let (reads, writes) = self.sandbox_paths(sb);
+            let policy = crate::sandbox::SandboxPolicy::new(&reads, &writes);
+            // SAFETY: runs in the forked child before execve; async-signal-safe
+            // (syscalls only, no alloc/locks) — see `SandboxPolicy::apply`.
+            unsafe {
+                builder.pre_exec(move || policy.apply().map(|_| ()));
+            }
+        }
+
         let child = builder
             .spawn()
             .map_err(|e| format!("Failed to spawn command: {e}"))?;
@@ -158,6 +214,19 @@ impl StaticTool for BashTool {
 
         if !output.status.success() {
             combined.push_str(&format!("\n[exit code: {exit_code}]"));
+            // When the sandbox is active and the failure looks like a denied
+            // write, point at the escape hatch — otherwise a confined
+            // cargo/npm build fails with an opaque "permission denied".
+            if self.sandbox.is_some()
+                && (stderr.contains("Permission denied")
+                    || stderr.contains("Read-only file system"))
+            {
+                combined.push_str(
+                    "\n[note: unattended-mode bash sandbox confines writes to the project + temp; \
+                     if a write outside those is legitimate, add its directory to \
+                     `[permissions] sandbox_write_paths` in config.]",
+                );
+            }
             return Err(combined);
         }
         Ok(combined)
@@ -186,6 +255,26 @@ mod tests {
     use super::*;
     use crate::AgentTool;
     use serde_json::json;
+
+    #[test]
+    fn sandbox_paths_grant_broad_reads_and_confined_writes() {
+        let cwd = PathBuf::from("/home/u/proj");
+        let tool = BashTool::new(&cwd);
+        let sb = BashSandbox {
+            extra_writes: vec![PathBuf::from("/home/u/.cargo")],
+        };
+        let (reads, writes) = tool.sandbox_paths(&sb);
+        // Reads are broad (the whole tree) so commands can read libs/sources.
+        assert_eq!(reads, vec![PathBuf::from("/")]);
+        // Writes are confined to cwd + temp + the configured extra + /dev/null.
+        assert!(writes.contains(&cwd));
+        assert!(writes.contains(&PathBuf::from("/tmp")));
+        assert!(writes.contains(&PathBuf::from("/home/u/.cargo")));
+        assert!(writes.contains(&PathBuf::from("/dev/null")));
+        // Home / etc. are NOT writable (no broad grant).
+        assert!(!writes.contains(&PathBuf::from("/home/u")));
+        assert!(!writes.contains(&PathBuf::from("/")));
+    }
 
     #[tokio::test]
     async fn test_bash_success() {

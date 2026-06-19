@@ -89,6 +89,12 @@ pub struct PermissionsConfig {
     pub ask: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Extra directories the bash sandbox may write to in unattended modes, on
+    /// top of the project (cwd) and temp dirs. A leading `~/` expands to home.
+    /// Empty by default — keeps the sandbox tight; add e.g. `~/.cargo` here if
+    /// auto-run builds need to write home caches. (Linux Landlock only.)
+    #[serde(default)]
+    pub sandbox_write_paths: Vec<String>,
 }
 
 /// OpenTelemetry export. Off by default — opt in with

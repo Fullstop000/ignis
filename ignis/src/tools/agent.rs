@@ -134,11 +134,12 @@ impl StaticTool for SubagentTool {
         let mut agent = Agent::new(spec.system_prompt.to_string(), provider);
         // The type's toolset — read-only types get reads + search only; `general`
         // gets the full native set. Minus `agent` itself either way (no nesting).
-        // No background context: sub-agents get plain blocking bash only.
+        // No background context and no bash sandbox: sub-agents get plain
+        // blocking bash only (the top-level loop is the gate).
         let tools = if spec.read_only {
             super::read_only_tools(&self.cwd)
         } else {
-            super::native_tools(&self.cwd, self.config.web_search.clone(), None)
+            super::native_tools(&self.cwd, self.config.web_search.clone(), None, None)
         };
         for tool in tools {
             agent.register_tool(tool);
@@ -239,7 +240,12 @@ mod tests {
             "read-only excludes writes"
         );
 
-        let general = names(crate::tools::native_tools(cwd, Default::default(), None));
+        let general = names(crate::tools::native_tools(
+            cwd,
+            Default::default(),
+            None,
+            None,
+        ));
         assert!(general.iter().any(|n| n == "bash"), "general includes bash");
     }
 }
