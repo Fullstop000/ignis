@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - TUI — the Ink `edit_file` diff view now syntax-highlights the code over the green/red `+`/`-` background tints. ([#213](https://github.com/Fullstop000/ignis/pull/213))
 
+### Fixed
+- TUI — the Ink task-list panel now paints immediately on resume, not only after the next prompt. ([#212](https://github.com/Fullstop000/ignis/pull/212))
+
 ## [0.41.1] - 2026-06-19
 
 ### Added
