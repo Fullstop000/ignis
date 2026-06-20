@@ -262,10 +262,11 @@ async fn agent_loop(
             created_at_ms: None,
         };
         // Re-sync the frontend's todo panel from the persisted list at the start
-        // of each turn. Within a run Ink already holds it, but after a /resume
-        // (or reconnect) the panel is empty until something re-emits — this keeps
-        // it in step with disk without a dedicated resume path. Skip when empty
-        // (nothing to show; the panel stays hidden).
+        // of each turn. Within a run Ink already holds it; after a reconnect
+        // the panel is empty until something re-emits. (Resume paths now emit
+        // directly — see the `send_transcript` sites — but this also covers
+        // reconnect and is a cheap no-op when the list is already in step.)
+        // Skip when empty (nothing to show; the panel stays hidden).
         {
             let todos = session.todos_handle().lock().unwrap().clone();
             if !todos.is_empty() {
@@ -695,6 +696,18 @@ pub async fn run_engine(
         hub.send_transcript(session_id.clone(), transcript_blocks(resumed))
             .await;
     }
+    // Re-emit the persisted task list so the todo panel paints immediately on
+    // resume — the transcript frame resets the frontend's todos to [], so
+    // this must follow it. Without this, the panel stays empty until the
+    // user sends their next prompt (the per-turn re-sync in `agent_loop`
+    // only fires at the start of a prompt, not at resume time).
+    let todos = FileStorage::new(storage_dir.clone())
+        .load_todos(&session_id)
+        .await
+        .unwrap_or_default();
+    if !todos.is_empty() {
+        hub.emit_event(AgentEvent::Todos { items: todos }).await;
+    }
 
     // Drive until the frontend closes our stdin (EOF = clean disconnect).
     drive_frontend_core(
@@ -1029,9 +1042,18 @@ async fn drive_frontend_core(
                         .load_session(&id)
                         .await
                         .unwrap_or_default();
+                    let todos = FileStorage::new(storage_dir.clone())
+                        .load_todos(&id)
+                        .await
+                        .unwrap_or_default();
                     current_session_id = id.clone();
                     hub.set_session_id(id.clone());
                     hub.send_transcript(id, transcript_blocks(messages)).await;
+                    // Re-emit persisted todos so the panel paints now, not on
+                    // the next prompt (the transcript frame cleared them).
+                    if !todos.is_empty() {
+                        hub.emit_event(AgentEvent::Todos { items: todos }).await;
+                    }
                     hub.send_snapshot().await;
                 }
                 // The agent task drains stale cancels at each prompt's start, so

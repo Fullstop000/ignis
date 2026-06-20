@@ -183,6 +183,94 @@ fn engine_replays_forwarded_session_transcript_at_startup() {
     assert!(status.is_some(), "engine exits after stdin closes");
 }
 
+/// Startup resume must also re-emit the persisted task list so the Ink todo
+/// panel paints immediately — not only when the user sends their next prompt.
+/// Seeds a session + a `.todos.json` sidecar on disk, then asserts a `todos`
+/// event frame carrying the items arrives right after the transcript replay.
+#[test]
+fn engine_replays_persisted_todos_at_startup_resume() {
+    let home = TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join(".ignis")).unwrap();
+    let proj = TempDir::new().unwrap();
+    let proj_dir = proj.path().canonicalize().unwrap();
+
+    let sessions_dir = ignis::session::project_sessions_dir(&home.path().join(".ignis"), &proj_dir);
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let id = "session-resume-todos-fixture";
+    let start_dir = proj_dir.to_string_lossy();
+
+    // Minimal session JSONL (one user turn) so the transcript replay fires.
+    let jsonl = format!(
+        concat!(
+            r#"{{"type":"session_meta","timestamp":1,"payload":{{"id":"{id}","start_dir":"{dir}"}}}}"#,
+            "\n",
+            r#"{{"type":"message","timestamp":2,"payload":{{"role":"user","content":"go"}}}}"#,
+            "\n"
+        ),
+        id = id,
+        dir = start_dir,
+    );
+    std::fs::write(sessions_dir.join(format!("{id}.jsonl")), jsonl).unwrap();
+
+    // Persist a todo list sidecar in the shape `load_todos` reads.
+    let todos_json = r#"[
+        {"content":"Build parser","status":"completed"},
+        {"content":"Wire the tool","status":"in_progress","activeForm":"Wiring the tool"},
+        {"content":"Write tests","status":"pending"}
+    ]"#;
+    std::fs::write(sessions_dir.join(format!("{id}.todos.json")), todos_json).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ignis"))
+        .arg("--engine")
+        .current_dir(&proj_dir)
+        .env("HOME", home.path())
+        .env("NO_COLOR", "1")
+        .env("IGNIS_SESSION_ID", id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ignis --engine");
+
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Scan frames for a `todos` event (transcript → todos → snapshot).
+    let mut todos_event = None;
+    for _ in 0..8 {
+        let line = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("engine emitted a frame within 20s");
+        let v: serde_json::Value = serde_json::from_str(&line).expect("frame is valid JSON");
+        if v["kind"] == "event" && v["data"]["type"] == "todos" {
+            todos_event = Some(v);
+            break;
+        }
+    }
+    let ev = todos_event.expect("engine emits a todos event at startup resume");
+    let items = ev["data"]["payload"]["items"]
+        .as_array()
+        .expect("todos event carries items");
+    let rendered = serde_json::to_string(items).unwrap();
+    assert!(
+        rendered.contains("Build parser") && rendered.contains("Wire the tool"),
+        "replayed todos carry the persisted items, got: {rendered}"
+    );
+
+    drop(stdin);
+    let _ = reader.join();
+    let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    assert!(status.is_some(), "engine exits after stdin closes");
+}
+
 /// `child.wait()` has no timeout; poll `try_wait` so a hung child fails the test
 /// instead of wedging it.
 fn wait_with_timeout(
