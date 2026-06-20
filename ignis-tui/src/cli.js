@@ -5,6 +5,7 @@
 import React from 'react';
 import { render } from 'ink';
 import { spawnEngine } from './engine.js';
+import { createPasteStream } from './paste-stream.js';
 import App from './app.js';
 
 const engine = spawnEngine();
@@ -13,10 +14,20 @@ const engine = spawnEngine();
 // when busy, exit cleanly when idle (see app.js).
 // `onExit` carries the `ignis --resume <id>` hint, printed AFTER Ink tears down
 // the alt buffer so it lands in the real scrollback like the native TUI.
+// Ask the terminal to wrap pastes in ESC[200~ … ESC[201~ so createPasteStream
+// can coalesce them; restore on exit (incl. a backstop for an abrupt kill) so
+// the user's shell isn't left in bracketed-paste mode.
+process.stdout.write('\x1b[?2004h');
+const disableBracketedPaste = () => process.stdout.write('\x1b[?2004l');
+process.once('exit', disableBracketedPaste);
+
 const ctx = {};
 const { waitUntilExit } = render(
   React.createElement(App, { engine, onExit: (hint) => (ctx.hint = hint) }),
-  { exitOnCtrlC: false },
+  // Coalesce bracketed-paste spans into one chunk before Ink parses input, so a
+  // multi-line paste collapses to a chip instead of submitting line-by-line.
+  { stdin: createPasteStream(process.stdin), exitOnCtrlC: false },
 );
 await waitUntilExit();
+disableBracketedPaste();
 if (ctx.hint) process.stdout.write(ctx.hint);
