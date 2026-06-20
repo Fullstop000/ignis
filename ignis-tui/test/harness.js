@@ -73,10 +73,16 @@ export function plain(frame) {
   return (frame ?? '').replace(/\x1b\[[0-9;]*m/g, '');
 }
 
-/** Let queued React state updates / effects flush. Generous enough to stay
- *  reliable when `node --test` runs files in parallel (CPU contention can delay
- *  Ink's re-render past a too-short timeout). */
-export const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+/** Let queued React state updates / effects flush. Flushes the event loop
+ *  deterministically via `setImmediate` (fires after I/O callbacks, so the
+ *  `data` event from `stdin.write` is processed) before a short delay for any
+ *  further async work. More reliable under CI CPU contention than a bare
+ *  `setTimeout`, which can miss its window when `node --test` runs files in
+ *  parallel on a loaded runner. */
+export const tick = async (ms = 30) => {
+  await new Promise((r) => setImmediate(r));
+  if (ms > 0) await new Promise((r) => setTimeout(r, ms));
+};
 
 // ── Outbound frame builders (mirror the engine's wire shapes) ──
 export const ev = (type, payload) => ({ kind: 'event', data: payload === undefined ? { type } : { type, payload } });

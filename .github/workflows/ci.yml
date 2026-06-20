@@ -27,6 +27,21 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  js-test:
+    name: js test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install
+        working-directory: ignis-tui
+        run: npm ci
+      - name: test
+        working-directory: ignis-tui
+        run: node --test
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
