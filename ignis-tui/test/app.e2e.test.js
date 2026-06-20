@@ -234,6 +234,7 @@ test('Ctrl+C cancels a busy turn (Cancel command), exits when idle', async () =>
   stdin.write(KEY.ctrlC);
   await tick();
   assert.deepEqual(engine.last(), { kind: '_closed' }, 'idle → engine.close()');
+  assert.ok(engine.sent.some((c) => c.kind === 'shutdown'), 'clean exit sends explicit shutdown command');
 });
 
 test('Ctrl+S injects the composer text during a turn', async () => {
@@ -611,4 +612,34 @@ test('snapshot hydrates a pending request (handover) → picker shown', async ()
   engine.emit(snapshot({ session_id: 's1', pending_request: { id: 9, questions: [askOptions(false)] } }));
   await tick();
   assert.match(plain(lastFrame()), /Pick a color/);
+});
+
+test('engine spawn error renders a blocking error overlay', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  engine.fireError(new Error('ignis: command not found'));
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /Engine error/);
+  assert.match(f, /Engine failed: ignis: command not found/);
+  assert.match(f, /Press any key to exit/);
+});
+
+test('engine close with non-zero code renders an error overlay', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  engine.fireClose(1);
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /Engine error/);
+  assert.match(f, /Engine exited unexpectedly \(code 1\)/);
+});
+
+test('engine close with code 0 exits cleanly without an error overlay', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  engine.fireClose(0);
+  await tick();
+  const f = plain(lastFrame());
+  assert.doesNotMatch(f, /Engine error/);
 });

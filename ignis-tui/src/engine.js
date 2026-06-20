@@ -12,7 +12,9 @@ export function spawnEngine({ bin = process.env.IGNIS_ENGINE_BIN || 'ignis', arg
   const rl = readline.createInterface({ input: child.stdout });
   const frameHandlers = [];
   const closeHandlers = [];
+  const errorHandlers = [];
   const pending = []; // frames that arrive before onFrame is registered (e.g. the startup snapshot)
+  let shutdownSent = false;
 
   rl.on('line', (line) => {
     const t = line.trim();
@@ -33,7 +35,7 @@ export function spawnEngine({ bin = process.env.IGNIS_ENGINE_BIN || 'ignis', arg
     for (const h of closeHandlers) h(code);
   });
   child.on('error', (err) => {
-    process.stderr.write(`ignis-tui: failed to spawn engine (${bin} --engine): ${err.message}\n`);
+    for (const h of errorHandlers) h(err);
     for (const h of closeHandlers) h(1);
   });
 
@@ -43,11 +45,16 @@ export function spawnEngine({ bin = process.env.IGNIS_ENGINE_BIN || 'ignis', arg
       if (pending.length) pending.splice(0).forEach(cb); // flush buffered frames
     },
     onClose: (cb) => closeHandlers.push(cb),
+    onError: (cb) => errorHandlers.push(cb),
     send: (cmd) => {
       if (child.stdin.writable) child.stdin.write(JSON.stringify(cmd) + '\n');
     },
     close: () => {
       try {
+        if (child.stdin.writable && !shutdownSent) {
+          shutdownSent = true;
+          child.stdin.write(JSON.stringify({ kind: 'shutdown' }) + '\n');
+        }
         child.stdin.end();
       } catch {
         /* already closed */

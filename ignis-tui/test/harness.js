@@ -7,11 +7,12 @@ import React from 'react';
 import { render } from 'ink-testing-library';
 import App from '../src/app.js';
 
-/** A fake of engine.js: stores App's frame/close callbacks, records sends, and
- *  lets the test push Outbound frames in. Shape matches src/engine.js. */
+/** A fake of engine.js: stores App's frame/close/error callbacks, records sends,
+ *  and lets the test push Outbound frames in. Shape matches src/engine.js. */
 export function mockEngine() {
   let frameCb = null;
   let closeCb = () => {};
+  let errorCb = () => {};
   const pending = []; // frames emitted before App registers onFrame (effect timing)
   const sent = [];
   return {
@@ -22,11 +23,18 @@ export function mockEngine() {
     onClose: (cb) => {
       closeCb = cb;
     },
+    onError: (cb) => {
+      errorCb = cb;
+    },
     send: (cmd) => sent.push(cmd),
-    close: () => sent.push({ kind: '_closed' }),
+    close: () => {
+      sent.push({ kind: 'shutdown' });
+      sent.push({ kind: '_closed' });
+    },
     // ── test-facing ──
     emit: (frame) => (frameCb ? frameCb(frame) : pending.push(frame)),
     fireClose: (code) => closeCb(code),
+    fireError: (err) => errorCb(err),
     sent,
     last: () => sent[sent.length - 1],
   };

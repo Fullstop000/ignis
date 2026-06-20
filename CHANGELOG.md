@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - TUI — the Ink task-list panel now paints immediately on resume, not only after the next prompt. ([#212](https://github.com/Fullstop000/ignis/pull/212))
+- Ink frontend — engine spawn and crash failures now surface a blocking error overlay, and clean exits send an explicit shutdown frame before closing stdin. ([#198](https://github.com/Fullstop000/ignis/pull/198))
 
 ## [0.41.1] - 2026-06-19
 
