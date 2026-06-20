@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUI — the Ink `edit_file` diff view now syntax-highlights the code over the green/red `+`/`-` background tints. ([#213](https://github.com/Fullstop000/ignis/pull/213))
 
 ### Fixed
+- TUI — multi-line pastes in the Ink composer now collapse to a `[paste #N]` chip instead of submitting line-by-line or fragmenting. ([#214](https://github.com/Fullstop000/ignis/pull/214))
 - TUI — the Ink task-list panel now paints immediately on resume, not only after the next prompt. ([#212](https://github.com/Fullstop000/ignis/pull/212))
 - Ink frontend — engine spawn and crash failures now surface a blocking error overlay, and clean exits send an explicit shutdown frame before closing stdin. ([#198](https://github.com/Fullstop000/ignis/pull/198))
 
