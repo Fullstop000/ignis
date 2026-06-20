@@ -82,7 +82,34 @@ test('DiffView reports overflow when diff exceeds the cap', () => {
   assert.match(plain(lastFrame()), /\+\d+ more lines/);
 });
 
+test('DiffView syntax-highlights code (emits color for a keyword line)', () => {
+  // A Rust keyword line should carry ANSI color codes; the ANSI-stripped text
+  // is unchanged, so highlighting is additive and never alters content.
+  const content = '@@ -1,1 +1,1 @@\n-let x = 1;\n+const y = 2;\n';
+  const { lastFrame } = render(e(DiffView, { content, path: 'lib.rs' }));
+  const raw = lastFrame() ?? '';
+  assert.notEqual(raw, plain(raw), 'raw frame should contain ANSI color codes');
+  // The base16-ocean.dark keyword color (#b48ead -> 24-bit fg 38;2;180;142;173).
+  assert.match(raw, /38;2;180;142;173/, 'keyword should use the base16 purple');
+  assert.match(plain(raw), /\+\s+const y = 2;/, 'added row keeps its plain text');
+});
+
+test('DiffView leaves unknown extensions unhighlighted but intact', () => {
+  const content = '@@ -1,1 +1,1 @@\n-alpha\n+beta\n';
+  const { lastFrame } = render(e(DiffView, { content, path: 'notes.zzz' }));
+  const f = plain(lastFrame());
+  assert.match(f, /-\s+alpha$/m);
+  assert.match(f, /\+\s+beta$/m);
+});
+
 function plain(frame) {
-  // eslint-disable-next-line no-control-regex
-  return (frame ?? '').replace(/\x1b\[[0-9;]*m/g, '');
+  // Strip ANSI, then drop each row's trailing whitespace: +/- rows are padded
+  // with background-tinted spaces to fill the terminal width, which is intended
+  // rendering, not line content, and would otherwise break `$`-anchored matches.
+  return (frame ?? '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-9;]*m/g, '')
+    .split('\n')
+    .map((l) => l.replace(/\s+$/, ''))
+    .join('\n');
 }

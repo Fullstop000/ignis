@@ -1,23 +1,25 @@
 // Standalone diff view for the Ink frontend.
 //
 // Parses the unified-diff body returned by `edit_file` and renders it as a
-// line-numbered, word-level diff. +/- rows get full-width green/red
-// background bars; the exact changed words are bold with a stronger background
-// so they stand out from the surrounding tinted row.
+// line-numbered diff with per-token syntax highlighting layered over add/remove
+// background tints — the same model the native ratatui TUI uses. +/- rows get
+// full-width green/red background bars (Claude-Code dark-theme tints); the exact
+// changed words get a stronger background so they stand out, while the code keeps
+// its syntax colors.
 import React from 'react';
 import { Box, Text, useStdout } from 'ink';
 import { diffWordsWithSpace } from 'diff';
 import { toolDiffPreview } from './protocol.js';
+import { highlightSpans } from './highlight.js';
 
 const e = React.createElement;
 
+// Claude-Code dark-theme diff tints: line-level bars + stronger changed-word bg.
 const COLORS = {
-  addFg: 'green',
-  delFg: 'red',
-  addBg: '#1d3b2e',
-  delBg: '#3b1d28',
-  addWordBg: '#2d5a44',
-  delWordBg: '#5a2d3a',
+  addBg: '#225c2b', // rgb(34,92,43)
+  delBg: '#7a2936', // rgb(122,41,54)
+  addWordBg: '#38a660', // rgb(56,166,96)
+  delWordBg: '#b3596b', // rgb(179,89,107)
 };
 
 // Word-level diffing is synchronous and can freeze the TUI on very long lines
@@ -42,6 +44,7 @@ export default function DiffView({ content, path }) {
   if (!lines.length) return header;
 
   const cols = useTerminalWidth();
+  const ext = fileExt(path);
   const maxLn = lines.reduce(
     (m, ln) => (ln.lineNo != null && ln.lineNo > m ? ln.lineNo : m),
     0,
@@ -66,19 +69,27 @@ export default function DiffView({ content, path }) {
 
     if (ln.kind === 'add' || ln.kind === 'del') {
       const isAdd = ln.kind === 'add';
-      const pair = pairs.get(i);
-      const baseColor = isAdd ? COLORS.addFg : COLORS.delFg;
-      const bgColor = isAdd ? COLORS.addBg : COLORS.delBg;
-      const children = pair
-        ? renderWordDiff(pair.oldText, pair.newText, isAdd, baseColor)
-        : [ln.text];
+      const rowBg = isAdd ? COLORS.addBg : COLORS.delBg;
+      const wordBg = isAdd ? COLORS.addWordBg : COLORS.delWordBg;
+      const segments = buildSegments(ln.text, ext, pairs.get(i), isAdd);
       // Pad to the terminal width so the background fills the whole row.
       const pad = ' '.repeat(Math.max(0, cols - prefix.length - ln.text.length));
       return e(
         Text,
-        { key: `d${i}`, color: baseColor, backgroundColor: bgColor },
+        { key: `d${i}`, backgroundColor: rowBg },
         prefix,
-        ...children,
+        ...segments.map((sg, k) =>
+          e(
+            Text,
+            {
+              key: `s${k}`,
+              color: sg.color,
+              backgroundColor: sg.changed ? wordBg : rowBg,
+              bold: sg.changed,
+            },
+            sg.text,
+          ),
+        ),
         pad,
       );
     }
@@ -107,6 +118,14 @@ export default function DiffView({ content, path }) {
 function useTerminalWidth() {
   const { stdout } = useStdout();
   return stdout?.columns || 80;
+}
+
+/** The file extension (lowercased, no dot) used to pick the highlight language. */
+function fileExt(path) {
+  if (!path) return '';
+  const base = path.split('/').pop();
+  const dot = base.lastIndexOf('.');
+  return dot > 0 ? base.slice(dot + 1) : '';
 }
 
 /**
@@ -140,34 +159,87 @@ function pairRows(lines) {
 }
 
 /**
- * Convert a word diff between an old and new line into Ink `<Text>` children.
- * Equal parts inherit the base row color/background; added/removed parts are
- * bold with a stronger background so the changed words pop.
+ * Build the renderable segments for one +/- row: syntax colors (foreground)
+ * intersected with the word-level diff (changed words get the stronger bg).
+ * Returns `[{ text, color, changed }]`.
  */
-function renderWordDiff(oldText, newText, isAdd, baseColor) {
-  if (oldText.length + newText.length > MAX_WORD_DIFF_CHARS) {
-    // Avoid a synchronous word-diff freeze; render the row as plain text.
-    return [isAdd ? newText : oldText];
+function buildSegments(text, ext, pair, isAdd) {
+  const syntax = highlightSpans(text, ext);
+  let wordParts = [{ changed: false, text }];
+  if (pair && pair.oldText.length + pair.newText.length <= MAX_WORD_DIFF_CHARS) {
+    wordParts = wordRanges(pair.oldText, pair.newText, isAdd);
   }
+  return mergeSegments(text, syntax, wordParts);
+}
+
+/**
+ * The word-diff parts belonging to one side of a paired old/new line, in order.
+ * Each `{ changed, text }`; concatenated, they reconstruct this side's line.
+ */
+function wordRanges(oldText, newText, isAdd) {
   const changes = diffWordsWithSpace(oldText, newText);
-  const wordBg = isAdd ? COLORS.addWordBg : COLORS.delWordBg;
-  return changes
-    .map((part, idx) => {
-      // For an addition row we render unchanged + inserted text; for a deletion
-      // row we render unchanged + removed text. The opposite side's exclusive
-      // text is omitted so each row reconstructs its own line content.
-      if (isAdd ? part.removed : part.added) return null;
-      if (!part.value) return null;
-      const changed = isAdd ? part.added : part.removed;
-      if (!changed) {
-        // Unchanged segment: just a string so it inherits the parent styles.
-        return part.value;
+  const parts = [];
+  for (const part of changes) {
+    // Skip the opposite side's exclusive text so each row rebuilds its own line.
+    if (isAdd ? part.removed : part.added) continue;
+    if (!part.value) continue;
+    parts.push({ changed: isAdd ? !!part.added : !!part.removed, text: part.value });
+  }
+  return parts.length ? parts : [{ changed: false, text: isAdd ? newText : oldText }];
+}
+
+/**
+ * Tile two sequences over the same line text — syntax spans (`{ color, text }`)
+ * and word-diff parts (`{ changed, text }`) — into segments carrying both, then
+ * coalesce neighbours that share color+changed. Both sequences cover the whole
+ * line, so we walk them in lockstep, cutting at whichever boundary comes first.
+ */
+function mergeSegments(text, syntax, wordParts) {
+  const segs = [];
+  let si = 0;
+  let wi = 0;
+  let so = 0;
+  let wo = 0;
+  let pos = 0;
+  while (pos < text.length && si < syntax.length && wi < wordParts.length) {
+    const s = syntax[si];
+    const w = wordParts[wi];
+    const sRemain = s.text.length - so;
+    const wRemain = w.text.length - wo;
+    const take = Math.min(sRemain, wRemain);
+    if (take <= 0) {
+      if (sRemain <= 0) {
+        si++;
+        so = 0;
       }
-      return e(
-        Text,
-        { key: `w${idx}`, bold: true, color: baseColor, backgroundColor: wordBg },
-        part.value,
-      );
-    })
-    .filter(Boolean);
+      if (wRemain <= 0) {
+        wi++;
+        wo = 0;
+      }
+      continue;
+    }
+    segs.push({ text: text.slice(pos, pos + take), color: s.color, changed: w.changed });
+    pos += take;
+    so += take;
+    wo += take;
+    if (so >= s.text.length) {
+      si++;
+      so = 0;
+    }
+    if (wo >= w.text.length) {
+      wi++;
+      wo = 0;
+    }
+  }
+  // The two sequences should tile `text` exactly; if rounding ever leaves a
+  // tail, emit it plain so the row still shows all of its content.
+  if (pos < text.length) segs.push({ text: text.slice(pos), color: undefined, changed: false });
+
+  const merged = [];
+  for (const seg of segs) {
+    const last = merged[merged.length - 1];
+    if (last && last.color === seg.color && last.changed === seg.changed) last.text += seg.text;
+    else merged.push({ ...seg });
+  }
+  return merged.length ? merged : [{ text, color: undefined, changed: false }];
 }
