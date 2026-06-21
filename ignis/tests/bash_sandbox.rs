@@ -105,6 +105,65 @@ async fn extra_write_path_becomes_writable() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// Regression for the synthetic-EXDEV bug. Landlock ABI V1 lacked
+/// `LANDLOCK_ACCESS_FS_REFER`, so the kernel denied every cross-*directory*
+/// `rename(2)`/`link(2)` with a fabricated EXDEV ("Invalid cross-device
+/// link") even when both directories were writable. That broke cargo/rustc
+/// under the unattended-mode sandbox — they atomically replace build
+/// artifacts by renaming a temp file into another directory under `target/`.
+/// ABI V2 handles REFER and grants it on the write roots, so reparenting
+/// *between writable directories* is allowed while escaping to a read-only
+/// directory stays denied.
+///
+/// Uses `ln` (raw `link(2)`, REFER-governed, no copy fallback) rather than
+/// `mv`: GNU `mv` silently falls back to copy+unlink on EXDEV and would mask
+/// the bug, whereas cargo/rustc — like `ln` — issue the bare syscall.
+#[tokio::test]
+async fn sandbox_allows_cross_directory_link_within_writable_tree() {
+    if !ignis::sandbox::is_kernel_sandbox_available() {
+        eprintln!("skipping: no kernel sandbox (Landlock) on this host");
+        return;
+    }
+    let base = fresh_base("bash-sbx-refer");
+    let cwd = base.join("proj");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(cwd.join("from")).unwrap();
+    std::fs::create_dir_all(cwd.join("to")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let tool = BashTool::new(&cwd).with_sandbox(Some(BashSandbox {
+        extra_writes: vec![],
+    }));
+
+    // Cross-directory link *within* cwd → allowed under V2 (was EXDEV on V1).
+    let r = tool
+        .call(json!({
+            "command": "echo artifact > from/a.txt && ln from/a.txt to/a.txt && cat to/a.txt"
+        }))
+        .await;
+    assert!(
+        !r.is_error,
+        "cross-directory link within cwd must succeed under ABI V2: {}",
+        r.content
+    );
+    assert!(cwd.join("to/a.txt").exists(), "the linked file must exist");
+
+    // Granting REFER must not open an escape hatch: linking out to a
+    // read-only directory still fails (the destination dir has no REFER).
+    let r = tool
+        .call(json!({
+            "command": format!("ln from/a.txt '{}/escaped.txt'", outside.display())
+        }))
+        .await;
+    assert!(r.is_error, "link out to a non-writable dir must be denied");
+    assert!(
+        !outside.join("escaped.txt").exists(),
+        "no file may escape to the read-only dir"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
 #[tokio::test]
 async fn no_sandbox_does_not_confine_writes() {
     // Off mode: BashTool with no sandbox — a write outside cwd is NOT blocked

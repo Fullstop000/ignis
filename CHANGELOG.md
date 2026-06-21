@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - TUI — the Ink UI now exits on a double Ctrl-D instead of Ctrl+C, matching the native TUI. ([#219](https://github.com/Fullstop000/ignis/pull/219))
 
+### Fixed
+- Bash sandbox (unattended modes) — bumped Linux Landlock to ABI V2 so cross-directory `rename`/`link` inside the project (e.g. cargo/rustc artifact writes under `target/`) no longer fail with a spurious `EXDEV` ("Invalid cross-device link").
+
 ## [0.41.2] - 2026-06-21
 
 ### Added
