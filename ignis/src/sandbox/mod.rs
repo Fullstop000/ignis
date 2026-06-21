@@ -273,20 +273,62 @@ pub fn is_kernel_sandbox_available() -> bool {
 fn probe_kernel_sandbox_available() -> bool {
     #[cfg(target_os = "linux")]
     {
+        // ABI >= 1 means the kernel recognises Landlock (5.13+).
+        linux_landlock_abi() >= 1
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+/// Highest Landlock ABI the running kernel supports, or `-1` if Landlock is
+/// unavailable (`ENOSYS` / `EOPNOTSUPP`). Cached — the probe is a pure
+/// query that never mutates userspace.
+#[cfg(target_os = "linux")]
+fn linux_landlock_abi() -> libc::c_long {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<libc::c_long> = OnceLock::new();
+    *CACHED.get_or_init(|| {
         const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
         // SAFETY: NULL + size 0 + flags = VERSION is documented to never
         // mutate userspace; it only reports the supported ABI as the
-        // return value. A return of >= 1 means the kernel recognises
-        // Landlock; -1 with ENOSYS / EOPNOTSUPP means it doesn't.
-        let ret = unsafe {
+        // return value (>= 1 on success, -1 with ENOSYS / EOPNOTSUPP if the
+        // kernel doesn't know Landlock).
+        unsafe {
             libc::syscall(
                 libc::SYS_landlock_create_ruleset,
                 std::ptr::null::<libc::c_void>(),
                 0usize,
                 LANDLOCK_CREATE_RULESET_VERSION,
             )
-        };
-        ret >= 1
+        }
+    })
+}
+
+/// Whether the host's sandbox permits a cross-directory `rename(2)` /
+/// `link(2)` *within* the writable set. This is the capability the bash
+/// sandbox relies on for cargo/rustc artifact writes, and the gate the
+/// REFER regression test skips on when it is absent.
+///
+/// * **Linux** — `true` only when Landlock ABI >= 2, the ABI that adds
+///   `LANDLOCK_ACCESS_FS_REFER`. On a kernel whose Landlock is only ABI V1
+///   (5.13–5.18) the kernel denies every cross-directory reparenting with a
+///   synthetic `EXDEV` regardless of our ruleset, so the assertion can't
+///   hold there. (A kernel with no Landlock confines nothing, but then the
+///   caller is unconfined anyway — also reported as `false` so confinement
+///   tests downgrade.)
+/// * **macOS** — `true`; the Seatbelt profile has no cross-directory
+///   reparenting restriction.
+/// * **Other targets** — `false`.
+pub fn sandbox_allows_cross_directory_rename() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_landlock_abi() >= 2
     }
     #[cfg(target_os = "macos")]
     {

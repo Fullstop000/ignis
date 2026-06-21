@@ -120,8 +120,12 @@ async fn extra_write_path_becomes_writable() {
 /// the bug, whereas cargo/rustc — like `ln` — issue the bare syscall.
 #[tokio::test]
 async fn sandbox_allows_cross_directory_link_within_writable_tree() {
-    if !ignis::sandbox::is_kernel_sandbox_available() {
-        eprintln!("skipping: no kernel sandbox (Landlock) on this host");
+    // Gate on the *REFER* capability, not just any sandbox: a Linux kernel
+    // with only Landlock ABI V1 (5.13–5.18) reports a sandbox as available
+    // but still denies cross-directory links with synthetic EXDEV, so the
+    // assertion below could not hold there.
+    if !ignis::sandbox::sandbox_allows_cross_directory_rename() {
+        eprintln!("skipping: host sandbox can't enforce cross-directory REFER (Landlock < V2)");
         return;
     }
     let base = fresh_base("bash-sbx-refer");
