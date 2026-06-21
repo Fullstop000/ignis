@@ -307,14 +307,15 @@ function reduceEvent(state, ev) {
     case EVENT.COMPACT_END:
       return { ...state, compacting: false };
     case EVENT.COMPACT_REPORT:
-      // A committed transcript block: the token reduction + full LLM summary.
-      // Same event on both the auto-compact and manual /compact paths, rendered
-      // identically. Only emitted when messages were actually replaced, so no
-      // empty-report guard is needed here.
+      // Compaction replaced the old conversation prefix with a summary in the
+      // engine's history. Mirror that on screen: drop the old blocks, leave
+      // only the compaction report, and bump generation so <Static> remounts
+      // and the terminal scrollback is wiped (same pattern as /clear and
+      // transcript-replace). Same event on both the auto-compact and manual
+      // /compact paths, rendered identically.
       return {
         ...state,
         blocks: [
-          ...state.blocks,
           {
             kind: 'compaction',
             before: p.before ?? 0,
@@ -322,6 +323,7 @@ function reduceEvent(state, ev) {
             summary: p.summary ?? '',
           },
         ],
+        generation: state.generation + 1,
       };
     default:
       // run_start / run_end — not surfaced in the minimal UI.

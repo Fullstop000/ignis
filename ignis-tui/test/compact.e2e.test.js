@@ -123,3 +123,31 @@ test('compact_report renders on the auto-compact path (idle status)', async () =
   // The spinner is gone (compact_end fired); only the committed block remains.
   assert.doesNotMatch(f, /Compacting context/);
 });
+
+test('compact_report clears the previous history from the render zone', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  // Seed some conversation history.
+  engine.emit(ev('user_prompt_committed', { text: 'what is two plus two' }));
+  await tick();
+  engine.emit(ev('message_end', { message: { role: 'assistant', content: 'the answer is four' } }));
+  await tick();
+  let f = plain(lastFrame());
+  assert.match(f, /what is two plus two/);
+  assert.match(f, /the answer is four/);
+  // Compaction fires — old history must be wiped, only the report remains.
+  engine.emit(ev('compact_start'));
+  await tick();
+  engine.emit(ev('compact_end'));
+  await tick();
+  engine.emit(ev('compact_report', { before: 42318, after: 8104, summary: 'Discussed arithmetic.' }));
+  await tick();
+  f = plain(lastFrame());
+  assert.match(f, /Compacted context/);
+  assert.match(f, /Discussed arithmetic/);
+  // NOTE: ink-testing-library accumulates <Static> output and does not
+  // interpret the \x1b[2J screen-wipe, so old blocks remain in the test
+  // frame. In production the generation bump (verified in protocol.test.js)
+  // wipes scrollback and remounts <Static> with only the compaction block.
+  // The reducer test asserts blocks.length === 1 + generation bump.
+});

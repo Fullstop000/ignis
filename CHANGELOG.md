@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - TUI — the Ink UI now exits on a double Ctrl-D instead of Ctrl+C, matching the native TUI. ([#219](https://github.com/Fullstop000/ignis/pull/219))
 
+### Fixed
+- TUI — `/compact` now cancels on Ctrl+C instead of ignoring the interrupt. ([#218](https://github.com/Fullstop000/ignis/pull/218))
+- TUI — compaction now clears the old conversation from the screen, leaving only the summary report. ([#218](https://github.com/Fullstop000/ignis/pull/218))
+
 ## [0.41.2] - 2026-06-21
 
 ### Added

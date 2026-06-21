@@ -306,41 +306,54 @@ async fn agent_loop(
                 // /compact: summarize earlier history. On success the report
                 // block (token reduction + full summary) replaces the old
                 // generic notice; the notice is kept only for the no-op and
-                // error cases so the user knows the command ran.
+                // error cases so the user knows the command ran. Wrapped in
+                // tokio::select! so Ctrl+C cancels the (potentially long) LLM
+                // summarization — same pattern as the Some(prompt) arm.
+                while cancel_rx.try_recv().is_ok() {}
                 let _ = agent_tx.send(AgentEvent::TurnStart).await;
                 let _ = agent_tx.send(AgentEvent::CompactStart).await;
-                let outcome = session.compact().await;
-                let _ = agent_tx.send(AgentEvent::CompactEnd).await;
-                let notice = match outcome {
-                    Ok(o) if o.messages_replaced > 0 => {
-                        let _ = agent_tx
-                            .send(AgentEvent::CompactReport {
-                                before: o.before_tokens,
-                                after: o.after_tokens,
-                                summary: o.summary,
-                            })
-                            .await;
-                        None
+                tokio::select! {
+                    outcome = session.compact() => {
+                        let _ = agent_tx.send(AgentEvent::CompactEnd).await;
+                        let notice = match outcome {
+                            Ok(o) if o.messages_replaced > 0 => {
+                                let _ = agent_tx
+                                    .send(AgentEvent::CompactReport {
+                                        before: o.before_tokens,
+                                        after: o.after_tokens,
+                                        summary: o.summary,
+                                    })
+                                    .await;
+                                None
+                            }
+                            Ok(_) => Some("Nothing to compact yet.".to_string()),
+                            Err(e) => Some(format!("Compact failed: {e}")),
+                        };
+                        if let Some(notice) = notice {
+                            let _ = agent_tx
+                                .send(AgentEvent::MessageStart {
+                                    message: notice_msg(""),
+                                })
+                                .await;
+                            let _ = agent_tx
+                                .send(AgentEvent::MessageUpdate {
+                                    delta: notice.clone(),
+                                })
+                                .await;
+                            let _ = agent_tx
+                                .send(AgentEvent::MessageEnd {
+                                    message: notice_msg(&notice),
+                                })
+                                .await;
+                        }
                     }
-                    Ok(_) => Some("Nothing to compact yet.".to_string()),
-                    Err(e) => Some(format!("Compact failed: {e}")),
-                };
-                if let Some(notice) = notice {
-                    let _ = agent_tx
-                        .send(AgentEvent::MessageStart {
-                            message: notice_msg(""),
-                        })
-                        .await;
-                    let _ = agent_tx
-                        .send(AgentEvent::MessageUpdate {
-                            delta: notice.clone(),
-                        })
-                        .await;
-                    let _ = agent_tx
-                        .send(AgentEvent::MessageEnd {
-                            message: notice_msg(&notice),
-                        })
-                        .await;
+                    // Only a real cancel (Some(())) aborts. Channel-close
+                    // (None) lets compact finish so a frontend disconnect
+                    // mid-compaction doesn't lose the work — same guard as
+                    // the Some(prompt) arm.
+                    Some(()) = cancel_rx.recv() => {
+                        let _ = agent_tx.send(AgentEvent::CompactEnd).await;
+                    }
                 }
                 let _ = agent_tx.send(AgentEvent::TurnEnd).await;
             }
