@@ -337,16 +337,19 @@ impl Config {
     }
 
     /// A clone of this config with the active model + effort overridden to the
-    /// model that serves `tier` on the active provider. If the tier doesn't
-    /// resolve (unknown, or no tagged model reaches it), returns an unchanged
-    /// clone — the sub-agent then runs on the session model.
-    pub fn with_tier(&self, tier: &str) -> Config {
-        let mut cfg = self.clone();
-        if let Some((model, effort)) = self.model_for_tier(tier) {
-            cfg.model = Some(model);
-            cfg.reasoning_effort = effort;
+    /// model that serves `tier` on the active provider, plus whether the tier
+    /// actually routed. `(clone, false)` when it didn't (unknown tier, or no
+    /// tagged model reaches it) — the sub-agent then runs on the session model.
+    pub fn with_tier(&self, tier: &str) -> (Config, bool) {
+        match self.model_for_tier(tier) {
+            Some((model, effort)) => {
+                let mut cfg = self.clone();
+                cfg.model = Some(model);
+                cfg.reasoning_effort = effort;
+                (cfg, true)
+            }
+            None => (self.clone(), false),
         }
-        cfg
     }
 
     /// `(model, tier_rank, effort_levels)` for every *tiered* model of
@@ -1472,11 +1475,13 @@ api_key = "x"
         )
         .unwrap();
         // Resolves: high → pro @ max.
-        let hi = cfg.with_tier("high");
+        let (hi, routed) = cfg.with_tier("high");
+        assert!(routed);
         assert_eq!(hi.active_model().as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(hi.active_effort().as_deref(), Some("max"));
-        // Unknown tier → unchanged clone (no silent downgrade).
-        let same = cfg.with_tier("ultra");
+        // Unknown tier → unchanged clone (no silent downgrade), not routed.
+        let (same, routed) = cfg.with_tier("ultra");
+        assert!(!routed);
         assert_eq!(same.active_model().as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(same.active_effort().as_deref(), Some("high"));
     }

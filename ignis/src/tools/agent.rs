@@ -211,10 +211,14 @@ impl StaticTool for SubagentTool {
         // resolved tier picks the cheapest adequate model (+ scaled effort) of
         // the active provider; unknown/unmatched/None → inherit the session model.
         let tier = chosen_tier(args.get("tier").and_then(|v| v.as_str()), spec);
-        let config = match tier {
+        let (config, routed) = match tier {
             Some(t) => self.config.with_tier(t),
-            None => self.config.clone(),
+            None => (self.config.clone(), false),
         };
+        // Only label the footer with the tier when it actually routed; an
+        // unresolved tier runs on the session model, so claiming the tier would
+        // mislabel which model ran.
+        let footer_tier = if routed { tier } else { None };
         let provider = crate::config::build_provider(&config)
             .map_err(|e| format!("Could not build provider: {e}"))?;
         let mut agent = Agent::new(spec.system_prompt.to_string(), provider);
@@ -271,7 +275,7 @@ impl StaticTool for SubagentTool {
 
         // Surface the delegation so it isn't a black box: which model/tier ran,
         // how much work it did, and what it cost.
-        let footer = subagent_footer(spec.name, tier, &config, &history, &usage);
+        let footer = subagent_footer(spec.name, footer_tier, &config, &history, &usage);
         Ok(format!("{answer}{footer}"))
     }
 }
