@@ -5,7 +5,10 @@
 // compact_start fires before turn_start).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { renderApp, plain, tick, ev } from './harness.js';
+import { renderApp, plain, tick, ev, KEY } from './harness.js';
+
+const submits = (engine) => engine.sent.filter((c) => c.kind === 'submit');
+const shutdowns = (engine) => engine.sent.filter((c) => c.kind === 'shutdown');
 
 test('compact_start shows the Compacting indicator while idle', async () => {
   const { engine, lastFrame } = renderApp();
@@ -150,4 +153,51 @@ test('compact_report clears the previous history from the render zone', async ()
   // frame. In production the generation bump (verified in protocol.test.js)
   // wipes scrollback and remounts <Static> with only the compaction block.
   // The reducer test asserts blocks.length === 1 + generation bump.
+});
+
+test('Enter while compacting (auto-compact) queues instead of submitting', async () => {
+  // Auto-compact fires before turn_start, so status stays 'idle' while
+  // compacting is true. A prompt typed then must queue, not race prompt().
+  const { engine, stdin, lastFrame } = renderApp();
+  await tick();
+  engine.emit(ev('compact_start'));
+  await tick();
+  stdin.write('during compact');
+  await tick();
+  stdin.write(KEY.enter);
+  await tick();
+  assert.equal(submits(engine).length, 0, 'compacting Enter must NOT submit');
+  const f = plain(lastFrame());
+  assert.match(f, /during compact/, 'message is held in the waiting queue');
+  assert.match(f, /Compacting context/, 'the compacting spinner is still up');
+});
+
+test('Ctrl-D while compacting does not exit', async () => {
+  // Auto-compact holds the just-submitted prompt mid-flight; exiting then would
+  // drop it. Double Ctrl-D (the idle exit chord) must be blocked while compacting.
+  const { engine, stdin, lastFrame } = renderApp();
+  await tick();
+  engine.emit(ev('compact_start'));
+  await tick();
+  stdin.write(KEY.ctrlD);
+  await tick();
+  stdin.write(KEY.ctrlD);
+  await tick();
+  assert.equal(shutdowns(engine).length, 0, 'Ctrl-D must not exit while compacting');
+  assert.match(plain(lastFrame()), /Compacting context/, 'app is still running');
+});
+
+test('Ctrl+C during auto-compact is a no-op (no cancel, no exit redirect)', async () => {
+  // Auto-compact can't be canceled (it runs inside prompt()), and Ctrl-D is
+  // blocked while compacting — so Ctrl+C must neither send cancel nor point the
+  // user at the (blocked) Ctrl-D exit.
+  const { engine, stdin, lastFrame } = renderApp();
+  await tick();
+  engine.emit(ev('compact_start'));
+  await tick();
+  stdin.write(KEY.ctrlC);
+  await tick();
+  const cancels = engine.sent.filter((c) => c.kind === 'cancel');
+  assert.equal(cancels.length, 0, 'Ctrl+C must not send cancel during auto-compact');
+  assert.doesNotMatch(plain(lastFrame()), /Ctrl-D to exit/, 'no redirect to a blocked exit');
 });

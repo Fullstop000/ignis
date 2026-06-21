@@ -294,7 +294,12 @@ export default function App({ engine, onExit }) {
     const ctx = {
       cancelOrHint: () => {
         // Ctrl+C cancels an in-flight turn; idle, it no longer exits — it points
-        // the user at Ctrl-D (the exit chord) instead.
+        // the user at Ctrl-D (the exit chord) instead. Auto-compact runs inside
+        // prompt() before turn_start (status still 'idle') and can't be canceled,
+        // so Ctrl+C is a no-op then (and Ctrl-D is blocked below while compacting).
+        // Manual /compact has status 'busy', so Ctrl+C falls through to the cancel
+        // path the runner select!s on.
+        if (state.compacting && state.status === 'idle') return;
         if (state.status !== 'idle') {
           engine.send(cancel());
           setExitHint(null);
@@ -304,8 +309,10 @@ export default function App({ engine, onExit }) {
       },
       exitArm: () => {
         // Double Ctrl-D to exit, like the native TUI. Only arm when idle with an
-        // empty composer so Ctrl-D mid-type / mid-turn can never quit.
-        if (state.status === 'idle' && !comp.text) {
+        // empty composer so Ctrl-D mid-type / mid-turn can never quit. Also block
+        // while compacting — auto-compact holds the prompt mid-flight before
+        // turn_start, so quitting then would drop the just-submitted prompt.
+        if (state.status === 'idle' && !state.compacting && !comp.text) {
           if (exitHint === 'confirm') cleanExit();
           else setExitHint('confirm');
         } else {
@@ -347,9 +354,10 @@ export default function App({ engine, onExit }) {
       // Resolve pastes now: the composer clears on Enter, so a queued line must
       // already carry its expanded content.
       const sent = expandPastes(line, pastes);
-      if (state.status === 'busy') {
-        // Busy: hold it in the waiting queue (no submit, no transcript block).
-        // It drains one-per-turn at turn-end. Ctrl+S sends now, ↑ edits last.
+      if (state.status === 'busy' || state.compacting) {
+        // Busy (or compacting — auto-compact holds the prompt mid-flight before
+        // turn_start): hold it in the waiting queue (no submit, no transcript
+        // block). It drains one-per-turn at turn-end. Ctrl+S sends now, ↑ edits.
         setQueue((q) => [...q, sent]);
       } else {
         // Idle: dispatch immediately (local slash command, or submit + block).
@@ -367,7 +375,7 @@ export default function App({ engine, onExit }) {
       }
       // While busy with a queue, ↑ pulls the most recent queued message back
       // into the composer to edit (matches the native TUI's "edit last").
-      if (state.status === 'busy' && queue.length > 0 && !comp.text) {
+      if ((state.status === 'busy' || state.compacting) && queue.length > 0 && !comp.text) {
         const last = queue[queue.length - 1];
         setQueue((q) => q.slice(0, -1));
         setComp({ text: last, cursor: last.length });
