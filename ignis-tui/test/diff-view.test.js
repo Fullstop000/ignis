@@ -2,9 +2,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import React from 'react';
-import { render } from 'ink-testing-library';
-import DiffView from '../src/diff-view.js';
 import { highlightSpans } from '../src/highlight.js';
+
+// Ink renders color through chalk, whose color level is locked the first time
+// chalk is imported. Force truecolor BEFORE importing anything that pulls in
+// Ink, so the diff view emits real SGR escapes both here and in CI (where
+// stdout is not a TTY and color would otherwise be disabled). `node --test`
+// runs each file in its own process, so this only affects this suite.
+process.env.FORCE_COLOR = '3';
+const { render } = await import('ink-testing-library');
+const { default: DiffView } = await import('../src/diff-view.js');
 
 const e = React.createElement;
 
