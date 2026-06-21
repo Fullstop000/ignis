@@ -225,8 +225,8 @@ test('welcome banner shows on an empty transcript, then disappears', async () =>
   assert.doesNotMatch(plain(lastFrame()), /██/, 'welcome gone once the transcript starts');
 });
 
-test('Ctrl+C cancels a busy turn (Cancel command), exits when idle', async () => {
-  const { engine, stdin } = renderApp();
+test('Ctrl+C cancels a busy turn; idle Ctrl+C does not exit, hints at Ctrl-D', async () => {
+  const { engine, stdin, lastFrame } = renderApp();
   await tick();
   engine.emit(ev('turn_start'));
   await tick();
@@ -238,8 +238,37 @@ test('Ctrl+C cancels a busy turn (Cancel command), exits when idle', async () =>
   await tick();
   stdin.write(KEY.ctrlC);
   await tick();
-  assert.deepEqual(engine.last(), { kind: '_closed' }, 'idle → engine.close()');
+  assert.ok(!engine.sent.some((c) => c.kind === 'shutdown'), 'idle Ctrl+C must NOT exit');
+  assert.match(plain(lastFrame()), /Press Ctrl-D to exit/, 'idle Ctrl+C shows the exit redirect hint');
+});
+
+test('double Ctrl+D exits; a single Ctrl+D only arms the confirm hint', async () => {
+  const { engine, stdin, lastFrame } = renderApp();
+  await tick();
+  stdin.write(KEY.ctrlD);
+  await tick();
+  assert.ok(!engine.sent.some((c) => c.kind === 'shutdown'), 'one Ctrl+D must NOT exit');
+  assert.match(plain(lastFrame()), /Press Ctrl-D again to exit/, 'first Ctrl+D arms the confirm hint');
+
+  stdin.write(KEY.ctrlD);
+  await tick();
+  assert.deepEqual(engine.last(), { kind: '_closed' }, 'second Ctrl+D → engine.close()');
   assert.ok(engine.sent.some((c) => c.kind === 'shutdown'), 'clean exit sends explicit shutdown command');
+});
+
+test('a non-exit key dismisses the armed Ctrl+D hint (the next Ctrl+D re-arms, no exit)', async () => {
+  const { engine, stdin, lastFrame } = renderApp();
+  await tick();
+  stdin.write(KEY.ctrlD); // arm
+  await tick();
+  assert.match(plain(lastFrame()), /Press Ctrl-D again to exit/);
+  stdin.write(KEY.left); // any other key clears the hint (composer stays empty)
+  await tick();
+  assert.doesNotMatch(plain(lastFrame()), /again to exit/, 'a stray key clears the confirm hint');
+  stdin.write(KEY.ctrlD); // re-arms from scratch — must NOT exit
+  await tick();
+  assert.ok(!engine.sent.some((c) => c.kind === 'shutdown'), 'Ctrl+D after a reset must NOT exit');
+  assert.match(plain(lastFrame()), /Press Ctrl-D again to exit/, 're-armed, not exited');
 });
 
 test('Ctrl+S injects the composer text during a turn', async () => {
