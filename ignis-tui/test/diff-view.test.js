@@ -100,6 +100,24 @@ test('DiffView routes Rust code through the syntax highlighter', () => {
   assert.equal(kw.color, '#b48ead', 'keyword uses the base16 purple');
 });
 
+test('DiffView highlights context lines, not just changed rows', () => {
+  // The whole diff content should be syntax-highlighted — unchanged context
+  // rows included — so context code reads with the same colors as +/- rows.
+  // The context line carries an `fn` keyword (base16 purple); the +/- rows are
+  // bare identifiers with no keyword, so the purple escape can only come from
+  // the context row, proving it is highlighted rather than rendered plain/dim.
+  const content = '@@ -1,3 +1,3 @@\n fn keep() {}\n-aaa\n+bbb\n';
+  const { lastFrame } = render(e(DiffView, { content, path: 'lib.rs' }));
+  const raw = lastFrame() ?? '';
+  // #b48ead -> rgb(180,142,173); Ink emits a truecolor SGR for hex colors.
+  assert.ok(
+    raw.includes('\x1b[38;2;180;142;173m'),
+    'context keyword carries the base16 purple color escape',
+  );
+  // The context text itself stays intact.
+  assert.match(plain(lastFrame()), /1\s+fn keep\(\) \{\}/);
+});
+
 test('DiffView leaves unknown extensions unhighlighted but intact', () => {
   const content = '@@ -1,1 +1,1 @@\n-alpha\n+beta\n';
   const { lastFrame } = render(e(DiffView, { content, path: 'notes.zzz' }));

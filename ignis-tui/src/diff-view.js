@@ -94,10 +94,17 @@ export default function DiffView({ content, path }) {
       );
     }
 
+    // Context (unchanged) rows: syntax-highlight the code so the whole diff
+    // reads with the same colors as the +/- rows. The line-number gutter stays
+    // dim as chrome; the code itself renders at full brightness.
+    const syntax = highlightSpans(ln.text, ext);
     return e(
       Text,
-      { key: `d${i}`, dimColor: true },
-      `${prefix}${ln.text}`,
+      { key: `d${i}` },
+      e(Text, { key: 'g', dimColor: true }, prefix),
+      ...syntax.map((sp, k) =>
+        e(Text, { key: `s${k}`, color: sp.color }, sp.text),
+      ),
     );
   });
 
