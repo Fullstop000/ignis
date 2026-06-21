@@ -74,3 +74,52 @@ test('turn_end resets a stuck compacting flag (cancel during auto-compact)', asy
   await tick();
   assert.doesNotMatch(plain(lastFrame()), /Compacting/);
 });
+
+test('compact_report renders the token reduction and full summary (manual /compact)', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  // Manual /compact path: turn_start → compact_start → compact_end → report.
+  engine.emit(ev('turn_start'));
+  await tick();
+  engine.emit(ev('compact_start'));
+  await tick();
+  engine.emit(ev('compact_end'));
+  await tick();
+  engine.emit(
+    ev('compact_report', {
+      before: 42318,
+      after: 8104,
+      summary: 'Built a compaction indicator. Touched app.js and protocol.js.',
+    }),
+  );
+  await tick();
+  engine.emit(ev('turn_end'));
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /Compacted context/);
+  assert.match(f, /42k → 8\.1k tokens/);
+  assert.match(f, /−81%/);
+  assert.match(f, /Built a compaction indicator/);
+});
+
+test('compact_report renders on the auto-compact path (idle status)', async () => {
+  // Auto-compact fires before turn_start, so status is 'idle' when the report
+  // lands — the block is a committed transcript item, independent of status.
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  engine.emit(ev('compact_start'));
+  await tick();
+  engine.emit(ev('compact_end'));
+  await tick();
+  engine.emit(
+    ev('compact_report', { before: 50000, after: 10000, summary: 'Summary of earlier work.' }),
+  );
+  await tick();
+  const f = plain(lastFrame());
+  assert.match(f, /Compacted context/);
+  assert.match(f, /50k → 10k tokens/);
+  assert.match(f, /−80%/);
+  assert.match(f, /Summary of earlier work/);
+  // The spinner is gone (compact_end fired); only the committed block remains.
+  assert.doesNotMatch(f, /Compacting context/);
+});

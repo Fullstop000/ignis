@@ -841,6 +841,11 @@ impl App {
             AgentEvent::CompactEnd => {
                 self.compacting = false;
             }
+            AgentEvent::CompactReport { .. } => {
+                // The compaction report (token reduction + full summary) is an
+                // Ink-frontend transcript block; the native TUI doesn't surface
+                // it (kept as the comparison baseline).
+            }
         }
     }
 

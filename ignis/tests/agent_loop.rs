@@ -494,8 +494,11 @@ async fn session_compact_summarizes_old_history() {
     });
     assert_eq!(session.history().len(), 10);
 
-    let removed = session.compact().await.unwrap();
-    assert!(removed > 0, "expected the older head to be compacted");
+    let outcome = session.compact().await.unwrap();
+    assert!(
+        outcome.messages_replaced > 0,
+        "expected the older head to be compacted"
+    );
 
     let h = session.history();
     assert!(h.len() < 10, "history should shrink");

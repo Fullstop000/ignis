@@ -303,30 +303,45 @@ async fn agent_loop(
                 *active_inject_runner.lock().unwrap() = None;
             }
             None => {
-                // /compact: summarize earlier history and report a notice.
+                // /compact: summarize earlier history. On success the report
+                // block (token reduction + full summary) replaces the old
+                // generic notice; the notice is kept only for the no-op and
+                // error cases so the user knows the command ran.
                 let _ = agent_tx.send(AgentEvent::TurnStart).await;
                 let _ = agent_tx.send(AgentEvent::CompactStart).await;
-                let notice = match session.compact().await {
-                    Ok(0) => "Nothing to compact yet.".to_string(),
-                    Ok(n) => format!("Compacted {n} earlier messages into a summary."),
-                    Err(e) => format!("Compact failed: {e}"),
-                };
+                let outcome = session.compact().await;
                 let _ = agent_tx.send(AgentEvent::CompactEnd).await;
-                let _ = agent_tx
-                    .send(AgentEvent::MessageStart {
-                        message: notice_msg(""),
-                    })
-                    .await;
-                let _ = agent_tx
-                    .send(AgentEvent::MessageUpdate {
-                        delta: notice.clone(),
-                    })
-                    .await;
-                let _ = agent_tx
-                    .send(AgentEvent::MessageEnd {
-                        message: notice_msg(&notice),
-                    })
-                    .await;
+                let notice = match outcome {
+                    Ok(o) if o.messages_replaced > 0 => {
+                        let _ = agent_tx
+                            .send(AgentEvent::CompactReport {
+                                before: o.before_tokens,
+                                after: o.after_tokens,
+                                summary: o.summary,
+                            })
+                            .await;
+                        None
+                    }
+                    Ok(_) => Some("Nothing to compact yet.".to_string()),
+                    Err(e) => Some(format!("Compact failed: {e}")),
+                };
+                if let Some(notice) = notice {
+                    let _ = agent_tx
+                        .send(AgentEvent::MessageStart {
+                            message: notice_msg(""),
+                        })
+                        .await;
+                    let _ = agent_tx
+                        .send(AgentEvent::MessageUpdate {
+                            delta: notice.clone(),
+                        })
+                        .await;
+                    let _ = agent_tx
+                        .send(AgentEvent::MessageEnd {
+                            message: notice_msg(&notice),
+                        })
+                        .await;
+                }
                 let _ = agent_tx.send(AgentEvent::TurnEnd).await;
             }
         }

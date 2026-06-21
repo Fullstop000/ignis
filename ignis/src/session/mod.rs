@@ -46,6 +46,18 @@ pub struct Session {
     todos: crate::tools::TodoStore,
 }
 
+/// Outcome of a context compaction: how the estimated token count changed and
+/// the summary text that now leads the history. `messages_replaced == 0` means
+/// nothing was compacted (history too short, or no user-turn boundary to cut
+/// at) — in that case the report is not emitted.
+#[derive(Debug, Clone)]
+pub struct CompactOutcome {
+    pub messages_replaced: usize,
+    pub before_tokens: usize,
+    pub after_tokens: usize,
+    pub summary: String,
+}
+
 impl Session {
     /// Open a session, loading any persisted history for `id`.
     #[tracing::instrument(
@@ -197,8 +209,22 @@ impl Session {
         if self.compaction.auto && estimate_tokens(&self.history) > self.compaction.threshold_tokens
         {
             let _ = tx.send(AgentEvent::CompactStart).await;
-            let _ = self.compact().await;
+            // Best-effort: a compaction failure must not block the user's
+            // prompt — CompactEnd always fires so the spinner hides, and the
+            // report is skipped (nothing was summarized).
+            let outcome = self.compact().await;
             let _ = tx.send(AgentEvent::CompactEnd).await;
+            if let Ok(o) = outcome {
+                if o.messages_replaced > 0 {
+                    let _ = tx
+                        .send(AgentEvent::CompactReport {
+                            before: o.before_tokens,
+                            after: o.after_tokens,
+                            summary: o.summary,
+                        })
+                        .await;
+                }
+            }
         }
 
         // Run UserPromptSubmit hooks. Soft failures fall back to the
@@ -304,13 +330,21 @@ impl Session {
     }
 
     /// Summarize older history into a single message, keeping the most recent
-    /// turns (by token budget) verbatim. Returns the number of messages
-    /// replaced by the summary (0 if nothing was compacted).
-    pub async fn compact(&mut self) -> Result<usize, anyhow::Error> {
+    /// turns (by token budget) verbatim. Returns the compaction outcome
+    /// (messages replaced, before/after token estimates, summary text); the
+    /// caller emits a `CompactReport` from it. `messages_replaced == 0` means
+    /// nothing was compacted.
+    pub async fn compact(&mut self) -> Result<CompactOutcome, anyhow::Error> {
         let n = self.history.len();
         if n == 0 {
-            return Ok(0);
+            return Ok(CompactOutcome {
+                messages_replaced: 0,
+                before_tokens: 0,
+                after_tokens: 0,
+                summary: String::new(),
+            });
         }
+        let before_tokens = estimate_tokens(&self.history);
         // Keep the most recent messages up to the token budget (walking from the
         // end), then snap the cut forward to a user turn boundary so a tool
         // result is never orphaned from the assistant message that requested it.
@@ -326,7 +360,14 @@ impl Session {
         }
         let cut = match (raw_start..n).find(|&i| self.history[i].role == "user") {
             Some(c) if c > 0 => c,
-            _ => return Ok(0),
+            _ => {
+                return Ok(CompactOutcome {
+                    messages_replaced: 0,
+                    before_tokens,
+                    after_tokens: before_tokens,
+                    summary: String::new(),
+                })
+            }
         };
 
         let transcript = render_transcript(&self.history[..cut]);
@@ -361,7 +402,13 @@ impl Session {
         // the kept tail without cloning it.
         self.history.splice(..cut, std::iter::once(summary_msg));
         self.persist().await?;
-        Ok(cut)
+        let after_tokens = estimate_tokens(&self.history);
+        Ok(CompactOutcome {
+            messages_replaced: cut,
+            before_tokens,
+            after_tokens,
+            summary,
+        })
     }
 
     async fn persist(&self) -> Result<(), anyhow::Error> {

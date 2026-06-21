@@ -618,11 +618,45 @@ function Block({ block, expanded }) {
       return e(ReasoningView, { text: block.text, done: true, expanded });
     case 'tool':
       return e(ToolBlock, { block });
+    case 'compaction':
+      return e(CompactionReport, { block });
     case 'inject':
       return e(Text, { color: 'cyan' }, `↳ ${block.text}`);
     default:
       return e(Text, { dimColor: true }, block.text);
   }
+}
+
+// Compaction report: a committed transcript block shown after every compaction
+// that replaced messages — on both the auto-compact path (inside a turn) and
+// the manual /compact path. The engine emits a single `compact_report` event;
+// this is the only render of it, so both paths look identical to the user.
+// A bordered box carries the token reduction; the full LLM-generated summary
+// follows beneath it so the user can read exactly what the summarization pause
+// produced.
+function CompactionReport({ block }) {
+  const before = fmtTokens(block.before);
+  const after = fmtTokens(block.after);
+  const delta =
+    block.before > 0 ? Math.max(0, Math.round((1 - block.after / block.before) * 100)) : 0;
+  return e(
+    Box,
+    { flexDirection: 'column', marginTop: 1 },
+    e(
+      Box,
+      { flexDirection: 'column', borderStyle: 'round', borderColor: 'cyan', paddingX: 1 },
+      e(Text, { color: 'cyan', bold: true }, 'Compacted context'),
+      e(
+        Text,
+        null,
+        `${before} → `,
+        e(Text, { color: 'green' }, after),
+        ' tokens',
+        e(Text, { color: 'green' }, `   −${delta}%`),
+      ),
+    ),
+    e(Markdown, { text: `## Summary\n\n${block.summary}` }),
+  );
 }
 
 // Chain-of-thought block (✻ Thinking). While streaming, a rolling tail of the

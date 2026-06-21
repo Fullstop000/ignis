@@ -251,6 +251,21 @@ test('streamChars accumulates message deltas and resets each turn', () => {
   assert.equal(s.streamChars, 0, 'reset at the next turn');
 });
 
+test('compact_report appends a compaction block with before/after/summary', () => {
+  let s = initialState();
+  s = reduceOutbound(s, {
+    kind: 'event',
+    data: { type: 'compact_report', payload: { before: 42318, after: 8104, summary: 'Built ignis.' } },
+  });
+  assert.equal(s.blocks.length, 1);
+  assert.deepEqual(s.blocks[0], {
+    kind: 'compaction',
+    before: 42318,
+    after: 8104,
+    summary: 'Built ignis.',
+  });
+});
+
 test('parseSlash recognizes slash commands, ignores normal prompts', () => {
   assert.equal(parseSlash('hello world'), null);
   assert.equal(parseSlash('  not /a slash'), null);

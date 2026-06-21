@@ -43,6 +43,7 @@ export const EVENT = Object.freeze({
   FOLLOW_UPS: 'follow_ups',
   COMPACT_START: 'compact_start',
   COMPACT_END: 'compact_end',
+  COMPACT_REPORT: 'compact_report',
 });
 
 /** `ClientCommand` kinds (frontend → engine). */
@@ -305,6 +306,23 @@ function reduceEvent(state, ev) {
       return { ...state, compacting: true };
     case EVENT.COMPACT_END:
       return { ...state, compacting: false };
+    case EVENT.COMPACT_REPORT:
+      // A committed transcript block: the token reduction + full LLM summary.
+      // Same event on both the auto-compact and manual /compact paths, rendered
+      // identically. Only emitted when messages were actually replaced, so no
+      // empty-report guard is needed here.
+      return {
+        ...state,
+        blocks: [
+          ...state.blocks,
+          {
+            kind: 'compaction',
+            before: p.before ?? 0,
+            after: p.after ?? 0,
+            summary: p.summary ?? '',
+          },
+        ],
+      };
     default:
       // run_start / run_end — not surfaced in the minimal UI.
       return state;
