@@ -12,7 +12,7 @@
 //!
 //! ## Platforms
 //!
-//! * **Linux** uses Landlock (ABI V1) via the `landlock` crate. See
+//! * **Linux** uses Landlock (ABI V2) via the `landlock` crate. See
 //!   [`linux`].
 //! * **macOS** uses Apple's `sandbox_init(3)` ("Seatbelt") with a
 //!   Scheme-syntax profile built in the parent. See [`macos`]. The
@@ -98,14 +98,26 @@ mod linux {
     /// `io::Error::from_raw_os_error` (no allocation) rather than the
     /// boxing `io::Error::other`.
     pub fn apply_with_paths(reads: &[PathBuf], writes: &[PathBuf]) -> io::Result<SandboxStatus> {
-        // ABI V1 is the introductory Landlock ABI (Linux 5.13). All the
-        // access modes we need (read_file, read_dir, write_file, etc.)
-        // are present in V1, so pinning to V1 makes our confinement
-        // deterministic across kernel versions — newer ABIs add
-        // capabilities we don't request anyway. `BestEffort` (the
-        // default on `Ruleset::new`) means: on older / unsupported
-        // kernels, degrade to NotEnforced instead of erroring.
-        let abi = ABI::V1;
+        // ABI V2 (Linux 5.19) is the floor because it is the first ABI
+        // with `LANDLOCK_ACCESS_FS_REFER` — the right governing `rename(2)`
+        // / `link(2)` *across* directories. When a ruleset does NOT handle
+        // REFER (as ABI V1 cannot), Landlock denies every cross-directory
+        // rename/link with **EXDEV** (a deliberate kernel back-compat
+        // behaviour, not a real cross-device move). Build tools we run
+        // under this sandbox — cargo/rustc above all — atomically replace
+        // artifacts by writing a temp file in one directory and renaming
+        // it into another *within `target/`*, so V1 turned every such
+        // build into a spurious EXDEV failure. `from_all(V2)` adds REFER
+        // to the handled set and `from_write(V2)` grants it on the write
+        // roots (see `from_write`), so cross-directory reparenting is
+        // allowed *between writable directories* while still denied out to
+        // read-only paths. `BestEffort` (the default on `Ruleset::new`)
+        // means: on a pre-5.19 kernel, REFER is silently dropped (back to
+        // the V1 behaviour — unavoidable, the kernel can't express it) and
+        // on no-Landlock kernels we degrade to NotEnforced instead of
+        // erroring. We request no V3+ capabilities, so enforcement stays
+        // deterministic (FullyEnforced) on any kernel ≥ 5.19.
+        let abi = ABI::V2;
 
         let ruleset_built = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))
@@ -261,20 +273,62 @@ pub fn is_kernel_sandbox_available() -> bool {
 fn probe_kernel_sandbox_available() -> bool {
     #[cfg(target_os = "linux")]
     {
+        // ABI >= 1 means the kernel recognises Landlock (5.13+).
+        linux_landlock_abi() >= 1
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+/// Highest Landlock ABI the running kernel supports, or `-1` if Landlock is
+/// unavailable (`ENOSYS` / `EOPNOTSUPP`). Cached — the probe is a pure
+/// query that never mutates userspace.
+#[cfg(target_os = "linux")]
+fn linux_landlock_abi() -> libc::c_long {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<libc::c_long> = OnceLock::new();
+    *CACHED.get_or_init(|| {
         const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
         // SAFETY: NULL + size 0 + flags = VERSION is documented to never
         // mutate userspace; it only reports the supported ABI as the
-        // return value. A return of >= 1 means the kernel recognises
-        // Landlock; -1 with ENOSYS / EOPNOTSUPP means it doesn't.
-        let ret = unsafe {
+        // return value (>= 1 on success, -1 with ENOSYS / EOPNOTSUPP if the
+        // kernel doesn't know Landlock).
+        unsafe {
             libc::syscall(
                 libc::SYS_landlock_create_ruleset,
                 std::ptr::null::<libc::c_void>(),
                 0usize,
                 LANDLOCK_CREATE_RULESET_VERSION,
             )
-        };
-        ret >= 1
+        }
+    })
+}
+
+/// Whether the host's sandbox permits a cross-directory `rename(2)` /
+/// `link(2)` *within* the writable set. This is the capability the bash
+/// sandbox relies on for cargo/rustc artifact writes, and the gate the
+/// REFER regression test skips on when it is absent.
+///
+/// * **Linux** — `true` only when Landlock ABI >= 2, the ABI that adds
+///   `LANDLOCK_ACCESS_FS_REFER`. On a kernel whose Landlock is only ABI V1
+///   (5.13–5.18) the kernel denies every cross-directory reparenting with a
+///   synthetic `EXDEV` regardless of our ruleset, so the assertion can't
+///   hold there. (A kernel with no Landlock confines nothing, but then the
+///   caller is unconfined anyway — also reported as `false` so confinement
+///   tests downgrade.)
+/// * **macOS** — `true`; the Seatbelt profile has no cross-directory
+///   reparenting restriction.
+/// * **Other targets** — `false`.
+pub fn sandbox_allows_cross_directory_rename() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_landlock_abi() >= 2
     }
     #[cfg(target_os = "macos")]
     {

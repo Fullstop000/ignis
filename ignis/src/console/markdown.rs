@@ -577,7 +577,7 @@ mod table_tests {
 | # | Layer | Detail |
 |---|-------|--------|
 | 1 | Env allowlist | UNIVERSAL_ENV_ALLOWLIST equals PATH HOME USER LANG, then Command::env_clear() plus explicit per-name cmd.env so the hook sees only universal plus declared names |
-| 2 | Filesystem sandbox | Linux Landlock ABI V1 and macOS sandbox_init Seatbelt, per-hook sandbox bool default true reading the hook folder and system cert and lib paths |";
+| 2 | Filesystem sandbox | Linux Landlock ABI V2 and macOS sandbox_init Seatbelt, per-hook sandbox bool default true reading the hook folder and system cert and lib paths |";
         let width = 60u16;
         let out = flat(&render_md_block(md, false, width));
 
@@ -619,7 +619,7 @@ mod table_tests {
         let md = "\
 | Key | Value |
 |-----|-------|
-| sandbox | Linux Landlock ABI V1 and macOS sandbox_init Seatbelt, default true |
+| sandbox | Linux Landlock ABI V2 and macOS sandbox_init Seatbelt, default true |
 | grace | SIGTERM then a one second grace window then SIGKILL via libc::kill |";
         for width in [30u16, 50, 80, 120] {
             let out = flat(&render_md_block(md, false, width));
