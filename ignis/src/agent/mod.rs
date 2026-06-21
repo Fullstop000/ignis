@@ -95,6 +95,33 @@ pub enum AgentEvent {
     /// pick from; cleared on the next turn. Surfacing-only.
     #[serde(rename = "follow_ups")]
     FollowUps { items: Vec<String> },
+    /// Context compaction (history summarization) is about to run — the
+    /// summarization LLM call can take several seconds. The frontend shows a
+    /// dedicated "Compacting…" spinner so the user knows the pause is
+    /// compaction, not normal thinking. Always paired with a [`CompactEnd`];
+    /// `CompactEnd` is emitted even when compaction fails so the icon always
+    /// disappears.
+    ///
+    /// [`CompactEnd`]: AgentEvent::CompactEnd
+    #[serde(rename = "compact_start")]
+    CompactStart,
+    #[serde(rename = "compact_end")]
+    CompactEnd,
+    /// Context compaction finished: the history was summarized from `before`
+    /// tokens down to `after`, with the LLM-generated `summary` now leading
+    /// the history. Emitted after [`CompactEnd`] whenever compaction actually
+    /// replaced messages — on both the auto-compact path (inside `prompt()`)
+    /// and the manual `/compact` path — so the frontend can render a single,
+    /// identical "Compacted context" block showing the token reduction and the
+    /// full summary text.
+    ///
+    /// [`CompactEnd`]: AgentEvent::CompactEnd
+    #[serde(rename = "compact_report")]
+    CompactReport {
+        before: usize,
+        after: usize,
+        summary: String,
+    },
 }
 
 /// Build the system prompt for an interactive/one-shot run: the static agent

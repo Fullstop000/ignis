@@ -251,6 +251,29 @@ test('streamChars accumulates message deltas and resets each turn', () => {
   assert.equal(s.streamChars, 0, 'reset at the next turn');
 });
 
+test('compact_report replaces all blocks with the compaction block and bumps generation', () => {
+  // Seed some conversation history first.
+  let s = initialState();
+  s = reduceOutbound(s, { kind: 'event', data: { type: 'user_prompt_committed', payload: { text: 'hello' } } });
+  s = reduceOutbound(s, { kind: 'event', data: { type: 'message_end', payload: { message: { role: 'assistant', content: 'hi there' } } } });
+  assert.equal(s.blocks.length, 2, 'seeded two history blocks');
+  assert.equal(s.generation, 0);
+  s = reduceOutbound(s, {
+    kind: 'event',
+    data: { type: 'compact_report', payload: { before: 42318, after: 8104, summary: 'Built ignis.' } },
+  });
+  // Old history is gone — only the compaction block remains.
+  assert.equal(s.blocks.length, 1);
+  assert.deepEqual(s.blocks[0], {
+    kind: 'compaction',
+    before: 42318,
+    after: 8104,
+    summary: 'Built ignis.',
+  });
+  // Generation bumped so <Static> remounts and scrollback is wiped.
+  assert.equal(s.generation, 1);
+});
+
 test('parseSlash recognizes slash commands, ignores normal prompts', () => {
   assert.equal(parseSlash('hello world'), null);
   assert.equal(parseSlash('  not /a slash'), null);

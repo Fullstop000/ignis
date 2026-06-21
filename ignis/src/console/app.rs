@@ -380,6 +380,7 @@ pub(crate) struct App {
     pub(crate) connect: ConnectFlow,
 
     pub(crate) mode: Mode,
+    pub(crate) compacting: bool,
     pub(crate) tick: u64,
     pub(crate) stream_start: Option<Instant>,
     pub(crate) current_chunk_idx: Option<usize>,
@@ -509,6 +510,7 @@ impl App {
             inline_picker: None,
             connect: ConnectFlow::default(),
             mode: Mode::Idle,
+            compacting: false,
             tick: 0,
             stream_start: None,
             current_chunk_idx: None,
@@ -741,6 +743,7 @@ impl App {
             }
             AgentEvent::TurnEnd => {
                 self.mode = Mode::Idle;
+                self.compacting = false;
                 self.current_chunk_idx = None;
                 self.stream_start = None;
                 // Only the TurnEnd of a turn we actually dispatched drains the
@@ -826,6 +829,22 @@ impl App {
             AgentEvent::FollowUps { .. } => {
                 // Suggested-next-prompt strip is an Ink-frontend affordance; the
                 // native TUI doesn't surface it (kept as the comparison baseline).
+            }
+            AgentEvent::CompactStart => {
+                self.compacting = true;
+                // Stamp the timer so the elapsed clock shows during auto-compact
+                // (which fires before TurnStart sets stream_start).
+                if self.stream_start.is_none() {
+                    self.stream_start = Some(Instant::now());
+                }
+            }
+            AgentEvent::CompactEnd => {
+                self.compacting = false;
+            }
+            AgentEvent::CompactReport { .. } => {
+                // The compaction report (token reduction + full summary) is an
+                // Ink-frontend transcript block; the native TUI doesn't surface
+                // it (kept as the comparison baseline).
             }
         }
     }
@@ -917,6 +936,7 @@ impl App {
         self.committed = 0;
         self.reset_transcript_view();
         self.current_chunk_idx = None;
+        self.compacting = false;
         self.composer.reset_history_browse();
         self.last_usage = None;
         self.cumulative_usage = crate::Usage::default();
@@ -1273,6 +1293,7 @@ impl App {
         self.committed = 0;
         self.reset_transcript_view();
         self.current_chunk_idx = None;
+        self.compacting = false;
         self.session_picker = None;
         self.last_usage = None;
         // Stats track this live session instance: a resumed transcript's prior

@@ -99,8 +99,10 @@ export default function App({ engine, onExit }) {
 
   // Drive the running status bar while a turn is in flight: stamp the start and
   // tick the spinner (which also re-renders the elapsed clock). No timer when idle.
+  // Also ticks during compaction (which can fire before turn_start, while status
+  // is still 'idle') so the CompactingBar spinner animates.
   useEffect(() => {
-    if (state.status !== 'busy') {
+    if (state.status !== 'busy' && !state.compacting) {
       turnStart.current = 0;
       return;
     }
@@ -110,7 +112,7 @@ export default function App({ engine, onExit }) {
     // alive via the engine pipe; tests/`node --test` would otherwise hang).
     if (typeof id.unref === 'function') id.unref();
     return () => clearInterval(id);
-  }, [state.status]);
+  }, [state.status, state.compacting]);
 
   // /clear, resume and Ctrl+O replace or repaint the transcript wholesale and
   // bump `generation`. The committed blocks live in <Static> (already flushed to
@@ -174,6 +176,7 @@ export default function App({ engine, onExit }) {
           activeTools: {},
           followUps: [],
           todos: [],
+          compacting: false,
           generation: s.generation + 1,
         }));
         return true;
@@ -291,7 +294,12 @@ export default function App({ engine, onExit }) {
     const ctx = {
       cancelOrHint: () => {
         // Ctrl+C cancels an in-flight turn; idle, it no longer exits — it points
-        // the user at Ctrl-D (the exit chord) instead.
+        // the user at Ctrl-D (the exit chord) instead. Auto-compact runs inside
+        // prompt() before turn_start (status still 'idle') and can't be canceled,
+        // so Ctrl+C is a no-op then (and Ctrl-D is blocked below while compacting).
+        // Manual /compact has status 'busy', so Ctrl+C falls through to the cancel
+        // path the runner select!s on.
+        if (state.compacting && state.status === 'idle') return;
         if (state.status !== 'idle') {
           engine.send(cancel());
           setExitHint(null);
@@ -301,8 +309,10 @@ export default function App({ engine, onExit }) {
       },
       exitArm: () => {
         // Double Ctrl-D to exit, like the native TUI. Only arm when idle with an
-        // empty composer so Ctrl-D mid-type / mid-turn can never quit.
-        if (state.status === 'idle' && !comp.text) {
+        // empty composer so Ctrl-D mid-type / mid-turn can never quit. Also block
+        // while compacting — auto-compact holds the prompt mid-flight before
+        // turn_start, so quitting then would drop the just-submitted prompt.
+        if (state.status === 'idle' && !state.compacting && !comp.text) {
           if (exitHint === 'confirm') cleanExit();
           else setExitHint('confirm');
         } else {
@@ -344,9 +354,10 @@ export default function App({ engine, onExit }) {
       // Resolve pastes now: the composer clears on Enter, so a queued line must
       // already carry its expanded content.
       const sent = expandPastes(line, pastes);
-      if (state.status === 'busy') {
-        // Busy: hold it in the waiting queue (no submit, no transcript block).
-        // It drains one-per-turn at turn-end. Ctrl+S sends now, ↑ edits last.
+      if (state.status === 'busy' || state.compacting) {
+        // Busy (or compacting — auto-compact holds the prompt mid-flight before
+        // turn_start): hold it in the waiting queue (no submit, no transcript
+        // block). It drains one-per-turn at turn-end. Ctrl+S sends now, ↑ edits.
         setQueue((q) => [...q, sent]);
       } else {
         // Idle: dispatch immediately (local slash command, or submit + block).
@@ -364,7 +375,7 @@ export default function App({ engine, onExit }) {
       }
       // While busy with a queue, ↑ pulls the most recent queued message back
       // into the composer to edit (matches the native TUI's "edit last").
-      if (state.status === 'busy' && queue.length > 0 && !comp.text) {
+      if ((state.status === 'busy' || state.compacting) && queue.length > 0 && !comp.text) {
         const last = queue[queue.length - 1];
         setQueue((q) => q.slice(0, -1));
         setComp({ text: last, cursor: last.length });
@@ -550,7 +561,10 @@ export default function App({ engine, onExit }) {
       children.push(e(TodosStrip, { key: 'todos', todos: state.todos }));
     }
     // Running status bar above the composer while a turn is in flight.
-    if (state.status === 'busy') {
+    // Compaction takes priority (more specific than generic "Working…").
+    if (state.compacting) {
+      children.push(e(CompactingBar, { key: 'compacting', spin, startedAt: turnStart.current }));
+    } else if (state.status === 'busy') {
       children.push(e(RunningBar, { key: 'running', state, spin, startedAt: turnStart.current }));
     }
     // Waiting queue: messages typed while busy, drained one per turn-end.
@@ -612,11 +626,45 @@ function Block({ block, expanded }) {
       return e(ReasoningView, { text: block.text, done: true, expanded });
     case 'tool':
       return e(ToolBlock, { block });
+    case 'compaction':
+      return e(CompactionReport, { block });
     case 'inject':
       return e(Text, { color: 'cyan' }, `↳ ${block.text}`);
     default:
       return e(Text, { dimColor: true }, block.text);
   }
+}
+
+// Compaction report: a committed transcript block shown after every compaction
+// that replaced messages — on both the auto-compact path (inside a turn) and
+// the manual /compact path. The engine emits a single `compact_report` event;
+// this is the only render of it, so both paths look identical to the user.
+// A bordered box carries the token reduction; the full LLM-generated summary
+// follows beneath it so the user can read exactly what the summarization pause
+// produced.
+function CompactionReport({ block }) {
+  const before = fmtTokens(block.before);
+  const after = fmtTokens(block.after);
+  const delta =
+    block.before > 0 ? Math.max(0, Math.round((1 - block.after / block.before) * 100)) : 0;
+  return e(
+    Box,
+    { flexDirection: 'column', marginTop: 1 },
+    e(
+      Box,
+      { flexDirection: 'column', borderStyle: 'round', borderColor: 'cyan', paddingX: 1 },
+      e(Text, { color: 'cyan', bold: true }, 'Compacted context'),
+      e(
+        Text,
+        null,
+        `${before} → `,
+        e(Text, { color: 'green' }, after),
+        ' tokens',
+        e(Text, { color: 'green' }, `   −${delta}%`),
+      ),
+    ),
+    e(Markdown, { text: `## Summary\n\n${block.summary}` }),
+  );
 }
 
 // Chain-of-thought block (✻ Thinking). While streaming, a rolling tail of the
@@ -829,6 +877,23 @@ function RunningBar({ state, spin, startedAt }) {
     }
   }
   return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
+}
+
+// Compaction indicator: a compact spinner shown while the engine summarizes
+// old history (the summarization LLM call can take several seconds). Takes
+// priority over RunningBar — during manual /compact both `status === 'busy'`
+// and `compacting` are true, but the user should see "Compacting…" not generic
+// "Working…". For auto-compact, `status` is still 'idle' (compact_start fires
+// before turn_start), so this must render independently of the busy gate.
+function CompactingBar({ spin, startedAt }) {
+  const frame = SPINNER[spin % SPINNER.length];
+  const elapsed = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
+  return e(
+    Box,
+    { marginTop: 1 },
+    e(Text, { color: 'cyan' }, `${frame} `),
+    e(Text, { color: 'gray' }, `Compacting context… ${elapsed}s`),
+  );
 }
 
 // Task-list panel (todo_write): a checklist the agent maintains for multi-step

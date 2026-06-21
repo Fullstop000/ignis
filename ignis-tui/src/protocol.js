@@ -41,6 +41,9 @@ export const EVENT = Object.freeze({
   TODOS: 'todos',
   BACKGROUND_SHELLS: 'background_shells',
   FOLLOW_UPS: 'follow_ups',
+  COMPACT_START: 'compact_start',
+  COMPACT_END: 'compact_end',
+  COMPACT_REPORT: 'compact_report',
 });
 
 /** `ClientCommand` kinds (frontend → engine). */
@@ -72,6 +75,11 @@ export function initialState() {
     status: 'idle',
     sessionId: null,
     request: null,
+    // True while the engine is compacting context (summarizing old history).
+    // Drives a dedicated "Compacting…" spinner that shows even when status is
+    // still 'idle' (auto-compact fires before turn_start). Toggled by
+    // compact_start / compact_end events; reset on transcript replace.
+    compacting: false,
     // Statusline meta (from the startup snapshot) + live counters.
     version: null,
     provider: null,
@@ -164,6 +172,7 @@ export function reduceOutbound(state, frame) {
         todos: [],
         followUps: [],
         activeTools: {},
+        compacting: false,
         generation: state.generation + 1,
       };
     default:
@@ -192,7 +201,7 @@ function reduceEvent(state, ev) {
       // some).
       return { ...state, status: 'busy', turns: state.turns + 1, streamChars: 0, followUps: [], activeTools: {} };
     case EVENT.TURN_END:
-      return { ...state, status: 'idle', turnEnds: state.turnEnds + 1 };
+      return { ...state, status: 'idle', compacting: false, turnEnds: state.turnEnds + 1 };
     case EVENT.MESSAGE_START: {
       // A reasoning block opens as { reasoning_content: "", content: null };
       // a reply opens with content. Track which the stream is so its deltas
@@ -293,6 +302,29 @@ function reduceEvent(state, ev) {
     case EVENT.FOLLOW_UPS:
       // AgentEvent::FollowUps { items } — suggested next prompts for this turn.
       return { ...state, followUps: p.items ?? [] };
+    case EVENT.COMPACT_START:
+      return { ...state, compacting: true };
+    case EVENT.COMPACT_END:
+      return { ...state, compacting: false };
+    case EVENT.COMPACT_REPORT:
+      // Compaction replaced the old conversation prefix with a summary in the
+      // engine's history. Mirror that on screen: drop the old blocks, leave
+      // only the compaction report, and bump generation so <Static> remounts
+      // and the terminal scrollback is wiped (same pattern as /clear and
+      // transcript-replace). Same event on both the auto-compact and manual
+      // /compact paths, rendered identically.
+      return {
+        ...state,
+        blocks: [
+          {
+            kind: 'compaction',
+            before: p.before ?? 0,
+            after: p.after ?? 0,
+            summary: p.summary ?? '',
+          },
+        ],
+        generation: state.generation + 1,
+      };
     default:
       // run_start / run_end — not surfaced in the minimal UI.
       return state;

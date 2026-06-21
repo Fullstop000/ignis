@@ -7,9 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- TUI — a "Compacting context…" spinner now shows while the agent summarizes old history, and disappears when compaction finishes. ([#218](https://github.com/Fullstop000/ignis/pull/218))
+- TUI — after each compaction, a report block shows the token reduction and the full summary text. ([#218](https://github.com/Fullstop000/ignis/pull/218))
+
 ### Changed
 - TUI — the Ink UI now exits on a double Ctrl-D instead of Ctrl+C, matching the native TUI. ([#219](https://github.com/Fullstop000/ignis/pull/219))
 - TUI — the Ink edit-diff view now syntax-highlights the whole diff, including unchanged context lines. ([#220](https://github.com/Fullstop000/ignis/pull/220))
+
+### Fixed
+- TUI — `/compact` now cancels on Ctrl+C instead of ignoring the interrupt. ([#218](https://github.com/Fullstop000/ignis/pull/218))
+- TUI — compaction now clears the old conversation from the screen, leaving only the summary report. ([#218](https://github.com/Fullstop000/ignis/pull/218))
+- TUI — the Ink UI blocks submit and exit while auto-compacting, so a second prompt queues instead of racing the in-flight compaction. ([#218](https://github.com/Fullstop000/ignis/pull/218))
 
 ## [0.41.2] - 2026-06-21
 
