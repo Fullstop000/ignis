@@ -200,7 +200,7 @@ function reduceEvent(state, ev) {
       // some).
       return { ...state, status: 'busy', turns: state.turns + 1, streamChars: 0, followUps: [], activeTools: {} };
     case EVENT.TURN_END:
-      return { ...state, status: 'idle', turnEnds: state.turnEnds + 1 };
+      return { ...state, status: 'idle', compacting: false, turnEnds: state.turnEnds + 1 };
     case EVENT.MESSAGE_START: {
       // A reasoning block opens as { reasoning_content: "", content: null };
       // a reply opens with content. Track which the stream is so its deltas

@@ -743,6 +743,7 @@ impl App {
             }
             AgentEvent::TurnEnd => {
                 self.mode = Mode::Idle;
+                self.compacting = false;
                 self.current_chunk_idx = None;
                 self.stream_start = None;
                 // Only the TurnEnd of a turn we actually dispatched drains the
@@ -831,6 +832,11 @@ impl App {
             }
             AgentEvent::CompactStart => {
                 self.compacting = true;
+                // Stamp the timer so the elapsed clock shows during auto-compact
+                // (which fires before TurnStart sets stream_start).
+                if self.stream_start.is_none() {
+                    self.stream_start = Some(Instant::now());
+                }
             }
             AgentEvent::CompactEnd => {
                 self.compacting = false;
@@ -925,6 +931,7 @@ impl App {
         self.committed = 0;
         self.reset_transcript_view();
         self.current_chunk_idx = None;
+        self.compacting = false;
         self.composer.reset_history_browse();
         self.last_usage = None;
         self.cumulative_usage = crate::Usage::default();
@@ -1281,6 +1288,7 @@ impl App {
         self.committed = 0;
         self.reset_transcript_view();
         self.current_chunk_idx = None;
+        self.compacting = false;
         self.session_picker = None;
         self.last_usage = None;
         // Stats track this live session instance: a resumed transcript's prior

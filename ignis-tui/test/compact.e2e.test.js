@@ -60,3 +60,17 @@ test('transcript replace resets compacting', async () => {
   await tick();
   assert.doesNotMatch(plain(lastFrame()), /Compacting/);
 });
+
+test('turn_end resets a stuck compacting flag (cancel during auto-compact)', async () => {
+  // If the user presses Ctrl+C during auto-compact, tokio::select! drops the
+  // compact() future so CompactEnd never fires — only TurnEnd arrives. The
+  // reducer must clear compacting on turn_end so the spinner can't stick.
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  engine.emit(ev('compact_start'));
+  await tick();
+  assert.match(plain(lastFrame()), /Compacting context/);
+  engine.emit(ev('turn_end'));
+  await tick();
+  assert.doesNotMatch(plain(lastFrame()), /Compacting/);
+});
