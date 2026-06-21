@@ -41,6 +41,12 @@ jobs:
       - name: test
         working-directory: ignis-tui
         run: node --test
+        env:
+          # ink-testing-library holds full render trees in memory; the e2e
+          # suites create many App instances per file without unmounting
+          # (harness limitation). 4GB keeps the suite stable on 7GB runners
+          # until the harness gains per-test cleanup.
+          NODE_OPTIONS: "--max-old-space-size=4096"
 
   test:
     name: test (${{ matrix.os }})

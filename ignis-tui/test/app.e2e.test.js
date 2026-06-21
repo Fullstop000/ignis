@@ -4,7 +4,12 @@
 // mock engine (see harness.js).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { renderApp, plain, tick, ev, request, snapshot, KEY } from './harness.js';
+import { renderApp, plain, tick, ev, request, snapshot, KEY, cleanup } from './harness.js';
+
+// Auto-cleanup: unmount every Ink instance created by `renderApp` after each
+// test so render trees don't accumulate in memory (this file creates ~37 App
+// instances; without cleanup the V8 heap OOMs on CI).
+test.afterEach(cleanup);
 
 const askOptions = (multi) => ({
   question: 'Pick a color',

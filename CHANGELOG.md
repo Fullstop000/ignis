@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.2] - 2026-06-21
+
 ### Added
 - TUI — the Ink `edit_file` diff view now syntax-highlights the code over the green/red `+`/`-` background tints. ([#213](https://github.com/Fullstop000/ignis/pull/213))
 

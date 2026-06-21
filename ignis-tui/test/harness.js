@@ -40,10 +40,30 @@ export function mockEngine() {
   };
 }
 
+// Track active Ink render instances so tests can clean them up after each test
+// (prevents the V8 heap from OOMing on large e2e suites — ink-testing-library
+// holds full render trees in memory until `unmount()` is called).
+const activeRenders = [];
+
 export function renderApp(props = {}) {
   const engine = mockEngine();
   const r = render(React.createElement(App, { engine, ...props }));
+  activeRenders.push(r);
   return { engine, ...r };
+}
+
+/** Unmount every Ink instance created by `renderApp` since the last cleanup.
+ *  Intended for `test.afterEach(cleanup)` in e2e files that create many
+ *  instances. */
+export function cleanup() {
+  while (activeRenders.length) {
+    const r = activeRenders.pop();
+    try {
+      r.unmount();
+    } catch {
+      // Already unmounted or errored — nothing to do.
+    }
+  }
 }
 
 // Key byte sequences for stdin.write (what a terminal sends).
