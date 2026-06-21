@@ -196,7 +196,9 @@ impl Session {
         // Best-effort: a compaction failure must not block the user's prompt.
         if self.compaction.auto && estimate_tokens(&self.history) > self.compaction.threshold_tokens
         {
+            let _ = tx.send(AgentEvent::CompactStart).await;
             let _ = self.compact().await;
+            let _ = tx.send(AgentEvent::CompactEnd).await;
         }
 
         // Run UserPromptSubmit hooks. Soft failures fall back to the

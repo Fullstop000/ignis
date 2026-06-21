@@ -99,8 +99,10 @@ export default function App({ engine, onExit }) {
 
   // Drive the running status bar while a turn is in flight: stamp the start and
   // tick the spinner (which also re-renders the elapsed clock). No timer when idle.
+  // Also ticks during compaction (which can fire before turn_start, while status
+  // is still 'idle') so the CompactingBar spinner animates.
   useEffect(() => {
-    if (state.status !== 'busy') {
+    if (state.status !== 'busy' && !state.compacting) {
       turnStart.current = 0;
       return;
     }
@@ -110,7 +112,7 @@ export default function App({ engine, onExit }) {
     // alive via the engine pipe; tests/`node --test` would otherwise hang).
     if (typeof id.unref === 'function') id.unref();
     return () => clearInterval(id);
-  }, [state.status]);
+  }, [state.status, state.compacting]);
 
   // /clear, resume and Ctrl+O replace or repaint the transcript wholesale and
   // bump `generation`. The committed blocks live in <Static> (already flushed to
@@ -174,6 +176,7 @@ export default function App({ engine, onExit }) {
           activeTools: {},
           followUps: [],
           todos: [],
+          compacting: false,
           generation: s.generation + 1,
         }));
         return true;
@@ -550,7 +553,10 @@ export default function App({ engine, onExit }) {
       children.push(e(TodosStrip, { key: 'todos', todos: state.todos }));
     }
     // Running status bar above the composer while a turn is in flight.
-    if (state.status === 'busy') {
+    // Compaction takes priority (more specific than generic "Working…").
+    if (state.compacting) {
+      children.push(e(CompactingBar, { key: 'compacting', spin, startedAt: turnStart.current }));
+    } else if (state.status === 'busy') {
       children.push(e(RunningBar, { key: 'running', state, spin, startedAt: turnStart.current }));
     }
     // Waiting queue: messages typed while busy, drained one per turn-end.
@@ -829,6 +835,23 @@ function RunningBar({ state, spin, startedAt }) {
     }
   }
   return e(Box, { flexDirection: 'column', marginTop: 1 }, rows);
+}
+
+// Compaction indicator: a compact spinner shown while the engine summarizes
+// old history (the summarization LLM call can take several seconds). Takes
+// priority over RunningBar — during manual /compact both `status === 'busy'`
+// and `compacting` are true, but the user should see "Compacting…" not generic
+// "Working…". For auto-compact, `status` is still 'idle' (compact_start fires
+// before turn_start), so this must render independently of the busy gate.
+function CompactingBar({ spin, startedAt }) {
+  const frame = SPINNER[spin % SPINNER.length];
+  const elapsed = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
+  return e(
+    Box,
+    { marginTop: 1 },
+    e(Text, { color: 'cyan' }, `${frame} `),
+    e(Text, { color: 'gray' }, `Compacting context… ${elapsed}s`),
+  );
 }
 
 // Task-list panel (todo_write): a checklist the agent maintains for multi-step

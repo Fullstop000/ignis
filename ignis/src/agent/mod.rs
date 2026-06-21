@@ -95,6 +95,18 @@ pub enum AgentEvent {
     /// pick from; cleared on the next turn. Surfacing-only.
     #[serde(rename = "follow_ups")]
     FollowUps { items: Vec<String> },
+    /// Context compaction (history summarization) is about to run — the
+    /// summarization LLM call can take several seconds. The frontend shows a
+    /// dedicated "Compacting…" spinner so the user knows the pause is
+    /// compaction, not normal thinking. Always paired with a [`CompactEnd`];
+    /// `CompactEnd` is emitted even when compaction fails so the icon always
+    /// disappears.
+    ///
+    /// [`CompactEnd`]: AgentEvent::CompactEnd
+    #[serde(rename = "compact_start")]
+    CompactStart,
+    #[serde(rename = "compact_end")]
+    CompactEnd,
 }
 
 /// Build the system prompt for an interactive/one-shot run: the static agent

@@ -380,6 +380,7 @@ pub(crate) struct App {
     pub(crate) connect: ConnectFlow,
 
     pub(crate) mode: Mode,
+    pub(crate) compacting: bool,
     pub(crate) tick: u64,
     pub(crate) stream_start: Option<Instant>,
     pub(crate) current_chunk_idx: Option<usize>,
@@ -509,6 +510,7 @@ impl App {
             inline_picker: None,
             connect: ConnectFlow::default(),
             mode: Mode::Idle,
+            compacting: false,
             tick: 0,
             stream_start: None,
             current_chunk_idx: None,
@@ -826,6 +828,12 @@ impl App {
             AgentEvent::FollowUps { .. } => {
                 // Suggested-next-prompt strip is an Ink-frontend affordance; the
                 // native TUI doesn't surface it (kept as the comparison baseline).
+            }
+            AgentEvent::CompactStart => {
+                self.compacting = true;
+            }
+            AgentEvent::CompactEnd => {
+                self.compacting = false;
             }
         }
     }

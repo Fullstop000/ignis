@@ -305,11 +305,13 @@ async fn agent_loop(
             None => {
                 // /compact: summarize earlier history and report a notice.
                 let _ = agent_tx.send(AgentEvent::TurnStart).await;
+                let _ = agent_tx.send(AgentEvent::CompactStart).await;
                 let notice = match session.compact().await {
                     Ok(0) => "Nothing to compact yet.".to_string(),
                     Ok(n) => format!("Compacted {n} earlier messages into a summary."),
                     Err(e) => format!("Compact failed: {e}"),
                 };
+                let _ = agent_tx.send(AgentEvent::CompactEnd).await;
                 let _ = agent_tx
                     .send(AgentEvent::MessageStart {
                         message: notice_msg(""),

@@ -41,6 +41,8 @@ export const EVENT = Object.freeze({
   TODOS: 'todos',
   BACKGROUND_SHELLS: 'background_shells',
   FOLLOW_UPS: 'follow_ups',
+  COMPACT_START: 'compact_start',
+  COMPACT_END: 'compact_end',
 });
 
 /** `ClientCommand` kinds (frontend → engine). */
@@ -72,6 +74,11 @@ export function initialState() {
     status: 'idle',
     sessionId: null,
     request: null,
+    // True while the engine is compacting context (summarizing old history).
+    // Drives a dedicated "Compacting…" spinner that shows even when status is
+    // still 'idle' (auto-compact fires before turn_start). Toggled by
+    // compact_start / compact_end events; reset on transcript replace.
+    compacting: false,
     // Statusline meta (from the startup snapshot) + live counters.
     version: null,
     provider: null,
@@ -164,6 +171,7 @@ export function reduceOutbound(state, frame) {
         todos: [],
         followUps: [],
         activeTools: {},
+        compacting: false,
         generation: state.generation + 1,
       };
     default:
@@ -293,6 +301,10 @@ function reduceEvent(state, ev) {
     case EVENT.FOLLOW_UPS:
       // AgentEvent::FollowUps { items } — suggested next prompts for this turn.
       return { ...state, followUps: p.items ?? [] };
+    case EVENT.COMPACT_START:
+      return { ...state, compacting: true };
+    case EVENT.COMPACT_END:
+      return { ...state, compacting: false };
     default:
       // run_start / run_end — not surfaced in the minimal UI.
       return state;

@@ -32,15 +32,19 @@ pub(crate) struct LoadingProps<'a> {
 impl<'a> From<&'a App> for LoadingProps<'a> {
     fn from(app: &'a App) -> Self {
         let (ctx_tokens, _) = app.context_usage();
-        let label = match app.mode {
-            Mode::Thinking => app.thinking_label(),
-            Mode::ToolRunning => "Running tool",
-            Mode::Idle => "",
+        let label = if app.compacting {
+            "Compacting"
+        } else {
+            match app.mode {
+                Mode::Thinking => app.thinking_label(),
+                Mode::ToolRunning => "Running tool",
+                Mode::Idle => "",
+            }
         };
         LoadingProps {
             exit_pending: app.exit_pending,
             error: app.error_flash.as_ref().map(|(m, _)| m.as_str()),
-            idle: app.mode == Mode::Idle,
+            idle: !app.compacting && app.mode == Mode::Idle,
             spinner: app.spinner(),
             label,
             elapsed: app.elapsed_str(),
@@ -175,5 +179,13 @@ mod tests {
             out.contains("↑ 1.5k ↓ 800 tok · 40/s"),
             "stream stats: {out}"
         );
+    }
+
+    #[test]
+    fn compacting_label_renders() {
+        let mut props = busy(0);
+        props.label = "Compacting";
+        let out = render_text(props, 100);
+        assert!(out.contains("Compacting…"), "compacting label: {out}");
     }
 }
