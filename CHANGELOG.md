@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.41.3] - 2026-06-21
-
 ### Added
 - TUI — a "Compacting context…" spinner now shows while the agent summarizes old history, and disappears when compaction finishes. ([#218](https://github.com/Fullstop000/ignis/pull/218))
 - TUI — after each compaction, a report block shows the token reduction and the full summary text. ([#218](https://github.com/Fullstop000/ignis/pull/218))
