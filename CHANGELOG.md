@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - TUI — the Ink UI now exits on a double Ctrl-D instead of Ctrl+C, matching the native TUI. ([#219](https://github.com/Fullstop000/ignis/pull/219))
+- TUI — the Ink edit-diff view now syntax-highlights the whole diff, including unchanged context lines. ([#220](https://github.com/Fullstop000/ignis/pull/220))
 
 ## [0.41.2] - 2026-06-21
 
