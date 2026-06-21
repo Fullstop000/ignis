@@ -12,7 +12,7 @@ use serde::Deserialize;
 /// ```toml
 /// models = [
 ///   "deepseek-v4-flash",
-///   { name = "deepseek-v4-pro", reasoning = ["high", "max"], context = 128000 },
+///   { name = "deepseek-v4-pro", reasoning = ["high", "max"], tier = "high" },
 /// ]
 /// ```
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +33,11 @@ pub struct ModelDef {
     /// Context window in tokens — an explicit override; otherwise it comes from
     /// models.dev.
     pub context: Option<u64>,
+    /// Capability tier override — `"low"`, `"medium"`, or `"high"`. Overrides the
+    /// baked catalog tier for this model and lets a sub-agent route a task by
+    /// complexity. Omit to inherit the baked default (or stay untiered).
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 impl ModelEntry {
@@ -54,6 +59,14 @@ impl ModelEntry {
         match self {
             ModelEntry::Name(_) => None,
             ModelEntry::Full(d) => d.context,
+        }
+    }
+
+    /// The config-declared tier override, if any (`None` for a bare name).
+    pub fn tier(&self) -> Option<&str> {
+        match self {
+            ModelEntry::Name(_) => None,
+            ModelEntry::Full(d) => d.tier.as_deref(),
         }
     }
 }

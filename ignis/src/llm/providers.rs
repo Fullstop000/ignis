@@ -24,6 +24,13 @@ pub struct ModelSpec {
     pub context: Option<u64>,
     /// Reasoning-effort levels, in display order (empty = no effort control).
     pub reasoning_effort: &'static [&'static str],
+    /// Capability tier — `"low"`, `"medium"`, or `"high"` — the curated default
+    /// that lets a sub-agent route a task by complexity. `None` = untiered (the
+    /// caller keeps the session model). Tier is the model's capability *ceiling*;
+    /// effort scales within it, so a reasoning-capable model is tagged by what it
+    /// reaches at full effort. A `[providers.<id>].models` entry's `tier`
+    /// overrides this.
+    pub tier: Option<&'static str>,
 }
 
 /// A selectable provider ("brand"). The user picks it by `id` and supplies an
@@ -64,11 +71,13 @@ static SPECS: &[ProviderSpec] = &[
                 name: "gpt-5.5",
                 context: Some(1_000_000),
                 reasoning_effort: &["none", "low", "medium", "high", "xhigh"],
+                tier: Some("high"),
             },
             ModelSpec {
                 name: "gpt-5.4-mini",
                 context: Some(400_000),
                 reasoning_effort: &["none", "low", "medium", "high", "xhigh"],
+                tier: Some("medium"),
             },
         ],
     },
@@ -89,11 +98,13 @@ static SPECS: &[ProviderSpec] = &[
                 name: "claude-sonnet-4-6",
                 context: Some(1_000_000),
                 reasoning_effort: &[],
+                tier: Some("medium"),
             },
             ModelSpec {
                 name: "claude-opus-4-8",
                 context: Some(1_000_000),
                 reasoning_effort: &[],
+                tier: Some("high"),
             },
         ],
     },
@@ -113,11 +124,13 @@ static SPECS: &[ProviderSpec] = &[
                 name: "deepseek-v4-flash",
                 context: Some(1_000_000),
                 reasoning_effort: &["high", "max"],
+                tier: Some("medium"),
             },
             ModelSpec {
                 name: "deepseek-v4-pro",
                 context: Some(1_000_000),
                 reasoning_effort: &["high", "max"],
+                tier: Some("high"),
             },
         ],
     },
@@ -137,6 +150,7 @@ static SPECS: &[ProviderSpec] = &[
             // models.dev doesn't know this alias; declare its 256K window.
             context: Some(262144),
             reasoning_effort: &[],
+            tier: Some("medium"),
         }],
     },
     // ── Volcengine Ark Coding Plan (flat-fee, aggregates third-party models) ─
@@ -162,36 +176,43 @@ static SPECS: &[ProviderSpec] = &[
                 name: "doubao-seed-2.0-code",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("medium"),
             },
             ModelSpec {
                 name: "doubao-seed-2.0-pro",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("high"),
             },
             ModelSpec {
                 name: "doubao-seed-2.0-lite",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("low"),
             },
             ModelSpec {
                 name: "doubao-seed-code",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("medium"),
             },
             ModelSpec {
                 name: "minimax-m2.7",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("medium"),
             },
             ModelSpec {
                 name: "minimax-m3",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("high"),
             },
             ModelSpec {
                 name: "glm-5.1",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("medium"),
             },
             ModelSpec {
                 // Ark exposes GLM-5.2 with a 1M context window; reasoning_effort
@@ -199,21 +220,25 @@ static SPECS: &[ProviderSpec] = &[
                 name: "glm-5.2",
                 context: Some(1_000_000),
                 reasoning_effort: &[],
+                tier: Some("high"),
             },
             ModelSpec {
                 name: "deepseek-v4-flash",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("medium"),
             },
             ModelSpec {
                 name: "deepseek-v4-pro",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("high"),
             },
             ModelSpec {
                 name: "kimi-k2.6",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("medium"),
             },
         ],
     },
@@ -233,21 +258,25 @@ static SPECS: &[ProviderSpec] = &[
                 name: "kimi-k2.6",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("medium"),
             },
             ModelSpec {
                 name: "kimi-k2.5",
                 context: Some(262_144),
                 reasoning_effort: &[],
+                tier: Some("medium"),
             },
             ModelSpec {
                 name: "kimi-latest",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("medium"),
             },
             ModelSpec {
                 name: "moonshot-v1-128k",
                 context: Some(131_072),
                 reasoning_effort: &[],
+                tier: Some("low"),
             },
         ],
     },
@@ -279,16 +308,19 @@ static SPECS: &[ProviderSpec] = &[
                 name: "MiniMax-M3",
                 context: Some(1_000_000),
                 reasoning_effort: &[],
+                tier: Some("high"),
             },
             ModelSpec {
                 name: "MiniMax-M2.7",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("medium"),
             },
             ModelSpec {
                 name: "MiniMax-M2.7-highspeed",
                 context: None,
                 reasoning_effort: &[],
+                tier: Some("low"),
             },
         ],
     },
@@ -309,6 +341,7 @@ static SPECS: &[ProviderSpec] = &[
             name: "glm-5.1",
             context: Some(200_000),
             reasoning_effort: &[],
+            tier: Some("medium"),
         }],
     },
     // ── Ollama (local; no key, no tool support) ─────────────────────────────
@@ -326,6 +359,7 @@ static SPECS: &[ProviderSpec] = &[
             name: "llama3",
             context: None,
             reasoning_effort: &[],
+            tier: Some("low"),
         }],
     },
     // ── Custom: a generic OpenAI-compatible escape hatch ────────────────────
