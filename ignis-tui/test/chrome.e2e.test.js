@@ -51,22 +51,27 @@ test('a running turn shows the status bar (spinner work + ↓ tokens + interrupt
   assert.match(f, /↓ \d+ tok/, 'live output-token estimate from streamed chars');
 });
 
-test('Ctrl+D after a turn emits the resume hint and exits', async () => {
+test('double Ctrl+D after a turn emits the resume hint and exits', async () => {
   const seen = {};
   const { engine, stdin } = renderApp({ onExit: (h) => (seen.hint = h) });
   await tick();
   engine.emit(snapshot({ session_id: 'session-123-abcd' }));
   engine.emit(ev('user_prompt_committed', { text: 'hi' }));
   await tick();
-  stdin.write(KEY.ctrlD);
+  stdin.write(KEY.ctrlD); // first press arms the confirm hint
+  await tick();
+  assert.ok(!seen.hint, 'a single Ctrl+D must not exit yet');
+  stdin.write(KEY.ctrlD); // second press exits
   await tick();
   assert.ok(seen.hint, 'onExit called with a hint');
   assert.match(seen.hint, /ignis --resume session-123-abcd/);
 });
 
-test('Ctrl+D with no turns yet does not emit a resume hint', async () => {
+test('double Ctrl+D with no turns yet does not emit a resume hint', async () => {
   const seen = {};
   const { stdin } = renderApp({ onExit: (h) => (seen.hint = h) });
+  await tick();
+  stdin.write(KEY.ctrlD);
   await tick();
   stdin.write(KEY.ctrlD);
   await tick();

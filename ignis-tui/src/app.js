@@ -40,6 +40,7 @@ import {
 } from './protocol.js';
 import DiffView from './diff-view.js';
 import { parseMarkdown, parseInline } from './markdown.js';
+import { dispatchShortcut } from './keymap.js';
 
 const e = React.createElement;
 
@@ -67,6 +68,10 @@ export default function App({ engine, onExit }) {
   const [queue, setQueue] = useState([]); // messages typed while busy, drained 1/turn-end
   const [followFocus, setFollowFocus] = useState(-1); // focused follow-up index, -1 = composer
   const [error, setError] = useState(null); // fatal engine error to display before exit
+  // Transient exit prompt shown in the footer, mirroring the native TUI's
+  // `exit_pending`. null = nothing; 'confirm' = Ctrl-D armed ("again to exit");
+  // 'redirect' = idle Ctrl-C points the user at Ctrl-D. Cleared by any other key.
+  const [exitHint, setExitHint] = useState(null);
   const closing = useRef(false); // true while the frontend is intentionally shutting down
   const fatal = useRef(false); // true once an engine failure has been handled
 
@@ -242,6 +247,10 @@ export default function App({ engine, onExit }) {
     // have their own useInput).
     if (req || localPicker) return;
 
+    // Any key other than the two exit chords dismisses a pending exit / redirect
+    // hint, mirroring the native TUI's clear_exit_hint on nearly every keypress.
+    if (exitHint && !(key.ctrl && (ch === 'c' || ch === 'd'))) setExitHint(null);
+
     // Follow-up suggestions: Tab focuses the strip, ↑/↓ select, Enter submits the
     // selected prompt, Esc unfocuses. Typing any character drops focus and falls
     // through to the composer. Only active while the idle strip is shown and the
@@ -275,36 +284,57 @@ export default function App({ engine, onExit }) {
       setFollowFocus(-1);
     }
 
-    if (key.ctrl && ch === 'c') {
-      if (state.status !== 'idle') engine.send(cancel());
-      else cleanExit();
-      return;
-    }
-    // Ctrl+D exits cleanly when idle (prints the resume hint), like the native TUI.
-    if (key.ctrl && ch === 'd') {
-      if (state.status === 'idle' && !comp.text) cleanExit();
-      return;
-    }
-    if (key.ctrl && ch === 's') {
-      // Inject only steers an IN-FLIGHT turn; when idle there's no inject sink
-      // and the engine would silently drop the text. Gate on busy (matching the
-      // native TUI's mode != Idle) so an idle Ctrl+S is a no-op that keeps the
-      // composer intact.
-      if (state.status === 'busy' && comp.text.trim()) {
-        engine.send(inject(expandPastes(comp.text, pastes)));
-        resetComposer();
-      }
-      return;
-    }
-    // Ctrl+O expands/collapses ✻ Thinking (reasoning) blocks, like ratatui.
-    // Committed reasoning lives in <Static> (frozen once flushed), so bump
-    // `generation` to remount + repaint with the new expand state — the same
-    // full-repaint the native TUI does via its re-anchor.
-    if (key.ctrl && ch === 'o') {
-      setReasoningExpanded((x) => !x);
-      setState((s) => ({ ...s, generation: s.generation + 1 }));
-      return;
-    }
+    // Chorded shortcuts (Ctrl+*) are declared in keymap.js; this `ctx` supplies
+    // their stateful implementations. dispatchShortcut runs the matching chord
+    // and returns true to consume the key. Editor mechanics below (Enter, arrows,
+    // history, backspace, printable input) are NOT chords and stay inline.
+    const ctx = {
+      cancelOrHint: () => {
+        // Ctrl+C cancels an in-flight turn; idle, it no longer exits — it points
+        // the user at Ctrl-D (the exit chord) instead.
+        if (state.status !== 'idle') {
+          engine.send(cancel());
+          setExitHint(null);
+        } else {
+          setExitHint('redirect');
+        }
+      },
+      exitArm: () => {
+        // Double Ctrl-D to exit, like the native TUI. Only arm when idle with an
+        // empty composer so Ctrl-D mid-type / mid-turn can never quit.
+        if (state.status === 'idle' && !comp.text) {
+          if (exitHint === 'confirm') cleanExit();
+          else setExitHint('confirm');
+        } else {
+          setExitHint(null);
+        }
+      },
+      inject: () => {
+        // Inject only steers an IN-FLIGHT turn; when idle there's no inject sink
+        // and the engine would silently drop the text. Gate on busy (matching the
+        // native TUI's mode != Idle) so an idle Ctrl+S is a no-op that keeps the
+        // composer intact.
+        if (state.status === 'busy' && comp.text.trim()) {
+          engine.send(inject(expandPastes(comp.text, pastes)));
+          resetComposer();
+        }
+      },
+      // Ctrl+O expands/collapses ✻ Thinking (reasoning) blocks, like ratatui.
+      // Committed reasoning lives in <Static> (frozen once flushed), so bump
+      // `generation` to remount + repaint with the new expand state — the same
+      // full-repaint the native TUI does via its re-anchor.
+      toggleReasoning: () => {
+        setReasoningExpanded((x) => !x);
+        setState((s) => ({ ...s, generation: s.generation + 1 }));
+      },
+      lineStart: () => setComp((c) => ({ ...c, cursor: 0 })),
+      lineEnd: () => setComp((c) => ({ ...c, cursor: c.text.length })),
+      killLine: () => resetComposer(),
+      killWord: () => setComp(deleteWordBefore),
+      newline: () =>
+        setComp((c) => ({ text: c.text.slice(0, c.cursor) + '\n' + c.text.slice(c.cursor), cursor: c.cursor + 1 })),
+    };
+    if (dispatchShortcut(ch, key, ctx)) return;
     if (key.return) {
       const raw = comp.text;
       if (!raw.trim()) return;
@@ -361,29 +391,14 @@ export default function App({ engine, onExit }) {
       }
       return;
     }
-    // Cursor movement + line editing (Ctrl+A/E/U/W), matching ratatui's apply_edit_key.
+    // Cursor movement by arrow key. The Ctrl+A/E/U/W line-editing chords are in
+    // the keymap (dispatched above), matching ratatui's apply_edit_key.
     if (key.leftArrow) {
       setComp((c) => ({ ...c, cursor: Math.max(0, c.cursor - 1) }));
       return;
     }
     if (key.rightArrow) {
       setComp((c) => ({ ...c, cursor: Math.min(c.text.length, c.cursor + 1) }));
-      return;
-    }
-    if (key.ctrl && ch === 'a') {
-      setComp((c) => ({ ...c, cursor: 0 }));
-      return;
-    }
-    if (key.ctrl && ch === 'e') {
-      setComp((c) => ({ ...c, cursor: c.text.length }));
-      return;
-    }
-    if (key.ctrl && ch === 'u') {
-      resetComposer();
-      return;
-    }
-    if (key.ctrl && ch === 'w') {
-      setComp(deleteWordBefore);
       return;
     }
     // Delete before the caret. Ink maps the common Backspace byte (\x7f) to
@@ -393,13 +408,6 @@ export default function App({ engine, onExit }) {
       setComp((c) =>
         c.cursor > 0 ? { text: c.text.slice(0, c.cursor - 1) + c.text.slice(c.cursor), cursor: c.cursor - 1 } : c,
       );
-      return;
-    }
-    // Ctrl+J inserts a newline (Ink delivers it as a lone '\n' with key.return
-    // false — Enter is '\r'). Handled before the paste branch so a single
-    // newline isn't mistaken for a multi-line paste.
-    if (ch === '\n') {
-      setComp((c) => ({ text: c.text.slice(0, c.cursor) + '\n' + c.text.slice(c.cursor), cursor: c.cursor + 1 }));
       return;
     }
     if (ch && !key.ctrl && !key.meta) {
@@ -561,6 +569,18 @@ export default function App({ engine, onExit }) {
     if (sugg.length) {
       children.push(e(SlashSuggestions, { key: 'slash', items: sugg, selected: Math.min(slashSel, sugg.length - 1) }));
     }
+  }
+  // Transient exit prompt (yellow), like the native TUI's footer hint. 'confirm'
+  // arms after one Ctrl-D; 'redirect' points an idle Ctrl-C at the exit chord.
+  // Composer-context only — a picker owns the screen, so don't paint under it.
+  if (exitHint && !req && !localPicker) {
+    children.push(
+      e(
+        Text,
+        { key: 'exit-hint', color: 'yellow' },
+        exitHint === 'confirm' ? '  Press Ctrl-D again to exit' : '  Press Ctrl-D to exit',
+      ),
+    );
   }
   children.push(e(Footer, { key: 'footer', state }));
   return e(Box, { flexDirection: 'column' }, children);

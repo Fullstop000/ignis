@@ -11,7 +11,7 @@ import App from './app.js';
 const engine = spawnEngine();
 // exitOnCtrlC:false — Ink's default would exit the whole app on Ctrl+C before
 // our handler runs, killing an in-flight turn. App owns Ctrl+C: cancel the turn
-// when busy, exit cleanly when idle (see app.js).
+// when busy, point at Ctrl-D when idle. Exit is double Ctrl-D (see app.js).
 // `onExit` carries the `ignis --resume <id>` hint, printed AFTER Ink tears down
 // the alt buffer so it lands in the real scrollback like the native TUI.
 // Ask the terminal to wrap pastes in ESC[200~ … ESC[201~ so createPasteStream
