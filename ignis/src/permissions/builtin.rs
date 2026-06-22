@@ -263,44 +263,74 @@ fn match_breaker_in_segment(segment: &str) -> Option<&'static str> {
     }
 
     let collapsed: String = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+    rm_root_breaker_label(&collapsed)
+}
 
-    // Match patterns. Each is a tuple of (label, predicate).
-    type Pattern = (&'static str, fn(&str) -> bool);
-    let patterns: &[Pattern] = &[
-        ("rm -rf /", |c| {
-            // `rm -rf /` or `rm -rf / <anything>` but not `rm -rf /tmp/...`
-            let with_flags = c.starts_with("rm -rf ") || c.starts_with("rm -fr ");
-            if !with_flags {
-                return false;
+/// Detect `rm` invoked with BOTH a recursive flag (`-r`/`-R`/`--recursive`) and
+/// a force flag (`-f`/`--force`) — in any bundling or order — whose operands
+/// include a catastrophic root (`/`, `/*`, `~`, `$HOME`). The match is
+/// quote-insensitive (`rm -rf "/"`) and operand-order-insensitive (`rm / -rf`),
+/// so the floor can't be skated past by trivial argument variation; unrelated
+/// flags like `--no-preserve-root` are ignored.
+///
+/// Requiring BOTH flags keeps benign `rm -r src` / `rm -f x` off the floor;
+/// requiring a catastrophic operand keeps `rm -rf /tmp/foo` off it. Returns the
+/// canonical label of the matched root, or `None`.
+fn rm_root_breaker_label(collapsed: &str) -> Option<&'static str> {
+    let mut tokens = collapsed.split_whitespace();
+    if tokens.next() != Some("rm") {
+        return None;
+    }
+    let mut recursive = false;
+    let mut force = false;
+    let mut operands: Vec<&str> = Vec::new();
+    for tok in tokens {
+        if let Some(long) = tok.strip_prefix("--") {
+            match long {
+                "recursive" => recursive = true,
+                "force" => force = true,
+                _ => {} // `--`, `--no-preserve-root`, etc. — irrelevant to the floor
             }
-            let after = &c[7..];
-            let first = after.split_whitespace().next().unwrap_or("");
-            first == "/"
-        }),
-        ("rm -rf ~", |c| {
-            let with_flags = c.starts_with("rm -rf ") || c.starts_with("rm -fr ");
-            if !with_flags {
-                return false;
+        } else if tok.len() > 1 && tok.starts_with('-') {
+            for ch in tok[1..].chars() {
+                match ch {
+                    'r' | 'R' => recursive = true,
+                    'f' => force = true,
+                    _ => {}
+                }
             }
-            let after = &c[7..];
-            let first = after.split_whitespace().next().unwrap_or("");
-            first == "~" || first == "~/"
-        }),
-        ("rm -rf $HOME", |c| {
-            let with_flags = c.starts_with("rm -rf ") || c.starts_with("rm -fr ");
-            if !with_flags {
-                return false;
-            }
-            let after = &c[7..];
-            let first = after.split_whitespace().next().unwrap_or("");
-            first == "$HOME" || first == "\"$HOME\"" || first == "${HOME}" || first == "\"${HOME}\""
-        }),
-    ];
-
-    patterns
+        } else {
+            operands.push(strip_surrounding_quotes(tok));
+        }
+    }
+    if !(recursive && force) {
+        return None;
+    }
+    if operands.iter().any(|t| *t == "/" || *t == "/*") {
+        Some("rm -rf /")
+    } else if operands.iter().any(|t| *t == "~" || *t == "~/") {
+        Some("rm -rf ~")
+    } else if operands
         .iter()
-        .find(|(_, p)| p(&collapsed))
-        .map(|(label, _)| *label)
+        .any(|t| matches!(*t, "$HOME" | "${HOME}" | "$HOME/" | "${HOME}/"))
+    {
+        Some("rm -rf $HOME")
+    } else {
+        None
+    }
+}
+
+/// Strip one layer of matched surrounding single or double quotes from a token,
+/// so a quoted destructive target (`"/"`, `'$HOME'`) compares like its bare form.
+fn strip_surrounding_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
 }
 
 /// Protected path patterns — files/dirs the model should never silently edit
@@ -557,8 +587,35 @@ mod tests {
             "rm foo.txt",
             "rm -r src",
             "rm -f x",
+            // recursive+force is fine as long as the target isn't a root.
+            "rm -r -f ./build",
+            "rm --recursive --force /tmp/cache",
+            "rm -rf /tmp /var/log",
         ] {
             assert!(!is_circuit_breaker(cmd), "should NOT trip: {cmd}");
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_catches_quote_and_flag_variants() {
+        // Regression (review finding): the floor must be insensitive to quoting,
+        // flag bundling/order, and operand order — otherwise the most common
+        // forms a model emits (`rm -rf "/"`, `rm -r -f /`, `rm / -rf`) skate
+        // past the "always ask" guarantee and auto-allow under HandsFree.
+        for cmd in [
+            "rm -rf \"/\"",
+            "rm -rf '/'",
+            "rm -rf /*",
+            "rm --recursive --force /",
+            "rm -r -f /",
+            "rm -f -r /",
+            "rm -rf --no-preserve-root /",
+            "rm / -rf",
+            "rm -fr \"$HOME\"",
+            "sudo rm --recursive --force /",
+            "FOO=bar rm -r -f $HOME",
+        ] {
+            assert!(is_circuit_breaker(cmd), "breaker must catch variant: {cmd}");
         }
     }
 
