@@ -12,7 +12,7 @@ pub(crate) fn render_md_spans(text: &str, base_style: Style) -> Vec<Span<'static
     let mut chars = text.char_indices().peekable();
     let mut buf = String::new();
 
-    while let Some((i, c)) = chars.next() {
+    while let Some((_, c)) = chars.next() {
         match c {
             '`' => {
                 // Inline code
@@ -91,7 +91,6 @@ pub(crate) fn render_md_spans(text: &str, base_style: Style) -> Vec<Span<'static
             }
             _ => buf.push(c),
         }
-        let _ = i; // suppress unused warning
     }
     if !buf.is_empty() {
         spans.push(Span::styled(buf, base_style));
@@ -648,5 +647,3 @@ mod table_tests {
         );
     }
 }
-
-// ==========================================

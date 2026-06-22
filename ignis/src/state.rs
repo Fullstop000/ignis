@@ -88,6 +88,22 @@ fn write_state(state: &State) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Serializes the read-modify-write cycle of the `persist_*` helpers below.
+/// Without it, the detached auto-update-check task (`cli::upgrade`) can read a
+/// stale snapshot and write it back seconds later, clobbering a `/model`,
+/// `/afk`, or grant the user persisted in between (a lost update). The atomic
+/// rename in `write_state` prevents a *torn* file, but not interleaved RMW.
+static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Load state, apply `mutate`, and write it back — atomically and under the
+/// global lock, so two concurrent persists can't lose each other's updates.
+fn update_state(mutate: impl FnOnce(&mut State)) -> Result<(), anyhow::Error> {
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = load_state();
+    mutate(&mut state);
+    write_state(&state)
+}
+
 /// Persist a `/model` selection, preserving any other fields already in
 /// `state.json` (notably `disabled_skills`).
 pub fn persist_model_selection(
@@ -95,58 +111,46 @@ pub fn persist_model_selection(
     model: &str,
     effort: Option<&str>,
 ) -> Result<(), anyhow::Error> {
-    let mut state = load_state();
-    state.model = Some(format!("{provider}/{model}"));
-    state.reasoning_effort = effort.map(str::to_string);
-    write_state(&state)
+    update_state(|state| {
+        state.model = Some(format!("{provider}/{model}"));
+        state.reasoning_effort = effort.map(str::to_string);
+    })
 }
 
 /// Persist the disabled-skills set, preserving the model selection.
 pub fn persist_disabled_skills(disabled: &[String]) -> Result<(), anyhow::Error> {
-    let mut state = load_state();
-    state.disabled_skills = disabled.to_vec();
-    write_state(&state)
+    update_state(|state| state.disabled_skills = disabled.to_vec())
 }
 
 /// Persist the disabled-MCP-servers set, preserving every other field
 /// (notably the model selection and disabled-skills set).
 pub fn persist_disabled_mcp_servers(disabled: &[String]) -> Result<(), anyhow::Error> {
-    let mut state = load_state();
-    state.disabled_mcp_servers = disabled.to_vec();
-    write_state(&state)
+    update_state(|state| state.disabled_mcp_servers = disabled.to_vec())
 }
 
 /// Persist the permission `mode`, preserving every other field. Called by
 /// `/afk` (which sets `Some("hands_free")` or `Some("fully_unattended")`) and
 /// by toggling off (which sets `None`, omitted from JSON).
 pub fn persist_permission_mode(mode: Option<&str>) -> Result<(), anyhow::Error> {
-    let mut state = load_state();
-    state.mode = mode.map(String::from);
-    write_state(&state)
+    update_state(|state| state.mode = mode.map(String::from))
 }
 
 /// Persist the "always allow" permission grants, preserving every other field.
 /// Called when the user picks "Always allow" in the permission picker.
 pub fn persist_permission_grants(grants: &[String]) -> Result<(), anyhow::Error> {
-    let mut state = load_state();
-    state.permission_grants = grants.to_vec();
-    write_state(&state)
+    update_state(|state| state.permission_grants = grants.to_vec())
 }
 
 /// Persist the cached auto-update-check result. `None` clears the cache (the
 /// next launch will re-check). Preserves every other field.
 pub fn persist_update_check(check: Option<UpdateCheckState>) -> Result<(), anyhow::Error> {
-    let mut state = load_state();
-    state.update_check = check;
-    write_state(&state)
+    update_state(|state| state.update_check = check)
 }
 
 /// Persist the hidden-footer-segments set, preserving every other field.
 /// Called by the `/settings` Statusline tab on each toggle.
 pub fn persist_statusline_hidden(hidden: &[String]) -> Result<(), anyhow::Error> {
-    let mut state = load_state();
-    state.statusline_hidden = hidden.to_vec();
-    write_state(&state)
+    update_state(|state| state.statusline_hidden = hidden.to_vec())
 }
 
 #[cfg(test)]

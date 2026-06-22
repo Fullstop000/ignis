@@ -238,7 +238,11 @@ impl InlinePickerState {
         // Last selectable index. When `allow_other` is false the picker has no
         // free-text row (permission/AFK pickers use this) so the cursor can
         // never reach what would have been the Other position.
-        let last = if q.allow_other { opts_n } else { opts_n - 1 };
+        let last = if q.allow_other {
+            opts_n
+        } else {
+            opts_n.saturating_sub(1)
+        };
         match key.code {
             KeyCode::Up => {
                 if self.cursor > 0 {

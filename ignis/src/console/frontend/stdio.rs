@@ -110,8 +110,10 @@ where
 /// child is killed if the handle is dropped (`kill_on_drop`), so a torn-down
 /// session never leaks a frontend process.
 ///
-/// Not yet called in production — frontend selection lands in phase 4. This is
-/// the one process-aware seam; all framing lives in [`StdioPort`] above.
+/// The shipped topology has the Ink host spawn the engine (`ignis --engine`),
+/// not the reverse, so this constructor — the one process-aware seam, where
+/// ignis would itself spawn and own a child frontend — is currently unused.
+/// All framing lives in [`StdioPort`] above.
 pub fn spawn_stdio_port(
     mut command: tokio::process::Command,
 ) -> std::io::Result<(
