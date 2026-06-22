@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Sub-agents can run on a cheaper or stronger model matched to the task — the `agent` tool takes a `tier` (`low`/`medium`/`high`), with sensible per-type defaults, and each result reports the model and token cost it used. ([#223](https://github.com/Fullstop000/ignis/pull/223))
+
 ## [0.41.3] - 2026-06-21
 
 ### Added

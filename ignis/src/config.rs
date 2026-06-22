@@ -311,6 +311,86 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// Route a requested capability tier (`"low"`/`"medium"`/`"high"`) to a
+    /// concrete `("provider/model", effort)` within the *active* provider, for a
+    /// sub-agent to run on. Picks the cheapest model whose tier reaches the
+    /// request (tier = capability ceiling) and scales effort to the request,
+    /// clamped to that model's declared levels. Returns `None` when the tier is
+    /// unknown or the active provider has no tagged model that reaches it — the
+    /// caller then keeps the session model (never a silent downgrade).
+    pub fn model_for_tier(&self, tier: &str) -> Option<(String, Option<String>)> {
+        let want = tier_rank(tier)?;
+        let provider = self.active_provider()?;
+        let mut best: Option<(String, u8, Vec<String>)> = None;
+        for (model, rank, levels) in self.tier_candidates(&provider) {
+            // Smallest tier that still reaches the request = cheapest adequate;
+            // ties resolve to the first listed (catalog order, then config).
+            if rank >= want && best.as_ref().map(|(_, br, _)| rank < *br).unwrap_or(true) {
+                best = Some((model, rank, levels));
+            }
+        }
+        let (model, _, levels) = best?;
+        Some((
+            format!("{provider}/{model}"),
+            effort_for_tier(&levels, want),
+        ))
+    }
+
+    /// A clone of this config with the active model + effort overridden to the
+    /// model that serves `tier` on the active provider, plus whether the tier
+    /// actually routed. `(clone, false)` when it didn't (unknown tier, or no
+    /// tagged model reaches it) — the sub-agent then runs on the session model.
+    pub fn with_tier(&self, tier: &str) -> (Config, bool) {
+        match self.model_for_tier(tier) {
+            Some((model, effort)) => {
+                let mut cfg = self.clone();
+                cfg.model = Some(model);
+                cfg.reasoning_effort = effort;
+                (cfg, true)
+            }
+            None => (self.clone(), false),
+        }
+    }
+
+    /// `(model, tier_rank, effort_levels)` for every *tiered* model of
+    /// `provider_id`: the baked catalog merged with config overrides (config wins
+    /// on tier and effort), in catalog-then-config order. Untiered models are
+    /// skipped — only tagged models can satisfy a tier route.
+    fn tier_candidates(&self, provider_id: &str) -> Vec<(String, u8, Vec<String>)> {
+        let cfg = self.providers.get(provider_id);
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        if let Some(spec) = providers::lookup(provider_id) {
+            for m in spec.models {
+                seen.insert(m.name.to_string());
+                let cfg_entry = cfg.and_then(|c| c.models.iter().find(|e| e.name() == m.name));
+                let Some(rank) = cfg_entry
+                    .and_then(|e| e.tier())
+                    .or(m.tier)
+                    .and_then(tier_rank)
+                else {
+                    continue;
+                };
+                let levels = cfg_entry
+                    .map(|e| e.reasoning().to_vec())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| m.reasoning_effort.iter().map(|s| s.to_string()).collect());
+                out.push((m.name.to_string(), rank, levels));
+            }
+        }
+        if let Some(cfg) = cfg {
+            for entry in &cfg.models {
+                if seen.contains(entry.name()) {
+                    continue;
+                }
+                if let Some(rank) = entry.tier().and_then(tier_rank) {
+                    out.push((entry.name().to_string(), rank, entry.reasoning().to_vec()));
+                }
+            }
+        }
+        out
+    }
+
     /// Merge provider metadata with config overrides into a [`Resolved`] selection.
     pub(crate) fn resolve(&self) -> Result<Resolved, anyhow::Error> {
         let (id, model) = self.active_selection().ok_or_else(|| {
@@ -542,6 +622,33 @@ fn upsert_provider(provider_id: &str, api_key: Option<&str>) -> Result<PathBuf, 
 
 pub fn build_provider(config: &Config) -> Result<Box<dyn LlmProvider>, anyhow::Error> {
     Ok(crate::llm::build(config.resolve()?))
+}
+
+/// Rank a tier label for ordering (`low < medium < high`). `None` for an unknown
+/// label — an unknown tier never routes anywhere.
+fn tier_rank(tier: &str) -> Option<u8> {
+    match tier {
+        "low" => Some(0),
+        "medium" => Some(1),
+        "high" => Some(2),
+        _ => None,
+    }
+}
+
+/// The effort level to run a tier at, drawn from the model's own declared
+/// `levels` (so it is always valid for that model): the lowest level for `low`,
+/// the highest for `high`, the middle for `medium`. `None` when the model exposes
+/// no effort control.
+fn effort_for_tier(levels: &[String], want: u8) -> Option<String> {
+    if levels.is_empty() {
+        return None;
+    }
+    let idx = match want {
+        0 => 0,
+        2 => levels.len() - 1,
+        _ => levels.len() / 2,
+    };
+    levels.get(idx).cloned()
 }
 
 /// Choose the endpoint for a provider: a config `protocol` override, else the
@@ -1206,5 +1313,176 @@ api_key = "x"
         assert_eq!(mode, 0o600);
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn model_for_tier_routes_cheapest_adequate_and_scales_effort() {
+        // DeepSeek: flash(medium, [high,max]) + pro(high, [high,max]).
+        let cfg: Config = toml::from_str(
+            r#"
+model = "deepseek/deepseek-v4-flash"
+[providers.deepseek]
+api_key = "x"
+"#,
+        )
+        .unwrap();
+        // low → flash (cheapest reaching low) at its lowest effort.
+        assert_eq!(
+            cfg.model_for_tier("low"),
+            Some((
+                "deepseek/deepseek-v4-flash".to_string(),
+                Some("high".to_string())
+            ))
+        );
+        // medium → still flash, dialed up to its top effort.
+        assert_eq!(
+            cfg.model_for_tier("medium"),
+            Some((
+                "deepseek/deepseek-v4-flash".to_string(),
+                Some("max".to_string())
+            ))
+        );
+        // high → pro (the only model reaching high) at max.
+        assert_eq!(
+            cfg.model_for_tier("high"),
+            Some((
+                "deepseek/deepseek-v4-pro".to_string(),
+                Some("max".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn model_for_tier_scales_effort_across_a_full_ladder() {
+        // OpenAI: gpt-5.4-mini(medium) + gpt-5.5(high), both none..xhigh.
+        let cfg: Config = toml::from_str(
+            r#"
+model = "openai/gpt-5.5"
+[providers.openai]
+api_key = "x"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.model_for_tier("low"),
+            Some(("openai/gpt-5.4-mini".to_string(), Some("none".to_string())))
+        );
+        assert_eq!(
+            cfg.model_for_tier("medium"),
+            Some((
+                "openai/gpt-5.4-mini".to_string(),
+                Some("medium".to_string())
+            ))
+        );
+        assert_eq!(
+            cfg.model_for_tier("high"),
+            Some(("openai/gpt-5.5".to_string(), Some("xhigh".to_string())))
+        );
+    }
+
+    #[test]
+    fn model_for_tier_omits_effort_when_model_has_none() {
+        // Anthropic models expose no effort levels — tier still routes the model.
+        let cfg: Config = toml::from_str(
+            r#"
+model = "anthropic/claude-sonnet-4-6"
+[providers.anthropic]
+api_key = "x"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.model_for_tier("low"),
+            Some(("anthropic/claude-sonnet-4-6".to_string(), None))
+        );
+        assert_eq!(
+            cfg.model_for_tier("high"),
+            Some(("anthropic/claude-opus-4-8".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn model_for_tier_none_when_unknown_or_unreachable() {
+        // Ollama has only llama3 (tier low) — `high` can't be reached here.
+        let cfg: Config = toml::from_str(
+            r#"
+model = "ollama/llama3"
+[providers.ollama]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.model_for_tier("high"), None);
+        assert_eq!(cfg.model_for_tier("ultra"), None); // unknown label
+        assert_eq!(
+            cfg.model_for_tier("low"),
+            Some(("ollama/llama3".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn config_tier_override_beats_baked_default() {
+        // Demote flash to `low`; `medium` now skips up to pro.
+        let cfg: Config = toml::from_str(
+            r#"
+model = "deepseek/deepseek-v4-flash"
+[providers.deepseek]
+api_key = "x"
+models = [{ name = "deepseek-v4-flash", tier = "low" }]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.model_for_tier("low").unwrap().0,
+            "deepseek/deepseek-v4-flash"
+        );
+        assert_eq!(
+            cfg.model_for_tier("medium").unwrap().0,
+            "deepseek/deepseek-v4-pro"
+        );
+    }
+
+    #[test]
+    fn config_only_tiered_models_route() {
+        let cfg: Config = toml::from_str(
+            r#"
+model = "custom/base"
+[providers.custom]
+api_key = "x"
+api_url = "https://x/v1"
+models = [
+  { name = "base", tier = "low" },
+  { name = "smart", tier = "high", reasoning = ["low", "high"] },
+]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.model_for_tier("low").unwrap().0, "custom/base");
+        assert_eq!(
+            cfg.model_for_tier("high"),
+            Some(("custom/smart".to_string(), Some("high".to_string())))
+        );
+    }
+
+    #[test]
+    fn with_tier_overrides_resolved_else_keeps_session_model() {
+        let cfg: Config = toml::from_str(
+            r#"
+model = "deepseek/deepseek-v4-flash"
+reasoning_effort = "high"
+[providers.deepseek]
+api_key = "x"
+"#,
+        )
+        .unwrap();
+        // Resolves: high → pro @ max.
+        let (hi, routed) = cfg.with_tier("high");
+        assert!(routed);
+        assert_eq!(hi.active_model().as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(hi.active_effort().as_deref(), Some("max"));
+        // Unknown tier → unchanged clone (no silent downgrade), not routed.
+        let (same, routed) = cfg.with_tier("ultra");
+        assert!(!routed);
+        assert_eq!(same.active_model().as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(same.active_effort().as_deref(), Some("high"));
     }
 }
