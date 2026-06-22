@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 /// Filesystem-sandbox config for auto-run bash (unattended modes only). Confines
 /// the spawned command's WRITES to the project + temp (+ configured extras), and
-/// its READS to the system roots + project + toolchain caches (+ configured
-/// extras) — so `$HOME` credential dirs stay private. `None` on `BashTool` = no
-/// sandbox (Off mode unchanged).
+/// — on Linux — its READS to the system roots + project + toolchain caches
+/// (+ configured extras) so `$HOME` credential dirs stay private. `None` on
+/// `BashTool` = no sandbox (Off mode unchanged).
 #[derive(Debug, Clone, Default)]
 pub struct BashSandbox {
     /// Extra writable dirs beyond cwd + temp, from `[permissions]
@@ -20,10 +20,11 @@ pub struct BashSandbox {
     pub extra_reads: Vec<PathBuf>,
 }
 
-/// FHS roots the bash sandbox grants read access to. These hold system
+/// FHS roots the Linux bash sandbox grants read access to. These hold system
 /// binaries, libraries, and config that builds read constantly — never user
 /// credentials, which live under `$HOME` (deliberately excluded). Missing roots
 /// are skipped by Landlock, so the list can be generous.
+#[cfg(target_os = "linux")]
 const SYSTEM_READ_ROOTS: &[&str] = &[
     "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt", "/var", "/proc", "/sys", "/dev",
     "/run",
@@ -80,17 +81,8 @@ impl BashTool {
     /// Writes: the project (cwd), the temp dirs, the `/dev/null` sink, `$TMPDIR`
     /// if set, plus any configured `sandbox_write_paths`.
     ///
-    /// Reads were once `/` (the whole filesystem), which let an unattended
-    /// command `cat ~/.ssh/id_ed25519` (and, with the network open, exfiltrate
-    /// it). Landlock is allowlist-only — it can't subtract `~/.ssh` from `/` —
-    /// so instead we grant the system roots broadly (no user secret lives there)
-    /// plus the project, the temp dirs, and the toolchain caches under `$HOME`
-    /// that builds genuinely need (`~/.cargo`, `~/.rustup`, honoring
-    /// `CARGO_HOME`/`RUSTUP_HOME`). `$HOME` itself is NOT granted, so credential
-    /// dirs (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.ignis`, …) are unreadable.
-    /// Stacks whose caches live elsewhere under `$HOME` add them via
-    /// `sandbox_read_paths`. Every writable path is also made readable (writing
-    /// to a dir you can't read is never what you want).
+    /// Reads: see [`Self::sandbox_reads`] — narrowed on Linux to keep `$HOME`
+    /// secrets unreadable, broad elsewhere.
     fn sandbox_paths(&self, sb: &BashSandbox) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let mut writes = vec![
             self.cwd.clone(),
@@ -102,10 +94,25 @@ impl BashTool {
             writes.push(PathBuf::from(tmp));
         }
         writes.extend(sb.extra_writes.iter().cloned());
+        let reads = self.sandbox_reads(sb, &writes);
+        (reads, writes)
+    }
 
+    /// Read allowlist on Linux (Landlock). Reads were once `/` (the whole
+    /// filesystem), which let an unattended command `cat ~/.ssh/id_ed25519`
+    /// (and, with the network open, exfiltrate it). Landlock is allowlist-only
+    /// — it can't subtract `~/.ssh` from `/` — so instead we grant the system
+    /// roots broadly (no user secret lives there) plus the project, the temp
+    /// dirs, and the toolchain caches under `$HOME` that builds genuinely need
+    /// (`~/.cargo`, `~/.rustup`, honoring `CARGO_HOME`/`RUSTUP_HOME`). `$HOME`
+    /// itself is NOT granted, so credential dirs (`~/.ssh`, `~/.aws`,
+    /// `~/.gnupg`, `~/.ignis`, …) are unreadable. Stacks whose caches live
+    /// elsewhere under `$HOME` add them via `sandbox_read_paths`. Every writable
+    /// path is also made readable (writing to a dir you can't read is never what
+    /// you want).
+    #[cfg(target_os = "linux")]
+    fn sandbox_reads(&self, sb: &BashSandbox, writes: &[PathBuf]) -> Vec<PathBuf> {
         let mut reads: Vec<PathBuf> = SYSTEM_READ_ROOTS.iter().map(PathBuf::from).collect();
-        // Toolchain caches under $HOME: without these cargo can't find the
-        // registry (`~/.cargo`) or the compiler itself (`~/.rustup`).
         for (var, default) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
             if let Some(dir) = std::env::var_os(var) {
                 reads.push(PathBuf::from(dir));
@@ -114,9 +121,18 @@ impl BashTool {
             }
         }
         reads.extend(sb.extra_reads.iter().cloned());
-        // Anything writable must also be readable.
         reads.extend(writes.iter().cloned());
-        (reads, writes)
+        reads
+    }
+
+    /// On non-Linux (macOS Seatbelt) the read narrowing isn't implemented:
+    /// getting the allowlist right there means resolving macOS's `/etc` →
+    /// `/private/etc` symlinks and the dyld cache layout, which can't be tested
+    /// from Linux CI. Reads stay broad — same as before this change, so no
+    /// regression — and the write confinement still applies.
+    #[cfg(not(target_os = "linux"))]
+    fn sandbox_reads(&self, _sb: &BashSandbox, _writes: &[PathBuf]) -> Vec<PathBuf> {
+        vec![PathBuf::from("/")]
     }
 }
 
@@ -298,6 +314,9 @@ mod tests {
     use crate::AgentTool;
     use serde_json::json;
 
+    // The read narrowing is Linux-only (see `BashTool::sandbox_reads`); on other
+    // targets reads stay broad, so this assertion is platform-specific.
+    #[cfg(target_os = "linux")]
     #[test]
     fn sandbox_paths_narrow_reads_and_confine_writes() {
         let cwd = PathBuf::from("/home/u/proj");

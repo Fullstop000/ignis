@@ -2,9 +2,9 @@
 //!
 //! Goes through the real `BashTool` → `tokio::process::Command` → child path.
 //! Asserts the externally-observable contract: a sandboxed command may write
-//! inside cwd but not outside it, may read the system roots + project but NOT
-//! arbitrary paths outside the allowlist (so `$HOME` secrets stay private); an
-//! unsandboxed command is unconfined.
+//! inside cwd but not outside it; on Linux it may read the system roots +
+//! project but NOT arbitrary paths outside the allowlist (so `$HOME` secrets
+//! stay private); an unsandboxed command is unconfined.
 //!
 //! Skipped (smoke-only) on kernels without Landlock — the confinement can't be
 //! asserted there. Linux/macOS only via the `#![cfg(unix)]` gate.
@@ -41,8 +41,6 @@ async fn sandbox_confines_writes_to_cwd_when_enforced() {
     let cwd = base.join("proj");
     std::fs::create_dir_all(&cwd).unwrap();
     let outside = base.join("outside.txt");
-    let secret = base.join("secret.txt");
-    std::fs::write(&secret, b"secret-but-readable").unwrap();
 
     let tool = BashTool::new(&cwd).with_sandbox(Some(BashSandbox::default()));
 
@@ -64,9 +62,30 @@ async fn sandbox_confines_writes_to_cwd_when_enforced() {
     assert!(r.is_error, "write outside cwd must be denied");
     assert!(!outside.exists(), "the outside file must not be created");
 
-    // Read a file OUTSIDE the allowlist (simulating ~/.ssh/id_*) → now denied.
-    // This is the security fix: reads were once `/`, so an unattended command
-    // could read and exfiltrate any secret on disk.
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Linux-only: the read narrowing (Landlock) denies a secret outside the
+/// allowlist (simulating `~/.ssh/id_*`) while keeping system reads. macOS
+/// Seatbelt keeps reads broad (see `BashTool::sandbox_reads`), so this contract
+/// is Linux-specific.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sandbox_narrows_reads_to_block_secrets_outside_the_allowlist() {
+    if !ignis::sandbox::is_kernel_sandbox_available() {
+        eprintln!("skipping: no kernel sandbox (Landlock) on this host");
+        return;
+    }
+    let base = fresh_base("bash-sbx-read");
+    let cwd = base.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let secret = base.join("secret.txt");
+    std::fs::write(&secret, b"secret-but-readable").unwrap();
+
+    let tool = BashTool::new(&cwd).with_sandbox(Some(BashSandbox::default()));
+
+    // Read a file OUTSIDE the allowlist → denied. Reads were once `/`, so an
+    // unattended command could read and exfiltrate any secret on disk.
     let r = tool
         .call(json!({ "command": format!("cat '{}'", secret.display()) }))
         .await;
@@ -204,7 +223,9 @@ async fn no_sandbox_does_not_confine_writes() {
 /// still run under the sandbox. The rustup proxy at `~/.cargo/bin/rustc` resolves
 /// and execs the toolchain under `~/.rustup` — both granted by the read policy —
 /// so a narrowed sandbox that broke this would break every auto-run cargo build.
-/// Skipped when rustc isn't installed (e.g. a minimal CI image).
+/// Linux-only (the read narrowing it exercises is Linux-only); skipped when
+/// rustc isn't installed (e.g. a minimal CI image).
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn sandbox_allows_real_toolchain_command() {
     if !ignis::sandbox::is_kernel_sandbox_available() {

@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ignis sessions` HTML export no longer lists phantom zero-count rows for internal todo sidecar files. ([#224](https://github.com/Fullstop000/ignis/pull/224))
 
 ### Security
-- Auto-run bash in hands-free / AFK modes can no longer read your home directory — `~/.ssh`, `~/.aws`, and the credentials in `~/.ignis` are now outside the sandbox's read scope, which is limited to system paths, the project, and the Rust toolchain (extend it with `sandbox_read_paths`). ([#224](https://github.com/Fullstop000/ignis/pull/224))
+- Auto-run bash in hands-free / AFK modes can no longer read your home directory on Linux — `~/.ssh`, `~/.aws`, and the credentials in `~/.ignis` are now outside the sandbox's read scope, which is limited to system paths, the project, and the Rust toolchain (extend it with `sandbox_read_paths`). ([#224](https://github.com/Fullstop000/ignis/pull/224))
 - The "always ask" prompt for `rm -rf /` and friends can no longer be skipped by quoting or reordering flags (e.g. `rm -rf "/"`, `rm -r -f /`, `rm --recursive --force /`). ([#224](https://github.com/Fullstop000/ignis/pull/224))
 - ignis now warns instead of silently continuing when it can't restrict `config.toml` (which holds your API keys) to owner-only `0600`. ([#224](https://github.com/Fullstop000/ignis/pull/224))
 
