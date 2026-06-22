@@ -19,10 +19,12 @@ pub(crate) mod inline_picker;
 pub(crate) mod keys;
 pub mod markdown;
 pub(crate) mod picker;
+pub(crate) mod pickers_state;
 pub mod render;
 pub(crate) mod render_diag;
 pub(crate) mod runner;
 pub(crate) mod slash;
+pub(crate) mod transcript;
 
 // Re-exports for paths the rest of the crate already uses.
 pub use runner::{run_console, run_engine};
