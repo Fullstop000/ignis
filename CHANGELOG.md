@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-06-22
+
 ### Added
 - Sub-agents can run on a cheaper or stronger model matched to the task — the `agent` tool takes a `tier` (`low`/`medium`/`high`), with sensible per-type defaults, and each result reports the model and token cost it used. ([#223](https://github.com/Fullstop000/ignis/pull/223))
+- `-r` — shortcut for `--resume`. ([#225](https://github.com/Fullstop000/ignis/pull/225))
 
 ### Fixed
 - Changing `/model`, `/afk`, or permission grants is no longer occasionally lost to a background update check overwriting `state.json` at the same time. ([#224](https://github.com/Fullstop000/ignis/pull/224))

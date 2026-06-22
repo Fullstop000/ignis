@@ -29,7 +29,7 @@ pub struct Cli {
     pub version: (),
 
     /// Resume the latest session, or the given session id.
-    #[arg(long, num_args = 0..=1, value_name = "ID")]
+    #[arg(short = 'r', long, num_args = 0..=1, value_name = "ID")]
     pub resume: Option<Option<String>>,
 
     /// Enable AFK mode (fully unattended) for this session — auto-approves
@@ -335,6 +335,27 @@ mod tests {
     #[test]
     fn resume_with_id_and_prompt() {
         let args = parse(&["--resume", "work", "follow-up"]).to_session_args();
+        assert!(args.resume);
+        assert_eq!(args.resume_session_id.as_deref(), Some("work"));
+        assert_eq!(args.prompt_args, vec!["follow-up"]);
+    }
+
+    #[test]
+    fn short_r_is_alias_for_resume() {
+        // `-r` bare: resume latest session.
+        let args = parse(&["-r"]).to_session_args();
+        assert!(args.resume);
+        assert!(args.resume_session_id.is_none());
+        assert!(args.prompt_args.is_empty());
+
+        // `-r <id>`: resume the given session id.
+        let args = parse(&["-r", "work"]).to_session_args();
+        assert!(args.resume);
+        assert_eq!(args.resume_session_id.as_deref(), Some("work"));
+
+        // `-r <id> <prompt>`: id consumed, prompt trails — parity with
+        // `--resume work follow-up` (resume_with_id_and_prompt).
+        let args = parse(&["-r", "work", "follow-up"]).to_session_args();
         assert!(args.resume);
         assert_eq!(args.resume_session_id.as_deref(), Some("work"));
         assert_eq!(args.prompt_args, vec!["follow-up"]);
