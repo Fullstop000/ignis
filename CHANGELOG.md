@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Sub-agents can run on a cheaper or stronger model matched to the task — the `agent` tool takes a `tier` (`low`/`medium`/`high`), with sensible per-type defaults, and each result reports the model and token cost it used. ([#223](https://github.com/Fullstop000/ignis/pull/223))
 
+### Fixed
+- Changing `/model`, `/afk`, or permission grants is no longer occasionally lost to a background update check overwriting `state.json` at the same time. ([#224](https://github.com/Fullstop000/ignis/pull/224))
+- `ignis sessions` HTML export no longer lists phantom zero-count rows for internal todo sidecar files. ([#224](https://github.com/Fullstop000/ignis/pull/224))
+
+### Security
+- Auto-run bash in hands-free / AFK modes can no longer read your home directory on Linux — `~/.ssh`, `~/.aws`, and the credentials in `~/.ignis` are now outside the sandbox's read scope, which is limited to system paths, the project, and the Rust toolchain (extend it with `sandbox_read_paths`). ([#224](https://github.com/Fullstop000/ignis/pull/224))
+- The "always ask" prompt for `rm -rf /` and friends can no longer be skipped by quoting or reordering flags (e.g. `rm -rf "/"`, `rm -r -f /`, `rm --recursive --force /`). ([#224](https://github.com/Fullstop000/ignis/pull/224))
+- ignis now warns instead of silently continuing when it can't restrict `config.toml` (which holds your API keys) to owner-only `0600`. ([#224](https://github.com/Fullstop000/ignis/pull/224))
+
 ## [0.41.3] - 2026-06-21
 
 ### Added

@@ -97,16 +97,19 @@ fn resolve_bash_sandbox(
         return None;
     }
     let home = dirs::home_dir();
-    let extra_writes = config
-        .permissions
-        .sandbox_write_paths
-        .iter()
-        .map(|s| match (s.strip_prefix("~/"), &home) {
-            (Some(rest), Some(h)) => h.join(rest),
-            _ => std::path::PathBuf::from(s),
-        })
-        .collect();
-    Some(bash::BashSandbox { extra_writes })
+    let expand = |paths: &[String]| -> Vec<std::path::PathBuf> {
+        paths
+            .iter()
+            .map(|s| match (s.strip_prefix("~/"), &home) {
+                (Some(rest), Some(h)) => h.join(rest),
+                _ => std::path::PathBuf::from(s),
+            })
+            .collect()
+    };
+    Some(bash::BashSandbox {
+        extra_writes: expand(&config.permissions.sandbox_write_paths),
+        extra_reads: expand(&config.permissions.sandbox_read_paths),
+    })
 }
 
 /// Same as `register_native_tools` but threads a shared MCP registry into the
@@ -209,6 +212,22 @@ mod tests {
             .any(|p| p == std::path::Path::new("/opt/cache")));
         if let Some(home) = dirs::home_dir() {
             assert!(sb.extra_writes.contains(&home.join(".cargo")));
+        }
+    }
+
+    #[test]
+    fn bash_sandbox_expands_configured_read_paths() {
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.sandbox_read_paths = vec!["~/.npm".to_string(), "/opt/sdk".to_string()];
+        let fu = PermissionState::new(Mode::FullyUnattended);
+        let sb = resolve_bash_sandbox(&cfg, Some(&fu)).expect("sandbox active");
+        assert!(sb.extra_reads.iter().any(|p| p.ends_with(".npm")));
+        assert!(sb
+            .extra_reads
+            .iter()
+            .any(|p| p == std::path::Path::new("/opt/sdk")));
+        if let Some(home) = dirs::home_dir() {
+            assert!(sb.extra_reads.contains(&home.join(".npm")));
         }
     }
 }

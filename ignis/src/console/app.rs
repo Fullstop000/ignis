@@ -9,6 +9,13 @@ use super::{
 };
 use crate::AgentEvent;
 
+// Picker UI state lives in `pickers_state`; re-exported here so existing
+// `crate::console::app::*` references keep resolving.
+pub(crate) use crate::console::pickers_state::{
+    McpPicker, ModelPicker, SessionPicker, SessionPickerMode, SettingsPanel, SettingsTab,
+    SkillPicker, STATUSLINE_SEGMENTS,
+};
+
 /// Clipboard function type: takes text, returns Ok/Err.
 type ClipFn = for<'a> fn(&'a str) -> Result<(), String>;
 
@@ -52,287 +59,6 @@ pub(crate) enum UIBlock {
     /// "✻ Thinking" header instead of being silently glued onto the reply.
     Reasoning(String),
     Tool(ToolCallEntry),
-}
-
-/// List = the session table; Detail = drill-in for one session showing turn
-/// waterfall + token/tool rollups. Right pushes List→Detail; Left/Esc pops back.
-#[derive(Debug, Clone)]
-pub(crate) enum SessionPickerMode {
-    List,
-    // Boxed because SessionDetail is ~232 B vs the bare List variant — clippy
-    // flags the size mismatch.
-    Detail(Box<crate::cli::sessions::SessionDetail>),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SessionPicker {
-    pub(crate) sessions: Vec<crate::cli::sessions::SessionRecord>,
-    pub(crate) selected: usize,
-    pub(crate) mode: SessionPickerMode,
-    pub(crate) projects_dir: std::path::PathBuf,
-}
-
-impl SessionPicker {
-    pub(crate) fn new(
-        sessions: Vec<crate::cli::sessions::SessionRecord>,
-        projects_dir: std::path::PathBuf,
-    ) -> Self {
-        Self {
-            sessions,
-            selected: 0,
-            mode: SessionPickerMode::List,
-            projects_dir,
-        }
-    }
-
-    pub(crate) fn select(&mut self, direction: SelectionDirection) {
-        // Navigation only applies to the list view; in Detail the keys are owned
-        // by the detail panel (scroll later if needed).
-        if !matches!(self.mode, SessionPickerMode::List) {
-            return;
-        }
-        // `next_selection` no-ops on empty — no extra guard needed.
-        self.selected = next_selection(self.selected, self.sessions.len(), direction);
-    }
-
-    pub(crate) fn selected_id(&self) -> Option<String> {
-        self.sessions
-            .get(self.selected)
-            .map(|s| s.session_id.clone())
-    }
-
-    pub(crate) fn is_detail(&self) -> bool {
-        matches!(self.mode, SessionPickerMode::Detail(_))
-    }
-
-    /// Push from List → Detail. Loads the highlighted session's per-turn
-    /// detail from disk; if there's no persisted JSONL (synthetic current row,
-    /// freshly started session), falls back to a synthetic `SessionDetail` so
-    /// the panel still opens — empty rather than silently no-op.
-    pub(crate) fn enter_detail(&mut self) {
-        if self.is_detail() {
-            return;
-        }
-        let Some(record) = self.sessions.get(self.selected) else {
-            return;
-        };
-        let detail = crate::cli::sessions::load_session_detail(
-            &self.projects_dir,
-            &record.project_slug,
-            &record.session_id,
-        )
-        .unwrap_or_else(|| crate::cli::sessions::SessionDetail {
-            record: record.clone(),
-            turns: Vec::new(),
-        });
-        self.mode = SessionPickerMode::Detail(Box::new(detail));
-    }
-
-    /// Pop from Detail → List. No-op if already in List (the keys.rs branch
-    /// then closes the picker entirely instead).
-    pub(crate) fn exit_detail(&mut self) {
-        if self.is_detail() {
-            self.mode = SessionPickerMode::List;
-        }
-    }
-}
-
-/// `/skills` picker state. Rows come from `App.skills` registry `all()`.
-#[derive(Debug, Clone)]
-pub(crate) struct SkillPicker {
-    pub(crate) selected: usize,
-    /// Transient one-line confirmation shown in the footer after `r` reloads
-    /// the registry (e.g. `↻ reloaded — 7 skills`). Cleared on navigation.
-    pub(crate) status: Option<String>,
-}
-
-impl SkillPicker {
-    /// Open over a non-empty registry; returns `None` (so the caller can show
-    /// a notice) when no skills are configured.
-    pub(crate) fn open(registry: &crate::skills::SkillRegistry) -> Option<Self> {
-        (!registry.is_empty()).then_some(Self {
-            selected: 0,
-            status: None,
-        })
-    }
-
-    pub(crate) fn select(&mut self, direction: SelectionDirection, total: usize) {
-        self.status = None;
-        self.selected = next_selection(self.selected, total, direction);
-    }
-
-    /// Toggle the highlighted skill on the registry; returns `(name, now_enabled)`
-    /// for the post-toggle notice.
-    pub(crate) fn toggle(&self, registry: &crate::skills::SkillRegistry) -> Option<(String, bool)> {
-        let name = registry.all().get(self.selected)?.name.clone();
-        let now_enabled = registry.toggle(&name);
-        Some((name, now_enabled))
-    }
-}
-
-/// `/mcp` picker state. Rows come from `App.mcp` registry `entries()` —
-/// includes connected, failed, and disabled servers in stable name order.
-#[derive(Debug, Clone)]
-pub(crate) struct McpPicker {
-    pub(crate) selected: usize,
-}
-
-impl McpPicker {
-    /// Open over a non-empty registry; returns `None` when no servers are
-    /// configured so the caller can show the "add one with `ignis mcp add`"
-    /// notice instead of an empty picker.
-    pub(crate) fn open(registry: &crate::mcp::McpRegistry) -> Option<Self> {
-        (!registry.is_empty()).then_some(Self { selected: 0 })
-    }
-
-    pub(crate) fn select(&mut self, direction: SelectionDirection, total: usize) {
-        self.selected = next_selection(self.selected, total, direction);
-    }
-
-    /// Toggle the highlighted MCP server on the registry; returns
-    /// `(name, now_enabled)`.
-    pub(crate) fn toggle(&self, registry: &crate::mcp::McpRegistry) -> Option<(String, bool)> {
-        let name = registry.entries().get(self.selected)?.name.clone();
-        let now_enabled = registry.toggle(&name);
-        Some((name, now_enabled))
-    }
-}
-
-/// `/model` picker state. Options live on `App.model_options`; this tracks the
-/// highlighted row and, for a reasoning-capable model, the chosen effort level.
-#[derive(Debug, Clone)]
-pub(crate) struct ModelPicker {
-    pub(crate) selected: usize,
-    /// Index into the selected option's `effort_levels` (ignored if empty).
-    pub(crate) effort_idx: usize,
-}
-
-impl ModelPicker {
-    /// Open the picker preselecting the currently active provider/model/effort
-    /// (falls back to row 0 / level 0 when no match). Returns `None` when there
-    /// are no options to show.
-    pub(crate) fn open(
-        options: &[crate::llm::ModelOption],
-        provider: &str,
-        model: &str,
-        effort: Option<&str>,
-    ) -> Option<Self> {
-        if options.is_empty() {
-            return None;
-        }
-        let selected = options
-            .iter()
-            .position(|o| o.provider == provider && o.model == model)
-            .unwrap_or(0);
-        let effort_idx = effort
-            .and_then(|e| options[selected].effort_levels.iter().position(|l| l == e))
-            .unwrap_or(0);
-        Some(Self {
-            selected,
-            effort_idx,
-        })
-    }
-
-    /// Move the highlighted model; resets effort to 0 when the new model has
-    /// fewer levels than the current effort_idx points at.
-    pub(crate) fn select(
-        &mut self,
-        direction: SelectionDirection,
-        options: &[crate::llm::ModelOption],
-    ) {
-        if options.is_empty() {
-            return;
-        }
-        self.selected = next_selection(self.selected, options.len(), direction);
-        let levels = options[self.selected].effort_levels.len();
-        if self.effort_idx >= levels {
-            self.effort_idx = 0;
-        }
-    }
-
-    /// Cycle the effort level within the currently highlighted model.
-    pub(crate) fn cycle_effort(
-        &mut self,
-        direction: SelectionDirection,
-        options: &[crate::llm::ModelOption],
-    ) {
-        let levels = options
-            .get(self.selected)
-            .map(|o| o.effort_levels.len())
-            .unwrap_or(0);
-        if levels == 0 {
-            return;
-        }
-        self.effort_idx = next_selection(self.effort_idx, levels, direction);
-    }
-
-    /// Resolve the picker's selection into `(provider, model, effort)` for the
-    /// caller to apply. Effort is `None` when the model declares no levels. The
-    /// caller retargets the context gauge from `model_options` separately, so
-    /// the window isn't surfaced here.
-    pub(crate) fn resolve(
-        &self,
-        options: &[crate::llm::ModelOption],
-    ) -> Option<(String, String, Option<String>)> {
-        let opt = options.get(self.selected)?;
-        let effort = if opt.effort_levels.is_empty() {
-            None
-        } else {
-            opt.effort_levels.get(self.effort_idx).cloned()
-        };
-        Some((opt.provider.clone(), opt.model.clone(), effort))
-    }
-}
-
-/// Which tab the `/settings` control panel is showing.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum SettingsTab {
-    Stats,
-    Statusline,
-}
-
-impl SettingsTab {
-    /// Tab order, used to cycle with `←`/`→`/Tab.
-    const ORDER: [SettingsTab; 2] = [SettingsTab::Stats, SettingsTab::Statusline];
-}
-
-/// Footer segments the user can show/hide via `/settings` → Statusline, in
-/// footer render order. The AFK/HANDS-FREE mode badge and the update notice
-/// are intentionally absent — always shown (safety / transient).
-pub(crate) const STATUSLINE_SEGMENTS: [(&str, &str); 5] = [
-    ("cwd", "working directory"),
-    ("git", "git branch"),
-    ("turns", "turns"),
-    ("model", "model"),
-    ("tokens", "tokens / context %"),
-];
-
-/// `/settings` control panel. Stats is a read-only live view of the session;
-/// Statusline toggles which footer segments show (Space/Enter, persisted
-/// immediately like `/skills`).
-#[derive(Debug, Clone)]
-pub(crate) struct SettingsPanel {
-    pub(crate) tab: SettingsTab,
-    /// Highlighted segment row on the Statusline tab.
-    pub(crate) statusline_idx: usize,
-}
-
-impl SettingsPanel {
-    pub(crate) fn open() -> Self {
-        Self {
-            tab: SettingsTab::Stats,
-            statusline_idx: 0,
-        }
-    }
-
-    /// Cycle the active tab (`←`/`→`/Tab).
-    pub(crate) fn switch_tab(&mut self, direction: SelectionDirection) {
-        let cur = SettingsTab::ORDER
-            .iter()
-            .position(|t| *t == self.tab)
-            .unwrap_or(0);
-        self.tab = SettingsTab::ORDER[next_selection(cur, SettingsTab::ORDER.len(), direction)];
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1309,84 +1035,30 @@ impl App {
             return;
         }
 
-        for message in messages {
-            match message.role.as_str() {
-                "user" => {
-                    if let Some(content) = message.content.filter(|c| !c.is_empty()) {
-                        self.blocks.push(UIBlock::User(content));
-                    }
-                }
-                "assistant" => {
-                    // Push reasoning first, then the reply — matches the
-                    // typical streaming order (reasoning chunks fully arrive
-                    // before any text). Either may be missing or empty.
-                    //
-                    // Caveat for interleaved-thinking streams (Anthropic
-                    // protocol via `interleaved-thinking-2025-05-14`): a
-                    // live turn may render as reasoning₁ → text → reasoning₂
-                    // as separate blocks, but the persisted Message
-                    // collapses to one (content, reasoning_content) pair, so
-                    // the resumed view shows one Reasoning + one Assistant.
-                    // Deliberate trade-off — per-block storage records would
-                    // cost every turn for an edge case OpenAI-compatible
-                    // providers don't hit today.
-                    if let Some(reasoning) = message.reasoning_content.filter(|r| !r.is_empty()) {
-                        self.blocks.push(UIBlock::Reasoning(reasoning));
-                    }
-                    if let Some(content) = message.content.filter(|c| !c.is_empty()) {
-                        self.blocks.push(UIBlock::Assistant(content));
-                    }
-                    // Reconstruct tool blocks from this turn's calls; the
-                    // following `tool` messages fill in each result by id.
-                    if let Some(tool_calls) = message.tool_calls {
-                        for tc in tool_calls {
-                            self.blocks.push(UIBlock::Tool(ToolCallEntry {
-                                id: tc.id,
-                                name: tc.function.name,
-                                arguments: tc.function.arguments,
-                                status: ToolStatus::Success(String::new()),
-                                started_at: Instant::now(),
-                                elapsed_ms: 0,
-                            }));
-                        }
-                    }
-                }
-                "tool" => {
-                    // Persisted tool content is {"result": <str>, "is_error": <bool>};
-                    // parse it and attach to the matching pending tool block.
-                    let (result, is_error) =
-                        parse_tool_result(message.content.as_deref().unwrap_or(""));
-                    let status = if is_error {
-                        ToolStatus::Error(result)
-                    } else {
-                        ToolStatus::Success(result)
-                    };
-                    let idx = message.tool_call_id.as_deref().and_then(|id| {
-                        self.blocks
-                            .iter()
-                            .rposition(|b| matches!(b, UIBlock::Tool(t) if t.id == id))
-                    });
-                    match idx {
-                        Some(i) => {
-                            if let UIBlock::Tool(t) = &mut self.blocks[i] {
-                                t.status = status;
-                            }
-                        }
-                        None => {
-                            // Orphaned result (no matching call) — show it standalone.
-                            self.blocks.push(UIBlock::Tool(ToolCallEntry {
-                                id: String::new(),
-                                name: message.name.unwrap_or_else(|| "tool".to_string()),
-                                arguments: String::new(),
-                                status,
-                                started_at: Instant::now(),
-                                elapsed_ms: 0,
-                            }));
-                        }
-                    }
-                }
-                _ => {}
-            }
+        use crate::console::transcript::{reduce_transcript, TranscriptItem};
+        for item in reduce_transcript(messages) {
+            self.blocks.push(match item {
+                TranscriptItem::User(text) => UIBlock::User(text),
+                TranscriptItem::Reasoning(text) => UIBlock::Reasoning(text),
+                TranscriptItem::Assistant(text) => UIBlock::Assistant(text),
+                TranscriptItem::Tool {
+                    id,
+                    name,
+                    args,
+                    result,
+                } => UIBlock::Tool(ToolCallEntry {
+                    id,
+                    name,
+                    arguments: args,
+                    status: match result {
+                        None => ToolStatus::Success(String::new()),
+                        Some((text, true)) => ToolStatus::Error(text),
+                        Some((text, false)) => ToolStatus::Success(text),
+                    },
+                    started_at: Instant::now(),
+                    elapsed_ms: 0,
+                }),
+            });
         }
         self.add_assistant_notice(format!("Resumed session `{}`.", session_id));
     }

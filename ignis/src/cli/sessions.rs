@@ -570,9 +570,11 @@ pub fn walk_sessions(projects_dir: &Path, scope: Scope, cwd: &Path) -> Result<Ve
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            // Sibling usage files are `<id>.usage.json` — their stem ends in
-            // `.usage`. Skip so they don't show up as phantom sessions.
-            if stem.ends_with(".usage") {
+            // Sibling sidecar files are `<id>.usage.json` / `<id>.todos.json` —
+            // their stem ends in `.usage` / `.todos`. Skip both so they don't
+            // show up as phantom zero-count sessions (matches
+            // `SessionManager::list`, which excludes both).
+            if stem.ends_with(".usage") || stem.ends_with(".todos") {
                 continue;
             }
             let raw = match std::fs::read_to_string(&fp) {

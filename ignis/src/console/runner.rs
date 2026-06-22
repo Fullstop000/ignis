@@ -825,75 +825,32 @@ fn session_infos(
         .collect()
 }
 
-/// Convert a loaded session's messages into render-ready [`TranscriptBlock`]s
-/// for replay. Mirrors `App::render_session_history`'s message→block mapping:
-/// reasoning precedes the assistant reply; a `tool` message fills the result of
-/// the most recent matching call; an orphan result becomes a standalone block.
+/// Map a loaded session's messages into render-ready [`TranscriptBlock`]s for
+/// replay, via the shared `console::transcript::reduce_transcript` walk — the
+/// same reduction the native renderer applies, mapped to the protocol block type.
 fn transcript_blocks(
     messages: Vec<Message>,
 ) -> Vec<crate::console::frontend::protocol::TranscriptBlock> {
     use crate::console::frontend::protocol::TranscriptBlock;
-    let mut blocks: Vec<TranscriptBlock> = Vec::new();
-    // tool_call_id -> index in `blocks`, so a following `tool` message attaches
-    // its result to the matching call.
-    let mut tool_idx: Vec<(String, usize)> = Vec::new();
-    for message in messages {
-        match message.role.as_str() {
-            "user" => {
-                if let Some(content) = message.content.filter(|c| !c.is_empty()) {
-                    blocks.push(TranscriptBlock::User { text: content });
-                }
-            }
-            "assistant" => {
-                // Reasoning before the reply, matching the streaming order.
-                if let Some(reasoning) = message.reasoning_content.filter(|r| !r.is_empty()) {
-                    blocks.push(TranscriptBlock::Reasoning { text: reasoning });
-                }
-                if let Some(content) = message.content.filter(|c| !c.is_empty()) {
-                    blocks.push(TranscriptBlock::Assistant { text: content });
-                }
-                if let Some(tool_calls) = message.tool_calls {
-                    for tc in tool_calls {
-                        tool_idx.push((tc.id, blocks.len()));
-                        blocks.push(TranscriptBlock::Tool {
-                            name: tc.function.name,
-                            args: tc.function.arguments,
-                            // Empty-success until the matching `tool` message
-                            // fills it; an interrupted call keeps it empty.
-                            result: crate::ToolResult::ok(String::new()),
-                        });
-                    }
-                }
-            }
-            "tool" => {
-                let (content, is_error) = crate::console::app::parse_tool_result(
-                    message.content.as_deref().unwrap_or(""),
-                );
-                let result = crate::ToolResult { content, is_error };
-                let idx = message.tool_call_id.as_deref().and_then(|id| {
-                    tool_idx
-                        .iter()
-                        .rev()
-                        .find(|(tid, _)| tid == id)
-                        .map(|(_, i)| *i)
-                });
-                match idx {
-                    Some(i) => {
-                        if let TranscriptBlock::Tool { result: r, .. } = &mut blocks[i] {
-                            *r = result;
-                        }
-                    }
-                    None => blocks.push(TranscriptBlock::Tool {
-                        name: message.name.unwrap_or_else(|| "tool".to_string()),
-                        args: String::new(),
-                        result,
-                    }),
-                }
-            }
-            _ => {}
-        }
-    }
-    blocks
+    use crate::console::transcript::TranscriptItem;
+    crate::console::transcript::reduce_transcript(messages)
+        .into_iter()
+        .map(|item| match item {
+            TranscriptItem::User(text) => TranscriptBlock::User { text },
+            TranscriptItem::Reasoning(text) => TranscriptBlock::Reasoning { text },
+            TranscriptItem::Assistant(text) => TranscriptBlock::Assistant { text },
+            TranscriptItem::Tool {
+                name, args, result, ..
+            } => TranscriptBlock::Tool {
+                name,
+                args,
+                result: match result {
+                    None => crate::ToolResult::ok(String::new()),
+                    Some((content, is_error)) => crate::ToolResult { content, is_error },
+                },
+            },
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

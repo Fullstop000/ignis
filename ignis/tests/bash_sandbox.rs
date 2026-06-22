@@ -2,8 +2,9 @@
 //!
 //! Goes through the real `BashTool` → `tokio::process::Command` → child path.
 //! Asserts the externally-observable contract: a sandboxed command may write
-//! inside cwd but not outside it, while reads stay broad; an unsandboxed
-//! command is unconfined.
+//! inside cwd but not outside it; on Linux it may read the system roots +
+//! project but NOT arbitrary paths outside the allowlist (so `$HOME` secrets
+//! stay private); an unsandboxed command is unconfined.
 //!
 //! Skipped (smoke-only) on kernels without Landlock — the confinement can't be
 //! asserted there. Linux/macOS only via the `#![cfg(unix)]` gate.
@@ -40,12 +41,8 @@ async fn sandbox_confines_writes_to_cwd_when_enforced() {
     let cwd = base.join("proj");
     std::fs::create_dir_all(&cwd).unwrap();
     let outside = base.join("outside.txt");
-    let readable = base.join("readable.txt");
-    std::fs::write(&readable, b"secret-but-readable").unwrap();
 
-    let tool = BashTool::new(&cwd).with_sandbox(Some(BashSandbox {
-        extra_writes: vec![],
-    }));
+    let tool = BashTool::new(&cwd).with_sandbox(Some(BashSandbox::default()));
 
     // Write inside cwd → allowed.
     let r = tool
@@ -65,16 +62,54 @@ async fn sandbox_confines_writes_to_cwd_when_enforced() {
     assert!(r.is_error, "write outside cwd must be denied");
     assert!(!outside.exists(), "the outside file must not be created");
 
-    // Read outside cwd → allowed (reads are broad).
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Linux-only: the read narrowing (Landlock) denies a secret outside the
+/// allowlist (simulating `~/.ssh/id_*`) while keeping system reads. macOS
+/// Seatbelt keeps reads broad (see `BashTool::sandbox_reads`), so this contract
+/// is Linux-specific.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sandbox_narrows_reads_to_block_secrets_outside_the_allowlist() {
+    if !ignis::sandbox::is_kernel_sandbox_available() {
+        eprintln!("skipping: no kernel sandbox (Landlock) on this host");
+        return;
+    }
+    let base = fresh_base("bash-sbx-read");
+    let cwd = base.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let secret = base.join("secret.txt");
+    std::fs::write(&secret, b"secret-but-readable").unwrap();
+
+    let tool = BashTool::new(&cwd).with_sandbox(Some(BashSandbox::default()));
+
+    // Read a file OUTSIDE the allowlist → denied. Reads were once `/`, so an
+    // unattended command could read and exfiltrate any secret on disk.
     let r = tool
-        .call(json!({ "command": format!("cat '{}'", readable.display()) }))
+        .call(json!({ "command": format!("cat '{}'", secret.display()) }))
+        .await;
+    assert!(
+        r.is_error,
+        "read outside the allowlist must be denied (the broad-read hole is closed)"
+    );
+    assert!(
+        !r.content.contains("secret-but-readable"),
+        "the secret's contents must not leak: {}",
+        r.content
+    );
+
+    // Read a system path (inside the allowlist) → still allowed, so builds can
+    // read libraries, binaries, and system config.
+    let r = tool
+        .call(json!({ "command": "cat /etc/hosts > /dev/null && echo readok" }))
         .await;
     assert!(
         !r.is_error,
-        "read outside cwd should succeed: {}",
+        "reads of system roots must still succeed: {}",
         r.content
     );
-    assert!(r.content.contains("secret-but-readable"));
+    assert!(r.content.contains("readok"));
 
     std::fs::remove_dir_all(&base).ok();
 }
@@ -92,6 +127,7 @@ async fn extra_write_path_becomes_writable() {
 
     let tool = BashTool::new(&cwd).with_sandbox(Some(BashSandbox {
         extra_writes: vec![extra.clone()],
+        ..Default::default()
     }));
     let r = tool
         .call(json!({ "command": format!("echo ok > '{}/f.txt'", extra.display()) }))
@@ -135,9 +171,7 @@ async fn sandbox_allows_cross_directory_link_within_writable_tree() {
     std::fs::create_dir_all(cwd.join("to")).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
 
-    let tool = BashTool::new(&cwd).with_sandbox(Some(BashSandbox {
-        extra_writes: vec![],
-    }));
+    let tool = BashTool::new(&cwd).with_sandbox(Some(BashSandbox::default()));
 
     // Cross-directory link *within* cwd → allowed under V2 (was EXDEV on V1).
     let r = tool
@@ -182,5 +216,47 @@ async fn no_sandbox_does_not_confine_writes() {
         .await;
     assert!(!r.is_error, "no sandbox: write outside cwd allowed");
     assert!(outside.exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Dogfood the read narrowing against a real build tool: `rustc --version` must
+/// still run under the sandbox. The rustup proxy at `~/.cargo/bin/rustc` resolves
+/// and execs the toolchain under `~/.rustup` — both granted by the read policy —
+/// so a narrowed sandbox that broke this would break every auto-run cargo build.
+/// Linux-only (the read narrowing it exercises is Linux-only); skipped when
+/// rustc isn't installed (e.g. a minimal CI image).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sandbox_allows_real_toolchain_command() {
+    if !ignis::sandbox::is_kernel_sandbox_available() {
+        eprintln!("skipping: no kernel sandbox (Landlock) on this host");
+        return;
+    }
+    // Probe in the parent (unconfined) so we only assert when rustc exists.
+    if std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: no rustc on PATH");
+        return;
+    }
+    let base = fresh_base("bash-sbx-toolchain");
+    let cwd = base.join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let tool = BashTool::new(&cwd).with_sandbox(Some(BashSandbox::default()));
+    let r = tool.call(json!({ "command": "rustc --version" })).await;
+    assert!(
+        !r.is_error,
+        "rustc must run under the narrowed sandbox (toolchain reads are granted): {}",
+        r.content
+    );
+    assert!(
+        r.content.contains("rustc"),
+        "unexpected output: {}",
+        r.content
+    );
+
     std::fs::remove_dir_all(&base).ok();
 }
