@@ -302,6 +302,28 @@ test('toolArgsSummary shows values only, never param names', () => {
   assert.ok(toolArgsSummary(`{"x":"${'a'.repeat(200)}"}`).length <= 80);
 });
 
+test('toolArgsSummary renders a friendly tally for todo_write', () => {
+  const plan = JSON.stringify({
+    todos: [
+      { content: 'Preflight: git status, branch, re…', status: 'completed', activeForm: 'Running preflight' },
+      { content: 'Write the fix', status: 'in_progress', activeForm: 'Writing the fix' },
+      { content: 'Run tests', status: 'pending' },
+    ],
+  });
+  assert.equal(toolArgsSummary(plan, 'todo_write'), '3 tasks · 1✓ 1◐ 1◻');
+  // Singular "task"; only the in-progress glyph shows.
+  assert.equal(
+    toolArgsSummary('{"todos":[{"content":"x","status":"in_progress"}]}', 'todo_write'),
+    '1 task · 1◐',
+  );
+  // Empty list → bare count.
+  assert.equal(toolArgsSummary('{"todos":[]}', 'todo_write'), '0 tasks');
+  // Without the tool name the raw JSON value shows (no special-casing).
+  const raw = toolArgsSummary(plan);
+  assert.ok(raw.startsWith('['));
+  assert.notEqual(raw, '3 tasks · 1✓ 1◐ 1◻');
+});
+
 test('toolOutputPreview caps lines (3 ok / 5 error) and counts the rest', () => {
   assert.deepEqual(toolOutputPreview(''), { lines: [], more: 0 });
   assert.deepEqual(toolOutputPreview('one\ntwo'), { lines: ['one', 'two'], more: 0 });

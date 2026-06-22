@@ -335,8 +335,12 @@ function reduceEvent(state, ev) {
  * Tool-call header summary: argument VALUES only, never param names — matching
  * the ratatui TUI (`grep("x")`, not `grep(pattern="x")`). Objects/arrays are
  * compact-JSON'd; the whole thing is capped so the header stays one line.
+ *
+ * `todo_write` is special-cased: its `todos` array would otherwise dump as raw
+ * JSON, so it renders a friendly task tally instead (`3 tasks · 1✓ 1◐ 1◻`),
+ * using the same glyphs as the checklist panel.
  */
-export function toolArgsSummary(argsJson, cap = 80) {
+export function toolArgsSummary(argsJson, toolName, cap = 80) {
   if (argsJson == null || argsJson === '') return '';
   let obj;
   try {
@@ -345,6 +349,9 @@ export function toolArgsSummary(argsJson, cap = 80) {
     return clip(String(argsJson), cap);
   }
   if (obj == null || typeof obj !== 'object') return clip(String(obj), cap);
+  if (toolName === 'todo_write' && Array.isArray(obj.todos)) {
+    return clip(todoTally(obj.todos), cap);
+  }
   const vals = Object.values(obj)
     .map((v) =>
       typeof v === 'string'
@@ -357,6 +364,22 @@ export function toolArgsSummary(argsJson, cap = 80) {
     )
     .filter((s) => s !== '');
   return clip(vals.join(', '), cap);
+}
+
+/** `{n} tasks · {done}✓ {active}◐ {pending}◻` — non-zero statuses only. */
+function todoTally(todos) {
+  const n = todos.length;
+  const head = `${n} ${n === 1 ? 'task' : 'tasks'}`;
+  if (n === 0) return head;
+  const count = (status) => todos.filter((t) => t.status === status).length;
+  const tally = [];
+  const done = count('completed');
+  const active = count('in_progress');
+  const pending = n - done - active;
+  if (done) tally.push(`${done}✓`);
+  if (active) tally.push(`${active}◐`);
+  if (pending) tally.push(`${pending}◻`);
+  return tally.length ? `${head} · ${tally.join(' ')}` : head;
 }
 
 function clip(s, cap) {

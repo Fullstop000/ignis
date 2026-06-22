@@ -707,7 +707,7 @@ function ToolBlock({ block }) {
   const header = e(
     Text,
     { key: 'h', color: headerColor },
-    `● ${block.name}(${toolArgsSummary(block.args)})`,
+    `● ${block.name}(${toolArgsSummary(block.args, block.name)})`,
   );
   if (!block.result) return header;
   const { lines, more } = toolOutputPreview(block.result.content, isError);
@@ -870,7 +870,7 @@ function RunningBar({ state, spin, startedAt }) {
       // full-screen-clear path).
       const oldest = state.activeTools[ids[0]];
       const more = ids.length - 1;
-      const summary = toolArgsSummary(oldest.args, 60);
+      const summary = toolArgsSummary(oldest.args, oldest.name, 60);
       const tail = more > 0 ? `  +${more} more running` : ' running';
       const label = `● ${oldest.name}(${summary})${tail}`;
       rows.push(e(Box, { key: 'tool' }, e(Text, { color: 'yellow' }, label)));
