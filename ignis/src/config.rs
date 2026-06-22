@@ -95,6 +95,15 @@ pub struct PermissionsConfig {
     /// auto-run builds need to write home caches. (Linux Landlock only.)
     #[serde(default)]
     pub sandbox_write_paths: Vec<String>,
+    /// Extra directories the bash sandbox may read in unattended modes, on top
+    /// of the system roots, the project (cwd), the temp dirs, and the Rust
+    /// toolchain caches (`~/.cargo`, `~/.rustup`). A leading `~/` expands to
+    /// home. Empty by default — `$HOME` is otherwise unreadable, so credential
+    /// dirs (`~/.ssh`, `~/.aws`, …) stay private; add other stacks' caches here
+    /// (e.g. `~/.npm`, `~/go`, `~/.cache`) if auto-run builds need them.
+    /// (Linux Landlock only.)
+    #[serde(default)]
+    pub sandbox_read_paths: Vec<String>,
 }
 
 /// OpenTelemetry export. Off by default — opt in with
@@ -492,9 +501,15 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
         return Ok(empty_config_with_state());
     }
     // One-time migration: pre-0.31 ignis wrote `config.toml` with the umask
-    // default (often `0644`, world-readable). Silently tighten to `0600` —
-    // best effort; a failure here must not block startup.
-    let _ = tighten_secrets_mode(&path);
+    // default (often `0644`, world-readable). Tighten to `0600` — best effort
+    // (must not block startup), but warn loudly rather than silently leaving a
+    // world-readable file full of API keys.
+    if let Err(e) = tighten_secrets_mode(&path) {
+        log::warn!(
+            "could not tighten {} to 0600 (it may be world-readable): {e}",
+            path.display()
+        );
+    }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| anyhow!("Failed to read {}: {}", path.display(), e))?;
     let mut config: Config = toml::from_str(&content)
