@@ -29,6 +29,12 @@ struct Inner {
     /// The persisted grant strings alone (config rules excluded), so an
     /// "Always allow" click can re-write the full grant list to `state.json`.
     grants: Vec<String>,
+    /// Whether the bash auto-run sandbox is active in the unattended modes.
+    /// `false` (the default) = OFF even in AFK/headless; flipped by `/sandbox`
+    /// (Ink) and the `/settings` Sandbox tab (native), seeded from `state.json`
+    /// at startup. Read live by `resolve_bash_sandbox` on each tool
+    /// registration, so a toggle takes effect on the next prompt.
+    sandbox_enabled: bool,
 }
 
 impl PermissionState {
@@ -90,6 +96,18 @@ impl PermissionState {
         self.write().mode = mode;
     }
 
+    /// Whether the bash auto-run sandbox should confine unattended commands.
+    /// Read by `resolve_bash_sandbox` (in addition to the mode gate).
+    pub fn sandbox_enabled(&self) -> bool {
+        self.read().sandbox_enabled
+    }
+
+    /// Flip the sandbox on/off. Called by `/sandbox` (Ink) and the `/settings`
+    /// Sandbox tab (native); the caller also persists to `state.json`.
+    pub fn set_sandbox_enabled(&self, enabled: bool) {
+        self.write().sandbox_enabled = enabled;
+    }
+
     pub fn is_session_allowed(&self, tool_name: &str) -> bool {
         self.read().session_allow.contains(tool_name)
     }
@@ -119,6 +137,16 @@ mod tests {
         assert_eq!(s.mode(), Mode::FullyUnattended);
         s.set_mode(Mode::Off);
         assert_eq!(s.mode(), Mode::Off);
+    }
+
+    #[test]
+    fn sandbox_defaults_off_and_toggles() {
+        let s = PermissionState::new(Mode::HandsFree);
+        assert!(!s.sandbox_enabled(), "off by default even in AFK");
+        s.set_sandbox_enabled(true);
+        assert!(s.sandbox_enabled());
+        s.set_sandbox_enabled(false);
+        assert!(!s.sandbox_enabled());
     }
 
     #[test]

@@ -828,6 +828,8 @@ pub(crate) struct SettingsData {
     pub effort: Option<String>,
     /// Which footer segments are on, aligned to `STATUSLINE_SEGMENTS`.
     pub segment_shown: [bool; STATUSLINE_SEGMENTS.len()],
+    /// Whether the bash auto-run sandbox is enabled (Sandbox tab).
+    pub sandbox_enabled: bool,
 }
 
 impl From<&App> for SettingsData {
@@ -853,6 +855,7 @@ impl From<&App> for SettingsData {
             model: app.model.clone(),
             effort: app.effort.clone(),
             segment_shown,
+            sandbox_enabled: app.sandbox_enabled(),
         }
     }
 }
@@ -872,6 +875,7 @@ pub(crate) fn render_settings_panel(
     for (label, active) in [
         ("Stats", panel.tab == SettingsTab::Stats),
         ("Statusline", panel.tab == SettingsTab::Statusline),
+        ("Sandbox", panel.tab == SettingsTab::Sandbox),
     ] {
         let style = if active {
             Style::default()
@@ -890,12 +894,14 @@ pub(crate) fn render_settings_panel(
     match panel.tab {
         SettingsTab::Stats => render_stats_tab(lines, &data),
         SettingsTab::Statusline => render_statusline_tab(lines, panel, &data),
+        SettingsTab::Sandbox => render_sandbox_tab(lines, &data),
     }
 
     lines.push(Line::from(""));
     let hint = match panel.tab {
         SettingsTab::Stats => "  ←/→ tab · Esc close",
         SettingsTab::Statusline => "  ←/→ tab · ↑/↓ move · Space toggle · Esc close",
+        SettingsTab::Sandbox => "  ←/→ tab · Space toggle · Esc close",
     };
     lines.push(Line::from(Span::styled(
         hint,
@@ -934,6 +940,33 @@ fn render_statusline_tab(
         "      ( AFK / HANDS-FREE badge is always shown )",
         Style::default().fg(TEXT_DIM),
     )));
+}
+
+/// Single on/off toggle for the bash auto-run sandbox, with a one-line note on
+/// what it does. The toggle row is always highlighted (it's the only row).
+fn render_sandbox_tab(lines: &mut Vec<Line<'static>>, data: &SettingsData) {
+    let check = if data.sandbox_enabled { "[x]" } else { "[ ]" };
+    let style = Style::default()
+        .fg(BG)
+        .bg(ACCENT)
+        .add_modifier(Modifier::BOLD);
+    lines.push(Line::from(vec![
+        Span::styled(format!("  > {check} "), style),
+        Span::styled("Sandbox auto-run bash", style),
+    ]));
+    lines.push(Line::from(""));
+    for note in [
+        "  Confines bash WRITES to the project + temp and READS away from",
+        "  ~/.ssh, ~/.aws, … — but ONLY in the unattended (AFK / headless)",
+        "  modes. Interactive mode is never sandboxed (the prompt is the gate).",
+        "",
+        "  OFF (default) lets credentialed commands like `git push` just work.",
+    ] {
+        lines.push(Line::from(Span::styled(
+            note,
+            Style::default().fg(TEXT_DIM),
+        )));
+    }
 }
 
 /// Live read-only stats for the current session.
@@ -1076,6 +1109,7 @@ mod tests {
             model: Some("MiniMax-M3".to_string()),
             effort: None,
             segment_shown: [true; STATUSLINE_SEGMENTS.len()],
+            sandbox_enabled: false,
         }
     }
 

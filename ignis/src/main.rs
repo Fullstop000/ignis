@@ -71,6 +71,10 @@ async fn main() -> Result<(), anyhow::Error> {
         perm_rules,
         persisted_state.permission_grants.clone(),
     );
+    // Seed the bash-sandbox toggle from persisted state (off by default). This
+    // process is also the engine the Ink frontend spawns, so this covers both
+    // frontends; `/sandbox` and `/settings` flip the live flag thereafter.
+    permissions.set_sandbox_enabled(persisted_state.sandbox_enabled);
 
     // 2. Resolve paths
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

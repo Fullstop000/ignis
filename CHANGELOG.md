@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The auto-run bash sandbox (hands-free / AFK) is now **opt-in and off by default**, so credentialed commands like `git push` work out of the box. Turn it on in `/settings` → Sandbox tab; the choice persists in `state.json`.
+
 ## [0.42.0] - 2026-06-22
 
 ### Added

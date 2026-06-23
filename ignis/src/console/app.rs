@@ -970,6 +970,30 @@ impl App {
         !self.statusline_hidden.iter().any(|s| s == id)
     }
 
+    /// Whether the bash auto-run sandbox is currently enabled (reads the shared
+    /// permission state). Read by the Sandbox tab renderer. `false` when no
+    /// permission state is attached (tests).
+    pub(crate) fn sandbox_enabled(&self) -> bool {
+        self.permissions
+            .as_ref()
+            .is_some_and(|p| p.sandbox_enabled())
+    }
+
+    /// Flip the bash sandbox on/off on the Sandbox tab and persist immediately
+    /// (like the Statusline toggle). The next prompt's tool registration
+    /// re-reads the flag, so it takes effect without a restart. No-op off the
+    /// Sandbox tab or when no permission state is attached.
+    pub(crate) fn settings_toggle_sandbox(&mut self) {
+        if !matches!(&self.settings_panel, Some(p) if p.tab == SettingsTab::Sandbox) {
+            return;
+        }
+        if let Some(p) = &self.permissions {
+            let enabled = !p.sandbox_enabled();
+            p.set_sandbox_enabled(enabled);
+            let _ = crate::state::persist_sandbox_enabled(enabled);
+        }
+    }
+
     /// Close the settings panel (`Esc` / a typed char / Stats-tab `Enter`).
     pub(crate) fn close_settings(&mut self) {
         self.settings_panel = None;
@@ -2397,15 +2421,17 @@ mod settings_tests {
     }
 
     #[test]
-    fn tab_switch_cycles_both_tabs_both_ways() {
+    fn tab_switch_cycles_all_tabs_both_ways() {
         let mut p = SettingsPanel::open();
         assert_eq!(p.tab, SettingsTab::Stats, "opens on Stats");
         p.switch_tab(SelectionDirection::Next);
         assert_eq!(p.tab, SettingsTab::Statusline);
         p.switch_tab(SelectionDirection::Next);
+        assert_eq!(p.tab, SettingsTab::Sandbox);
+        p.switch_tab(SelectionDirection::Next);
         assert_eq!(p.tab, SettingsTab::Stats, "wraps around");
         p.switch_tab(SelectionDirection::Previous);
-        assert_eq!(p.tab, SettingsTab::Statusline, "← wraps the other way");
+        assert_eq!(p.tab, SettingsTab::Sandbox, "← wraps the other way");
     }
 
     #[test]
@@ -2434,6 +2460,49 @@ mod settings_tests {
         app.settings_toggle_statusline();
         assert!(app.statusline_shows("git"));
         assert!(app.statusline_hidden.is_empty());
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn sandbox_toggle_flips_shared_flag_and_persists() {
+        let _env = crate::util::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = crate::util::unique_temp_dir("ignis-app-sandbox-toggle");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        let mut app = test_app();
+        let perms =
+            crate::permissions::runtime::PermissionState::new(crate::permissions::Mode::HandsFree);
+        app.permissions = Some(perms.clone());
+        assert!(!app.sandbox_enabled(), "off by default");
+
+        app.show_settings_panel();
+        app.settings_switch_tab(SelectionDirection::Next); // Stats → Statusline
+        app.settings_switch_tab(SelectionDirection::Next); // Statusline → Sandbox
+        assert_eq!(
+            app.settings_panel.as_ref().unwrap().tab,
+            SettingsTab::Sandbox
+        );
+
+        app.settings_toggle_sandbox();
+        assert!(app.sandbox_enabled(), "enabled after toggle");
+        assert!(perms.sandbox_enabled(), "the shared flag flipped");
+        assert!(
+            crate::state::load_state().sandbox_enabled,
+            "persisted to state.json"
+        );
+
+        app.settings_toggle_sandbox();
+        assert!(!app.sandbox_enabled(), "back off");
+        assert!(!crate::state::load_state().sandbox_enabled);
 
         match prev {
             Some(v) => std::env::set_var("HOME", v),
