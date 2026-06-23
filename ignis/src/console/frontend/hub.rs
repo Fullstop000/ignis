@@ -19,7 +19,7 @@
 use crate::console::frontend::command::{control_signal, ControlSignal};
 use crate::console::frontend::port::Acceptor;
 use crate::console::frontend::protocol::{
-    ClientCommand, ClientRequest, ModelRef, Outbound, SessionInfo, Snapshot, Toggle,
+    ClientCommand, ClientRequest, ModelRef, Outbound, SessionInfo, Setting, Snapshot, Toggle,
     TranscriptBlock,
 };
 use crate::console::frontend::RequestBroker;
@@ -49,6 +49,12 @@ pub enum CommandOutcome {
     /// Switch the permission mode (`/afk`): the core applies + persists it and
     /// re-snapshots.
     SetMode(String),
+    /// Flip a `/settings` config knob: the core calls `settings::apply_setting`
+    /// (effect + persist) and re-snapshots with the rebuilt settings list.
+    SetSetting {
+        id: String,
+        value: bool,
+    },
     /// Toggle a skill / MCP server (`/skills`, `/mcp`): the core flips + persists
     /// it and re-snapshots.
     ToggleSkill(String),
@@ -85,6 +91,8 @@ pub struct FrontendHub {
     /// Skills + MCP servers with enabled state (set after construction + on toggle).
     skills: Vec<Toggle>,
     mcp: Vec<Toggle>,
+    /// Generic `/settings` config knobs (set at startup + rebuilt on each toggle).
+    settings: Vec<Setting>,
     acceptor: Acceptor,
     broker: RequestBroker,
     /// The single picker awaiting an answer, if any. The console opens pickers
@@ -113,6 +121,7 @@ impl FrontendHub {
             models,
             skills: Vec::new(),
             mcp: Vec::new(),
+            settings: Vec::new(),
             acceptor,
             broker,
             pending: None,
@@ -135,6 +144,7 @@ impl FrontendHub {
             models: self.models.clone(),
             skills: self.skills.clone(),
             mcp: self.mcp.clone(),
+            settings: self.settings.clone(),
             pending_request: self.pending.clone(),
         }
     }
@@ -156,6 +166,12 @@ impl FrontendHub {
     }
     pub fn set_mcp(&mut self, mcp: Vec<Toggle>) {
         self.mcp = mcp;
+    }
+
+    /// Update the `/settings` config knobs the hub reports (startup + rebuilt
+    /// after each `SetSetting`).
+    pub fn set_settings(&mut self, settings: Vec<Setting>) {
+        self.settings = settings;
     }
 
     /// Retarget the session this hub reports in snapshots (after `/clear`).
@@ -260,6 +276,7 @@ impl FrontendHub {
                 effort,
             },
             ClientCommand::SetMode { mode } => CommandOutcome::SetMode(mode),
+            ClientCommand::SetSetting { id, value } => CommandOutcome::SetSetting { id, value },
             ClientCommand::ToggleSkill { name } => CommandOutcome::ToggleSkill(name),
             ClientCommand::ToggleMcp { name } => CommandOutcome::ToggleMcp(name),
             ClientCommand::ListSessions => CommandOutcome::ListSessions,

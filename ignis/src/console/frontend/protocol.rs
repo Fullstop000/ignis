@@ -134,6 +134,34 @@ pub struct Toggle {
     pub enabled: bool,
 }
 
+/// The kind of a [`Setting`]'s value. Boolean-only for now; an `Enum` variant is
+/// an additive change (see `console::settings`), so adding richer knobs later
+/// never rewrites the descriptor.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SettingKind {
+    Bool,
+}
+
+/// One generic config knob in the `/settings` panel. The engine owns the
+/// registry (`console::settings::build_settings`); the frontend renders this
+/// descriptor and sends [`ClientCommand::SetSetting`] to flip it. Adding a knob
+/// is one registry entry — the protocol and the renderer don't change.
+#[derive(Debug, Clone, Serialize)]
+pub struct Setting {
+    /// Stable key the frontend echoes back in `SetSetting` (e.g.
+    /// `"sandbox_enabled"`, `"statusline.cwd"`).
+    pub id: String,
+    /// Display label for the row.
+    pub label: String,
+    /// One-line description rendered dim under the row.
+    pub help: String,
+    /// Display grouping + order (e.g. `"General"`, `"Statusline"`).
+    pub section: String,
+    pub kind: SettingKind,
+    pub value: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub session_id: String,
@@ -156,6 +184,9 @@ pub struct Snapshot {
     /// Skills + MCP servers with their enabled state, for `/skills` and `/mcp`.
     pub skills: Vec<Toggle>,
     pub mcp: Vec<Toggle>,
+    /// Generic config knobs for the `/settings` panel (the engine owns the
+    /// registry; the frontend renders these + sends `SetSetting`).
+    pub settings: Vec<Setting>,
     /// Request awaiting an answer at activation time, if a tool was blocked
     /// when this frontend took over.
     pub pending_request: Option<ClientRequest>,
@@ -209,6 +240,11 @@ pub enum ClientCommand {
     /// `fully_unattended`. The core applies + persists it and re-snapshots.
     #[serde(rename = "set_mode")]
     SetMode { mode: String },
+    /// Flip a generic config knob from the `/settings` panel. `id` is the
+    /// [`Setting::id`] the snapshot carried; the core applies the effect,
+    /// persists it, and re-snapshots. One command covers every knob.
+    #[serde(rename = "set_setting")]
+    SetSetting { id: String, value: bool },
     /// Toggle a skill (`/skills`) or MCP server (`/mcp`) on/off. The core flips
     /// + persists it and re-snapshots with the new enabled state.
     #[serde(rename = "toggle_skill")]

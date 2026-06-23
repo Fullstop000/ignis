@@ -23,6 +23,7 @@ pub(crate) mod pickers_state;
 pub mod render;
 pub(crate) mod render_diag;
 pub(crate) mod runner;
+pub(crate) mod settings;
 pub(crate) mod slash;
 pub(crate) mod transcript;
 

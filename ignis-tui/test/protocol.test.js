@@ -13,6 +13,7 @@ import {
   newSession,
   setModel,
   setMode,
+  setSetting,
   toggleSkill,
   toggleMcp,
   listSessions,
@@ -174,11 +175,33 @@ test('command builders match the Rust ClientCommand wire shapes', () => {
     data: { provider: 'deepseek', model: 'v4', effort: 'high' },
   });
   assert.deepEqual(setMode('hands_free'), { kind: 'set_mode', data: { mode: 'hands_free' } });
+  assert.deepEqual(setSetting('sandbox_enabled', true), {
+    kind: 'set_setting',
+    data: { id: 'sandbox_enabled', value: true },
+  });
+  assert.deepEqual(setSetting('statusline.cwd', false), {
+    kind: 'set_setting',
+    data: { id: 'statusline.cwd', value: false },
+  });
   assert.deepEqual(toggleSkill('git'), { kind: 'toggle_skill', data: { name: 'git' } });
   assert.deepEqual(toggleMcp('fs'), { kind: 'toggle_mcp', data: { name: 'fs' } });
   assert.deepEqual(listSessions(), { kind: 'list_sessions' });
   assert.deepEqual(resumeSession('session-x'), { kind: 'resume_session', data: { session_id: 'session-x' } });
   assert.deepEqual(copy('hello'), { kind: 'copy', data: { text: 'hello' } });
+});
+
+test('a snapshot hydrates the generic settings list', () => {
+  const s0 = initialState();
+  assert.deepEqual(s0.settings, [], 'empty by default');
+  const settings = [
+    { id: 'sandbox_enabled', label: 'Sandbox', help: '', section: 'General', kind: { kind: 'bool' }, value: false },
+    { id: 'statusline.cwd', label: 'Working directory', help: '', section: 'Statusline', kind: { kind: 'bool' }, value: true },
+  ];
+  const s1 = reduceOutbound(s0, { kind: 'snapshot', data: { settings } });
+  assert.deepEqual(s1.settings, settings);
+  // A snapshot without the field leaves the prior list intact.
+  const s2 = reduceOutbound(s1, { kind: 'snapshot', data: { model: 'x' } });
+  assert.deepEqual(s2.settings, settings);
 });
 
 test('a sessions frame stores the picker list', () => {

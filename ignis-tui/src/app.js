@@ -22,6 +22,7 @@ import {
   newSession,
   setModel,
   setMode,
+  setSetting,
   toggleSkill,
   toggleMcp,
   listSessions,
@@ -59,7 +60,7 @@ export default function App({ engine, onExit }) {
   const [comp, setComp] = useState({ text: '', cursor: 0 });
   const [history, setHistory] = useState([]);
   const [histIdx, setHistIdx] = useState(-1); // -1 = editing live (not recalling)
-  const [localPicker, setLocalPicker] = useState(null); // null | 'model' | 'afk' | 'skills' | 'mcp' | 'sessions'
+  const [localPicker, setLocalPicker] = useState(null); // null | 'model' | 'afk' | 'settings' | 'skills' | 'mcp' | 'sessions'
   const [pastes, setPastes] = useState([]); // multi-line paste contents, shown as [paste #N] chips
   const [reasoningExpanded, setReasoningExpanded] = useState(false); // Ctrl+O expands ✻ Thinking blocks
   const [slashSel, setSlashSel] = useState(0); // selected row in the slash-command suggestions
@@ -185,6 +186,9 @@ export default function App({ engine, onExit }) {
         return true;
       case 'afk':
         setLocalPicker('afk');
+        return true;
+      case 'settings':
+        setLocalPicker('settings');
         return true;
       case 'skills':
         setLocalPicker('skills');
@@ -522,6 +526,15 @@ export default function App({ engine, onExit }) {
         onCancel: () => setLocalPicker(null),
       }),
     );
+  } else if (localPicker === 'settings') {
+    children.push(
+      e(SettingsPanel, {
+        key: 'settings-panel',
+        settings: state.settings,
+        onToggle: (id, value) => engine.send(setSetting(id, value)),
+        onClose: () => setLocalPicker(null),
+      }),
+    );
   } else if (localPicker === 'skills') {
     children.push(
       e(TogglePicker, {
@@ -751,20 +764,30 @@ function parseEditPath(argsJson) {
 // Statusline footer: provider/model · cwd · turns · context tokens — fed by the
 // startup snapshot and the `usage`/`turn_start` events (engine-owned data).
 function Footer({ state }) {
+  // Honor the /settings Statusline toggles: a `statusline.<seg>` setting with
+  // value=false hides that segment here. Absent ⇒ shown (default).
+  const hidden = new Set(
+    (state.settings || [])
+      .filter((s) => s.id.startsWith('statusline.') && !s.value)
+      .map((s) => s.id.slice('statusline.'.length)),
+  );
+  const shows = (seg) => !hidden.has(seg);
   const segs = [];
-  if (state.provider || state.model) {
+  if ((state.provider || state.model) && shows('model')) {
     const effort = state.effort ? ` (${state.effort})` : '';
     segs.push(`${state.provider || '?'}/${state.model || '?'}${effort}`);
   }
-  if (state.cwd) segs.push(baseName(state.cwd));
-  segs.push(`${state.turns} turn${state.turns === 1 ? '' : 's'}`);
+  if (state.cwd && shows('cwd')) segs.push(baseName(state.cwd));
+  if (shows('turns')) segs.push(`${state.turns} turn${state.turns === 1 ? '' : 's'}`);
   // Context-fill gauge: tokens used vs the active model's window (its `context`,
   // carried in the models list), as `N tok (X%)` — mirrors the native footer.
-  const active = state.models.find((m) => m.provider === state.provider && m.model === state.model);
-  const window = active?.context || 120000; // last-resort fallback, like the native TUI
-  const ctxTokens = state.usage?.input_tokens > 0 ? state.usage.input_tokens : estimateContextTokens(state.blocks);
-  const pct = window > 0 ? Math.min(100, Math.floor((ctxTokens * 100) / window)) : 0;
-  segs.push(`${ctxTokens} tok (${pct}%)`);
+  if (shows('tokens')) {
+    const active = state.models.find((m) => m.provider === state.provider && m.model === state.model);
+    const window = active?.context || 120000; // last-resort fallback, like the native TUI
+    const ctxTokens = state.usage?.input_tokens > 0 ? state.usage.input_tokens : estimateContextTokens(state.blocks);
+    const pct = window > 0 ? Math.min(100, Math.floor((ctxTokens * 100) / window)) : 0;
+    segs.push(`${ctxTokens} tok (${pct}%)`);
+  }
   // Background-shell indicator: `⚙ N bg` while any bash(run_in_background) shells
   // are live (hidden at 0).
   if (state.bgShells > 0) segs.push(`⚙ ${state.bgShells} bg`);
@@ -1314,6 +1337,56 @@ function TogglePicker({ title, items, onToggle, onClose }) {
 function PickerRow({ label, focused, checked, multi }) {
   const box = multi ? (checked ? '[x] ' : '[ ] ') : '';
   return e(Text, { color: focused ? 'cyan' : undefined }, `${focused ? '❯ ' : '  '}${box}${label}`);
+}
+
+// Generic /settings panel: renders the engine-owned settings registry
+// (state.settings) as section-grouped toggle rows. Adding a knob engine-side
+// makes it appear here automatically — this component never changes per knob.
+// ↑/↓ moves across the toggleable rows (section headers are skipped), Space/Enter
+// flips the focused knob (sends SetSetting), help shows for the focused row.
+function SettingsPanel({ settings, onToggle, onClose }) {
+  const cols = useTerminalWidth();
+  const [cursor, setCursor] = useState(0);
+  const n = settings.length;
+  useInput((ch, key) => {
+    if (key.escape) {
+      onClose();
+      return;
+    }
+    if (key.upArrow) {
+      setCursor((c) => Math.max(0, c - 1));
+      return;
+    }
+    if (key.downArrow) {
+      setCursor((c) => Math.min(Math.max(n - 1, 0), c + 1));
+      return;
+    }
+    if ((ch === ' ' || key.return) && settings[cursor]) {
+      const s = settings[cursor];
+      onToggle(s.id, !s.value);
+    }
+  });
+  const rows = [e(Text, { key: 'title', bold: true }, '⚙ Settings')];
+  if (!n) rows.push(e(Text, { key: 'empty', dimColor: true }, 'No settings.'));
+  let lastSection = null;
+  settings.forEach((s, i) => {
+    if (s.section !== lastSection) {
+      if (lastSection !== null) rows.push(e(Text, { key: `sp${i}` }, ' '));
+      rows.push(e(Text, { key: `sec${i}`, bold: true, dimColor: true }, s.section));
+      lastSection = s.section;
+    }
+    const focused = i === cursor;
+    rows.push(
+      e(
+        Text,
+        { key: `r${i}`, color: focused ? 'cyan' : undefined },
+        `${focused ? '❯ ' : '  '}${s.value ? '[x] ' : '[ ] '}${s.label}`,
+      ),
+    );
+    if (focused && s.help) rows.push(e(Text, { key: `h${i}`, dimColor: true }, `      ${s.help}`));
+  });
+  rows.push(e(Text, { key: 'hint', dimColor: true }, '↑/↓ move · space toggle · esc close'));
+  return e(Box, { flexDirection: 'column', width: cols, marginTop: 1, borderStyle: 'round', paddingX: 1 }, rows);
 }
 
 // Local session picker (/sessions, /resume). The list arrives asynchronously

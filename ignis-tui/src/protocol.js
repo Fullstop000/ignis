@@ -55,6 +55,7 @@ export const CMD = Object.freeze({
   NEW_SESSION: 'new_session',
   SET_MODEL: 'set_model',
   SET_MODE: 'set_mode',
+  SET_SETTING: 'set_setting',
   TOGGLE_SKILL: 'toggle_skill',
   TOGGLE_MCP: 'toggle_mcp',
   LIST_SESSIONS: 'list_sessions',
@@ -87,6 +88,10 @@ export function initialState() {
     cwd: null,
     effort: null,
     mode: null,
+    // Generic config knobs for the /settings panel (engine-owned registry).
+    // Each: { id, label, help, section, kind, value }. Footer also reads the
+    // statusline.* entries to decide which segments to show.
+    settings: [],
     models: [],
     skills: [],
     mcp: [],
@@ -147,6 +152,7 @@ export function reduceOutbound(state, frame) {
         cwd: frame.data?.cwd ?? state.cwd,
         effort: frame.data?.effort ?? state.effort,
         mode: frame.data?.mode ?? state.mode,
+        settings: frame.data?.settings ?? state.settings,
         models: frame.data?.models ?? state.models,
         skills: frame.data?.skills ?? state.skills,
         mcp: frame.data?.mcp ?? state.mcp,
@@ -479,6 +485,7 @@ export const setModel = (provider, model, effort = null) => ({
   data: { provider, model, effort },
 });
 export const setMode = (mode) => ({ kind: CMD.SET_MODE, data: { mode } });
+export const setSetting = (id, value) => ({ kind: CMD.SET_SETTING, data: { id, value } });
 export const toggleSkill = (name) => ({ kind: CMD.TOGGLE_SKILL, data: { name } });
 export const toggleMcp = (name) => ({ kind: CMD.TOGGLE_MCP, data: { name } });
 export const listSessions = () => ({ kind: CMD.LIST_SESSIONS });
@@ -500,7 +507,7 @@ export function parseSlash(text) {
 
 // The slash commands the Ink frontend actually handles (a subset of the native
 // TUI's). /connect is engine-driven (submitted, not handled locally); the
-// remaining deferred ones (/telemetry, /hooks, /settings) aren't listed.
+// remaining deferred ones (/telemetry, /hooks) aren't listed.
 export const SLASH_COMMANDS = [
   { name: '/sessions', description: 'List sessions; Enter to resume' },
   { name: '/resume', description: 'Resume a past session' },
@@ -512,6 +519,7 @@ export const SLASH_COMMANDS = [
   { name: '/skills', description: 'Manage skills (enable/disable)' },
   { name: '/mcp', description: 'Manage MCP servers (enable/disable)' },
   { name: '/afk', description: 'Toggle AFK / hands-free mode' },
+  { name: '/settings', description: 'Settings — sandbox, statusline, …' },
 ];
 
 /**
