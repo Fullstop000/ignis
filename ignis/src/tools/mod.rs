@@ -85,15 +85,19 @@ pub fn register_native_tools(
     register_native_tools_with_mcp(session, cwd, config, None, None, None, None, None)
 }
 
-/// Resolve the bash write-sandbox for the top-level agent: active only in the
-/// auto-approve (unattended) modes; `None` in `Off` (the permission prompt is
-/// the gate there). The configured `sandbox_write_paths` are `~`-expanded.
+/// Resolve the bash write-sandbox for the top-level agent. Two gates: it only
+/// applies in the auto-approve (unattended) modes — `None` in `Off`, where the
+/// permission prompt is the gate — AND only when the user has opted in via
+/// `sandbox_enabled` (off by default, so AFK/headless runs are unconfined and
+/// credentialed commands like `git push` work out of the box). Toggled by
+/// `/sandbox` (Ink) and the `/settings` Sandbox tab (native). The configured
+/// `sandbox_write_paths` are `~`-expanded.
 fn resolve_bash_sandbox(
     config: &crate::config::Config,
     permissions: Option<&Arc<crate::permissions::runtime::PermissionState>>,
 ) -> Option<bash::BashSandbox> {
     let p = permissions?;
-    if !p.mode().auto_approves_sensitive() {
+    if !p.mode().auto_approves_sensitive() || !p.sandbox_enabled() {
         return None;
     }
     let home = dirs::home_dir();
@@ -183,18 +187,35 @@ mod tests {
     use crate::permissions::Mode;
 
     #[test]
-    fn bash_sandbox_active_only_in_unattended_modes() {
+    fn bash_sandbox_off_by_default_even_in_unattended_modes() {
         let cfg = crate::config::Config::default();
-        // Off → no sandbox (the permission prompt is the gate there).
-        let off = PermissionState::new(Mode::Off);
-        assert!(resolve_bash_sandbox(&cfg, Some(&off)).is_none());
-        // HandsFree / FullyUnattended → sandbox active.
-        let hf = PermissionState::new(Mode::HandsFree);
-        assert!(resolve_bash_sandbox(&cfg, Some(&hf)).is_some());
-        let fu = PermissionState::new(Mode::FullyUnattended);
-        assert!(resolve_bash_sandbox(&cfg, Some(&fu)).is_some());
+        // Sandbox defaults OFF — even in the unattended modes — so the user's
+        // credentialed commands work until they opt in.
+        for mode in [Mode::Off, Mode::HandsFree, Mode::FullyUnattended] {
+            let p = PermissionState::new(mode);
+            assert!(
+                resolve_bash_sandbox(&cfg, Some(&p)).is_none(),
+                "{mode:?} should be unsandboxed by default"
+            );
+        }
         // No permission state (tests) → no sandbox.
         assert!(resolve_bash_sandbox(&cfg, None).is_none());
+    }
+
+    #[test]
+    fn bash_sandbox_active_when_enabled_in_unattended_modes() {
+        let cfg = crate::config::Config::default();
+        // Opt-in: enabled + an unattended mode → sandbox active.
+        let hf = PermissionState::new(Mode::HandsFree);
+        hf.set_sandbox_enabled(true);
+        assert!(resolve_bash_sandbox(&cfg, Some(&hf)).is_some());
+        let fu = PermissionState::new(Mode::FullyUnattended);
+        fu.set_sandbox_enabled(true);
+        assert!(resolve_bash_sandbox(&cfg, Some(&fu)).is_some());
+        // Enabled but interactive `Off` → still no sandbox (mode gate wins).
+        let off = PermissionState::new(Mode::Off);
+        off.set_sandbox_enabled(true);
+        assert!(resolve_bash_sandbox(&cfg, Some(&off)).is_none());
     }
 
     #[test]
@@ -203,6 +224,7 @@ mod tests {
         cfg.permissions.sandbox_write_paths =
             vec!["~/.cargo".to_string(), "/opt/cache".to_string()];
         let fu = PermissionState::new(Mode::FullyUnattended);
+        fu.set_sandbox_enabled(true);
         let sb = resolve_bash_sandbox(&cfg, Some(&fu)).expect("sandbox active");
         // The `~/` entry is home-expanded; the absolute one passes through.
         assert!(sb.extra_writes.iter().any(|p| p.ends_with(".cargo")));
@@ -220,6 +242,7 @@ mod tests {
         let mut cfg = crate::config::Config::default();
         cfg.permissions.sandbox_read_paths = vec!["~/.npm".to_string(), "/opt/sdk".to_string()];
         let fu = PermissionState::new(Mode::FullyUnattended);
+        fu.set_sandbox_enabled(true);
         let sb = resolve_bash_sandbox(&cfg, Some(&fu)).expect("sandbox active");
         assert!(sb.extra_reads.iter().any(|p| p.ends_with(".npm")));
         assert!(sb

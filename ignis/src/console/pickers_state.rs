@@ -241,11 +241,16 @@ impl ModelPicker {
 pub(crate) enum SettingsTab {
     Stats,
     Statusline,
+    Sandbox,
 }
 
 impl SettingsTab {
     /// Tab order, used to cycle with `←`/`→`/Tab.
-    const ORDER: [SettingsTab; 2] = [SettingsTab::Stats, SettingsTab::Statusline];
+    const ORDER: [SettingsTab; 3] = [
+        SettingsTab::Stats,
+        SettingsTab::Statusline,
+        SettingsTab::Sandbox,
+    ];
 }
 
 /// Footer segments the user can show/hide via `/settings` → Statusline, in

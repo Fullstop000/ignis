@@ -48,6 +48,20 @@ pub struct State {
     /// `"git"`, `"turns"`). Empty / missing = every segment shown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statusline_hidden: Vec<String>,
+    /// Whether the bash auto-run sandbox is active in the unattended (AFK /
+    /// headless) modes. Default / missing = `false` = OFF, so an AFK run is
+    /// unsandboxed (credentialed commands like `git push` work) unless the user
+    /// opts in via `/sandbox` (Ink) or `/settings` (native). Persisted on each
+    /// toggle. Has no effect in interactive `Off` mode (never sandboxed).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sandbox_enabled: bool,
+}
+
+/// `skip_serializing_if` predicate for the boolean toggles above — keeps a
+/// default-`false` flag out of `state.json` (matching the Option/Vec fields,
+/// which omit their empty defaults too).
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn state_path() -> Result<std::path::PathBuf, anyhow::Error> {
@@ -153,6 +167,12 @@ pub fn persist_statusline_hidden(hidden: &[String]) -> Result<(), anyhow::Error>
     update_state(|state| state.statusline_hidden = hidden.to_vec())
 }
 
+/// Persist the bash-sandbox on/off toggle, preserving every other field.
+/// Called by `/sandbox` (Ink) and the `/settings` Sandbox tab (native).
+pub fn persist_sandbox_enabled(enabled: bool) -> Result<(), anyhow::Error> {
+    update_state(|state| state.sandbox_enabled = enabled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +233,7 @@ mod tests {
             permission_grants: vec![],
             update_check: None,
             statusline_hidden: vec![],
+            sandbox_enabled: false,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -231,6 +252,7 @@ mod tests {
             permission_grants: vec![],
             update_check: None,
             statusline_hidden: vec![],
+            sandbox_enabled: false,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -256,6 +278,7 @@ mod tests {
             permission_grants: vec![],
             update_check: None,
             statusline_hidden: vec![],
+            sandbox_enabled: false,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -297,6 +320,7 @@ mod tests {
                 permission_grants: vec![],
                 update_check: None,
                 statusline_hidden: vec![],
+                sandbox_enabled: false,
             };
             let json = serde_json::to_string(&state).unwrap();
             let back: State = serde_json::from_str(&json).unwrap();
@@ -404,6 +428,47 @@ mod tests {
         persist_model_selection("openai", "gpt-5.5", None).unwrap();
         let s = load_state();
         assert_eq!(s.statusline_hidden, vec!["git".to_string()]);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn sandbox_enabled_round_trip_and_default_omitted() {
+        // Default is false and omitted from JSON (so legacy state files load it
+        // as the OFF default).
+        let json = serde_json::to_string(&State::default()).unwrap();
+        assert!(!json.contains("sandbox_enabled"), "default omits it");
+        let legacy = r#"{"model":"openai/gpt-5.5"}"#;
+        let back: State = serde_json::from_str(legacy).unwrap();
+        assert!(!back.sandbox_enabled);
+        // True survives a round-trip and IS written.
+        let state = State {
+            sandbox_enabled: true,
+            ..State::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("sandbox_enabled"));
+        let back: State = serde_json::from_str(&json).unwrap();
+        assert!(back.sandbox_enabled);
+    }
+
+    #[test]
+    fn persist_sandbox_enabled_preserves_siblings() {
+        let tmp = crate::util::unique_temp_dir("ignis-state-sandbox-rmw");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _home = crate::util::HomeGuard::set(&tmp);
+
+        persist_model_selection("deepseek", "deepseek-v4-pro", Some("high")).unwrap();
+        persist_sandbox_enabled(true).unwrap();
+        let s = load_state();
+        assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert!(s.sandbox_enabled);
+
+        // Toggling it back off must not drop the model selection.
+        persist_sandbox_enabled(false).unwrap();
+        let s = load_state();
+        assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert!(!s.sandbox_enabled);
 
         std::fs::remove_dir_all(&tmp).ok();
     }

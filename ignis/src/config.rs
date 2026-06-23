@@ -1052,6 +1052,7 @@ api_key = "x"
             permission_grants: vec![],
             update_check: None,
             statusline_hidden: vec![],
+            sandbox_enabled: false,
         });
         assert_eq!(cfg.active_model().as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(cfg.active_effort().as_deref(), Some("high"));
@@ -1302,6 +1303,7 @@ api_key = "x"
             permission_grants: vec![],
             update_check: None,
             statusline_hidden: vec![],
+            sandbox_enabled: false,
         });
         assert_eq!(cfg.active_model().as_deref(), Some("gpt-4o"));
         assert_eq!(cfg.active_effort(), None);

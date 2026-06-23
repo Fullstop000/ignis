@@ -456,15 +456,21 @@ pub(crate) async fn handle_key(
                 app.settings_move(SelectionDirection::Next);
                 return;
             }
-            // Space toggles a footer segment on the Statusline tab.
+            // Space toggles on the Statusline (a segment) and Sandbox (on/off) tabs.
             KeyCode::Char(' ') if tab == SettingsTab::Statusline => {
                 app.settings_toggle_statusline();
+                return;
+            }
+            KeyCode::Char(' ') if tab == SettingsTab::Sandbox => {
+                app.settings_toggle_sandbox();
                 return;
             }
             KeyCode::Enter => {
                 match tab {
                     // Statusline: Enter toggles like Space (stays open).
                     SettingsTab::Statusline => app.settings_toggle_statusline(),
+                    // Sandbox: Enter toggles like Space (stays open).
+                    SettingsTab::Sandbox => app.settings_toggle_sandbox(),
                     // Stats is read-only — Enter just closes.
                     SettingsTab::Stats => app.close_settings(),
                 }
