@@ -48,6 +48,7 @@ pub fn control_signal(cmd: &ClientCommand) -> Option<ControlSignal> {
         | ClientCommand::NewSession
         | ClientCommand::SetModel { .. }
         | ClientCommand::SetMode { .. }
+        | ClientCommand::SetSetting { .. }
         | ClientCommand::ToggleSkill { .. }
         | ClientCommand::ToggleMcp { .. }
         | ClientCommand::ListSessions

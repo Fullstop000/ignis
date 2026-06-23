@@ -583,6 +583,49 @@ test('/afk picker switches permission mode and the footer shows a badge', async 
   assert.match(plain(lastFrame()), /HANDS-FREE/);
 });
 
+test('/settings panel flips a knob via set_setting', async () => {
+  const { engine, lastFrame, stdin } = renderApp();
+  await tick();
+  const settings = [
+    { id: 'sandbox_enabled', label: 'Sandbox auto-run bash', help: 'confine bash', section: 'General', kind: { kind: 'bool' }, value: false },
+    { id: 'statusline.model', label: 'Model', help: '', section: 'Statusline', kind: { kind: 'bool' }, value: true },
+  ];
+  engine.emit(snapshot({ session_id: 's1', settings }));
+  await tick();
+  stdin.write('/settings');
+  await tick();
+  stdin.write(KEY.enter);
+  await tick();
+  const frame = plain(lastFrame());
+  assert.match(frame, /Settings/);
+  assert.match(frame, /Sandbox auto-run bash/);
+  assert.match(frame, /\[ \] Sandbox/, 'starts unchecked');
+  // Cursor is on the first knob (sandbox, value=false) → Space enables it.
+  stdin.write(' ');
+  await tick();
+  assert.deepEqual(engine.last(), { kind: 'set_setting', data: { id: 'sandbox_enabled', value: true } });
+});
+
+test('footer hides a statusline segment toggled off in settings', async () => {
+  const { engine, lastFrame } = renderApp();
+  await tick();
+  engine.emit(
+    snapshot({
+      session_id: 's1',
+      provider: 'p',
+      model: 'm',
+      settings: [
+        { id: 'statusline.model', label: 'Model', help: '', section: 'Statusline', kind: { kind: 'bool' }, value: true },
+        { id: 'statusline.turns', label: 'Turns', help: '', section: 'Statusline', kind: { kind: 'bool' }, value: false },
+      ],
+    }),
+  );
+  await tick();
+  const out = plain(lastFrame());
+  assert.match(out, /p\/m/, 'model segment shown');
+  assert.doesNotMatch(out, /\bturns?\b/, 'turns segment hidden');
+});
+
 test('/model picker cancels on Esc without sending a command', async () => {
   const { engine, lastFrame, stdin } = renderApp();
   await tick();

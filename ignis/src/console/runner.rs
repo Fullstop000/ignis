@@ -867,10 +867,15 @@ async fn drive_frontend_core(
     mut current_session_id: String,
     storage_dir: PathBuf,
 ) {
-    // Seed the snapshot with the live permission mode + skill/MCP state.
+    // Seed the snapshot with the live permission mode + skill/MCP state + the
+    // generic `/settings` config knobs (built from live perms + persisted state).
     hub.set_mode(permissions.mode().as_str().to_string());
     hub.set_skills(skill_toggles(&skill_registry));
     hub.set_mcp(mcp_toggles(&mcp_registry));
+    hub.set_settings(crate::console::settings::build_settings(
+        &permissions,
+        &crate::state::load_state(),
+    ));
     // Hand the freshly-attached frontend its session snapshot (provider/model/
     // cwd/session id) so it can render a statusline before any turn. The
     // ratatui frontend ignores snapshots; the out-of-process Ink one consumes it.
@@ -974,6 +979,17 @@ async fn drive_frontend_core(
                         hub.set_mode(m.as_str().to_string());
                         hub.send_snapshot().await;
                     }
+                }
+                // `/settings`: apply the knob (its effect + persist), rebuild the
+                // settings list from the new state, and re-snapshot so the panel
+                // (and, for statusline knobs, the footer) reflect it.
+                CommandOutcome::SetSetting { id, value } => {
+                    crate::console::settings::apply_setting(&id, value, &permissions);
+                    hub.set_settings(crate::console::settings::build_settings(
+                        &permissions,
+                        &crate::state::load_state(),
+                    ));
+                    hub.send_snapshot().await;
                 }
                 // `/skills`: flip the skill, persist the disabled set, re-snapshot.
                 CommandOutcome::ToggleSkill(name) => {
