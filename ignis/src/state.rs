@@ -55,6 +55,17 @@ pub struct State {
     /// toggle. Has no effect in interactive `Off` mode (never sandboxed).
     #[serde(default, skip_serializing_if = "is_false")]
     pub sandbox_enabled: bool,
+    /// TUI override for `[compaction] auto` in `config.toml`. `None` (missing) =
+    /// the TUI never set it ⇒ fall back to `config.toml` / the built-in default
+    /// (`true`); `Some(v)` overlays the config. Set by `/settings` → Context.
+    /// `Option` (not bool) so a default state doesn't override config's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_auto: Option<bool>,
+    /// TUI override for `[settings] strip-think` in `config.toml`. Same overlay
+    /// semantics as [`State::compaction_auto`]: `None` ⇒ config / default
+    /// (`true`); `Some(v)` overlays. Set by `/settings` → Context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip_think: Option<bool>,
 }
 
 /// `skip_serializing_if` predicate for the boolean toggles above — keeps a
@@ -173,6 +184,19 @@ pub fn persist_sandbox_enabled(enabled: bool) -> Result<(), anyhow::Error> {
     update_state(|state| state.sandbox_enabled = enabled)
 }
 
+/// Persist the auto-compaction TUI override, preserving every other field.
+/// Called by `/settings` → Context. Always writes `Some(_)` (the panel only
+/// produces explicit on/off).
+pub fn persist_compaction_auto(enabled: bool) -> Result<(), anyhow::Error> {
+    update_state(|state| state.compaction_auto = Some(enabled))
+}
+
+/// Persist the strip-reasoning-from-history TUI override, preserving every other
+/// field. Called by `/settings` → Context.
+pub fn persist_strip_think(enabled: bool) -> Result<(), anyhow::Error> {
+    update_state(|state| state.strip_think = Some(enabled))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +258,8 @@ mod tests {
             update_check: None,
             statusline_hidden: vec![],
             sandbox_enabled: false,
+            compaction_auto: None,
+            strip_think: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -253,6 +279,8 @@ mod tests {
             update_check: None,
             statusline_hidden: vec![],
             sandbox_enabled: false,
+            compaction_auto: None,
+            strip_think: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -279,6 +307,8 @@ mod tests {
             update_check: None,
             statusline_hidden: vec![],
             sandbox_enabled: false,
+            compaction_auto: None,
+            strip_think: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -321,6 +351,8 @@ mod tests {
                 update_check: None,
                 statusline_hidden: vec![],
                 sandbox_enabled: false,
+                compaction_auto: None,
+                strip_think: None,
             };
             let json = serde_json::to_string(&state).unwrap();
             let back: State = serde_json::from_str(&json).unwrap();
@@ -469,6 +501,55 @@ mod tests {
         let s = load_state();
         assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
         assert!(!s.sandbox_enabled);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn context_overrides_round_trip_and_default_omitted() {
+        // Both default to None and are omitted (so config.toml / built-in
+        // defaults apply); a legacy state file loads them as None.
+        let json = serde_json::to_string(&State::default()).unwrap();
+        assert!(!json.contains("compaction_auto"), "default omits it");
+        assert!(!json.contains("strip_think"), "default omits it");
+        let legacy = r#"{"model":"openai/gpt-5.5"}"#;
+        let back: State = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.compaction_auto, None);
+        assert_eq!(back.strip_think, None);
+        // Explicit values survive a round-trip and ARE written.
+        let state = State {
+            compaction_auto: Some(false),
+            strip_think: Some(false),
+            ..State::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("compaction_auto"));
+        assert!(json.contains("strip_think"));
+        let back: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.compaction_auto, Some(false));
+        assert_eq!(back.strip_think, Some(false));
+    }
+
+    #[test]
+    fn persist_context_overrides_preserve_siblings() {
+        let tmp = crate::util::unique_temp_dir("ignis-state-context-rmw");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _home = crate::util::HomeGuard::set(&tmp);
+
+        persist_model_selection("deepseek", "deepseek-v4-pro", Some("high")).unwrap();
+        persist_compaction_auto(false).unwrap();
+        persist_strip_think(false).unwrap();
+        let s = load_state();
+        assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(s.compaction_auto, Some(false));
+        assert_eq!(s.strip_think, Some(false));
+
+        // Re-toggling one must not drop the model or the other override.
+        persist_compaction_auto(true).unwrap();
+        let s = load_state();
+        assert_eq!(s.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(s.compaction_auto, Some(true));
+        assert_eq!(s.strip_think, Some(false));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
