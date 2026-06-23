@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-06-23
+
+### Added
+- `/settings` panel in the Ink frontend — toggle the bash sandbox and which statusline segments (model / cwd / turns / tokens) show; choices persist in `state.json`. ([#227](https://github.com/Fullstop000/ignis/pull/227))
+
 ## [0.43.0] - 2026-06-23
 
 ### Changed
