@@ -190,6 +190,20 @@ test('command builders match the Rust ClientCommand wire shapes', () => {
   assert.deepEqual(copy('hello'), { kind: 'copy', data: { text: 'hello' } });
 });
 
+test('a snapshot hydrates the git branch (and a missing field leaves it)', () => {
+  const s0 = initialState();
+  assert.equal(s0.gitBranch, null, 'null by default');
+  const s1 = reduceOutbound(s0, { kind: 'snapshot', data: { git_branch: 'feature/login' } });
+  assert.equal(s1.gitBranch, 'feature/login');
+  // A snapshot without `git_branch` preserves the prior value (matches the
+  // way effort/cwd/provider behave).
+  const s2 = reduceOutbound(s1, { kind: 'snapshot', data: { model: 'x' } });
+  assert.equal(s2.gitBranch, 'feature/login');
+  // An explicit `null` (cwd outside a work tree) clears it.
+  const s3 = reduceOutbound(s2, { kind: 'snapshot', data: { git_branch: null } });
+  assert.equal(s3.gitBranch, null);
+});
+
 test('a snapshot hydrates the generic settings list', () => {
   const s0 = initialState();
   assert.deepEqual(s0.settings, [], 'empty by default');

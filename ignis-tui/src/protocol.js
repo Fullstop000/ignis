@@ -86,6 +86,10 @@ export function initialState() {
     provider: null,
     model: null,
     cwd: null,
+    // Current git branch of `cwd` (oh-my-zsh `git:(branch)` segment); `null`
+    // outside a work tree. Updated by every snapshot (the engine refreshes it
+    // at turn-end so a mid-session `git checkout` is reflected).
+    gitBranch: null,
     effort: null,
     mode: null,
     // Generic config knobs for the /settings panel (engine-owned registry).
@@ -150,6 +154,10 @@ export function reduceOutbound(state, frame) {
         provider: frame.data?.provider ?? state.provider,
         model: frame.data?.model ?? state.model,
         cwd: frame.data?.cwd ?? state.cwd,
+        // Snapshot's `git_branch` (snake_case on the wire). `null` is a valid
+        // value (cwd outside a work tree) and overrides the prior value;
+        // `undefined` (field absent) preserves it — matching effort/cwd/etc.
+        gitBranch: 'git_branch' in (frame.data || {}) ? frame.data.git_branch : state.gitBranch,
         effort: frame.data?.effort ?? state.effort,
         mode: frame.data?.mode ?? state.mode,
         settings: frame.data?.settings ?? state.settings,

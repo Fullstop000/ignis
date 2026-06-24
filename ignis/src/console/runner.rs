@@ -476,6 +476,9 @@ pub async fn run_console(
     let driver_storage_dir = storage_dir.clone();
     let ui_storage_dir = storage_dir;
     let agent_cwd = cwd;
+    // Clone for the driver task's per-turn git-branch refresh; `agent_cwd`
+    // is moved into the agent loop below.
+    let driver_cwd = agent_cwd.clone();
     let agent_config = config;
     let runner_hook_registry = hook_registry.clone();
     app.hooks = Some(hook_registry);
@@ -541,6 +544,9 @@ pub async fn run_console(
         app.provider.clone().unwrap_or_default(),
         app.model.clone().unwrap_or_default(),
         app.cwd.to_string_lossy().to_string(),
+        // Native ratatui frontend reads `App::git_branch` directly for its footer;
+        // pass it through the snapshot for symmetry with the Ink path.
+        app.git_branch.clone(),
         // The ratatui frontend ignores snapshots (its /model picker reads App
         // directly), so the wire model list is unused here.
         Vec::new(),
@@ -559,6 +565,7 @@ pub async fn run_console(
         driver_mcp_registry,
         app.session_id.clone(),
         driver_storage_dir,
+        driver_cwd,
     ));
 
     // The in-progress block's already-streamed row count lives on `app`
@@ -664,6 +671,12 @@ pub async fn run_engine(
     let model = config.active_model().unwrap_or_default();
     let effort = config.active_effort();
     let cwd_str = cwd.to_string_lossy().to_string();
+    // Initial git branch for the footer; refreshed at each turn boundary by
+    // the agent_rx pump so a mid-session `git checkout` is reflected.
+    let git_branch = crate::console::git::branch(&cwd);
+    // Hold on to `cwd` for the per-turn git-branch refresh below — the
+    // agent_loop takes the original by value.
+    let cwd_for_git = cwd.clone();
     let catalog = crate::llm::catalog::load();
     let models: Vec<crate::console::frontend::protocol::ModelRef> = config
         .model_options(&catalog)
@@ -703,6 +716,7 @@ pub async fn run_engine(
         provider,
         model,
         cwd_str,
+        git_branch,
         models,
         acceptor,
         RequestBroker::new(),
@@ -752,6 +766,7 @@ pub async fn run_engine(
         mcp_registry,
         session_id,
         storage_dir,
+        cwd_for_git,
     )
     .await;
 
@@ -866,6 +881,7 @@ async fn drive_frontend_core(
     mcp_registry: std::sync::Arc<crate::mcp::McpRegistry>,
     mut current_session_id: String,
     storage_dir: PathBuf,
+    cwd: PathBuf,
 ) {
     // Seed the snapshot with the live permission mode + skill/MCP state + the
     // generic `/settings` config knobs (built from live perms + persisted state).
@@ -1092,7 +1108,19 @@ async fn drive_frontend_core(
             },
             // Frontend disconnected with no successor — nothing left to drive.
             CoreWake::Command(None) => break,
-            CoreWake::Event(ev) => hub.emit_event(ev).await,
+            CoreWake::Event(ev) => {
+                // On turn-end, recompute the cached git branch (oh-my-zsh
+                // recomputes per prompt). Re-snapshot only when the value
+                // actually changed so we don't churn the wire on every turn.
+                if matches!(ev, AgentEvent::TurnEnd) {
+                    let new_branch = crate::console::git::branch(&cwd);
+                    if new_branch.as_deref() != hub.git_branch() {
+                        hub.set_git_branch(new_branch);
+                        hub.send_snapshot().await;
+                    }
+                }
+                hub.emit_event(ev).await;
+            }
             CoreWake::Request(req) => hub.open_request(req).await,
         }
     }
@@ -1911,6 +1939,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            None,
             Vec::new(),
             acceptor,
             RequestBroker::new(),
@@ -1945,6 +1974,7 @@ mod tests {
             )),
             crate::mcp::McpRegistry::empty(),
             "s1".to_string(),
+            store.path().to_path_buf(),
             store.path().to_path_buf(),
         ));
 
@@ -2157,6 +2187,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            None,
             Vec::new(),
             acceptor,
             RequestBroker::new(),
@@ -2177,6 +2208,7 @@ mod tests {
             )),
             crate::mcp::McpRegistry::empty(),
             "s1".to_string(),
+            store.path().to_path_buf(),
             store.path().to_path_buf(),
         ));
 
