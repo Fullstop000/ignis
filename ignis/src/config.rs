@@ -527,14 +527,14 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
         validate_mcp_server_name(name)?;
         srv.validate(name)?;
     }
-    // Plumb the single-bool config knob into the protocol layer's static
-    // override slot. Done once at startup.
-    if let Some(strip) = config.settings.strip_think {
-        crate::llm::protocols::set_history_policy(crate::llm::protocols::HistoryPolicy {
-            strip_think: strip,
-        });
-    }
     config.apply_state(load_state());
+    // Plumb the *merged* strip-think (a `state.json` / `/settings` override
+    // layered over `config.toml`, default ON) into the protocol layer's
+    // history-policy slot. Set AFTER `apply_state` so the overlay wins, and on
+    // every call (load + each `ReloadConfig`) so a live toggle takes effect.
+    crate::llm::protocols::set_history_policy(crate::llm::protocols::HistoryPolicy {
+        strip_think: config.settings.strip_think.unwrap_or(true),
+    });
     Ok(config)
 }
 
@@ -1081,6 +1081,41 @@ api_key = "x"
         .unwrap();
         cfg.apply_state(State::default());
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn load_config_plumbs_merged_strip_think_into_history_policy() {
+        // Regression: a `state.json` (TUI) strip-think override must reach the
+        // protocol layer's history-policy slot, and must be updatable on reload
+        // — config.toml has NO strip-think, so only the state override sets it.
+        use crate::llm::protocols::HistoryPolicy;
+        let tmp = crate::util::unique_temp_dir("ignis-cfg-striphist");
+        std::fs::create_dir_all(tmp.join(".ignis")).unwrap();
+        let _home = crate::util::HomeGuard::set(&tmp);
+        std::fs::write(
+            tmp.join(".ignis/config.toml"),
+            "model = \"deepseek/deepseek-v4-flash\"\n[providers.deepseek]\napi_key = \"x\"\n",
+        )
+        .unwrap();
+
+        // State turns strip-think OFF ⇒ both the merged config and the global
+        // policy default reflect it (the bug was the policy keeping the default).
+        crate::state::persist_strip_think(false).unwrap();
+        let cfg = super::load_config().unwrap();
+        assert_eq!(cfg.settings.strip_think, Some(false));
+        assert!(!HistoryPolicy::default().strip_think, "policy honors state");
+
+        // Toggling back ON and reloading must flip the policy live (OnceLock
+        // would have frozen it at the first value).
+        crate::state::persist_strip_think(true).unwrap();
+        let cfg = super::load_config().unwrap();
+        assert_eq!(cfg.settings.strip_think, Some(true));
+        assert!(
+            HistoryPolicy::default().strip_think,
+            "policy updated on reload"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

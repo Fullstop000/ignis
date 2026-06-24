@@ -353,28 +353,36 @@ pub struct HistoryPolicy {
     pub strip_think: bool,
 }
 
-/// Config-supplied override for the default history policy. Set once at
-/// startup by [`set_history_policy`] when the user's `~/.ignis/config.toml`
-/// includes a `[settings] strip-think = ...` line.
-static HISTORY_POLICY_FROM_CONFIG: std::sync::OnceLock<HistoryPolicy> = std::sync::OnceLock::new();
+/// Config-supplied default history policy, set by [`set_history_policy`] from
+/// `load_config()` — at startup AND on every `ReloadConfig`. Holds the *merged*
+/// value (a `state.json`/`/settings` strip-think override layered over
+/// `config.toml`). A `RwLock` (not `OnceLock`) so a live toggle can overwrite it.
+static HISTORY_POLICY_FROM_CONFIG: std::sync::RwLock<Option<HistoryPolicy>> =
+    std::sync::RwLock::new(None);
 
-/// Set the config-derived default [`HistoryPolicy`]. Called once at startup
-/// from `load_config()`. First call wins; subsequent calls are no-ops.
+/// Set (or replace) the config-derived default [`HistoryPolicy`]. Called from
+/// `load_config()` with the merged config value; last write wins, so a
+/// `/settings` strip-think toggle (which triggers a `ReloadConfig`) takes effect
+/// on the next outbound turn.
 pub fn set_history_policy(policy: HistoryPolicy) {
-    let _ = HISTORY_POLICY_FROM_CONFIG.set(policy);
+    if let Ok(mut slot) = HISTORY_POLICY_FROM_CONFIG.write() {
+        *slot = Some(policy);
+    }
 }
 
 impl Default for HistoryPolicy {
     /// Resolved in precedence order, highest first:
     ///
-    /// 1. `[settings] strip-think = ...` from `~/.ignis/config.toml`, plumbed in
-    ///    once at startup via [`set_history_policy`].
+    /// 1. The merged config value (`config.toml` with any `state.json` / TUI
+    ///    override layered on), plumbed in via [`set_history_policy`] on load and
+    ///    on every reload.
     /// 2. Built-in fallback: strip on. Cache-stable; never regressed in the
     ///    validation A/B series that led to this default (PR #123).
     fn default() -> Self {
         HISTORY_POLICY_FROM_CONFIG
-            .get()
-            .copied()
+            .read()
+            .ok()
+            .and_then(|slot| *slot)
             .unwrap_or(Self { strip_think: true })
     }
 }
