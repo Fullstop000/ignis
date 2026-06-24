@@ -293,6 +293,15 @@ impl Config {
             self.model = state.model;
             self.reasoning_effort = state.reasoning_effort;
         }
+        // TUI-managed `/settings` overrides overlay the config defaults (same
+        // precedence as the model selection above). `None` = the TUI never set
+        // the knob ⇒ keep the config / built-in default.
+        if let Some(v) = state.compaction_auto {
+            self.compaction.auto = v;
+        }
+        if let Some(v) = state.strip_think {
+            self.settings.strip_think = Some(v);
+        }
     }
 
     /// The reasoning effort to send: only if it's a declared level for the active
@@ -518,14 +527,14 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
         validate_mcp_server_name(name)?;
         srv.validate(name)?;
     }
-    // Plumb the single-bool config knob into the protocol layer's static
-    // override slot. Done once at startup.
-    if let Some(strip) = config.settings.strip_think {
-        crate::llm::protocols::set_history_policy(crate::llm::protocols::HistoryPolicy {
-            strip_think: strip,
-        });
-    }
     config.apply_state(load_state());
+    // Plumb the *merged* strip-think (a `state.json` / `/settings` override
+    // layered over `config.toml`, default ON) into the protocol layer's
+    // history-policy slot. Set AFTER `apply_state` so the overlay wins, and on
+    // every call (load + each `ReloadConfig`) so a live toggle takes effect.
+    crate::llm::protocols::set_history_policy(crate::llm::protocols::HistoryPolicy {
+        strip_think: config.settings.strip_think.unwrap_or(true),
+    });
     Ok(config)
 }
 
@@ -1053,6 +1062,8 @@ api_key = "x"
             update_check: None,
             statusline_hidden: vec![],
             sandbox_enabled: false,
+            compaction_auto: None,
+            strip_think: None,
         });
         assert_eq!(cfg.active_model().as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(cfg.active_effort().as_deref(), Some("high"));
@@ -1070,6 +1081,70 @@ api_key = "x"
         .unwrap();
         cfg.apply_state(State::default());
         assert_eq!(cfg.active_model().as_deref(), Some("deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn load_config_plumbs_merged_strip_think_into_history_policy() {
+        // Regression: a `state.json` (TUI) strip-think override must reach the
+        // protocol layer's history-policy slot, and must be updatable on reload
+        // — config.toml has NO strip-think, so only the state override sets it.
+        use crate::llm::protocols::HistoryPolicy;
+        let tmp = crate::util::unique_temp_dir("ignis-cfg-striphist");
+        std::fs::create_dir_all(tmp.join(".ignis")).unwrap();
+        let _home = crate::util::HomeGuard::set(&tmp);
+        std::fs::write(
+            tmp.join(".ignis/config.toml"),
+            "model = \"deepseek/deepseek-v4-flash\"\n[providers.deepseek]\napi_key = \"x\"\n",
+        )
+        .unwrap();
+
+        // State turns strip-think OFF ⇒ both the merged config and the global
+        // policy default reflect it (the bug was the policy keeping the default).
+        crate::state::persist_strip_think(false).unwrap();
+        let cfg = super::load_config().unwrap();
+        assert_eq!(cfg.settings.strip_think, Some(false));
+        assert!(!HistoryPolicy::default().strip_think, "policy honors state");
+
+        // Toggling back ON and reloading must flip the policy live (OnceLock
+        // would have frozen it at the first value).
+        crate::state::persist_strip_think(true).unwrap();
+        let cfg = super::load_config().unwrap();
+        assert_eq!(cfg.settings.strip_think, Some(true));
+        assert!(
+            HistoryPolicy::default().strip_think,
+            "policy updated on reload"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn state_overlays_context_settings_else_keeps_config() {
+        // config.toml turns auto-compaction off and strip-think off.
+        let base = r#"
+model = "deepseek/deepseek-v4-flash"
+[providers.deepseek]
+api_key = "x"
+[compaction]
+auto = false
+[settings]
+strip-think = false
+"#;
+        // No TUI override (None) ⇒ config values stand.
+        let mut cfg: Config = toml::from_str(base).unwrap();
+        cfg.apply_state(State::default());
+        assert!(!cfg.compaction.auto);
+        assert_eq!(cfg.settings.strip_think, Some(false));
+
+        // TUI override (Some) wins over config in both directions.
+        let mut cfg: Config = toml::from_str(base).unwrap();
+        cfg.apply_state(State {
+            compaction_auto: Some(true),
+            strip_think: Some(true),
+            ..State::default()
+        });
+        assert!(cfg.compaction.auto);
+        assert_eq!(cfg.settings.strip_think, Some(true));
     }
 
     #[test]
@@ -1304,6 +1379,8 @@ api_key = "x"
             update_check: None,
             statusline_hidden: vec![],
             sandbox_enabled: false,
+            compaction_auto: None,
+            strip_think: None,
         });
         assert_eq!(cfg.active_model().as_deref(), Some("gpt-4o"));
         assert_eq!(cfg.active_effort(), None);

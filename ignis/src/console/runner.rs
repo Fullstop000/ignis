@@ -875,6 +875,7 @@ async fn drive_frontend_core(
     hub.set_settings(crate::console::settings::build_settings(
         &permissions,
         &crate::state::load_state(),
+        &crate::config::load_config().unwrap_or_default(),
     ));
     // Hand the freshly-attached frontend its session snapshot (provider/model/
     // cwd/session id) so it can render a statusline before any turn. The
@@ -984,10 +985,21 @@ async fn drive_frontend_core(
                 // settings list from the new state, and re-snapshot so the panel
                 // (and, for statusline knobs, the footer) reflect it.
                 CommandOutcome::SetSetting { id, value } => {
-                    crate::console::settings::apply_setting(&id, value, &permissions);
+                    use crate::console::settings::Effect;
+                    // Persist the knob; config.toml-overlay knobs need the agent
+                    // loop to re-read its merged config so the next prompt honors
+                    // them (mirrors `/connect`'s ReloadConfig).
+                    if crate::console::settings::apply_setting(&id, value, &permissions)
+                        == Effect::ReloadConfig
+                    {
+                        let _ = prompt_tx.send(AgentRequest::ReloadConfig).await;
+                    }
+                    // Rebuild from the merged config (state.json overlaid) so the
+                    // panel — and the footer, for statusline knobs — reflect it.
                     hub.set_settings(crate::console::settings::build_settings(
                         &permissions,
                         &crate::state::load_state(),
+                        &crate::config::load_config().unwrap_or_default(),
                     ));
                     hub.send_snapshot().await;
                 }
