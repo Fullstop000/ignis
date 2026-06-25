@@ -82,6 +82,10 @@ pub struct FrontendHub {
     provider: String,
     model: String,
     cwd: String,
+    /// Current git branch of `cwd`, surfaced in every snapshot so the footer
+    /// can render `git:(branch)`. `None` outside a work tree. Refreshed by
+    /// the runner on each turn boundary via [`Self::set_git_branch`].
+    git_branch: Option<String>,
     /// Active permission mode (set after construction + on `/afk`).
     mode: String,
     /// Active reasoning effort (set after construction + on `/model`).
@@ -102,11 +106,13 @@ pub struct FrontendHub {
 }
 
 impl FrontendHub {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: String,
         provider: String,
         model: String,
         cwd: String,
+        git_branch: Option<String>,
         models: Vec<ModelRef>,
         acceptor: Acceptor,
         broker: RequestBroker,
@@ -116,6 +122,7 @@ impl FrontendHub {
             provider,
             model,
             cwd,
+            git_branch,
             mode: String::new(),
             effort: None,
             models,
@@ -139,6 +146,7 @@ impl FrontendHub {
             provider: self.provider.clone(),
             model: self.model.clone(),
             cwd: self.cwd.clone(),
+            git_branch: self.git_branch.clone(),
             effort: self.effort.clone(),
             mode: self.mode.clone(),
             models: self.models.clone(),
@@ -152,6 +160,19 @@ impl FrontendHub {
     /// Update the permission mode the hub reports (startup + after `/afk`).
     pub fn set_mode(&mut self, mode: String) {
         self.mode = mode;
+    }
+
+    /// Update the cached git branch surfaced in snapshots (refreshed at each
+    /// turn boundary so a mid-session `git checkout` is reflected). The runner
+    /// re-snapshots after calling this so the change reaches the frontend.
+    pub fn set_git_branch(&mut self, branch: Option<String>) {
+        self.git_branch = branch;
+    }
+
+    /// The cached git branch the hub reports — read by the runner so it can
+    /// no-op the per-turn refresh when the branch hasn't changed.
+    pub fn git_branch(&self) -> Option<&str> {
+        self.git_branch.as_deref()
     }
 
     /// Update the active reasoning effort the hub reports (startup; `/model`
@@ -433,6 +454,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            None,
             Vec::new(),
             acc,
             RequestBroker::new(),
@@ -497,6 +519,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            None,
             Vec::new(),
             acc,
             RequestBroker::new(),
@@ -519,6 +542,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_carries_git_branch_from_set_and_ctor() {
+        // Constructor seeds the branch; set_git_branch updates it.
+        let (p, mut sent, _cmds) = port();
+        let mut acc = Acceptor::new();
+        acc.attach(Box::new(p));
+        let mut hub = FrontendHub::new(
+            "s1".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Some("main".to_string()),
+            Vec::new(),
+            acc,
+            RequestBroker::new(),
+        );
+        hub.send_snapshot().await;
+        match sent.recv().await {
+            Some(Outbound::Snapshot(s)) => assert_eq!(s.git_branch.as_deref(), Some("main")),
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+        hub.set_git_branch(Some("feature/login".to_string()));
+        hub.send_snapshot().await;
+        match sent.recv().await {
+            Some(Outbound::Snapshot(s)) => {
+                assert_eq!(s.git_branch.as_deref(), Some("feature/login"))
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+        // Reading-back accessor mirrors the snapshot value.
+        assert_eq!(hub.git_branch(), Some("feature/login"));
+    }
+
+    #[tokio::test]
     async fn disconnect_with_no_successor_cancels_requests() {
         let (mut dead, _sent, _c) = port();
         dead.dead = true;
@@ -529,6 +585,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            None,
             Vec::new(),
             acc,
             RequestBroker::new(),

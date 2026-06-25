@@ -23,7 +23,6 @@ pub enum Effect {
 }
 
 /// Footer segments Ink can show/hide, in display order: `(id, label, help)`.
-/// Only the segments Ink's footer actually renders — no `git` (Ink has none).
 /// Each `id` becomes `statusline.<id>` and matches the shared `statusline_hidden`
 /// keys, so native `/settings` and Ink stay consistent.
 const STATUSLINE_SEGMENTS: &[(&str, &str, &str)] = &[
@@ -32,6 +31,11 @@ const STATUSLINE_SEGMENTS: &[(&str, &str, &str)] = &[
         "cwd",
         "Working directory",
         "current directory in the footer",
+    ),
+    (
+        "git",
+        "Git branch",
+        "current git branch in the footer (oh-my-zsh style)",
     ),
     ("turns", "Turns", "turn count in the footer"),
     (

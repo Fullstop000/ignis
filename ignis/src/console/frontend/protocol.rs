@@ -173,6 +173,11 @@ pub struct Snapshot {
     pub provider: String,
     pub model: String,
     pub cwd: String,
+    /// Current git branch of `cwd` (or short detached SHA), for the footer's
+    /// oh-my-zsh-style `git:(branch)` segment. `None` when `cwd` isn't inside
+    /// a work tree. Refreshed on each turn boundary so a mid-session
+    /// `git checkout` is reflected.
+    pub git_branch: Option<String>,
     /// Active reasoning effort (`None` = the model has no effort control or none
     /// is set), so the `/model` picker can preselect it and the footer can show it.
     pub effort: Option<String>,
