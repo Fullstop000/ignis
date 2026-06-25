@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `/settings` — new Context toggles for auto-compaction and stripping reasoning from history, both managed from the panel and persisted in `state.json`. ([#229](https://github.com/Fullstop000/ignis/pull/229))
 
+### Fixed
+- LLM — Anthropic protocol no longer 400s on degenerate turns: `tool_use.input` falls back to `{}` when a streamed tool call has no `input_json_delta` chunks or a non-object payload, and reasoning-only assistant turns are emitted with a single-space text block to satisfy the `content` and alternation rules instead of being dropped. ([#232](https://github.com/Fullstop000/ignis/pull/232))
+
 ## [0.44.0] - 2026-06-23
 
 ### Added
