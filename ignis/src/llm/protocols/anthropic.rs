@@ -150,59 +150,7 @@ impl LlmProvider for AnthropicCompatible {
         // `reasoning_content` into the outbound payload).
         let trimmed = prep_outbound_history(messages, &HistoryPolicy::default());
 
-        // Map messages
-        let mut anthropic_messages = Vec::new();
-        for msg in &trimmed {
-            match msg.role.as_str() {
-                "user" => {
-                    anthropic_messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": msg.content.clone().unwrap_or_default()
-                    }));
-                }
-                "assistant" => {
-                    let mut content_blocks = Vec::new();
-                    if let Some(text) = &msg.content {
-                        content_blocks.push(serde_json::json!({
-                            "type": "text",
-                            "text": text
-                        }));
-                    }
-                    if let Some(tool_calls) = &msg.tool_calls {
-                        for tc in tool_calls {
-                            let args: serde_json::Value =
-                                serde_json::from_str(&tc.function.arguments)
-                                    .unwrap_or(serde_json::Value::Null);
-                            content_blocks.push(serde_json::json!({
-                                "type": "tool_use",
-                                "id": tc.id.clone(),
-                                "name": tc.function.name.clone(),
-                                "input": args
-                            }));
-                        }
-                    }
-                    anthropic_messages.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": content_blocks
-                    }));
-                }
-                "tool" => {
-                    let tool_use_id = msg.tool_call_id.clone().unwrap_or_default();
-                    let content_str = msg.content.clone().unwrap_or_default();
-                    anthropic_messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_id,
-                                "content": content_str
-                            }
-                        ]
-                    }));
-                }
-                _ => {}
-            }
-        }
+        let anthropic_messages = map_messages_to_anthropic(&trimmed);
 
         let req_body = AnthropicMessagesRequest {
             model: self.model.clone(),
@@ -255,6 +203,99 @@ impl LlmProvider for AnthropicCompatible {
 
         Ok(delta_stream.boxed())
     }
+}
+
+/// Translate a session history (OpenAI-shaped `Message`s) into the
+/// Anthropic-Messages wire shape (`{role, content: [...blocks]}`).
+///
+/// Extracted from `chat_stream` so the mapping — and the two edge cases
+/// Anthropic 400s on — can be unit-tested without standing up an HTTP server.
+///
+/// The two 400s this guards against:
+///   * `tool_use.input` must be a JSON object. Empty / unparseable /
+///     non-object `arguments` strings fall back to `{}`.
+///   * Assistant messages must have a non-empty `content` array AND must
+///     alternate with user messages. Turns whose reasoning was stripped by
+///     `prep_outbound_history` (leaving `content = None`, `tool_calls = None`)
+///     get a single-space text block as a placeholder so the message stays
+///     present and alternation is preserved — dropping the message entirely
+///     would produce adjacent `user` messages and trigger a different
+///     "messages must alternate" 400.
+fn map_messages_to_anthropic(messages: &[Message]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for msg in messages {
+        match msg.role.as_str() {
+            "user" => {
+                out.push(serde_json::json!({
+                    "role": "user",
+                    "content": msg.content.clone().unwrap_or_default()
+                }));
+            }
+            "assistant" => {
+                let mut content_blocks = Vec::new();
+                if let Some(text) = &msg.content {
+                    if !text.is_empty() {
+                        content_blocks.push(serde_json::json!({
+                            "type": "text",
+                            "text": text
+                        }));
+                    }
+                }
+                if let Some(tool_calls) = &msg.tool_calls {
+                    for tc in tool_calls {
+                        // Anthropic's `tool_use.input` must be a JSON object —
+                        // `null`, arrays, or primitives are all rejected with
+                        // `Input should be a valid dictionary`. The accumulator
+                        // can leave `arguments` empty (no `input_json_delta`
+                        // chunks) or unparseable; in either case fall back to
+                        // `{}` so the request stays valid.
+                        let parsed = serde_json::from_str(&tc.function.arguments)
+                            .ok()
+                            .filter(|v: &serde_json::Value| v.is_object());
+                        content_blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id.clone(),
+                            "name": tc.function.name.clone(),
+                            "input": parsed.unwrap_or_else(|| serde_json::json!({}))
+                        }));
+                    }
+                }
+                if content_blocks.is_empty() {
+                    // Reasoning-only turn whose reasoning was stripped.
+                    // Anthropic rejects `{"content":[]}` AND requires
+                    // user/assistant alternation, so we can't drop the
+                    // message — emit a single-space text block as the
+                    // minimal valid payload. The model still sees the
+                    // turn boundary, and the placeholder text is
+                    // whitespace so it doesn't poison the context.
+                    content_blocks.push(serde_json::json!({
+                        "type": "text",
+                        "text": " "
+                    }));
+                }
+                out.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": content_blocks
+                }));
+            }
+            "tool" => {
+                let tool_use_id = msg.tool_call_id.clone().unwrap_or_default();
+                let content_str = msg.content.clone().unwrap_or_default();
+                out.push(serde_json::json!({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": content_str
+                        }
+                    ]
+                }));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 #[derive(Default)]
@@ -344,6 +385,7 @@ fn parse_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ToolCall, ToolCallFunction};
 
     /// Mirror of the agent loop's tool-call accumulator (`agent/mod.rs` keeps
     /// `id`/`name`/`arguments` strings and `push_str`s every delta that arrives
@@ -450,5 +492,249 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["max_tokens"], serde_json::json!(DEFAULT_MAX_TOKENS));
+    }
+
+    // ---- map_messages_to_anthropic: outbound history shape ----
+    //
+    // Two regressions these cover, both reproducing 400s the user hit in
+    // production:
+    //   * `tool_use.input` must be a JSON object — empty / unparseable /
+    //     non-object `arguments` strings used to fall through as `null`
+    //     (`Input should be a valid dictionary (2013)` at the offending
+    //     `messages.<i>.content.<j>.tool_use.input` path).
+    //   * Assistant messages with no visible content blocks (e.g. a turn that
+    //     produced only reasoning, which `prep_outbound_history` then strips)
+    //     used to serialize as `{"role":"assistant","content":[]}` and the
+    //     API returned `missing messages.content parameter`.
+
+    fn user_msg(text: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: Some(text.to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at_ms: None,
+        }
+    }
+
+    fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            r#type: "function".to_string(),
+            function: ToolCallFunction {
+                name: name.to_string(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    fn tool_result_msg(call_id: &str, body: &str) -> Message {
+        Message {
+            role: "tool".to_string(),
+            content: Some(body.to_string()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: Some(call_id.to_string()),
+            tool_calls: None,
+            created_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn tool_use_input_falls_back_to_empty_object_for_empty_arguments() {
+        // The accumulator leaves `arguments` empty when the model streams a
+        // `content_block_start` for a tool_use but no `input_json_delta`
+        // chunks. Anthropic rejects `input: null`; we must send `{}`.
+        let history = vec![
+            user_msg("hi"),
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![tool_call("toolu_1", "bash", "")]),
+                created_at_ms: None,
+            },
+        ];
+        let out = map_messages_to_anthropic(&history);
+        let assistant = &out[1];
+        let input = &assistant["content"][0]["input"];
+        assert_eq!(
+            input,
+            &serde_json::json!({}),
+            "empty arguments must default to empty object, not null"
+        );
+    }
+
+    #[test]
+    fn tool_use_input_falls_back_to_empty_object_for_invalid_json() {
+        // Defensive: a partial / corrupt `arguments` string would also have
+        // produced `input: null` under the old `unwrap_or(Value::Null)`.
+        let history = vec![Message {
+            role: "assistant".to_string(),
+            content: None,
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![tool_call("toolu_1", "bash", "{not json")]),
+            created_at_ms: None,
+        }];
+        let out = map_messages_to_anthropic(&history);
+        let input = &out[0]["content"][0]["input"];
+        assert_eq!(input, &serde_json::json!({}));
+    }
+
+    #[test]
+    fn tool_use_input_rejects_non_object_values() {
+        // Anthropic's contract is stricter than "any JSON value" — `input`
+        // must be an object, not an array/string/number. A non-object payload
+        // (e.g. a model that emitted a bare array) would also be rejected;
+        // normalize to `{}` so the request goes through.
+        for raw in [r#""just a string""#, r#"[1,2,3]"#, r#"42"#, r#"true"#] {
+            let history = vec![Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![tool_call("toolu_1", "bash", raw)]),
+                created_at_ms: None,
+            }];
+            let out = map_messages_to_anthropic(&history);
+            assert_eq!(
+                out[0]["content"][0]["input"],
+                serde_json::json!({}),
+                "non-object {raw} must normalize to empty object"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_use_input_preserves_valid_object_arguments() {
+        // Sanity: a well-formed object payload passes through unchanged.
+        let history = vec![Message {
+            role: "assistant".to_string(),
+            content: None,
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![tool_call("toolu_1", "bash", r#"{"command":"ls"}"#)]),
+            created_at_ms: None,
+        }];
+        let out = map_messages_to_anthropic(&history);
+        assert_eq!(
+            out[0]["content"][0]["input"],
+            serde_json::json!({"command": "ls"})
+        );
+    }
+
+    #[test]
+    fn assistant_message_with_no_content_blocks_emits_placeholder_text() {
+        // Reproduces the `missing messages.content parameter` 400: a turn that
+        // produced only reasoning (which the history-prep layer strips) arrives
+        // here with `content = None` and `tool_calls = None`. We can't drop the
+        // message either — Anthropic requires user/assistant alternation and
+        // would 400 on the resulting adjacent-user shape. Send a single-space
+        // text block as the minimal valid placeholder that preserves the
+        // turn boundary without polluting the context.
+        let history = vec![
+            user_msg("hi"),
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                created_at_ms: None,
+            },
+            user_msg("hello?"),
+        ];
+        let out = map_messages_to_anthropic(&history);
+        assert_eq!(out.len(), 3, "all three messages must be preserved");
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[2]["role"], "user");
+        let content = out[1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "single placeholder text block");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], " ");
+    }
+
+    #[test]
+    fn assistant_message_with_only_empty_text_emits_placeholder_text() {
+        // `prep_outbound_history` can leave `content = Some("")` on a turn
+        // whose only payload was a `<think>...</think>` block. The placeholder
+        // path is the same as for `content = None`: a single-space text
+        // block keeps the message and the alternation intact.
+        let history = vec![
+            user_msg("hi"),
+            Message {
+                role: "assistant".to_string(),
+                content: Some(String::new()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                created_at_ms: None,
+            },
+        ];
+        let out = map_messages_to_anthropic(&history);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["role"], "assistant");
+        let content = out[1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], " ");
+    }
+
+    #[test]
+    fn assistant_message_with_empty_text_and_tool_calls_keeps_only_tool_use() {
+        // Empty text + real tool calls: the tool_use blocks satisfy the
+        // "non-empty content" rule, and we should not bolt on a placeholder
+        // text block that would push the tool_use out of the first position
+        // Anthropic's streaming parser expects.
+        let history = vec![Message {
+            role: "assistant".to_string(),
+            content: Some(String::new()),
+            reasoning_content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![tool_call("toolu_1", "bash", r#"{"command":"ls"}"#)]),
+            created_at_ms: None,
+        }];
+        let out = map_messages_to_anthropic(&history);
+        assert_eq!(out.len(), 1);
+        let content = out[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "only the tool_use block is sent");
+        assert_eq!(content[0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn tool_result_message_wraps_in_user_role() {
+        // Sanity: the tool → user-role conversion is unchanged by the new
+        // guards; we want to make sure regressions here don't silently
+        // break the call→result linkage Anthropic validates.
+        let history = vec![
+            user_msg("please ls"),
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![tool_call("toolu_1", "bash", r#"{"command":"ls"}"#)]),
+                created_at_ms: None,
+            },
+            tool_result_msg("toolu_1", "app/  README.md"),
+        ];
+        let out = map_messages_to_anthropic(&history);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2]["role"], "user");
+        assert_eq!(out[2]["content"][0]["type"], "tool_result");
+        assert_eq!(out[2]["content"][0]["tool_use_id"], "toolu_1");
+        assert_eq!(out[2]["content"][0]["content"], "app/  README.md");
     }
 }
