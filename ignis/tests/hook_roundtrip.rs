@@ -22,6 +22,20 @@ fn write_executable(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// Assert the channel carries no hook-failure events. The dispatcher's
+/// "hook runs unconfined" notice (`source = "hook.sandbox"`) fires only on
+/// platforms/kernels without an enforceable sandbox (Landlock-less Linux,
+/// non-Linux) and is not a failure, so it is tolerated here to keep these
+/// happy-path assertions environment-independent.
+async fn assert_no_hook_failures(rx: &mut mpsc::Receiver<ignis::AgentEvent>) {
+    while let Some(ev) = rx.recv().await {
+        assert!(
+            matches!(&ev, ignis::AgentEvent::Warning { source, .. } if source == "hook.sandbox"),
+            "unexpected event on happy path: {ev:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn user_prompt_submit_chain_rewrites_prompt() {
     let dir = tempfile::tempdir().unwrap();
@@ -68,8 +82,8 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","updatedI
         out,
         PromptHookResult::Continue("HELLO_FROM_HOOK".to_string())
     );
-    // No warnings on the happy path.
-    assert!(rx.recv().await.is_none());
+    // No hook-failure warnings on the happy path.
+    assert_no_hook_failures(&mut rx).await;
 }
 
 #[tokio::test]
@@ -107,7 +121,7 @@ printf '%s' '{"hookSpecificOutput":{"hookEventName":"AssistantMessageRender","up
         .await;
     drop(tx);
     assert_eq!(out, "渲染后");
-    assert!(rx.recv().await.is_none());
+    assert_no_hook_failures(&mut rx).await;
 }
 
 #[tokio::test]

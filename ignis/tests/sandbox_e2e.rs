@@ -246,14 +246,24 @@ async fn env_allowlist_blocks_secret_by_default() {
 async fn env_allowlist_passes_universal_set() {
     let tmp = tempfile::tempdir().unwrap();
     let script = env_dump_script(tmp.path());
+    // Set HOME and USER explicitly so the passthrough assertions don't depend
+    // on these being present in the ambient environment (minimal containers
+    // may not export USER).
     let home_before = std::env::var_os("HOME");
+    let user_before = std::env::var_os("USER");
     std::env::set_var("HOME", "/home/e2e-user");
+    std::env::set_var("USER", "e2e-user");
 
     let (out, _) = run_dispatch(spec_with(script, false, vec![]), "x").await;
     if let Some(v) = home_before {
         std::env::set_var("HOME", v);
     } else {
         std::env::remove_var("HOME");
+    }
+    if let Some(v) = user_before {
+        std::env::set_var("USER", v);
+    } else {
+        std::env::remove_var("USER");
     }
     let body = match out {
         HookOutcome::Mutated { updated, .. } => updated,
@@ -759,7 +769,7 @@ async fn missing_binary_is_soft_failed_with_disabled_status() {
             sandbox_status,
         } => {
             assert!(reason.contains("spawn failed"));
-            assert_eq!(sandbox_status, SandboxStatus::FullyEnforced);
+            assert_eq!(sandbox_status, expected_sandbox_status(true));
         }
         other => panic!("expected SoftFailed, got {other:?}"),
     }

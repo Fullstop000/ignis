@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - LLM — Anthropic protocol no longer 400s on degenerate turns: `tool_use.input` falls back to `{}` when a streamed tool call has no `input_json_delta` chunks or a non-object payload, and reasoning-only assistant turns are emitted with a single-space text block to satisfy the `content` and alternation rules instead of being dropped. ([#232](https://github.com/Fullstop000/ignis/pull/232))
+- Tests — hook unit and integration tests now tolerate the `hook.sandbox` warning emitted on platforms without enforceable Landlock/Seatbelt support, eliminating 5 spurious failures on vanilla Linux kernels and macOS. ([#236](https://github.com/Fullstop000/ignis/pull/236))
 
 ## [0.44.0] - 2026-06-23
 
