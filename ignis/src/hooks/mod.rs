@@ -623,10 +623,16 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         // Last good value is preserved.
         assert_eq!(out, PromptHookResult::Continue("GOOD".to_string()));
         drop(tx);
-        // Exactly one warning emitted.
+        // Exactly one warning emitted. Ignore the dispatcher's "hook runs
+        // unconfined" notice, which fires only on platforms/kernels without an
+        // enforceable sandbox (e.g. Landlock-less Linux, non-Linux) and would
+        // otherwise make this assertion environment-dependent.
         let mut warnings = 0;
         while let Some(ev) = rx.recv().await {
-            if matches!(ev, AgentEvent::Warning { .. }) {
+            if let AgentEvent::Warning { source, .. } = &ev {
+                if source == "hook.sandbox" {
+                    continue;
+                }
                 warnings += 1;
             }
         }
@@ -669,6 +675,10 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         let mut warnings = 0;
         while let Some(ev) = rx.recv().await {
             if let AgentEvent::Warning { source, message } = ev {
+                // Skip the environment-dependent unconfined-sandbox notice.
+                if source == "hook.sandbox" {
+                    continue;
+                }
                 assert_eq!(source, "UserPromptSubmit");
                 assert!(message.contains("blocked"));
                 warnings += 1;
@@ -705,6 +715,10 @@ printf '%s' '{"hookSpecificOutput":{"updatedInput":"STEP1!"}}'
         let mut warnings = 0;
         while let Some(ev) = rx.recv().await {
             if let AgentEvent::Warning { source, .. } = ev {
+                // Skip the environment-dependent unconfined-sandbox notice.
+                if source == "hook.sandbox" {
+                    continue;
+                }
                 assert_eq!(source, "AssistantMessageRender");
                 warnings += 1;
             }

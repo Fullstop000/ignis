@@ -836,9 +836,13 @@ async fn user_prompt_submit_block_short_circuits_turn() {
     let any_user = hist.iter().any(|m| m.role == "user");
     assert!(!any_user, "blocked prompt must not be in history");
 
-    // The user sees a Warning carrying the hook stderr.
+    // The user sees a Warning carrying the hook stderr. Skip the dispatcher's
+    // environment-dependent "hook runs unconfined" notice, which fires only
+    // where no sandbox can be enforced (Landlock-less Linux, non-Linux).
     let warning = events.iter().find_map(|e| match e {
-        AgentEvent::Warning { source, message } => Some((source.clone(), message.clone())),
+        AgentEvent::Warning { source, message } if source != "hook.sandbox" => {
+            Some((source.clone(), message.clone()))
+        }
         _ => None,
     });
     let (src, msg) = warning.expect("Warning event emitted on block");
