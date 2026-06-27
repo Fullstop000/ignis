@@ -1,16 +1,14 @@
+use crate::tools::cwd::SessionCwd;
 use crate::{StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
 
 pub struct ReadFileTool {
-    cwd: PathBuf,
+    cwd: SessionCwd,
 }
 
 impl ReadFileTool {
-    pub fn new(cwd: &Path) -> Self {
-        Self {
-            cwd: cwd.to_path_buf(),
-        }
+    pub fn new(cwd: impl Into<SessionCwd>) -> Self {
+        Self { cwd: cwd.into() }
     }
 }
 
@@ -43,7 +41,7 @@ impl StaticTool for ReadFileTool {
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
         let limit = args["limit"].as_u64().unwrap_or(2000) as usize;
 
-        let resolved = crate::util::resolve_path(&self.cwd, path);
+        let resolved = crate::util::resolve_path(&self.cwd.get(), path);
         let content = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|e| format!("Failed to read file: {e}"))?;
