@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `enter_worktree` / `exit_worktree` — isolate a session's edits on a fresh git worktree + branch, then keep it for review or remove it. ([#237](https://github.com/Fullstop000/ignis/pull/237))
 - `/settings` — new Context toggles for auto-compaction and stripping reasoning from history, both managed from the panel and persisted in `state.json`. ([#229](https://github.com/Fullstop000/ignis/pull/229))
 
 ### Fixed

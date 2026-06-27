@@ -5,6 +5,7 @@ pub(crate) mod ask_user;
 mod background;
 mod bash;
 mod create_file;
+mod cwd;
 mod edit_file;
 mod glob;
 mod grep;
@@ -15,12 +16,14 @@ mod todo_write;
 mod util;
 mod web_fetch;
 mod web_search;
+mod worktree;
 
 pub use agent::SubagentTool;
 pub use ask_user::AskUserTool;
 pub use background::{BackgroundCtx, BackgroundShells, BashOutputTool, KillShellTool};
 pub use bash::{BashSandbox, BashTool};
 pub use create_file::CreateFileTool;
+pub use cwd::SessionCwd;
 pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
@@ -42,18 +45,19 @@ use std::sync::Arc;
 /// `bash_sandbox` confines auto-run bash writes in unattended modes. Sub-agents
 /// pass `None` for both — plain blocking bash, no background shells, no sandbox.
 pub fn native_tools(
-    cwd: &Path,
+    cwd: impl Into<SessionCwd>,
     web_search: crate::config::WebSearchConfig,
     background: Option<background::BackgroundCtx>,
     bash_sandbox: Option<bash::BashSandbox>,
 ) -> Vec<Arc<dyn AgentTool>> {
+    let cwd: SessionCwd = cwd.into();
     vec![
-        Arc::new(ReadFileTool::new(cwd)) as Arc<dyn AgentTool>,
-        Arc::new(CreateFileTool::new(cwd)),
-        Arc::new(EditFileTool::new(cwd)),
-        Arc::new(ListDirTool::new(cwd)),
-        Arc::new(GrepTool::new(cwd)),
-        Arc::new(GlobTool::new(cwd)),
+        Arc::new(ReadFileTool::new(cwd.clone())) as Arc<dyn AgentTool>,
+        Arc::new(CreateFileTool::new(cwd.clone())),
+        Arc::new(EditFileTool::new(cwd.clone())),
+        Arc::new(ListDirTool::new(cwd.clone())),
+        Arc::new(GrepTool::new(cwd.clone())),
+        Arc::new(GlobTool::new(cwd.clone())),
         Arc::new(
             BashTool::new(cwd)
                 .with_background(background)
@@ -68,11 +72,12 @@ pub fn native_tools(
 /// execution, or network reach. Used by the read-only sub-agent types
 /// (`explore`, `review`). Read-only here is enforced by tool selection, not a
 /// sandbox — the permission pipeline remains the hard gate underneath.
-pub fn read_only_tools(cwd: &Path) -> Vec<Arc<dyn AgentTool>> {
+pub fn read_only_tools(cwd: impl Into<SessionCwd>) -> Vec<Arc<dyn AgentTool>> {
+    let cwd: SessionCwd = cwd.into();
     vec![
-        Arc::new(ReadFileTool::new(cwd)) as Arc<dyn AgentTool>,
-        Arc::new(ListDirTool::new(cwd)),
-        Arc::new(GrepTool::new(cwd)),
+        Arc::new(ReadFileTool::new(cwd.clone())) as Arc<dyn AgentTool>,
+        Arc::new(ListDirTool::new(cwd.clone())),
+        Arc::new(GrepTool::new(cwd.clone())),
         Arc::new(GlobTool::new(cwd)),
     ]
 }
@@ -142,7 +147,15 @@ pub fn register_native_tools_with_mcp(
         events: events.clone(),
     });
     let bash_sandbox = resolve_bash_sandbox(config, permissions.as_ref());
-    for tool in native_tools(cwd, config.web_search.clone(), bg_ctx, bash_sandbox) {
+    // One shared cwd handle for the whole toolset, so `enter_worktree` can
+    // redirect every file/bash tool at once by swapping it.
+    let session_cwd = SessionCwd::from(cwd);
+    for tool in native_tools(
+        session_cwd.clone(),
+        config.web_search.clone(),
+        bg_ctx,
+        bash_sandbox,
+    ) {
         session.register_tool(tool);
     }
     // Background-shell polling tools — top-level only (sub-agents return one
@@ -151,9 +164,21 @@ pub fn register_native_tools_with_mcp(
         session.register_tool(Arc::new(BashOutputTool::new(shells.clone())));
         session.register_tool(Arc::new(KillShellTool::new(shells, events.clone())));
     }
+    // Worktree tools — top-level only, sharing the session cwd so entering a
+    // worktree redirects the whole toolset. Sub-agents don't get them (they
+    // can't switch the session's working directory).
+    let wt_state = worktree::new_state();
+    session.register_tool(Arc::new(worktree::EnterWorktreeTool::new(
+        session_cwd.clone(),
+        wt_state.clone(),
+    )));
+    session.register_tool(Arc::new(worktree::ExitWorktreeTool::new(
+        session_cwd.clone(),
+        wt_state,
+    )));
     // The `agent` tool builds sub-agents from the config; registered only at the
     // top level so sub-agents can't recurse.
-    let mut subagent = SubagentTool::new(config.clone(), cwd);
+    let mut subagent = SubagentTool::new(config.clone(), session_cwd);
     if let Some(mcp) = mcp {
         subagent = subagent.with_mcp(mcp);
     }

@@ -1,7 +1,8 @@
 use crate::tools::background::{spawn_background, BackgroundCtx};
+use crate::tools::cwd::SessionCwd;
 use crate::{ExecutionMode, StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Filesystem-sandbox config for auto-run bash (unattended modes only). Confines
 /// the spawned command's WRITES to the project + temp (+ configured extras), and
@@ -31,7 +32,7 @@ const SYSTEM_READ_ROOTS: &[&str] = &[
 ];
 
 pub struct BashTool {
-    cwd: PathBuf,
+    cwd: SessionCwd,
     /// Background-execution context (registry + event channel). `None` for
     /// sub-agents and headless one-shot — `run_in_background` is rejected there.
     background: Option<BackgroundCtx>,
@@ -41,9 +42,9 @@ pub struct BashTool {
 }
 
 impl BashTool {
-    pub fn new(cwd: &Path) -> Self {
+    pub fn new(cwd: impl Into<SessionCwd>) -> Self {
         Self {
-            cwd: cwd.to_path_buf(),
+            cwd: cwd.into(),
             background: None,
             sandbox: None,
         }
@@ -59,13 +60,14 @@ impl BashTool {
     /// Validate that `cwd` exists and is a directory. Shared by the foreground
     /// and background spawn paths.
     async fn check_cwd(&self) -> Result<(), String> {
-        match tokio::fs::metadata(&self.cwd).await {
+        let cwd = self.cwd.get();
+        match tokio::fs::metadata(&cwd).await {
             Ok(meta) if meta.is_dir() => Ok(()),
-            Ok(_) => Err(format!("cwd '{}' is not a directory", self.cwd.display())),
+            Ok(_) => Err(format!("cwd '{}' is not a directory", cwd.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(format!("cwd '{}' does not exist", self.cwd.display()))
+                Err(format!("cwd '{}' does not exist", cwd.display()))
             }
-            Err(e) => Err(format!("cwd '{}': {e}", self.cwd.display())),
+            Err(e) => Err(format!("cwd '{}': {e}", cwd.display())),
         }
     }
 
@@ -85,7 +87,7 @@ impl BashTool {
     /// secrets unreadable, broad elsewhere.
     fn sandbox_paths(&self, sb: &BashSandbox) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let mut writes = vec![
-            self.cwd.clone(),
+            self.cwd.get(),
             PathBuf::from("/tmp"),
             PathBuf::from("/var/tmp"),
             PathBuf::from("/dev/null"),
@@ -171,7 +173,7 @@ impl StaticTool for BashTool {
                 Some(ctx) => {
                     // Validate cwd up front (matches the foreground path below).
                     self.check_cwd().await?;
-                    spawn_background(ctx, &self.cwd, command).await
+                    spawn_background(ctx, &self.cwd.get(), command).await
                 }
                 None => Err(
                     "Background execution is not available here (sub-agents and one-shot runs \
@@ -187,7 +189,7 @@ impl StaticTool for BashTool {
         builder
             .arg("-c")
             .arg(command)
-            .current_dir(&self.cwd)
+            .current_dir(self.cwd.get())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // Backstop: dropping the wait future on timeout SIGKILLs the bash

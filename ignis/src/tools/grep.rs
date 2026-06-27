@@ -1,8 +1,8 @@
+use crate::tools::cwd::SessionCwd;
 use crate::{StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use regex::Regex;
-use std::path::{Path, PathBuf};
 
 /// Maximum matches returned before truncating, to keep results readable.
 const MAX_MATCHES: usize = 200;
@@ -12,14 +12,12 @@ const MAX_LINE_CHARS: usize = 300;
 /// Search file *contents* with a regex, gitignore-aware (skips `target/`,
 /// `.git/`, etc.). The bread-and-butter code-navigation tool.
 pub struct GrepTool {
-    cwd: PathBuf,
+    cwd: SessionCwd,
 }
 
 impl GrepTool {
-    pub fn new(cwd: &Path) -> Self {
-        Self {
-            cwd: cwd.to_path_buf(),
-        }
+    pub fn new(cwd: impl Into<SessionCwd>) -> Self {
+        Self { cwd: cwd.into() }
     }
 }
 
@@ -52,8 +50,8 @@ impl StaticTool for GrepTool {
         let pattern = args.require_str("pattern")?;
         let re = Regex::new(pattern).map_err(|e| format!("Invalid regex: {e}"))?;
         let base = match args["path"].as_str() {
-            Some(p) => crate::util::resolve_path(&self.cwd, p),
-            None => self.cwd.clone(),
+            Some(p) => crate::util::resolve_path(&self.cwd.get(), p),
+            None => self.cwd.get(),
         };
         let matcher = match args["glob"].as_str() {
             Some(g) => Some(
@@ -64,7 +62,7 @@ impl StaticTool for GrepTool {
             None => None,
         };
 
-        let cwd = self.cwd.clone();
+        let cwd = self.cwd.get();
         let (mut lines, truncated) = tokio::task::spawn_blocking(move || {
             let mut out: Vec<String> = Vec::new();
             let mut truncated = false;
@@ -150,7 +148,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_rejects_bad_regex() {
-        let tool = GrepTool::new(Path::new("."));
+        let tool = GrepTool::new(std::path::Path::new("."));
         let res = tool.call(json!({ "pattern": "(" })).await;
         assert!(res.is_error);
     }
