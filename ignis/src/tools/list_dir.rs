@@ -1,16 +1,14 @@
+use crate::tools::cwd::SessionCwd;
 use crate::{StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
 
 pub struct ListDirTool {
-    cwd: PathBuf,
+    cwd: SessionCwd,
 }
 
 impl ListDirTool {
-    pub fn new(cwd: &Path) -> Self {
-        Self {
-            cwd: cwd.to_path_buf(),
-        }
+    pub fn new(cwd: impl Into<SessionCwd>) -> Self {
+        Self { cwd: cwd.into() }
     }
 }
 
@@ -27,7 +25,7 @@ impl StaticTool for ListDirTool {
 
     async fn run(&self, args: serde_json::Value) -> ToolOutcome {
         let path = args.require_str("path")?;
-        let resolved = crate::util::resolve_path(&self.cwd, path);
+        let resolved = crate::util::resolve_path(&self.cwd.get(), path);
         let mut entries = tokio::fs::read_dir(&resolved)
             .await
             .map_err(|e| format!("Failed to read directory: {e}"))?;

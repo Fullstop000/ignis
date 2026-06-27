@@ -1,18 +1,16 @@
+use crate::tools::cwd::SessionCwd;
 use crate::{ExecutionMode, StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
 
 pub struct CreateFileTool {
-    cwd: PathBuf,
+    cwd: SessionCwd,
 }
 
 impl CreateFileTool {
     pub const NAME: &'static str = "create_file";
 
-    pub fn new(cwd: &Path) -> Self {
-        Self {
-            cwd: cwd.to_path_buf(),
-        }
+    pub fn new(cwd: impl Into<SessionCwd>) -> Self {
+        Self { cwd: cwd.into() }
     }
 }
 
@@ -40,7 +38,7 @@ impl StaticTool for CreateFileTool {
         let path = args.require_str("path")?;
         let content = args.require_str("content")?;
 
-        let resolved = crate::util::resolve_path(&self.cwd, path);
+        let resolved = crate::util::resolve_path(&self.cwd.get(), path);
         if let Some(parent) = resolved.parent() {
             tokio::fs::create_dir_all(parent)
                 .await

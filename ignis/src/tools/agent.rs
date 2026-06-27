@@ -1,9 +1,9 @@
 use crate::agent::Agent;
 use crate::config::Config;
 use crate::mcp::McpRegistry;
+use crate::tools::cwd::SessionCwd;
 use crate::{AgentTool, Message, StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const SUBAGENT_SYSTEM_PROMPT: &str =
@@ -139,17 +139,20 @@ fn subagent_footer(
 /// completion and returns the sub-agent's final answer.
 pub struct SubagentTool {
     config: Config,
-    cwd: PathBuf,
+    /// Shared with the parent, so a sub-agent spawned after `enter_worktree`
+    /// operates inside the active worktree (it can't switch cwd itself — the
+    /// worktree tools are top-level only).
+    cwd: SessionCwd,
     /// Shared with the parent — subagents see the same connected MCP servers
     /// and their tools (as `mcp__<server>__<tool>`).
     mcp: Option<Arc<McpRegistry>>,
 }
 
 impl SubagentTool {
-    pub fn new(config: Config, cwd: &Path) -> Self {
+    pub fn new(config: Config, cwd: impl Into<SessionCwd>) -> Self {
         Self {
             config,
-            cwd: cwd.to_path_buf(),
+            cwd: cwd.into(),
             mcp: None,
         }
     }
@@ -227,9 +230,9 @@ impl StaticTool for SubagentTool {
         // No background context and no bash sandbox: sub-agents get plain
         // blocking bash only (the top-level loop is the gate).
         let tools = if spec.read_only {
-            super::read_only_tools(&self.cwd)
+            super::read_only_tools(self.cwd.clone())
         } else {
-            super::native_tools(&self.cwd, self.config.web_search.clone(), None, None)
+            super::native_tools(self.cwd.clone(), self.config.web_search.clone(), None, None)
         };
         for tool in tools {
             agent.register_tool(tool);
@@ -287,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn subagent_requires_prompt() {
-        let tool = SubagentTool::new(Config::default(), Path::new("."));
+        let tool = SubagentTool::new(Config::default(), std::path::Path::new("."));
         let res = tool.call(json!({})).await;
         assert!(res.is_error);
     }
@@ -334,7 +337,7 @@ mod tests {
     /// includes them. Pins the toolset-by-type contract.
     #[test]
     fn read_only_toolset_excludes_bash_but_general_includes_it() {
-        let cwd = Path::new(".");
+        let cwd = std::path::Path::new(".");
         let names = |tools: Vec<Arc<dyn AgentTool>>| -> Vec<String> {
             tools.iter().map(|t| t.name().to_string()).collect()
         };

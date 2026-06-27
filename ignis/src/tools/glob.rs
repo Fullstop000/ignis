@@ -1,8 +1,8 @@
+use crate::tools::cwd::SessionCwd;
 use crate::{StaticTool, ToolArgs, ToolOutcome, ToolParam};
 use async_trait::async_trait;
 use globset::Glob;
 use ignore::WalkBuilder;
-use std::path::{Path, PathBuf};
 
 /// Cap on returned paths so a broad pattern can't flood the output.
 const MAX_PATHS: usize = 300;
@@ -10,14 +10,12 @@ const MAX_PATHS: usize = 300;
 /// Find files by name/path glob (e.g. `**/*.rs`), gitignore-aware. Returns
 /// matching paths relative to the project root.
 pub struct GlobTool {
-    cwd: PathBuf,
+    cwd: SessionCwd,
 }
 
 impl GlobTool {
-    pub fn new(cwd: &Path) -> Self {
-        Self {
-            cwd: cwd.to_path_buf(),
-        }
+    pub fn new(cwd: impl Into<SessionCwd>) -> Self {
+        Self { cwd: cwd.into() }
     }
 }
 
@@ -47,11 +45,11 @@ impl StaticTool for GlobTool {
             .map_err(|e| format!("Invalid glob: {e}"))?
             .compile_matcher();
         let base = match args["path"].as_str() {
-            Some(p) => crate::util::resolve_path(&self.cwd, p),
-            None => self.cwd.clone(),
+            Some(p) => crate::util::resolve_path(&self.cwd.get(), p),
+            None => self.cwd.get(),
         };
 
-        let cwd = self.cwd.clone();
+        let cwd = self.cwd.get();
         let (mut paths, truncated) = tokio::task::spawn_blocking(move || {
             let mut paths: Vec<String> = Vec::new();
             let mut truncated = false;
