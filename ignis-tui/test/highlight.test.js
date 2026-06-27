@@ -33,3 +33,19 @@ test('matches the base16 string color for a quoted literal', () => {
     'string literal should be base16 green',
   );
 });
+
+test('matches native: function names are base16 blue (base0D)', () => {
+  const spans = highlightSpans('fn greet() {}', 'rs');
+  const fn = spans.find((s) => s.text === 'greet');
+  assert.ok(fn, 'function name is its own span');
+  assert.equal(fn.color, '#8fa1b3', 'function name uses base0D blue, like native syntect');
+});
+
+test('matches native: types and methods stay at the default fg, not colored', () => {
+  // Native syntect leaves type/builtin/method identifiers at base05 (#c0c5ce);
+  // the Ink palette must not over-color them (they were orange/yellow before).
+  const spans = highlightSpans('let m: HashMap = 1;', 'rs');
+  const ty = spans.find((s) => s.text.includes('HashMap'));
+  assert.ok(ty, 'type span present');
+  assert.equal(ty.color, '#c0c5ce', 'type uses base05 default fg, not a syntax color');
+});
