@@ -127,6 +127,14 @@ fn sanitize(name: &str) -> Result<String, String> {
     if cleaned.is_empty() {
         return Err("worktree name is empty after sanitizing".to_string());
     }
+    // Reject shapes git refuses as a branch ref, so the failure is an upfront
+    // message instead of a downstream "git worktree add failed".
+    if cleaned.starts_with('.') || cleaned.ends_with(".lock") || cleaned.contains("..") {
+        return Err(format!(
+            "worktree name '{cleaned}' is not a valid branch name (no leading '.', trailing \
+             '.lock', or '..')"
+        ));
+    }
     Ok(cleaned)
 }
 
@@ -193,7 +201,9 @@ async fn create(
 async fn unsaved_work(active: &ActiveWorktree) -> Result<Option<String>, String> {
     let status = git(&active.path, &["status", "--porcelain"]).await?;
     let uncommitted = status.lines().filter(|l| !l.trim().is_empty()).count();
-    let ahead = git(
+    // Fail closed: if the commit count can't be determined, treat the worktree
+    // as holding work rather than silently force-deleting an unmerged branch.
+    let ahead: usize = git(
         &active.path,
         &[
             "rev-list",
@@ -202,9 +212,9 @@ async fn unsaved_work(active: &ActiveWorktree) -> Result<Option<String>, String>
         ],
     )
     .await
-    .ok()
-    .and_then(|s| s.parse::<usize>().ok())
-    .unwrap_or(0);
+    .map_err(|e| format!("cannot verify commits in the worktree for safe removal: {e}"))?
+    .parse()
+    .unwrap_or(usize::MAX);
     if uncommitted == 0 && ahead == 0 {
         return Ok(None);
     }
@@ -259,8 +269,10 @@ impl StaticTool for EnterWorktreeTool {
     const DESCRIPTION: &'static str =
         "Create a fresh git worktree on a new branch and switch this session into it, so your \
          edits stay isolated from the user's working copy and land as a reviewable branch. Use \
-         this as your FIRST action when asked to work in a worktree; edits made by relative path \
-         after this go into the worktree. Call exit_worktree(keep|remove) when done.";
+         this as your FIRST action when asked to work in a worktree. IMPORTANT: afterwards refer \
+         to files by RELATIVE path (or an absolute path under the worktree) — an absolute path \
+         into the original checkout is NOT redirected and would edit the user's copy. Call \
+         exit_worktree(keep|remove) when done.";
     const PARAMETERS: &'static [ToolParam] = &[
         ToolParam {
             name: "name",
@@ -296,8 +308,10 @@ impl StaticTool for EnterWorktreeTool {
 
         self.cwd.set(active.path.clone());
         let msg = format!(
-            "Entered worktree at {} on new branch `{}` (isolated from {}). Edits now land here. \
-             Call exit_worktree with action \"keep\" (review later) or \"remove\" (discard) when done.",
+            "Entered worktree at {} on new branch `{}` (isolated from {}). Use relative paths \
+             from here on — they now resolve inside the worktree (your system prompt's Working \
+             Directory is stale). Call exit_worktree with action \"keep\" (review later) or \
+             \"remove\" (discard) when done.",
             active.path.display(),
             active.branch,
             active.original_cwd.display()
@@ -516,6 +530,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exit_remove_refuses_to_drop_worktree_only_commits() {
+        let repo = init_repo();
+        let (_cwd, state, enter, exit) = tools(repo.path());
+        enter.run(json!({ "name": "committed" })).await.unwrap();
+        let wt = state.lock().unwrap().clone().unwrap().path;
+        // Commit work inside the worktree: tree is clean but ahead of the base.
+        std::fs::write(wt.join("feature.txt"), "done\n").unwrap();
+        sh(&wt, &["git", "add", "."]);
+        sh(&wt, &["git", "commit", "-qm", "feature work"]);
+
+        let err = exit.run(json!({ "action": "remove" })).await.unwrap_err();
+        assert!(err.contains("commit"), "must refuse to drop commits: {err}");
+        assert!(wt.exists());
+
+        // discard_changes forces it.
+        exit.run(json!({ "action": "remove", "discard_changes": true }))
+            .await
+            .unwrap();
+        assert!(!wt.exists());
+    }
+
+    #[tokio::test]
     async fn exit_with_no_active_session_is_a_noop() {
         let repo = init_repo();
         let (_cwd, _state, _enter, exit) = tools(repo.path());
@@ -569,5 +605,9 @@ mod tests {
         assert_eq!(sanitize("feat/login!").unwrap(), "feat-login");
         assert_eq!(sanitize("ok.name_1").unwrap(), "ok.name_1");
         assert!(sanitize("///").is_err());
+        // Shapes git rejects as a ref are caught upfront.
+        assert!(sanitize(".hidden").is_err());
+        assert!(sanitize("..").is_err());
+        assert!(sanitize("foo.lock").is_err());
     }
 }
