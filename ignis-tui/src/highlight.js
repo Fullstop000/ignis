@@ -25,18 +25,27 @@ const EXT_TO_LANG = {
   lua: 'lua', kt: 'kotlin', swift: 'swift',
 };
 
+// base16-ocean.dark default foreground (base05). Unscoped tokens inside a
+// highlighted line get this — matching what native syntect emits for the things
+// it leaves uncolored: plain identifiers, punctuation, types and method names.
+const DEFAULT_FG = '#c0c5ce';
+
 // base16-ocean.dark, keyed by the highlight.js scope (className minus `hljs-`).
-// Approximates the theme the native TUI loads (syntect), kept close by eye.
+// Tuned to reproduce what native syntect actually emits (verified against
+// `src/console/highlight.rs`): keywords purple, function names blue, strings
+// green, numbers/constants orange, variables red, comments grey. Types,
+// built-ins and method names are deliberately left at DEFAULT_FG, as native
+// does not color them.
 const SCOPE_COLORS = {
   keyword: '#b48ead', 'selector-tag': '#b48ead',
-  title: '#ebcb8b', section: '#ebcb8b',
+  title: '#8fa1b3', function: '#8fa1b3',
   string: '#a3be8c', symbol: '#a3be8c', bullet: '#a3be8c', addition: '#a3be8c',
-  number: '#d08770', meta: '#d08770', 'built_in': '#d08770',
-  'builtin-name': '#d08770', literal: '#d08770', type: '#d08770',
-  params: '#d08770', deletion: '#d08770',
-  variable: '#bf616a', 'template-variable': '#bf616a', attribute: '#bf616a',
+  number: '#d08770', literal: '#d08770', meta: '#d08770',
+  'template-variable': '#d08770', subst: '#d08770',
+  variable: '#bf616a', attribute: '#bf616a', attr: '#bf616a',
   tag: '#bf616a', name: '#bf616a', regexp: '#bf616a', link: '#bf616a',
-  'selector-id': '#bf616a', 'selector-class': '#bf616a', attr: '#bf616a',
+  'selector-id': '#bf616a', 'selector-class': '#bf616a', deletion: '#bf616a',
+  section: '#ebcb8b',
   comment: '#65737e', quote: '#65737e',
 };
 
@@ -57,7 +66,7 @@ export function highlightSpans(text, ext) {
   try {
     const tree = lowlight.highlight(lang, text);
     const spans = [];
-    walk(tree.children, undefined, spans);
+    walk(tree.children, DEFAULT_FG, spans);
     // Coalesce adjacent same-color spans so we emit the fewest `<Text>` nodes.
     return coalesce(spans, text);
   } catch {
@@ -69,8 +78,13 @@ export function highlightSpans(text, ext) {
 function scopeColor(node, inherited) {
   const classes = node.properties?.className;
   if (Array.isArray(classes)) {
-    for (const c of classes) {
-      const key = c.startsWith('hljs-') ? c.slice(5) : c;
+    const keys = classes.map((c) => (c.startsWith('hljs-') ? c.slice(5) : c));
+    // lowlight tags both function definitions and call sites with `title`, but
+    // marks call sites with an extra `invoke__`. Native syntect only colors the
+    // definition (blue); `foo.bar()` / `Path::new()` stay at the default fg. So
+    // suppress the `title` color for invocations rather than blue them.
+    if (keys.includes('invoke__')) return inherited;
+    for (const key of keys) {
       if (SCOPE_COLORS[key]) return SCOPE_COLORS[key];
     }
   }
