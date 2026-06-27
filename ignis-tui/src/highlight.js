@@ -78,8 +78,13 @@ export function highlightSpans(text, ext) {
 function scopeColor(node, inherited) {
   const classes = node.properties?.className;
   if (Array.isArray(classes)) {
-    for (const c of classes) {
-      const key = c.startsWith('hljs-') ? c.slice(5) : c;
+    const keys = classes.map((c) => (c.startsWith('hljs-') ? c.slice(5) : c));
+    // lowlight tags both function definitions and call sites with `title`, but
+    // marks call sites with an extra `invoke__`. Native syntect only colors the
+    // definition (blue); `foo.bar()` / `Path::new()` stay at the default fg. So
+    // suppress the `title` color for invocations rather than blue them.
+    if (keys.includes('invoke__')) return inherited;
+    for (const key of keys) {
       if (SCOPE_COLORS[key]) return SCOPE_COLORS[key];
     }
   }

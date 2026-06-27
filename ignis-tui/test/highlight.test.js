@@ -49,3 +49,15 @@ test('matches native: types and methods stay at the default fg, not colored', ()
   assert.ok(ty, 'type span present');
   assert.equal(ty.color, '#c0c5ce', 'type uses base05 default fg, not a syntax color');
 });
+
+test('matches native: call sites are not blued like function definitions', () => {
+  // lowlight tags both `fn greet` and `obj.bar()` with `title`; only the
+  // definition should be blue. Invocations (method or associated) stay default,
+  // matching native syntect (which reserves the function-definition blue).
+  const call = highlightSpans('obj.bar();', 'rs').find((s) => s.text.includes('bar'));
+  assert.ok(call, 'method-call span present');
+  assert.equal(call.color, '#c0c5ce', 'method call stays at the default fg, not blue');
+
+  const def = highlightSpans('fn greet() {}', 'rs').find((s) => s.text === 'greet');
+  assert.equal(def.color, '#8fa1b3', 'the function definition is still base0D blue');
+});
