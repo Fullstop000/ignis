@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `/settings` — new Context toggles for auto-compaction and stripping reasoning from history, both managed from the panel and persisted in `state.json`. ([#229](https://github.com/Fullstop000/ignis/pull/229))
+- Git branch in the Ink status footer — oh-my-zsh-style `git:(branch)` segment, toggleable via `/settings` → Statusline. ([#231](https://github.com/Fullstop000/ignis/pull/231))
 
 ### Changed
 - TUI — the Ink edit-diff view's syntax colors now match the native ratatui palette: function names blue, types and call sites neutral, instead of the previous yellow/orange. ([#238](https://github.com/Fullstop000/ignis/pull/238))

@@ -778,6 +778,8 @@ function Footer({ state }) {
     segs.push(`${state.provider || '?'}/${state.model || '?'}${effort}`);
   }
   if (state.cwd && shows('cwd')) segs.push(baseName(state.cwd));
+  // Git branch (oh-my-zsh `git:(branch)` style) when cwd is in a work tree.
+  if (state.gitBranch && shows('git')) segs.push(`git:(${state.gitBranch})`);
   if (shows('turns')) segs.push(`${state.turns} turn${state.turns === 1 ? '' : 's'}`);
   // Context-fill gauge: tokens used vs the active model's window (its `context`,
   // carried in the models list), as `N tok (X%)` — mirrors the native footer.
