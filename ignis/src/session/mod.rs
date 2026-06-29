@@ -134,6 +134,11 @@ impl Session {
         self.agent.register_tool(tool);
     }
 
+    #[cfg(test)]
+    pub(crate) fn tool_for_test(&self, name: &str) -> Option<Arc<dyn AgentTool>> {
+        self.agent.tool_for_test(name)
+    }
+
     pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
         self.agent.set_hooks(hooks);
     }

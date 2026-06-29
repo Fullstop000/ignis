@@ -902,6 +902,11 @@ impl Agent {
         self.tools.push(tool);
     }
 
+    #[cfg(test)]
+    pub(crate) fn tool_for_test(&self, name: &str) -> Option<Arc<dyn AgentTool>> {
+        self.tools.iter().find(|tool| tool.name() == name).cloned()
+    }
+
     pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
         self.hooks = Some(hooks);
     }

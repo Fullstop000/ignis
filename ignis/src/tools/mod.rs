@@ -208,8 +208,63 @@ pub fn register_mcp_tools(session: &mut crate::Session, registry: &crate::mcp::M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::{LlmProvider, LlmResponseDelta, Message};
     use crate::permissions::runtime::PermissionState;
     use crate::permissions::Mode;
+    use futures_util::{stream, StreamExt};
+    use serde_json::json;
+    use std::path::Path;
+    use std::process::Command;
+
+    struct NoopProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NoopProvider {
+        async fn chat_stream(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _tools: &[serde_json::Value],
+        ) -> Result<
+            futures_util::stream::BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
+            anyhow::Error,
+        > {
+            Ok(stream::empty().boxed())
+        }
+
+        fn model_id(&self) -> &str {
+            "noop"
+        }
+
+        fn provider_name(&self) -> &str {
+            "noop"
+        }
+    }
+
+    fn sh(dir: &Path, args: &[&str]) {
+        let out = Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "cmd {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        sh(p, &["git", "init", "-q", "-b", "main"]);
+        sh(p, &["git", "config", "user.email", "t@t.dev"]);
+        sh(p, &["git", "config", "user.name", "Tester"]);
+        std::fs::write(p.join("README.md"), "hi\n").unwrap();
+        sh(p, &["git", "add", "."]);
+        sh(p, &["git", "commit", "-qm", "init"]);
+        tmp
+    }
 
     #[test]
     fn bash_sandbox_off_by_default_even_in_unattended_modes() {
@@ -277,5 +332,63 @@ mod tests {
         if let Some(home) = dirs::home_dir() {
             assert!(sb.extra_reads.contains(&home.join(".npm")));
         }
+    }
+
+    #[tokio::test]
+    async fn registered_worktree_redirects_registered_file_tools() {
+        let repo = init_repo();
+        let mut session = crate::Session::open(
+            "test".to_string(),
+            "system".to_string(),
+            Box::new(NoopProvider),
+            Box::new(crate::storage::InMemoryStorage::new()),
+            repo.path().display().to_string(),
+        )
+        .await
+        .unwrap();
+        register_native_tools_with_mcp(
+            &mut session,
+            repo.path(),
+            &crate::config::Config::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let enter = session.tool_for_test("enter_worktree").unwrap();
+        let create = session.tool_for_test("create_file").unwrap();
+        let read = session.tool_for_test("read_file").unwrap();
+        let exit = session.tool_for_test("exit_worktree").unwrap();
+
+        let entered = enter.call(json!({ "name": "registered" })).await;
+        assert!(!entered.is_error, "{}", entered.content);
+        let worktree = repo.path().join(".ignis/worktrees/registered");
+        assert!(worktree.exists());
+
+        let created = create
+            .call(json!({ "path": "probe.txt", "content": "from worktree" }))
+            .await;
+        assert!(!created.is_error, "{}", created.content);
+
+        assert!(
+            !repo.path().join("probe.txt").exists(),
+            "registered create_file must not write into the original checkout"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("probe.txt")).unwrap(),
+            "from worktree"
+        );
+
+        let read_back = read.call(json!({ "path": "probe.txt" })).await;
+        assert!(!read_back.is_error, "{}", read_back.content);
+        assert_eq!(read_back.content, "from worktree");
+
+        let removed = exit
+            .call(json!({ "action": "remove", "discard_changes": true }))
+            .await;
+        assert!(!removed.is_error, "{}", removed.content);
+        assert!(!worktree.exists());
     }
 }
