@@ -14,6 +14,7 @@
 
 use crate::tools::cwd::SessionCwd;
 use crate::tools::tool::{ExecutionMode, StaticTool, ToolArgs, ToolOutcome, ToolParam};
+use crate::Message;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -150,6 +151,76 @@ fn generated_name() -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     format!("wt-{:06x}", nanos & 0xff_ffff)
+}
+
+fn tool_result(message: &Message) -> Option<String> {
+    let content = message.content.as_ref()?;
+    let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
+    if parsed["is_error"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    parsed["result"].as_str().map(ToString::to_string)
+}
+
+fn parse_enter_result(result: &str) -> Option<ActiveWorktree> {
+    let rest = result.strip_prefix("Entered worktree at ")?;
+    let (session_cwd, rest) = rest.split_once(" on new branch `")?;
+    let (branch, rest) = rest.split_once("` (isolated from ")?;
+    let (original_cwd, _) = rest.split_once(").")?;
+
+    let session_cwd = PathBuf::from(session_cwd);
+    let original_cwd = PathBuf::from(original_cwd);
+    let prefix = git_sync(&original_cwd, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+    let mut path = session_cwd.clone();
+    for _ in prefix
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+    {
+        path.pop();
+    }
+    let base_commit = git_sync(&original_cwd, &["merge-base", branch, "HEAD"])
+        .or_else(|_| git_sync(&path, &["rev-parse", "HEAD"]))
+        .unwrap_or_default();
+
+    Some(ActiveWorktree {
+        path,
+        session_cwd,
+        branch: branch.to_string(),
+        base_commit,
+        original_cwd,
+    })
+}
+
+pub(crate) fn recover_active(history: &[Message]) -> Option<ActiveWorktree> {
+    let mut active = None;
+    for message in history {
+        match message.name.as_deref() {
+            Some("enter_worktree") => {
+                if let Some(result) = tool_result(message) {
+                    active = parse_enter_result(&result);
+                }
+            }
+            Some("exit_worktree") if tool_result(message).is_some() => {
+                active = None;
+            }
+            _ => {}
+        }
+    }
+    active
+}
+
+fn git_sync(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
 }
 
 /// Create the worktree + branch, returning the tracked handle. Does not switch
@@ -495,7 +566,12 @@ mod tests {
         enter.run(json!({ "name": "subdir" })).await.unwrap();
 
         let active = state.lock().unwrap().clone().unwrap();
-        assert_eq!(active.path, repo.path().join(".ignis/worktrees/subdir"));
+        let expected_worktree = repo
+            .path()
+            .join(".ignis/worktrees/subdir")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(active.path, expected_worktree);
         assert_eq!(active.session_cwd, active.path.join("crates/app"));
         assert_eq!(cwd.get(), active.session_cwd);
         assert!(

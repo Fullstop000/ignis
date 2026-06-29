@@ -147,9 +147,15 @@ pub fn register_native_tools_with_mcp(
         events: events.clone(),
     });
     let bash_sandbox = resolve_bash_sandbox(config, permissions.as_ref());
-    // One shared cwd handle for the whole toolset, so `enter_worktree` can
-    // redirect every file/bash tool at once by swapping it.
-    let session_cwd = SessionCwd::from(cwd);
+    // One shared cwd handle for the session, so `enter_worktree` can redirect
+    // file/bash tools, hooks, and sub-agents at once by swapping it.
+    let session_cwd = session.cwd_handle();
+    session_cwd.set(cwd.to_path_buf());
+    let wt_state = worktree::new_state();
+    if let Some(active) = worktree::recover_active(session.history()) {
+        session_cwd.set(active.session_cwd.clone());
+        *wt_state.lock().unwrap() = Some(active);
+    }
     for tool in native_tools(
         session_cwd.clone(),
         config.web_search.clone(),
@@ -167,7 +173,6 @@ pub fn register_native_tools_with_mcp(
     // Worktree tools — top-level only, sharing the session cwd so entering a
     // worktree redirects the whole toolset. Sub-agents don't get them (they
     // can't switch the session's working directory).
-    let wt_state = worktree::new_state();
     session.register_tool(Arc::new(worktree::EnterWorktreeTool::new(
         session_cwd.clone(),
         wt_state.clone(),
@@ -211,6 +216,7 @@ mod tests {
     use crate::llm::{LlmProvider, LlmResponseDelta, Message};
     use crate::permissions::runtime::PermissionState;
     use crate::permissions::Mode;
+    use crate::storage::SessionStorage;
     use futures_util::{stream, StreamExt};
     use serde_json::json;
     use std::path::Path;
@@ -392,6 +398,99 @@ mod tests {
         let read_back = read.call(json!({ "path": "src/generated.rs" })).await;
         assert!(!read_back.is_error, "{}", read_back.content);
         assert_eq!(read_back.content, "from worktree");
+
+        let removed = exit
+            .call(json!({ "action": "remove", "discard_changes": true }))
+            .await;
+        assert!(!removed.is_error, "{}", removed.content);
+        assert!(!worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn registered_tools_recover_active_worktree_on_resume() {
+        let repo = init_repo();
+        let subdir = repo.path().join("crates/app");
+        std::fs::create_dir_all(subdir.join("src")).unwrap();
+        std::fs::write(subdir.join("src/lib.rs"), "// original\n").unwrap();
+        sh(repo.path(), &["git", "add", "."]);
+        sh(repo.path(), &["git", "commit", "-qm", "add app"]);
+
+        let mut session = crate::Session::open(
+            "resume".to_string(),
+            "system".to_string(),
+            Box::new(NoopProvider),
+            Box::new(crate::storage::InMemoryStorage::new()),
+            subdir.display().to_string(),
+        )
+        .await
+        .unwrap();
+        register_native_tools_with_mcp(
+            &mut session,
+            &subdir,
+            &crate::config::Config::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let enter = session.tool_for_test("enter_worktree").unwrap();
+        let entered = enter.call(json!({ "name": "resume-wt" })).await;
+        assert!(!entered.is_error, "{}", entered.content);
+
+        let storage = crate::storage::InMemoryStorage::new();
+        storage
+            .save_session(
+                "resume",
+                &[Message {
+                    role: "tool".to_string(),
+                    content: Some(
+                        json!({ "result": entered.content, "is_error": false }).to_string(),
+                    ),
+                    reasoning_content: None,
+                    name: Some("enter_worktree".to_string()),
+                    tool_call_id: Some("call_1".to_string()),
+                    tool_calls: None,
+                    created_at_ms: None,
+                }],
+                Some(&subdir.display().to_string()),
+            )
+            .await
+            .unwrap();
+
+        let mut resumed = crate::Session::open(
+            "resume".to_string(),
+            "system".to_string(),
+            Box::new(NoopProvider),
+            Box::new(storage),
+            subdir.display().to_string(),
+        )
+        .await
+        .unwrap();
+        register_native_tools_with_mcp(
+            &mut resumed,
+            &subdir,
+            &crate::config::Config::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let create = resumed.tool_for_test("create_file").unwrap();
+        let exit = resumed.tool_for_test("exit_worktree").unwrap();
+        let created = create
+            .call(json!({ "path": "src/resumed.rs", "content": "from resumed worktree" }))
+            .await;
+        assert!(!created.is_error, "{}", created.content);
+
+        let worktree = repo.path().join(".ignis/worktrees/resume-wt");
+        assert!(!subdir.join("src/resumed.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("crates/app/src/resumed.rs")).unwrap(),
+            "from resumed worktree"
+        );
 
         let removed = exit
             .call(json!({ "action": "remove", "discard_changes": true }))
