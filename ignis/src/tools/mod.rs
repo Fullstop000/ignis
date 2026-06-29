@@ -337,18 +337,24 @@ mod tests {
     #[tokio::test]
     async fn registered_worktree_redirects_registered_file_tools() {
         let repo = init_repo();
+        let subdir = repo.path().join("crates/app");
+        std::fs::create_dir_all(subdir.join("src")).unwrap();
+        std::fs::write(subdir.join("src/lib.rs"), "// original\n").unwrap();
+        sh(repo.path(), &["git", "add", "."]);
+        sh(repo.path(), &["git", "commit", "-qm", "add app"]);
+
         let mut session = crate::Session::open(
             "test".to_string(),
             "system".to_string(),
             Box::new(NoopProvider),
             Box::new(crate::storage::InMemoryStorage::new()),
-            repo.path().display().to_string(),
+            subdir.display().to_string(),
         )
         .await
         .unwrap();
         register_native_tools_with_mcp(
             &mut session,
-            repo.path(),
+            &subdir,
             &crate::config::Config::default(),
             None,
             None,
@@ -365,23 +371,25 @@ mod tests {
         let entered = enter.call(json!({ "name": "registered" })).await;
         assert!(!entered.is_error, "{}", entered.content);
         let worktree = repo.path().join(".ignis/worktrees/registered");
+        let worktree_subdir = worktree.join("crates/app");
         assert!(worktree.exists());
+        assert!(worktree_subdir.exists());
 
         let created = create
-            .call(json!({ "path": "probe.txt", "content": "from worktree" }))
+            .call(json!({ "path": "src/generated.rs", "content": "from worktree" }))
             .await;
         assert!(!created.is_error, "{}", created.content);
 
         assert!(
-            !repo.path().join("probe.txt").exists(),
+            !subdir.join("src/generated.rs").exists(),
             "registered create_file must not write into the original checkout"
         );
         assert_eq!(
-            std::fs::read_to_string(worktree.join("probe.txt")).unwrap(),
+            std::fs::read_to_string(worktree_subdir.join("src/generated.rs")).unwrap(),
             "from worktree"
         );
 
-        let read_back = read.call(json!({ "path": "probe.txt" })).await;
+        let read_back = read.call(json!({ "path": "src/generated.rs" })).await;
         assert!(!read_back.is_error, "{}", read_back.content);
         assert_eq!(read_back.content, "from worktree");
 

@@ -26,7 +26,10 @@ const WORKTREE_DIR: &str = ".ignis/worktrees";
 /// A worktree this session created via `enter_worktree`.
 #[derive(Clone, Debug)]
 pub struct ActiveWorktree {
+    /// The linked worktree root, used for git cleanup and dirty checks.
     pub path: PathBuf,
+    /// The cwd inside the linked worktree that corresponds to the caller's cwd.
+    pub session_cwd: PathBuf,
     pub branch: String,
     /// The commit the branch was cut from — used to detect commits made only in
     /// the worktree when deciding whether `remove` would lose work.
@@ -173,6 +176,14 @@ async fn create(
         return Err(format!("{} already exists", path.display()));
     }
     let path_str = path.to_str().ok_or("worktree path is not valid UTF-8")?;
+    let prefix = git(cwd, &["rev-parse", "--show-prefix"])
+        .await
+        .map_err(|e| format!("cannot resolve cwd relative to repository root: {e}"))?;
+    let session_cwd = if prefix.is_empty() {
+        path.clone()
+    } else {
+        path.join(prefix.trim_end_matches('/'))
+    };
 
     let base = match base_ref {
         BaseRef::Head => "HEAD".to_string(),
@@ -191,6 +202,7 @@ async fn create(
 
     Ok(ActiveWorktree {
         path,
+        session_cwd,
         branch: name,
         base_commit,
         original_cwd: cwd.to_path_buf(),
@@ -306,13 +318,13 @@ impl StaticTool for EnterWorktreeTool {
         let cwd = self.cwd.get();
         let active = create(&cwd, name, base_ref).await?;
 
-        self.cwd.set(active.path.clone());
+        self.cwd.set(active.session_cwd.clone());
         let msg = format!(
             "Entered worktree at {} on new branch `{}` (isolated from {}). Use relative paths \
              from here on — they now resolve inside the worktree (your system prompt's Working \
              Directory is stale). Call exit_worktree with action \"keep\" (review later) or \
              \"remove\" (discard) when done.",
-            active.path.display(),
+            active.session_cwd.display(),
             active.branch,
             active.original_cwd.display()
         );
@@ -467,6 +479,28 @@ mod tests {
                 .await
                 .unwrap(),
             "feat-x"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_from_subdir_preserves_relative_cwd_inside_worktree() {
+        let repo = init_repo();
+        let subdir = repo.path().join("crates/app");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("README.md"), "app\n").unwrap();
+        sh(repo.path(), &["git", "add", "."]);
+        sh(repo.path(), &["git", "commit", "-qm", "add app"]);
+
+        let (cwd, state, enter, _exit) = tools(&subdir);
+        enter.run(json!({ "name": "subdir" })).await.unwrap();
+
+        let active = state.lock().unwrap().clone().unwrap();
+        assert_eq!(active.path, repo.path().join(".ignis/worktrees/subdir"));
+        assert_eq!(active.session_cwd, active.path.join("crates/app"));
+        assert_eq!(cwd.get(), active.session_cwd);
+        assert!(
+            active.session_cwd.exists(),
+            "matching subdir should exist in the linked worktree"
         );
     }
 
