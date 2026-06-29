@@ -231,11 +231,26 @@ function reduceEvent(state, ev) {
         streamChars: state.streamChars + (p.delta ?? '').length,
       };
     case EVENT.MESSAGE_END: {
-      const isReasoning = state.streamKind === 'reasoning';
-      const text = (isReasoning ? p.message?.reasoning_content : p.message?.content) ?? state.stream ?? '';
-      const blocks = text.trim().length
-        ? [...state.blocks, { kind: isReasoning ? 'reasoning' : 'assistant', text }]
-        : state.blocks;
+      const content = p.message?.content;
+      const reasoning = p.message?.reasoning_content;
+      const blocks = [...state.blocks];
+      const pushBlock = (kind, text) => {
+        if ((text ?? '').trim().length) blocks.push({ kind, text });
+      };
+
+      if (state.streamKind === 'reasoning') {
+        pushBlock('reasoning', reasoning ?? state.stream ?? '');
+        // Some providers' final assistant snapshot can carry both the completed
+        // reasoning and the visible answer. Do not let a stale reasoning stream
+        // classification hide the answer.
+        pushBlock('assistant', content);
+      } else if (state.streamKind === 'assistant') {
+        pushBlock('assistant', content ?? state.stream ?? '');
+      } else if (content != null) {
+        pushBlock('assistant', content);
+      } else {
+        pushBlock('reasoning', reasoning ?? state.stream ?? '');
+      }
       return { ...state, blocks, stream: null, streamKind: null };
     }
     case EVENT.USER_PROMPT_COMMITTED: {
