@@ -72,6 +72,34 @@ test('a reasoning stream finalizes to a reasoning block, not an assistant one', 
   assert.deepEqual(s.blocks.at(-1), { kind: 'assistant', text: 'the answer' });
 });
 
+test('a mixed final message after reasoning still commits the assistant answer', () => {
+  // Providers can persist a final assistant snapshot with both the accumulated
+  // reasoning and the visible answer. If the frontend still thinks the current
+  // stream is reasoning, the answer must not be dropped.
+  let s = initialState();
+  s = reduceOutbound(s, { kind: 'event', data: { type: 'message_start', payload: { message: { reasoning_content: '' } } } });
+  s = reduceOutbound(s, { kind: 'event', data: { type: 'message_update', payload: { delta: 'first thought' } } });
+  s = reduceOutbound(s, {
+    kind: 'event',
+    data: {
+      type: 'message_end',
+      payload: {
+        message: {
+          reasoning_content: 'first thought\n\nsecond thought',
+          content: 'the visible answer',
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(s.blocks.slice(-2), [
+    { kind: 'reasoning', text: 'first thought\n\nsecond thought' },
+    { kind: 'assistant', text: 'the visible answer' },
+  ]);
+  assert.equal(s.stream, null);
+  assert.equal(s.streamKind, null);
+});
+
 test('user prompt and tool lifecycle render blocks', () => {
   // Append-only contract: tool_execution_start does NOT enter `blocks` (it
   // sets `state.activeTools[id]` for the running status bar instead);
