@@ -4,6 +4,7 @@ use crate::hooks::{HookContext, HookRegistry, PromptHookResult};
 use crate::llm::LlmProvider;
 use crate::storage::SessionStorage;
 use crate::tools::tool::{AgentTool, ToolHooks};
+use crate::tools::SessionCwd;
 use crate::{AgentEvent, Message};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -28,6 +29,7 @@ pub struct Session {
     /// accepts `Box<dyn SessionStorage>` for caller ergonomics.
     storage: Arc<dyn SessionStorage>,
     start_dir: String,
+    cwd: SessionCwd,
     agent: Agent,
     compaction: CompactionConfig,
     /// Cumulative real token usage for this session (persisted alongside it).
@@ -99,6 +101,7 @@ impl Session {
             id,
             history,
             storage: Arc::from(storage),
+            cwd: SessionCwd::from(Path::new(&start_dir)),
             start_dir,
             agent,
             compaction: CompactionConfig::default(),
@@ -132,6 +135,15 @@ impl Session {
 
     pub fn register_tool(&mut self, tool: Arc<dyn AgentTool>) {
         self.agent.register_tool(tool);
+    }
+
+    pub(crate) fn cwd_handle(&self) -> SessionCwd {
+        self.cwd.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tool_for_test(&self, name: &str) -> Option<Arc<dyn AgentTool>> {
+        self.agent.tool_for_test(name)
     }
 
     pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
@@ -233,13 +245,14 @@ impl Session {
         // the spec's one explicit exception to "hooks never kill a turn"
         // — so the prompt MUST NOT reach the model. Without this, a
         // DLP-style hook returning exit 2 would leak the original prompt.
+        let hook_cwd = self.cwd.get().to_string_lossy().to_string();
         let effective = match self
             .hooks
             .run_user_prompt_submit(
                 text,
                 HookContext {
                     session_id: &self.id,
-                    cwd: &self.start_dir,
+                    cwd: &hook_cwd,
                 },
                 &tx,
             )
@@ -305,10 +318,10 @@ impl Session {
                 tx,
                 self.inject_rx.as_mut(),
                 Some(&self.hooks),
-                Some(HookContext {
-                    session_id: &self.id,
-                    cwd: &self.start_dir,
-                }),
+                Some(crate::agent::AgentHookContext::new(
+                    self.id.clone(),
+                    self.cwd.clone(),
+                )),
             )
             .await?;
         if !run_usage.is_zero() {

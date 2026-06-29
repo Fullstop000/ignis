@@ -5,6 +5,7 @@ pub(crate) mod ask_user;
 mod background;
 mod bash;
 mod create_file;
+mod cwd;
 mod edit_file;
 mod glob;
 mod grep;
@@ -15,12 +16,14 @@ mod todo_write;
 mod util;
 mod web_fetch;
 mod web_search;
+mod worktree;
 
 pub use agent::SubagentTool;
 pub use ask_user::AskUserTool;
 pub use background::{BackgroundCtx, BackgroundShells, BashOutputTool, KillShellTool};
 pub use bash::{BashSandbox, BashTool};
 pub use create_file::CreateFileTool;
+pub use cwd::SessionCwd;
 pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
@@ -42,18 +45,19 @@ use std::sync::Arc;
 /// `bash_sandbox` confines auto-run bash writes in unattended modes. Sub-agents
 /// pass `None` for both — plain blocking bash, no background shells, no sandbox.
 pub fn native_tools(
-    cwd: &Path,
+    cwd: impl Into<SessionCwd>,
     web_search: crate::config::WebSearchConfig,
     background: Option<background::BackgroundCtx>,
     bash_sandbox: Option<bash::BashSandbox>,
 ) -> Vec<Arc<dyn AgentTool>> {
+    let cwd: SessionCwd = cwd.into();
     vec![
-        Arc::new(ReadFileTool::new(cwd)) as Arc<dyn AgentTool>,
-        Arc::new(CreateFileTool::new(cwd)),
-        Arc::new(EditFileTool::new(cwd)),
-        Arc::new(ListDirTool::new(cwd)),
-        Arc::new(GrepTool::new(cwd)),
-        Arc::new(GlobTool::new(cwd)),
+        Arc::new(ReadFileTool::new(cwd.clone())) as Arc<dyn AgentTool>,
+        Arc::new(CreateFileTool::new(cwd.clone())),
+        Arc::new(EditFileTool::new(cwd.clone())),
+        Arc::new(ListDirTool::new(cwd.clone())),
+        Arc::new(GrepTool::new(cwd.clone())),
+        Arc::new(GlobTool::new(cwd.clone())),
         Arc::new(
             BashTool::new(cwd)
                 .with_background(background)
@@ -68,11 +72,12 @@ pub fn native_tools(
 /// execution, or network reach. Used by the read-only sub-agent types
 /// (`explore`, `review`). Read-only here is enforced by tool selection, not a
 /// sandbox — the permission pipeline remains the hard gate underneath.
-pub fn read_only_tools(cwd: &Path) -> Vec<Arc<dyn AgentTool>> {
+pub fn read_only_tools(cwd: impl Into<SessionCwd>) -> Vec<Arc<dyn AgentTool>> {
+    let cwd: SessionCwd = cwd.into();
     vec![
-        Arc::new(ReadFileTool::new(cwd)) as Arc<dyn AgentTool>,
-        Arc::new(ListDirTool::new(cwd)),
-        Arc::new(GrepTool::new(cwd)),
+        Arc::new(ReadFileTool::new(cwd.clone())) as Arc<dyn AgentTool>,
+        Arc::new(ListDirTool::new(cwd.clone())),
+        Arc::new(GrepTool::new(cwd.clone())),
         Arc::new(GlobTool::new(cwd)),
     ]
 }
@@ -142,7 +147,21 @@ pub fn register_native_tools_with_mcp(
         events: events.clone(),
     });
     let bash_sandbox = resolve_bash_sandbox(config, permissions.as_ref());
-    for tool in native_tools(cwd, config.web_search.clone(), bg_ctx, bash_sandbox) {
+    // One shared cwd handle for the session, so `enter_worktree` can redirect
+    // file/bash tools, hooks, and sub-agents at once by swapping it.
+    let session_cwd = session.cwd_handle();
+    session_cwd.set(cwd.to_path_buf());
+    let wt_state = worktree::new_state();
+    if let Some(active) = worktree::recover_active(session.history()) {
+        session_cwd.set(active.session_cwd.clone());
+        *wt_state.lock().unwrap() = Some(active);
+    }
+    for tool in native_tools(
+        session_cwd.clone(),
+        config.web_search.clone(),
+        bg_ctx,
+        bash_sandbox,
+    ) {
         session.register_tool(tool);
     }
     // Background-shell polling tools — top-level only (sub-agents return one
@@ -151,9 +170,20 @@ pub fn register_native_tools_with_mcp(
         session.register_tool(Arc::new(BashOutputTool::new(shells.clone())));
         session.register_tool(Arc::new(KillShellTool::new(shells, events.clone())));
     }
+    // Worktree tools — top-level only, sharing the session cwd so entering a
+    // worktree redirects the whole toolset. Sub-agents don't get them (they
+    // can't switch the session's working directory).
+    session.register_tool(Arc::new(worktree::EnterWorktreeTool::new(
+        session_cwd.clone(),
+        wt_state.clone(),
+    )));
+    session.register_tool(Arc::new(worktree::ExitWorktreeTool::new(
+        session_cwd.clone(),
+        wt_state,
+    )));
     // The `agent` tool builds sub-agents from the config; registered only at the
     // top level so sub-agents can't recurse.
-    let mut subagent = SubagentTool::new(config.clone(), cwd);
+    let mut subagent = SubagentTool::new(config.clone(), session_cwd);
     if let Some(mcp) = mcp {
         subagent = subagent.with_mcp(mcp);
     }
@@ -183,8 +213,64 @@ pub fn register_mcp_tools(session: &mut crate::Session, registry: &crate::mcp::M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::{LlmProvider, LlmResponseDelta, Message};
     use crate::permissions::runtime::PermissionState;
     use crate::permissions::Mode;
+    use crate::storage::SessionStorage;
+    use futures_util::{stream, StreamExt};
+    use serde_json::json;
+    use std::path::Path;
+    use std::process::Command;
+
+    struct NoopProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NoopProvider {
+        async fn chat_stream(
+            &self,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _tools: &[serde_json::Value],
+        ) -> Result<
+            futures_util::stream::BoxStream<'static, Result<LlmResponseDelta, anyhow::Error>>,
+            anyhow::Error,
+        > {
+            Ok(stream::empty().boxed())
+        }
+
+        fn model_id(&self) -> &str {
+            "noop"
+        }
+
+        fn provider_name(&self) -> &str {
+            "noop"
+        }
+    }
+
+    fn sh(dir: &Path, args: &[&str]) {
+        let out = Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "cmd {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        sh(p, &["git", "init", "-q", "-b", "main"]);
+        sh(p, &["git", "config", "user.email", "t@t.dev"]);
+        sh(p, &["git", "config", "user.name", "Tester"]);
+        std::fs::write(p.join("README.md"), "hi\n").unwrap();
+        sh(p, &["git", "add", "."]);
+        sh(p, &["git", "commit", "-qm", "init"]);
+        tmp
+    }
 
     #[test]
     fn bash_sandbox_off_by_default_even_in_unattended_modes() {
@@ -252,5 +338,164 @@ mod tests {
         if let Some(home) = dirs::home_dir() {
             assert!(sb.extra_reads.contains(&home.join(".npm")));
         }
+    }
+
+    #[tokio::test]
+    async fn registered_worktree_redirects_registered_file_tools() {
+        let repo = init_repo();
+        let subdir = repo.path().join("crates/app");
+        std::fs::create_dir_all(subdir.join("src")).unwrap();
+        std::fs::write(subdir.join("src/lib.rs"), "// original\n").unwrap();
+        sh(repo.path(), &["git", "add", "."]);
+        sh(repo.path(), &["git", "commit", "-qm", "add app"]);
+
+        let mut session = crate::Session::open(
+            "test".to_string(),
+            "system".to_string(),
+            Box::new(NoopProvider),
+            Box::new(crate::storage::InMemoryStorage::new()),
+            subdir.display().to_string(),
+        )
+        .await
+        .unwrap();
+        register_native_tools_with_mcp(
+            &mut session,
+            &subdir,
+            &crate::config::Config::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let enter = session.tool_for_test("enter_worktree").unwrap();
+        let create = session.tool_for_test("create_file").unwrap();
+        let read = session.tool_for_test("read_file").unwrap();
+        let exit = session.tool_for_test("exit_worktree").unwrap();
+
+        let entered = enter.call(json!({ "name": "registered" })).await;
+        assert!(!entered.is_error, "{}", entered.content);
+        let worktree = repo.path().join(".ignis/worktrees/registered");
+        let worktree_subdir = worktree.join("crates/app");
+        assert!(worktree.exists());
+        assert!(worktree_subdir.exists());
+
+        let created = create
+            .call(json!({ "path": "src/generated.rs", "content": "from worktree" }))
+            .await;
+        assert!(!created.is_error, "{}", created.content);
+
+        assert!(
+            !subdir.join("src/generated.rs").exists(),
+            "registered create_file must not write into the original checkout"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree_subdir.join("src/generated.rs")).unwrap(),
+            "from worktree"
+        );
+
+        let read_back = read.call(json!({ "path": "src/generated.rs" })).await;
+        assert!(!read_back.is_error, "{}", read_back.content);
+        assert_eq!(read_back.content, "from worktree");
+
+        let removed = exit
+            .call(json!({ "action": "remove", "discard_changes": true }))
+            .await;
+        assert!(!removed.is_error, "{}", removed.content);
+        assert!(!worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn registered_tools_recover_active_worktree_on_resume() {
+        let repo = init_repo();
+        let subdir = repo.path().join("crates/app");
+        std::fs::create_dir_all(subdir.join("src")).unwrap();
+        std::fs::write(subdir.join("src/lib.rs"), "// original\n").unwrap();
+        sh(repo.path(), &["git", "add", "."]);
+        sh(repo.path(), &["git", "commit", "-qm", "add app"]);
+
+        let mut session = crate::Session::open(
+            "resume".to_string(),
+            "system".to_string(),
+            Box::new(NoopProvider),
+            Box::new(crate::storage::InMemoryStorage::new()),
+            subdir.display().to_string(),
+        )
+        .await
+        .unwrap();
+        register_native_tools_with_mcp(
+            &mut session,
+            &subdir,
+            &crate::config::Config::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let enter = session.tool_for_test("enter_worktree").unwrap();
+        let entered = enter.call(json!({ "name": "resume-wt" })).await;
+        assert!(!entered.is_error, "{}", entered.content);
+
+        let storage = crate::storage::InMemoryStorage::new();
+        storage
+            .save_session(
+                "resume",
+                &[Message {
+                    role: "tool".to_string(),
+                    content: Some(
+                        json!({ "result": entered.content, "is_error": false }).to_string(),
+                    ),
+                    reasoning_content: None,
+                    name: Some("enter_worktree".to_string()),
+                    tool_call_id: Some("call_1".to_string()),
+                    tool_calls: None,
+                    created_at_ms: None,
+                }],
+                Some(&subdir.display().to_string()),
+            )
+            .await
+            .unwrap();
+
+        let mut resumed = crate::Session::open(
+            "resume".to_string(),
+            "system".to_string(),
+            Box::new(NoopProvider),
+            Box::new(storage),
+            subdir.display().to_string(),
+        )
+        .await
+        .unwrap();
+        register_native_tools_with_mcp(
+            &mut resumed,
+            &subdir,
+            &crate::config::Config::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let create = resumed.tool_for_test("create_file").unwrap();
+        let exit = resumed.tool_for_test("exit_worktree").unwrap();
+        let created = create
+            .call(json!({ "path": "src/resumed.rs", "content": "from resumed worktree" }))
+            .await;
+        assert!(!created.is_error, "{}", created.content);
+
+        let worktree = repo.path().join(".ignis/worktrees/resume-wt");
+        assert!(!subdir.join("src/resumed.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("crates/app/src/resumed.rs")).unwrap(),
+            "from resumed worktree"
+        );
+
+        let removed = exit
+            .call(json!({ "action": "remove", "discard_changes": true }))
+            .await;
+        assert!(!removed.is_error, "{}", removed.content);
+        assert!(!worktree.exists());
     }
 }

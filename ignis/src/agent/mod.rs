@@ -13,6 +13,7 @@ use crate::llm::{
     now_ms, LlmProvider, LlmResponseDelta, Message, ToolCall, ToolCallFunction, Usage,
 };
 use crate::tools::tool::{AgentTool, ExecutionMode, ToolHooks, ToolResult};
+use crate::tools::SessionCwd;
 
 pub mod agents_md;
 pub mod follow_ups;
@@ -122,6 +123,25 @@ pub enum AgentEvent {
         after: usize,
         summary: String,
     },
+}
+
+#[derive(Clone)]
+pub struct AgentHookContext {
+    session_id: String,
+    cwd: SessionCwd,
+}
+
+impl AgentHookContext {
+    pub(crate) fn new(session_id: String, cwd: SessionCwd) -> Self {
+        Self { session_id, cwd }
+    }
+
+    fn snapshot(&self) -> (String, String) {
+        (
+            self.session_id.clone(),
+            self.cwd.get().to_string_lossy().to_string(),
+        )
+    }
 }
 
 /// Build the system prompt for an interactive/one-shot run: the static agent
@@ -246,14 +266,25 @@ async fn before_llm_call(
     history: &mut Vec<Message>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
     prompt_hooks: Option<&crate::hooks::HookRegistry>,
-    hook_ctx: Option<crate::hooks::HookContext<'_>>,
+    hook_ctx: Option<&AgentHookContext>,
 ) -> usize {
     let mut n = 0;
     if let Some(rx) = inject_rx {
         while let Ok(text) = rx.try_recv() {
             let effective = match (prompt_hooks, hook_ctx) {
                 (Some(reg), Some(ctx)) => {
-                    match reg.run_user_prompt_submit(&text, ctx, tx).await {
+                    let (session_id, cwd) = ctx.snapshot();
+                    match reg
+                        .run_user_prompt_submit(
+                            &text,
+                            crate::hooks::HookContext {
+                                session_id: &session_id,
+                                cwd: &cwd,
+                            },
+                            tx,
+                        )
+                        .await
+                    {
                         crate::hooks::PromptHookResult::Continue(t) => Some(t),
                         // Block: warning already emitted on `tx`; drop
                         // the inject entirely — same posture as
@@ -317,9 +348,9 @@ async fn execute_single_tool(
     tools_map: HashMap<String, Arc<dyn AgentTool>>,
     tx_inner: tokio::sync::mpsc::Sender<AgentEvent>,
     // PostToolUse subprocess hooks (main agent only; `None` for sub-agents).
-    // Owned so each parallel task carries its own; `(session_id, cwd)`.
+    // Owned so each parallel task can snapshot the current redirected cwd.
     post_hooks: Option<crate::hooks::HookRegistry>,
-    hook_ctx: Option<(String, String)>,
+    hook_ctx: Option<AgentHookContext>,
 ) -> Message {
     let tc_id = tc.id;
     let tool_name = tc.function.name;
@@ -378,7 +409,8 @@ async fn execute_single_tool(
     // PostToolUse: let hooks rewrite/observe the result (success or error)
     // before the model and the frontend see it.
     let result = match (post_hooks, hook_ctx) {
-        (Some(registry), Some((session_id, cwd))) => {
+        (Some(registry), Some(ctx)) => {
+            let (session_id, cwd) = ctx.snapshot();
             let rewritten = registry
                 .run_post_tool_use(
                     &tool_name,
@@ -442,16 +474,25 @@ fn tool_result_message(name: &str, call_id: &str, result: &ToolResult) -> Messag
 async fn apply_pre_tool_use(
     tc: ToolCall,
     tool_hooks: Option<&crate::hooks::HookRegistry>,
-    hook_ctx: Option<crate::hooks::HookContext<'_>>,
+    hook_ctx: Option<&AgentHookContext>,
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
 ) -> Result<ToolCall, Message> {
     let (Some(hooks), Some(ctx)) = (tool_hooks, hook_ctx) else {
         return Ok(tc);
     };
+    let (session_id, cwd) = ctx.snapshot();
     let args: serde_json::Value =
         serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
     match hooks
-        .run_pre_tool_use(&tc.function.name, &args, ctx, tx)
+        .run_pre_tool_use(
+            &tc.function.name,
+            &args,
+            crate::hooks::HookContext {
+                session_id: &session_id,
+                cwd: &cwd,
+            },
+            tx,
+        )
         .await
     {
         crate::hooks::PreToolOutcome::Proceed(new_args) => {
@@ -902,6 +943,11 @@ impl Agent {
         self.tools.push(tool);
     }
 
+    #[cfg(test)]
+    pub(crate) fn tool_for_test(&self, name: &str) -> Option<Arc<dyn AgentTool>> {
+        self.tools.iter().find(|tool| tool.name() == name).cloned()
+    }
+
     pub fn set_hooks(&mut self, hooks: Box<dyn ToolHooks>) {
         self.hooks = Some(hooks);
     }
@@ -1255,7 +1301,7 @@ impl Agent {
         tx: tokio::sync::mpsc::Sender<AgentEvent>,
         mut inject_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
         prompt_hooks: Option<&crate::hooks::HookRegistry>,
-        hook_ctx: Option<crate::hooks::HookContext<'_>>,
+        hook_ctx: Option<AgentHookContext>,
     ) -> Result<Usage, anyhow::Error> {
         let _ = tx.send(AgentEvent::TurnStart).await;
         let effective_prompt = with_catalog(
@@ -1272,7 +1318,7 @@ impl Agent {
                 history,
                 &tx,
                 prompt_hooks,
-                hook_ctx,
+                hook_ctx.as_ref(),
             )
             .await;
             let _ = tx.send(AgentEvent::RunStart).await;
@@ -1293,8 +1339,14 @@ impl Agent {
             total_usage.add(&outcome.usage);
 
             if !outcome.tool_calls.is_empty() {
-                self.execute_tool_calls(&outcome.tool_calls, history, &tx, prompt_hooks, hook_ctx)
-                    .await;
+                self.execute_tool_calls(
+                    &outcome.tool_calls,
+                    history,
+                    &tx,
+                    prompt_hooks,
+                    hook_ctx.clone(),
+                )
+                .await;
                 let _ = tx.send(AgentEvent::RunEnd).await;
                 // Continue the turn loop: tool results go back to the model.
             } else {
@@ -1306,7 +1358,7 @@ impl Agent {
                     history,
                     &tx,
                     prompt_hooks,
-                    hook_ctx,
+                    hook_ctx.as_ref(),
                 )
                 .await;
                 let _ = tx.send(AgentEvent::RunEnd).await;
@@ -1333,7 +1385,7 @@ impl Agent {
         // Subprocess tool hooks (PreToolUse/PostToolUse). `None` for sub-agents
         // (their tool calls are unhooked in v1) and when no registry is wired.
         tool_hooks: Option<&crate::hooks::HookRegistry>,
-        hook_ctx: Option<crate::hooks::HookContext<'_>>,
+        hook_ctx: Option<AgentHookContext>,
     ) {
         use futures_util::stream::StreamExt;
         let tx_clone = tx.clone();
@@ -1342,10 +1394,7 @@ impl Agent {
             .iter()
             .map(|t| (t.name().to_string(), t.clone()))
             .collect();
-        // Owned PostToolUse context for the (possibly parallel) execute tasks.
         let post_registry = tool_hooks.cloned();
-        let post_ctx: Option<(String, String)> =
-            hook_ctx.map(|c| (c.session_id.to_string(), c.cwd.to_string()));
 
         // Check if any tool requires sequential execution
         let force_sequential = tool_calls.iter().any(|tc| {
@@ -1366,7 +1415,7 @@ impl Agent {
         let mut allowed_calls: Vec<ToolCall> = Vec::new();
         let mut blocked_results: Vec<Message> = Vec::new();
         for tc in tool_calls_owned {
-            let tc = match apply_pre_tool_use(tc, tool_hooks, hook_ctx, &tx_clone).await {
+            let tc = match apply_pre_tool_use(tc, tool_hooks, hook_ctx.as_ref(), &tx_clone).await {
                 Ok(tc) => tc,
                 Err(blocked) => {
                     blocked_results.push(blocked);
@@ -1388,7 +1437,7 @@ impl Agent {
                         tools_map.clone(),
                         tx_clone.clone(),
                         post_registry.clone(),
-                        post_ctx.clone(),
+                        hook_ctx.clone(),
                     )
                     .await,
                 );
@@ -1401,7 +1450,7 @@ impl Agent {
                     tools_map.clone(),
                     tx_clone.clone(),
                     post_registry.clone(),
-                    post_ctx.clone(),
+                    hook_ctx.clone(),
                 )
             });
             let mut parallel_results: Vec<Message> = futures_util::stream::iter(tool_futures)
@@ -1471,6 +1520,19 @@ mod tests {
     #[test]
     fn truncate_diff_passes_short_diffs_through() {
         assert_eq!(truncate_diff_for_context("short".to_string()), "short");
+    }
+
+    #[test]
+    fn hook_context_snapshots_redirected_cwd() {
+        let cwd = SessionCwd::from(std::path::Path::new("/repo"));
+        let ctx = AgentHookContext::new("s1".to_string(), cwd.clone());
+
+        assert_eq!(ctx.snapshot(), ("s1".to_string(), "/repo".to_string()));
+        cwd.set(std::path::PathBuf::from("/repo/.ignis/worktrees/wt"));
+        assert_eq!(
+            ctx.snapshot(),
+            ("s1".to_string(), "/repo/.ignis/worktrees/wt".to_string())
+        );
     }
 
     #[test]

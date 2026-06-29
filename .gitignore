@@ -54,3 +54,5 @@ raw_run.log
 
 # Worktrees
 .worktrees/
+# Session worktrees created by the enter_worktree tool
+.ignis/worktrees/
