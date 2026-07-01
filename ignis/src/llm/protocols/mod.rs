@@ -450,6 +450,27 @@ pub(crate) fn prep_outbound_history(messages: &[Message], policy: &HistoryPolicy
     out
 }
 
+/// Guarantee every outbound message carries a `content` field for OpenAI-compatible
+/// providers. `Message::content` is `Option<String>` and skipped when `None`, so a
+/// tool-call-only assistant turn (no visible text) or a reasoning-only turn whose
+/// reasoning was stripped by [`prep_outbound_history`] serializes as
+/// `{"role":"assistant","tool_calls":[...]}` — or even a bare `{"role":"assistant"}`.
+/// Standard OpenAI accepts that, but strict gateways (e.g. Ark/Doubao) reject it with
+/// `missing messages.content parameter (MissingParameter)`, which poisons the whole
+/// session because the offending history message is replayed on every subsequent turn.
+///
+/// Filling the gap with an empty string is the minimal fix: it's a valid `content`
+/// value under the OpenAI spec, preserves the turn, and — because it runs at send time
+/// — also unbreaks a session that was already poisoned before this shipped. Mirrors the
+/// Anthropic path's placeholder handling in `map_messages_to_anthropic`.
+pub(crate) fn ensure_content_present(messages: &mut [Message]) {
+    for msg in messages.iter_mut() {
+        if msg.content.is_none() {
+            msg.content = Some(String::new());
+        }
+    }
+}
+
 /// Stream a chat completion from an OpenAI-compatible endpoint. The only
 /// provider-specific knob is `request_headers`: built-in provider declarations
 /// can add headers such as Kimi's whitelisted `User-Agent`. All response parsing
@@ -478,6 +499,10 @@ pub(crate) async fn openai_compatible_chat_stream(
         created_at_ms: None,
     }];
     request_messages.extend(history);
+    // Strict OpenAI-compatible gateways reject any message missing `content`
+    // (a tool-call-only or stripped reasoning-only assistant turn), so backfill
+    // an empty string before serializing. See `ensure_content_present`.
+    ensure_content_present(&mut request_messages);
 
     let req_body = ChatCompletionsRequest {
         model,
@@ -796,5 +821,45 @@ mod tests {
     #[test]
     fn prep_history_identity_on_empty_input() {
         assert!(prep_outbound_history(&[], &HistoryPolicy { strip_think: true }).is_empty());
+    }
+
+    // ---- ensure_content_present: strict-gateway `missing messages.content` guard ----
+
+    #[test]
+    fn ensure_content_backfills_tool_call_only_assistant_turn() {
+        // A tool-call-only assistant turn stores `content: None` and serializes
+        // as `{"role":"assistant","tool_calls":[...]}` — which strict gateways
+        // (Ark/Doubao) reject with `missing messages.content parameter`.
+        let mut msgs = vec![assistant_calling("", None, "call_1")];
+        // Simulate the stored shape: no visible text means content is None.
+        msgs[0].content = None;
+        ensure_content_present(&mut msgs);
+        assert_eq!(msgs[0].content.as_deref(), Some(""));
+        // The tool call is untouched.
+        assert!(msgs[0].tool_calls.as_ref().is_some_and(|t| !t.is_empty()));
+    }
+
+    #[test]
+    fn ensure_content_backfills_reasoning_stripped_assistant_turn() {
+        // A reasoning-only turn arrives here as `content: None` after
+        // `prep_outbound_history` clears its reasoning — a bare
+        // `{"role":"assistant"}` that any strict gateway 400s on.
+        let history = vec![
+            user("question"),
+            assistant_text("the answer", Some("first I considered ...")),
+        ];
+        let mut out = prep_outbound_history(&history, &HistoryPolicy { strip_think: true });
+        // Force the reasoning-only shape: content None, reasoning already stripped.
+        out[1].content = None;
+        ensure_content_present(&mut out);
+        assert_eq!(out[1].content.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn ensure_content_leaves_existing_content_untouched() {
+        let mut msgs = vec![user("hi"), assistant_text("real answer", None)];
+        ensure_content_present(&mut msgs);
+        assert_eq!(msgs[0].content.as_deref(), Some("hi"));
+        assert_eq!(msgs[1].content.as_deref(), Some("real answer"));
     }
 }
