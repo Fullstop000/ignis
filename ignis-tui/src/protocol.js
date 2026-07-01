@@ -135,6 +135,11 @@ export function initialState() {
     // the committed <Static> scrollback region remounts and re-renders from
     // scratch — Ink's <Static> is append-only and won't otherwise reset.
     generation: 0,
+    // Whether the welcome banner has been committed to scrollback. Once true,
+    // the banner lives in <Static> and is no longer rendered in the dynamic
+    // region, matching the native TUI behavior where the banner persists in
+    // scrollback after the first prompt.
+    welcomeShown: false,
   };
 }
 
@@ -173,9 +178,10 @@ export function reduceOutbound(state, frame) {
       // A resumed session replayed as render-ready blocks: replace the
       // transcript wholesale and adopt the retargeted session id. A streaming
       // turn can't be in flight (resume only fires while idle), so clear it.
+      const newBlocks = (frame.data?.blocks ?? []).map(toBlock);
       return {
         ...state,
-        blocks: (frame.data?.blocks ?? []).map(toBlock),
+        blocks: newBlocks,
         stream: null,
         streamKind: null,
         sessionId: frame.data?.session_id ?? state.sessionId,
@@ -188,6 +194,9 @@ export function reduceOutbound(state, frame) {
         activeTools: {},
         compacting: false,
         generation: state.generation + 1,
+        // On /clear the banner returns to the dynamic region; on resume it
+        // stays in scrollback if it was already committed.
+        welcomeShown: newBlocks.length > 0 ? state.welcomeShown : false,
       };
     default:
       return state;
@@ -262,9 +271,9 @@ function reduceEvent(state, ev) {
       if (last && last.kind === 'user' && last.pending) {
         const blocks = state.blocks.slice(0, -1);
         blocks.push({ kind: 'user', text });
-        return { ...state, blocks };
+        return { ...state, blocks, welcomeShown: true };
       }
-      return { ...state, blocks: [...state.blocks, { kind: 'user', text }] };
+      return { ...state, blocks: [...state.blocks, { kind: 'user', text }], welcomeShown: true };
     }
     case EVENT.USER_INJECTED:
       return { ...state, blocks: [...state.blocks, { kind: 'inject', text: p.text ?? '' }] };
