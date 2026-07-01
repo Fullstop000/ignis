@@ -214,15 +214,18 @@ test('inject + warning + reconnecting render their own blocks', async () => {
   assert.match(f, /⟳ reconnecting 1\/3: connection reset/);
 });
 
-test('welcome banner shows on an empty transcript, then disappears', async () => {
-  const { engine, lastFrame } = renderApp();
+test('welcome banner shows on an empty transcript, then persists in scrollback', async () => {
+  const { engine, lastFrame, frames } = renderApp();
   await tick();
-  // The welcome is the ASCII-art IGNIS banner (block glyphs), shown only on the
+  // The welcome is the ASCII-art IGNIS banner (block glyphs), shown on the
   // empty startup screen.
   assert.match(plain(lastFrame()), /██/);
   engine.emit(ev('user_prompt_committed', { text: 'go' }));
   await tick();
-  assert.doesNotMatch(plain(lastFrame()), /██/, 'welcome gone once the transcript starts');
+  // After the first prompt, the banner is committed to <Static> scrollback
+  // alongside the user block, so both are visible in the combined output.
+  assert.match(plain(lastFrame()), /▌ go/, 'user prompt committed to scrollback');
+  assert.ok(frames.some((f) => plain(f).includes('██')), 'welcome banner persisted in scrollback');
 });
 
 test('Ctrl+C cancels a busy turn; idle Ctrl+C does not exit, hints at Ctrl-D', async () => {
