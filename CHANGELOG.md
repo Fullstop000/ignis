@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - LLM — OpenAI-compatible requests no longer 400 with `missing messages.content parameter` on strict gateways: tool-call-only and stripped reasoning-only assistant turns now carry an empty `content` string, which also unbreaks sessions already poisoned by the error. ([#242](https://github.com/Fullstop000/ignis/pull/242))
+- Ink TUI — the welcome banner remains in scrollback after the first prompt. ([#241](https://github.com/Fullstop000/ignis/pull/241))
 
 ## [0.45.0] - 2026-06-30
 
