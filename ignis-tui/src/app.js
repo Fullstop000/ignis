@@ -480,14 +480,16 @@ export default function App({ engine, onExit }) {
   // hook chain changes the text. The reducer replaces it with the committed
   // version a frame later, and that version goes into <Static> on the next
   // render.
-  const committed = state.blocks.filter((b) => !(b.kind === 'user' && b.pending));
+  const committed = state.welcomeShown
+    ? [{ kind: 'welcome', version: state.version, cwd: state.cwd }, ...state.blocks.filter((b) => !(b.kind === 'user' && b.pending))]
+    : state.blocks.filter((b) => !(b.kind === 'user' && b.pending));
   const pendingUser = state.blocks.find((b) => b.kind === 'user' && b.pending);
   children.push(
     e(Static, { key: `tx-${state.generation}`, items: committed }, (b, i) =>
       e(Block, { key: i, block: b, expanded: reasoningExpanded }),
     ),
   );
-  if (state.blocks.length === 0 && !req) {
+  if (state.blocks.length === 0 && !req && !state.welcomeShown) {
     children.push(e(Welcome, { key: 'welcome', version: state.version, cwd: state.cwd }));
   }
   if (pendingUser) {
@@ -631,6 +633,8 @@ function deleteWordBefore(c) {
 
 function Block({ block, expanded }) {
   switch (block.kind) {
+    case 'welcome':
+      return e(Welcome, { version: block.version, cwd: block.cwd });
     case 'user':
       return e(Text, { color: 'magenta' }, `▌ ${block.text}`);
     case 'assistant':
