@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Macros — `#[tool]` no longer silently maps non-scalar parameter types to `"string"` in the generated JSON schema. `Vec<T>` and fixed-size arrays now emit `{"type": "array", "items": ...}`, maps and structs emit `{"type": "object"}`, and unsupported types (references, tuples, slices) are rejected at compile time. ([#235](https://github.com/Fullstop000/ignis/pull/235))
+
 ## [0.45.1] - 2026-07-01
 
 ### Fixed

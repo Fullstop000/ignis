@@ -1,5 +1,5 @@
 use proc_macro::TokenStream;
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{
     parse::{Parse, ParseStream},
@@ -60,29 +60,98 @@ fn get_inner_type_from_option(ty: &Type) -> Option<&Type> {
     None
 }
 
-fn map_type_to_json_schema(ty: &Type) -> &'static str {
-    let check_ty = get_inner_type_from_option(ty).unwrap_or(ty);
-    if let Type::Path(type_path) = check_ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            let ident_str = segment.ident.to_string();
-            match ident_str.as_str() {
-                "String" | "str" | "char" => "string",
-                "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
-                    "integer"
-                }
-                "f32" | "f64" => "number",
-                "bool" => "boolean",
-                _ => "string", // Fallback to string
-            }
-        } else {
-            "string"
+/// Maps a Rust parameter type to a JSON-Schema expression.
+/// Returns a `TokenStream2` that evaluates to a `serde_json::Value`.
+fn map_type_to_json_schema(ty: &Type) -> syn::Result<TokenStream2> {
+    // Option<T> is represented by the schema of T; the field is marked optional
+    // via the `required` array, not via the schema type.
+    if let Some(inner) = get_inner_type_from_option(ty) {
+        return map_type_to_json_schema(inner);
+    }
+
+    match ty {
+        Type::Array(type_array) => {
+            let inner = map_type_to_json_schema(&type_array.elem)?;
+            Ok(quote! { serde_json::json!({ "type": "array", "items": #inner }) })
         }
-    } else {
-        "string"
+        Type::Slice(type_slice) => {
+            let inner = map_type_to_json_schema(&type_slice.elem)?;
+            Ok(quote! { serde_json::json!({ "type": "array", "items": #inner }) })
+        }
+        Type::Reference(type_ref) => {
+            // &[T] is a slice reference, which cannot be deserialized from a
+            // `serde_json::Value` (it needs a borrowed lifetime). Point users to
+            // Vec<T> instead.
+            if type_ref.mutability.is_none() {
+                if let Type::Slice(_) = &*type_ref.elem {
+                    return Err(syn::Error::new_spanned(
+                        ty,
+                        "slice references (&[T]) are not supported by #[tool]; use Vec<T> instead",
+                    ));
+                }
+            }
+            Err(syn::Error::new_spanned(
+                ty,
+                "references are not supported by #[tool]; use owned types like String or Vec<T>",
+            ))
+        }
+        Type::Path(type_path) => {
+            if let Some(segment) = type_path.path.segments.last() {
+                let ident_str = segment.ident.to_string();
+                match ident_str.as_str() {
+                    "Vec" => {
+                        if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                            if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
+                                let inner = map_type_to_json_schema(inner_ty)?;
+                                return Ok(quote! {
+                                    serde_json::json!({ "type": "array", "items": #inner })
+                                });
+                            }
+                        }
+                        Err(syn::Error::new_spanned(ty, "Vec requires a type argument"))
+                    }
+                    "HashMap" | "BTreeMap" => {
+                        Ok(quote! { serde_json::json!({ "type": "object" }) })
+                    }
+                    "String" | "str" | "char" => {
+                        Ok(quote! { serde_json::json!({ "type": "string" }) })
+                    }
+                    "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64"
+                    | "usize" => Ok(quote! { serde_json::json!({ "type": "integer" }) }),
+                    "f32" | "f64" => Ok(quote! { serde_json::json!({ "type": "number" }) }),
+                    "bool" => Ok(quote! { serde_json::json!({ "type": "boolean" }) }),
+                    // Other path types (structs, enums, type aliases) are treated as objects.
+                    _ => Ok(quote! { serde_json::json!({ "type": "object" }) }),
+                }
+            } else {
+                Ok(quote! { serde_json::json!({ "type": "object" }) })
+            }
+        }
+        _ => Err(syn::Error::new_spanned(
+            ty,
+            "unsupported parameter type for #[tool]",
+        )),
     }
 }
 
 #[proc_macro_attribute]
+/// The `#[tool]` attribute turns an async function into an `ignis::AgentTool`.
+///
+/// Supported parameter types map to the corresponding JSON Schema type:
+/// - scalars (`String`, integers, floats, `bool`) → `string`, `integer`, `number`, `boolean`
+/// - `Vec<T>` and fixed-size arrays `[T; N]` → `array` with `items` schemas
+/// - maps (`HashMap`, `BTreeMap`) and structs/enums → `object`
+/// - `Option<T>` → schema of `T`, and the field is omitted from `required`
+///
+/// Unsupported types (references, tuples, slices, etc.) are rejected at compile
+/// time rather than silently mapped to `"string"`.
+///
+/// ```compile_fail
+/// use ignis_macros::tool;
+///
+/// #[tool(name = "bad", description = "bad")]
+/// async fn bad_tool(_x: (String, String)) -> Result<String, String> { Ok(String::new()) }
+/// ```
 pub fn tool(args: TokenStream, input: TokenStream) -> TokenStream {
     let tool_args = parse_macro_input!(args as ToolArgs);
     let func = parse_macro_input!(input as ItemFn);
@@ -123,7 +192,10 @@ pub fn tool(args: TokenStream, input: TokenStream) -> TokenStream {
 
             let ty = &pat_type.ty;
             let is_optional = get_inner_type_from_option(ty).is_some();
-            let json_type = map_type_to_json_schema(ty);
+            let schema_expr = match map_type_to_json_schema(ty) {
+                Ok(expr) => expr,
+                Err(e) => return e.to_compile_error().into(),
+            };
 
             arg_names.push(syn::Ident::new(&arg_name, Span::call_site()));
             arg_types.push(ty.clone());
@@ -133,9 +205,7 @@ pub fn tool(args: TokenStream, input: TokenStream) -> TokenStream {
             }
 
             properties_code.push(quote! {
-                properties.insert(#arg_name.to_string(), serde_json::json!({
-                    "type": #json_type
-                }));
+                properties.insert(#arg_name.to_string(), #schema_expr);
             });
         }
     }
