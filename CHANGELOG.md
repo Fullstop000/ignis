@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.3] - 2026-07-07
+
 ### Fixed
-- LLM — OpenAI-compatible requests now use a single-space placeholder, not an empty string, for degenerate assistant turns. This fixes strict gateways that reject replayed reasoning-only session records with `the message ... with role 'assistant' must not be empty`.
+- LLM — OpenAI-compatible requests no longer fail on strict gateways that reject replayed reasoning-only assistant turns as empty messages. ([#246](https://github.com/Fullstop000/ignis/pull/246))
 
 ### Deprecated
-- TUI — the built-in `ratatui` TUI (`IGNIS_FRONTEND=native`) is deprecated and no longer actively developed. It remains the automatic fallback when Node ≥18 is unavailable; the [Ink frontend](ignis-tui/README.md) is the only actively-maintained UI.
+- TUI — the built-in `ratatui` TUI (`IGNIS_FRONTEND=native`) is deprecated and no longer actively developed; the Ink frontend is the only actively-maintained UI. ([#246](https://github.com/Fullstop000/ignis/pull/246))
 
 ## [0.45.2] - 2026-07-03
 
