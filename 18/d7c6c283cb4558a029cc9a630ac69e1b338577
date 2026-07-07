@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_ca6629893fb013::t_b2a12c7f66a549 10-11,13,16
+Cargo.lock
+  s_ca6629893fb013::t_7a02adea8bafad 1054
+ignis/Cargo.toml
+  s_ca6629893fb013::t_2c07995e1d3392 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "18d7c6c283cb4558a029cc9a630ac69e1b338577",
+  "prompts": {},
+  "sessions": {
+    "s_ca6629893fb013": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3ca7-ea0b-76d0-8f3a-de3740653e9a",
+        "model": "unknown"
+      },
+      "human_author": "Fullstop000 <fullstop1005@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
