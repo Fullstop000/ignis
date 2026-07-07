@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_ca6629893fb013::t_ff4d1bb9416ad2 10-12
+ignis/src/llm/protocols/mod.rs
+  s_ca6629893fb013::t_39e2afd0fe4dac 453-460,462-474,477-479,837,848,855-859,862-870,873-875,877-890,892-903
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e02570ec9d8ca6dbb074972aaf7799166ab85052",
+  "prompts": {},
+  "sessions": {
+    "s_ca6629893fb013": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3ca7-ea0b-76d0-8f3a-de3740653e9a",
+        "model": "unknown"
+      },
+      "human_author": "Fullstop000 <fullstop1005@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
