@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+- TUI — the built-in `ratatui` TUI (`IGNIS_FRONTEND=native`) is deprecated and no longer actively developed. It remains the automatic fallback when Node ≥18 is unavailable; the [Ink frontend](ignis-tui/README.md) is the only actively-maintained UI.
+
 ## [0.45.2] - 2026-07-03
 
 ### Fixed

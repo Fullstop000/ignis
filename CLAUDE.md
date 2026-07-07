@@ -5,7 +5,7 @@ This guide contains commands, patterns, and style rules for developers and AI as
 ## Build and Run Commands
 
 *   **Build all workspace crates:** `cargo build` (workspace = `ignis` + `ignis-macros`; `ignis-tui/` is a separate Node/Ink project, not a Cargo crate).
-*   **Run interactive TUI (default):** `cargo run` — no-arg launches the TUI. The default UI is the **Ink frontend** (`ignis-tui/`, requires Node ≥18); `IGNIS_FRONTEND=native` forces the built-in `ratatui` TUI, which is also the automatic fallback when Node is missing. (The `--tui` flag was removed in v0.15.0 — no-arg *is* the TUI.)
+*   **Run interactive TUI (default):** `cargo run` — no-arg launches the TUI. The UI is the **Ink frontend** (`ignis-tui/`, requires Node ≥18). The built-in `ratatui` TUI is **deprecated** (no longer actively developed) but remains the automatic fallback when Node is missing, or forced with `IGNIS_FRONTEND=native`. (The `--tui` flag was removed in v0.15.0 — no-arg *is* the TUI.)
 *   **Run one-shot CLI:** `cargo run -- <prompt>` — streams a single turn to stdout and exits.
 *   **Subcommands:** `ignis mcp`, `ignis upgrade` (alias `update`), `ignis sessions`.
 *   **Other flags:** `-r, --resume [ID]`, `--afk` (fully unattended), `-v, --version`.
@@ -46,11 +46,11 @@ Cross-cutting top-level files: `main.rs` (routing — `--engine` headless vs TUI
 *   Keep changes tightly scoped to the current active goal.
 
 ### R2. TUI Design
-*   Two frontends share one Rust core: the **Ink frontend** (`ignis-tui/`, Node/React-Ink — default when Node ≥18 is present, since v0.40.0) and the **built-in `ratatui` TUI** (`crossterm` backend, fallback). The Ink host owns the terminal and spawns the Rust binary as a headless `--engine` over an NDJSON stdin/stdout protocol; `IGNIS_FRONTEND=native` forces the built-in.
+*   Two frontends share one Rust core: the **Ink frontend** (`ignis-tui/`, Node/React-Ink — default when Node ≥18 is present, since v0.40.0) and the **built-in `ratatui` TUI** (`crossterm` backend). The ratatui TUI is **deprecated** and no longer actively developed — it remains as a fallback when Node is unavailable, forced with `IGNIS_FRONTEND=native`. The Ink host owns the terminal and spawns the Rust binary as a headless `--engine` over an NDJSON stdin/stdout protocol.
 *   The built-in TUI renders at a ~30fps frame tick (`FRAME = 33ms` in `console/runner.rs`); `AgentEvent`s stream in between frames and are coalesced into the next draw.
 *   Use the established dark color palette (Catppuccin Mocha, defined in `src/console/colors.rs`).
 *   Tool call blocks encode status via a color-coded **bullet** (`●`): yellow=pending, green=success, red=error (`console/render/tool_block.rs`).
-*   The Rust core ships as a **single binary**; the default Ink frontend additionally requires Node ≥18 (the `ratatui` TUI has no external runtime deps).
+*   The Rust core ships as a **single binary**; the Ink frontend additionally requires Node ≥18 (the deprecated `ratatui` TUI is the only no-runtime-deps path).
 
 ### R3. Quality & Warning Gate
 *   Maintain **zero compiler warnings and clippy errors** in the Rust crates.
