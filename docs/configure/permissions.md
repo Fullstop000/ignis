@@ -162,7 +162,34 @@ unattended they hard `Deny`.
 
 The floor is intentionally small, covers catastrophic-and-easily-
 recognized cases, and doesn't try to reason about every destructive
-command. Sandbox-level enforcement (Linux Landlock) is on the roadmap.
+command.
+
+## Bash sandbox
+
+For auto-approved `bash` in the unattended modes (hands-free / AFK),
+ignis can additionally confine each spawned command with a filesystem
+sandbox — a defense-in-depth layer *below* the permission gate. It is
+**opt-in and off by default** (so credentialed commands like `git push`
+work out of the box); turn it on in `/settings` → *Sandbox auto-run bash*.
+The choice persists in `~/.ignis/state.json`.
+
+When on, the sandbox confines **writes** to the project directory, the
+temp dirs, `/dev/null`, and any configured `sandbox_write_paths`. On
+**Linux** (Landlock, ABI V2) it also narrows **reads** to system roots,
+the project, temp, and the Rust toolchain caches (`~/.cargo`,
+`~/.rustup`), so `$HOME` credential dirs (`~/.ssh`, `~/.aws`, `~/.gnupg`,
+`~/.ignis`) stay unreadable — extend reads with `sandbox_read_paths`. On
+**macOS** (Seatbelt) the read narrowing isn't implemented; writes are
+still confined.
+
+```toml
+[permissions]
+sandbox_write_paths = ["~/projects/shared", "/var/cache/myapp"]
+sandbox_read_paths  = ["~/.npm", "/opt/sdk"]
+```
+
+The sandbox only engages for auto-run (unattended) `bash` — under `Off`,
+or with the toggle off, bash runs unsandboxed.
 
 ## Roadmap
 
@@ -176,7 +203,5 @@ Not yet shipped:
 - `plan` mode — read-only exploration with no edits.
 - **Multi-scope rule layering** — managed > project > user precedence for
   the rule grammar (today there's one `config.toml`).
-- **OS-level sandboxing** — Linux Landlock filesystem restrictions for
-  bash calls, as a defense-in-depth layer below the permission gate.
 
 Anything not listed above is not on the near-term roadmap.

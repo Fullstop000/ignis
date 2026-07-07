@@ -44,7 +44,7 @@ ignis upgrade --version v0.14.1   # pin to a specific tag
 git clone https://github.com/Fullstop000/ignis.git
 cd ignis && cargo build --release   # → target/release/ignis
 
-# Optional: the experimental Ink frontend (Node required). Built from a source
+# Optional: the Ink frontend (Node required). Built from a source
 # checkout, `ignis` launches it by default; install its deps once first.
 ( cd ignis-tui && npm install )
 ```
@@ -146,14 +146,14 @@ the active selection at runtime, saving it to `~/.ignis/state.json` — your
 | `ignis upgrade` | Update to the latest release |
 | `ignis --help` | Full flag and subcommand list |
 
-In the TUI: `Enter` sends, `↑/↓` walk history, `Ctrl+D` exits. Output renders
+In the TUI: `Enter` sends, `↑/↓` walk history, `Ctrl+D` twice exits. Output renders
 inline in the normal buffer, so scroll with your terminal/tmux as usual. Type
 `/` for slash-command suggestions — see
 [`docs/usage/commands.md`](docs/usage/commands.md) for the full reference.
 
 ## Docs
 
-Deep references live in [`docs/`](docs/README.md) — commands, permissions,
+Deep references live in [`docs/`](docs/README.md) — commands, hooks, permissions,
 skills, MCP servers, telemetry.
 
 ## Development

@@ -67,6 +67,19 @@ no native dependency.
 
 ---
 
+### `/connect`
+
+Connect a provider and pick a default model. The picker walks through choosing
+a provider brand, entering credentials, and selecting a model; the choices are
+saved to your ignis config (`~/.ignis/config.toml`). It's also the landing
+screen when no provider is configured yet.
+
+```
+/connect
+```
+
+---
+
 ### `/model`
 
 Open the model picker. Lists every model declared under each configured
@@ -127,14 +140,42 @@ confirmation picker before flipping state.
 
 ### `/telemetry`
 
-Print the current OpenTelemetry exporter status (endpoint, headers redacted,
-sample run-time counters) as an assistant notice. Read-only.
+Show the current OpenTelemetry exporter status (endpoint, headers redacted,
+sample run-time counters) as an assistant notice, and toggle export on or off.
 
 ```
 /telemetry
 ```
 
 See [configure/telemetry.md](../configure/telemetry.md) for setup.
+
+---
+
+### `/hooks`
+
+List the hook chains the running session actually uses (`/hooks` or
+`/hooks list`), or re-read `~/.ignis/hooks.json` after editing it
+(`/hooks reload`). One block per event, each entry showing the program path,
+argv tail, and per-hook timeout. See [hooks](hooks.md) for the full protocol.
+
+```
+/hooks
+/hooks reload
+```
+
+---
+
+### `/settings`
+
+Toggle live session settings from a panel — the bash sandbox (confine
+unattended `bash` to the project + temp, away from `$HOME` secrets; off by
+default), auto-compaction, stripping reasoning from history, and which
+statusline segments show (model / cwd / git branch / turns / tokens). Choices
+persist in `~/.ignis/state.json`.
+
+```
+/settings
+```
 
 ---
 
@@ -170,4 +211,4 @@ keys apply while the TUI input is active:
 | `Ctrl+W` | Delete previous word |
 | `Ctrl+S` | Steer the running turn (queue an instruction mid-stream) |
 | `Ctrl+C` | Cancel the running turn / clear the input |
-| `Ctrl+D` | Exit ignis |
+| `Ctrl+D` (twice) | Exit ignis — the first press prompts "Press Ctrl-D again to exit" |

@@ -9,9 +9,13 @@ feature list — these pages go deeper.
 How to drive ignis day to day.
 
 - [Commands](usage/commands.md) — every built-in TUI slash command (`/sessions`,
-  `/clear`, `/compact`, `/copy`, `/model`, `/skills`, `/mcp`, `/afk`,
-  `/telemetry`) plus the `/<skill-name>` force-load form, with a global
-  keybindings table.
+  `/clear`, `/compact`, `/copy`, `/connect`, `/model`, `/skills`, `/mcp`, `/afk`,
+  `/hooks`, `/settings`, `/telemetry`) plus the `/<skill-name>` force-load form,
+  with a global keybindings table.
+- [Hooks](usage/hooks.md) — external subprocess hooks on the
+  `UserPromptSubmit`, `PreToolUse`/`PostToolUse`, and `AssistantMessageRender`
+  lifecycle events: envelope, exit codes, the `~/.ignis/hooks.json` declaration,
+  and the per-hook filesystem sandbox.
 
 ## Configure
 
