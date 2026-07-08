@@ -136,10 +136,6 @@ defense in depth.
 
 ## Known limitations (v1)
 
-- **Anthropic provider does not emit token usage** at all today (separate
-  pre-existing gap in the provider's stream parser). Anthropic users will see
-  spans but zero token-usage metric points. Follow-up issue:
-  add `message_delta` event parsing to `provider/anthropic.rs`.
 - **No distributed tracing** into bash/MCP subprocesses (`traceparent`
   propagation). Deferred to v2; rare need for the current use cases.
 - **Cost is not computed inside ignis.** Compute it backend-side from

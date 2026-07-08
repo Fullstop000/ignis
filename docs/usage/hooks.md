@@ -1,10 +1,16 @@
 # Hooks
 
 Hooks let an external program subscribe to ignis lifecycle events and,
-where the event permits it, rewrite the data flowing through. v1 ships
-two events — `UserPromptSubmit` (mutates the prompt before model send)
-and `AssistantMessageRender` (mutates the assistant's text before TUI
-render).
+where the event permits it, rewrite the data flowing through. Four events
+ship today:
+
+- `UserPromptSubmit` — mutates the user prompt before it enters history.
+- `AssistantMessageRender` — mutates the assistant's text before TUI render.
+- `PreToolUse` — runs before a tool call (and before the permission gate);
+  can rewrite the tool's args or block the call. A tool-name `matcher`
+  filters which hooks run.
+- `PostToolUse` — runs after a tool call (success or error); can rewrite the
+  result the model sees or just observe. Cannot block. `matcher` applies.
 
 > ## Hook sandbox (v2)
 >
@@ -26,7 +32,7 @@ render).
 >    the whole tree).
 >
 >    The mechanism is per-platform:
->    * **Linux** uses Landlock (ABI V1, Linux 5.13+). On older kernels
+>    * **Linux** uses Landlock (ABI V2, Linux 5.19+). On older kernels
 >      a one-time `[warn] hook.sandbox: <hook>: Landlock unavailable
 >      on this kernel; hook runs unconfined` notice fires per session.
 >    * **macOS** uses Apple's `sandbox_init(3)` ("Seatbelt") with a
@@ -73,6 +79,24 @@ the model's original output**, not the rewritten render — so prompt
 cache stays clean and replay is exact. The rewrite shows as a
 labelled `[hook rewrite]` block immediately below the model's original.
 
+### `PreToolUse`
+
+Fires before a tool call runs — and before the permission gate, so a
+rewrite is what both the gate and the tool see. Hooks may rewrite the
+tool's args (`updatedInput`, parsed back to JSON; a malformed rewrite is
+a soft failure that keeps the prior args) or block the call
+(`continue: false` or exit 2). Only specs whose `matcher` matches the
+tool name run; an absent `matcher` runs for every tool. Each hook
+receives the previous hook's (possibly rewritten) args.
+
+### `PostToolUse`
+
+Fires after a tool call completes, whether it succeeded or errored. Hooks
+may rewrite the result text the model sees (`updatedOutput`) or just
+observe it (along with `isError`). It **cannot block** — the tool already
+ran, so `continue: false` / exit 2 degrades to a warning and the current
+result passes through. `matcher` applies; chaining as above.
+
 ## Envelope
 
 ### stdin — JSON object
@@ -88,7 +112,11 @@ labelled `[hook rewrite]` block immediately below the model's original.
 
 - `prompt` is present for `UserPromptSubmit`.
 - `content` is present for `AssistantMessageRender`.
-- The other field is omitted.
+- `toolName` and `toolInput` are present for `PreToolUse` / `PostToolUse`
+  (the tool name and its argument object).
+- `toolResult` and `isError` are additionally present for `PostToolUse`
+  (the tool's result text and whether it errored).
+- Fields not relevant to an event are omitted.
 
 ### stdout — JSON object (all fields optional)
 
@@ -103,16 +131,20 @@ labelled `[hook rewrite]` block immediately below the model's original.
 }
 ```
 
-For `AssistantMessageRender`, the rewrite field is `updatedOutput`.
-Absent rewrite field, or `continue: false`, means "no rewrite from this
-hook" — but `continue: false` is also a block signal (see exit codes).
+For `AssistantMessageRender` and `PostToolUse`, the rewrite field is
+`updatedOutput`; for `UserPromptSubmit` and `PreToolUse` it is
+`updatedInput`. An absent rewrite field means "no rewrite from this
+hook". `continue: false` is also a block signal (see exit codes) —
+honoured for `UserPromptSubmit` and `PreToolUse`, degraded to a soft
+failure for `AssistantMessageRender` and `PostToolUse` (the message /
+tool already ran, so it can't be unsent).
 
 ## Exit codes
 
 | Code | Behaviour |
 |---|---|
 | `0` | OK. stdout is parsed; absent/empty stdout = pass-through. |
-| `2` | Block the chain. Honoured for `UserPromptSubmit` (turn does not send). Degraded to a soft failure for `AssistantMessageRender`. |
+| `2` | Block the chain. Honoured for `UserPromptSubmit` (turn does not send) and `PreToolUse` (tool call does not run). Degraded to a soft failure for `AssistantMessageRender` and `PostToolUse` (already ran). |
 | anything else | Soft failure: original text kept; a `[warn]` line is committed to scrollback. |
 
 A hook that runs longer than its `timeout_ms` is sent `SIGTERM`,
@@ -138,6 +170,20 @@ given one second to exit cleanly, and then `SIGKILL`'d. Outcome is
         "command": "~/.ignis/hooks/translate-en/run.py",
         "env": ["ANTHROPIC_API_KEY"],
         "timeout_ms": 30000
+      }
+    ],
+    "PreToolUse": [
+      {
+        "command": "~/.ignis/hooks/redact.sh",
+        "matcher": "bash",
+        "timeout_ms": 10000
+      }
+    ],
+    "PostToolUse": [
+      {
+        "command": "~/.ignis/hooks/observe.sh",
+        "matcher": "mcp__*",
+        "timeout_ms": 10000
       }
     ]
   }
@@ -167,6 +213,9 @@ given one second to exit cleanly, and then `SIGKILL`'d. Outcome is
   legitimately need broader filesystem access. On platforms with no
   sandbox implementation the flag has no effect — the one-time
   `[warn] hook.sandbox` notice is your hint.
+- `matcher` (PreToolUse / PostToolUse only) is a tool-name glob — `bash`,
+  `edit_*`, `mcp__*`, or `*`. Absent means the hook runs for every tool.
+  Ignored by the prompt/render events.
 - Each event takes a JSON array — multiple hooks chain left-to-right,
   each receiving the previous hook's output.
 - The file is loaded at session start. An absent file means no hooks
@@ -182,12 +231,16 @@ per-hook timeout. The leftmost column is the hook's `display_name()`
 (its program file's stem, no directory or extension):
 
 ```
-[info] 3 hooks registered · /hooks reload to re-read · run unsandboxed; audit before installing:
+[info] 5 hooks registered · /hooks reload to re-read · run unsandboxed; audit before installing:
   UserPromptSubmit (2):
     · translate-en  ~/.ignis/hooks/translate-en/run.py  (timeout 10000ms)
     · redact        /opt/ignis/hooks/redact.sh --strict  (timeout 30000ms)
   AssistantMessageRender (1):
     · translate-en  ~/.ignis/hooks/translate-en/run.py  (timeout 10000ms)
+  PreToolUse (1):
+    · redact  ~/.ignis/hooks/redact.sh  (timeout 10000ms)
+  PostToolUse (1):
+    · observe  ~/.ignis/hooks/observe.sh  (timeout 10000ms)
 ```
 
 (The `translate-en` in the name column there assumes your program

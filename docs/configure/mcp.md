@@ -159,9 +159,12 @@ predictable:
   (or `bearer_token_env_var = "…"` in TOML). For stdio, pass credentials via
   `-e KEY=VALUE` or the server's own config file.
 - **MCP resources and prompts** — only `tools/*` surfaces are wired.
-- **Per-tool permission rules** — the existing
-  [permissions](permissions.md) system gates the wrappers as a group; per-tool
-  allow/deny is not yet supported.
+- **Per-server glob permission rules** — the existing
+  [permissions](permissions.md) system gates each MCP tool by its full
+  `mcp__<server>__<tool>` name, so you can `allow`/`ask`/`deny` an individual
+  tool (e.g. `deny = ["mcp__github__create_issue"]`). What's *not* supported is
+  globbing across a server's tools (`mcp__github__*`) — list each tool by name,
+  or gate the bare name.
 - **`${VAR}` interpolation in `headers`** — secrets belong in
   `bearer_token_env_var`; literal headers stay literal.
 - **Mid-session reconnect** on a hard transport drop. rmcp handles

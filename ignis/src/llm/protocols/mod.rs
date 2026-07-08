@@ -450,22 +450,33 @@ pub(crate) fn prep_outbound_history(messages: &[Message], policy: &HistoryPolicy
     out
 }
 
-/// Guarantee every outbound message carries a `content` field for OpenAI-compatible
-/// providers. `Message::content` is `Option<String>` and skipped when `None`, so a
-/// tool-call-only assistant turn (no visible text) or a reasoning-only turn whose
-/// reasoning was stripped by [`prep_outbound_history`] serializes as
-/// `{"role":"assistant","tool_calls":[...]}` — or even a bare `{"role":"assistant"}`.
-/// Standard OpenAI accepts that, but strict gateways (e.g. Ark/Doubao) reject it with
-/// `missing messages.content parameter (MissingParameter)`, which poisons the whole
-/// session because the offending history message is replayed on every subsequent turn.
+/// Guarantee every outbound message carries a non-empty `content` field for
+/// OpenAI-compatible providers. `Message::content` is `Option<String>` and
+/// skipped when `None`, so a tool-call-only assistant turn (no visible text) or
+/// a reasoning-only turn whose reasoning was stripped by
+/// [`prep_outbound_history`] serializes as
+/// `{"role":"assistant","tool_calls":[...]}` — or even a bare
+/// `{"role":"assistant"}`. `prep_outbound_history` can also strip inline
+/// `<think>...</think>` down to `content: ""`.
 ///
-/// Filling the gap with an empty string is the minimal fix: it's a valid `content`
-/// value under the OpenAI spec, preserves the turn, and — because it runs at send time
-/// — also unbreaks a session that was already poisoned before this shipped. Mirrors the
-/// Anthropic path's placeholder handling in `map_messages_to_anthropic`.
+/// Standard OpenAI accepts missing or empty assistant text in these degenerate
+/// turns, but strict gateways reject either the missing field or the empty
+/// assistant message. We preserve the assistant turn instead of dropping it:
+/// removing it would change history shape (`user -> assistant -> user` becomes
+/// adjacent user turns), which is more semantically meaningful than a whitespace
+/// placeholder. The single space is deliberately boring: it satisfies
+/// non-empty-content validators without inventing model-visible text such as
+/// "(no visible response)".
+///
+/// Keep the single-space workaround scoped to assistant turns. Other roles only
+/// need the old missing-field guard, so `None` still becomes `""` for them.
+/// Because this runs at send time, it also unbreaks sessions that were already
+/// poisoned before this shipped.
 pub(crate) fn ensure_content_present(messages: &mut [Message]) {
     for msg in messages.iter_mut() {
-        if msg.content.is_none() {
+        if msg.role == "assistant" && msg.content.as_deref().map(str::is_empty).unwrap_or(true) {
+            msg.content = Some(" ".to_string());
+        } else if msg.content.is_none() {
             msg.content = Some(String::new());
         }
     }
@@ -823,7 +834,7 @@ mod tests {
         assert!(prep_outbound_history(&[], &HistoryPolicy { strip_think: true }).is_empty());
     }
 
-    // ---- ensure_content_present: strict-gateway `missing messages.content` guard ----
+    // ---- ensure_content_present: strict-gateway content guard ----
 
     #[test]
     fn ensure_content_backfills_tool_call_only_assistant_turn() {
@@ -834,25 +845,62 @@ mod tests {
         // Simulate the stored shape: no visible text means content is None.
         msgs[0].content = None;
         ensure_content_present(&mut msgs);
-        assert_eq!(msgs[0].content.as_deref(), Some(""));
+        assert_eq!(msgs[0].content.as_deref(), Some(" "));
         // The tool call is untouched.
         assert!(msgs[0].tool_calls.as_ref().is_some_and(|t| !t.is_empty()));
     }
 
     #[test]
     fn ensure_content_backfills_reasoning_stripped_assistant_turn() {
-        // A reasoning-only turn arrives here as `content: None` after
-        // `prep_outbound_history` clears its reasoning — a bare
-        // `{"role":"assistant"}` that any strict gateway 400s on.
+        // A persisted reasoning-only turn with no visible content arrives from
+        // session replay as `reasoning_content: Some(..), content: None`.
+        // `prep_outbound_history` clears the reasoning, leaving a bare
+        // `{"role":"assistant"}`; strict gateways then require a non-empty
+        // placeholder.
         let history = vec![
             user("question"),
-            assistant_text("the answer", Some("first I considered ...")),
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: Some("first I considered ...".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                created_at_ms: None,
+            },
         ];
         let mut out = prep_outbound_history(&history, &HistoryPolicy { strip_think: true });
-        // Force the reasoning-only shape: content None, reasoning already stripped.
-        out[1].content = None;
+        assert!(out[1].content.is_none());
+        assert!(out[1].reasoning_content.is_none());
+
         ensure_content_present(&mut out);
+        assert_eq!(out[1].content.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn ensure_content_replaces_empty_assistant_content() {
+        // `prep_outbound_history` can strip an inline `<think>...</think>`-only
+        // assistant turn down to `content: ""`. Some strict gateways reject
+        // that as an empty assistant message even though the `content` field is
+        // present.
+        let history = vec![
+            user("question"),
+            assistant_text("<think>only thought</think>", None),
+        ];
+        let mut out = prep_outbound_history(&history, &HistoryPolicy { strip_think: true });
         assert_eq!(out[1].content.as_deref(), Some(""));
+
+        ensure_content_present(&mut out);
+        assert_eq!(out[1].content.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn ensure_content_uses_empty_string_for_missing_non_assistant_content() {
+        let mut msgs = vec![user("hi")];
+        msgs[0].content = None;
+
+        ensure_content_present(&mut msgs);
+        assert_eq!(msgs[0].content.as_deref(), Some(""));
     }
 
     #[test]

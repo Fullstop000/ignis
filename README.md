@@ -25,8 +25,9 @@ Drops the binary in `~/.ignis/bin` and the Ink frontend in `~/.ignis/ignis-tui`.
 Already installed? Update in place with `ignis upgrade`.
 
 `ignis` runs the [Ink frontend](ignis-tui/README.md) by default when **Node ≥18**
-is on your PATH, and falls back to the built-in `ratatui` TUI otherwise. Force the
-built-in any time with `IGNIS_FRONTEND=native`.
+is on your PATH, and falls back to the built-in `ratatui` TUI otherwise. The
+ratatui TUI is **deprecated** (no longer actively developed); `IGNIS_FRONTEND=native`
+forces it.
 
 <details>
 <summary>Other ways to install</summary>
@@ -44,7 +45,7 @@ ignis upgrade --version v0.14.1   # pin to a specific tag
 git clone https://github.com/Fullstop000/ignis.git
 cd ignis && cargo build --release   # → target/release/ignis
 
-# Optional: the experimental Ink frontend (Node required). Built from a source
+# Optional: the Ink frontend (Node required). Built from a source
 # checkout, `ignis` launches it by default; install its deps once first.
 ( cd ignis-tui && npm install )
 ```
@@ -81,9 +82,9 @@ See [Configure](#configure) for more providers and per-model options.
 
 ## Features
 
-- **TUI + CLI** — a terminal TUI and a one-shot CLI from the same binary. The
-  default UI is the [Ink frontend](ignis-tui/README.md) when Node is present, with
-  the built-in `ratatui` TUI as the always-available fallback (`IGNIS_FRONTEND=native`).
+- **TUI + CLI** — a terminal TUI and a one-shot CLI from the same binary. The UI
+  is the [Ink frontend](ignis-tui/README.md) when Node is present, with the built-in
+  `ratatui` TUI as a deprecated fallback for Node-less environments (`IGNIS_FRONTEND=native`).
 - **Bring your own model** — OpenAI, Anthropic, DeepSeek, Kimi, MiniMax,
   Moonshot, Ollama, and any OpenAI-compatible endpoint (the `custom` provider).
   Providers are built in — drop in an API key and go. Switch model and reasoning
@@ -102,8 +103,8 @@ See [Configure](#configure) for more providers and per-model options.
   gate, with a built-in safety floor and user-declarable allow/ask/deny rules.
 - **Sessions** — project-scoped history with `--resume`, auto-resume, and
   context compaction; export per-session stats with `ignis sessions export`.
-- **Single binary** — the core agent is one self-updating binary with no runtime
-  deps; the optional Ink frontend is the only piece that needs Node.
+- **Single binary** — the core agent is one self-updating binary; the Ink frontend
+  needs Node ≥18 (the deprecated `ratatui` TUI is the no-Node fallback).
 
 ## Configure
 
@@ -146,14 +147,14 @@ the active selection at runtime, saving it to `~/.ignis/state.json` — your
 | `ignis upgrade` | Update to the latest release |
 | `ignis --help` | Full flag and subcommand list |
 
-In the TUI: `Enter` sends, `↑/↓` walk history, `Ctrl+D` exits. Output renders
+In the TUI: `Enter` sends, `↑/↓` walk history, `Ctrl+D` twice exits. Output renders
 inline in the normal buffer, so scroll with your terminal/tmux as usual. Type
 `/` for slash-command suggestions — see
 [`docs/usage/commands.md`](docs/usage/commands.md) for the full reference.
 
 ## Docs
 
-Deep references live in [`docs/`](docs/README.md) — commands, permissions,
+Deep references live in [`docs/`](docs/README.md) — commands, hooks, permissions,
 skills, MCP servers, telemetry.
 
 ## Development
