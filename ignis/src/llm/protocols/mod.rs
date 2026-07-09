@@ -293,50 +293,66 @@ where
     )
 }
 
-/// Parse one SSE line's payload into a response delta. Returns `None` for lines
-/// that carry no delta: blank lines, comments / non-`data:` lines, the terminal
-/// `[DONE]`, unparseable JSON, and empty-content deltas. Shared by every
-/// OpenAI-compatible provider so the mapping lives — and is tested — once.
-pub(crate) fn parse_sse_line(line: &str) -> Option<LlmResponseDelta> {
+/// Parse one SSE line's payload into one or more response deltas. Returns an
+/// empty vec for lines that carry no delta: blank lines, comments /
+/// non-`data:` lines, the terminal `[DONE]`, unparseable JSON, and
+/// empty-content deltas. Shared by every OpenAI-compatible provider so the
+/// mapping lives — and is tested — once.
+pub(crate) fn parse_sse_line(line: &str) -> Vec<LlmResponseDelta> {
     let line = line.trim();
     if line.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let data_part = line.strip_prefix("data:")?.trim();
+    let data_part = match line.strip_prefix("data:").map(str::trim) {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
     if data_part == "[DONE]" {
-        return None;
+        return Vec::new();
     }
-    let chunk: Chunk = serde_json::from_str(data_part).ok()?;
+    let chunk: Chunk = match serde_json::from_str(data_part).ok() {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
     if let Some(choice) = chunk.choices.as_ref().and_then(|c| c.first()) {
         if let Some(content) = &choice.delta.content {
             if !content.is_empty() {
-                return Some(LlmResponseDelta::Text(content.clone()));
+                out.push(LlmResponseDelta::Text(content.clone()));
             }
         }
-        if let Some(reasoning) = &choice.delta.reasoning_content {
-            if !reasoning.is_empty() {
-                return Some(LlmResponseDelta::Reasoning(reasoning.clone()));
+        // Legacy single-delta behavior: when both content and reasoning are
+        // present in the same chunk, content "wins". Keep that ordering so a
+        // reasoning-only chunk is only emitted when there is no content.
+        if out.is_empty() {
+            if let Some(reasoning) = &choice.delta.reasoning_content {
+                if !reasoning.is_empty() {
+                    out.push(LlmResponseDelta::Reasoning(reasoning.clone()));
+                }
             }
         }
-        if let Some(tc) = choice.delta.tool_calls.as_ref().and_then(|t| t.first()) {
-            let name = tc.function.as_ref().and_then(|f| f.name.clone());
-            let arguments = tc
-                .function
-                .as_ref()
-                .and_then(|f| f.arguments.clone())
-                .unwrap_or_default();
-            return Some(LlmResponseDelta::ToolCall {
-                index: tc.index,
-                id: tc.id.clone(),
-                name,
-                arguments,
-            });
+        if let Some(tool_calls) = &choice.delta.tool_calls {
+            for tc in tool_calls {
+                let name = tc.function.as_ref().and_then(|f| f.name.clone());
+                let arguments = tc
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.arguments.clone())
+                    .unwrap_or_default();
+                out.push(LlmResponseDelta::ToolCall {
+                    index: tc.index,
+                    id: tc.id.clone(),
+                    name,
+                    arguments,
+                });
+            }
         }
     }
     if let Some(u) = &chunk.usage {
-        return Some(LlmResponseDelta::Usage(u.to_usage()));
+        out.push(LlmResponseDelta::Usage(u.to_usage()));
     }
-    None
+    out
 }
 
 /// Policy for trimming prior-turn material from a `history` before serializing
@@ -543,10 +559,9 @@ pub(crate) async fn openai_compatible_chat_stream(
 
     let status = res.status();
     if !status.is_success() {
-        let error_text = res
-            .text()
+        let (error_text, _) = crate::tools::util::read_body_with_cap(res, 64 * 1024)
             .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
+            .unwrap_or_else(|e| (format!("Unknown error: {e}"), false));
         return Err(LlmHttpError {
             status,
             body: error_text,
@@ -555,11 +570,12 @@ pub(crate) async fn openai_compatible_chat_stream(
     }
 
     let line_stream = bytes_to_lines(res.bytes_stream());
-    let delta_stream = line_stream.filter_map(|line_result| async move {
-        match line_result {
-            Err(err) => Some(Err(err)),
-            Ok(line) => parse_sse_line(&line).map(Ok),
-        }
+    let delta_stream = line_stream.flat_map(|line_result| {
+        let deltas = match line_result {
+            Err(err) => vec![Err(err)],
+            Ok(line) => parse_sse_line(&line).into_iter().map(Ok).collect(),
+        };
+        futures_util::stream::iter(deltas)
     });
     Ok(delta_stream.boxed())
 }
@@ -600,13 +616,13 @@ mod tests {
     #[test]
     fn parse_sse_text_delta() {
         let d = parse_sse_line(r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#);
-        assert!(matches!(d, Some(LlmResponseDelta::Text(t)) if t == "hello"));
+        assert!(matches!(d.as_slice(), [LlmResponseDelta::Text(t)] if t == "hello"));
     }
 
     #[test]
     fn parse_sse_reasoning_delta() {
         let d = parse_sse_line(r#"data: {"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#);
-        assert!(matches!(d, Some(LlmResponseDelta::Reasoning(t)) if t == "hmm"));
+        assert!(matches!(d.as_slice(), [LlmResponseDelta::Reasoning(t)] if t == "hmm"));
     }
 
     #[test]
@@ -614,14 +630,14 @@ mod tests {
         let d = parse_sse_line(
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":"}}]}}]}"#,
         );
-        match d {
-            Some(LlmResponseDelta::ToolCall {
+        match d.as_slice() {
+            [LlmResponseDelta::ToolCall {
                 index,
                 id,
                 name,
                 arguments,
-            }) => {
-                assert_eq!(index, 0);
+            }] => {
+                assert_eq!(*index, 0);
                 assert_eq!(id.as_deref(), Some("call_1"));
                 assert_eq!(name.as_deref(), Some("bash"));
                 assert_eq!(arguments, r#"{"command":"#);
@@ -636,7 +652,21 @@ mod tests {
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"x"}}]}}]}"#,
         );
         assert!(
-            matches!(d, Some(LlmResponseDelta::ToolCall { arguments, .. }) if arguments.is_empty())
+            matches!(d.as_slice(), [LlmResponseDelta::ToolCall { arguments, .. }] if arguments.is_empty())
+        );
+    }
+
+    #[test]
+    fn parse_sse_emits_all_tool_calls_in_chunk() {
+        let d = parse_sse_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}},{"index":1,"id":"call_2","function":{"name":"read_file","arguments":"{\"path\":\"/tmp/a\"}"}}]}}]}"#,
+        );
+        assert_eq!(d.len(), 2);
+        assert!(
+            matches!(&d[0], LlmResponseDelta::ToolCall { index: 0, id, name, .. } if id.as_deref() == Some("call_1") && name.as_deref() == Some("bash"))
+        );
+        assert!(
+            matches!(&d[1], LlmResponseDelta::ToolCall { index: 1, id, name, .. } if id.as_deref() == Some("call_2") && name.as_deref() == Some("read_file"))
         );
     }
 
@@ -645,18 +675,18 @@ mod tests {
         let d = parse_sse_line(
             r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3}}"#,
         );
-        assert!(matches!(d, Some(LlmResponseDelta::Usage(u)) if u.input_tokens == 10));
+        assert!(matches!(d.as_slice(), [LlmResponseDelta::Usage(u)] if u.input_tokens == 10));
     }
 
     #[test]
-    fn parse_sse_done_and_noise_yield_none() {
-        assert!(parse_sse_line("data: [DONE]").is_none());
-        assert!(parse_sse_line("").is_none());
-        assert!(parse_sse_line("   ").is_none());
-        assert!(parse_sse_line(": keep-alive comment").is_none()); // not a data: line
-        assert!(parse_sse_line("data: {not json}").is_none());
+    fn parse_sse_done_and_noise_yield_empty() {
+        assert!(parse_sse_line("data: [DONE]").is_empty());
+        assert!(parse_sse_line("").is_empty());
+        assert!(parse_sse_line("   ").is_empty());
+        assert!(parse_sse_line(": keep-alive comment").is_empty()); // not a data: line
+        assert!(parse_sse_line("data: {not json}").is_empty());
         // Empty content delta carries no signal.
-        assert!(parse_sse_line(r#"data: {"choices":[{"delta":{"content":""}}]}"#).is_none());
+        assert!(parse_sse_line(r#"data: {"choices":[{"delta":{"content":""}}]}"#).is_empty());
     }
 
     #[test]
@@ -665,7 +695,7 @@ mod tests {
         let d = parse_sse_line(
             r#"data: {"choices":[{"delta":{"content":"a","reasoning_content":"b"}}]}"#,
         );
-        assert!(matches!(d, Some(LlmResponseDelta::Text(t)) if t == "a"));
+        assert!(matches!(d.as_slice(), [LlmResponseDelta::Text(t)] if t == "a"));
     }
 
     // ---- prep_outbound_history: stale tool-output masking + reasoning strip ----
