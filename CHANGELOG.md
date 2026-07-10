@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.5] - 2026-07-10
+
+### Fixed
+- Worktree — `exit_worktree remove` no longer demands `discard_changes` when the worktree branch has already been merged into its base branch (e.g. after a PR merge). (#248)
+
 ## [0.45.4] - 2026-07-09
 
 ### Fixed
