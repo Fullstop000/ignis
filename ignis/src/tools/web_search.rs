@@ -3,6 +3,12 @@ use async_trait::async_trait;
 use serde_json::json;
 
 const RESULT_COUNT: u32 = 5;
+/// Cap on bytes read from a search API error response; keeps the error message
+/// small without buffering an arbitrary server body into memory.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Cap on bytes read from a search API success response. Search results are
+/// JSON and should be small, but this bounds memory against a misbehaving API.
+const MAX_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// A normalized search hit, independent of which backend produced it.
 struct SearchResult {
@@ -55,13 +61,19 @@ impl WebSearchTool {
         .await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let (body, _) =
+                crate::tools::util::read_body_with_cap(resp, MAX_ERROR_BODY_BYTES).await?;
             return Err(format!("Brave API error {status}: {}", truncate(&body)));
         }
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        let (body, truncated) =
+            crate::tools::util::read_body_with_cap(resp, MAX_JSON_BODY_BYTES).await?;
+        if truncated {
+            return Err(format!(
+                "Brave API response body exceeded maximum allowed size (>{MAX_JSON_BODY_BYTES} bytes)"
+            ));
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {e}"))?;
         Ok(parse_brave(&json))
     }
 
@@ -78,13 +90,19 @@ impl WebSearchTool {
         .await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let (body, _) =
+                crate::tools::util::read_body_with_cap(resp, MAX_ERROR_BODY_BYTES).await?;
             return Err(format!("Tavily API error {status}: {}", truncate(&body)));
         }
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse response: {e}"))?;
+        let (body, truncated) =
+            crate::tools::util::read_body_with_cap(resp, MAX_JSON_BODY_BYTES).await?;
+        if truncated {
+            return Err(format!(
+                "Tavily API response body exceeded maximum allowed size (>{MAX_JSON_BODY_BYTES} bytes)"
+            ));
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {e}"))?;
         Ok(parse_tavily(&json))
     }
 }

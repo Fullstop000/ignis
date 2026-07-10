@@ -13,7 +13,7 @@ mod list_dir;
 mod read_file;
 mod skill;
 mod todo_write;
-mod util;
+pub(crate) mod util;
 mod web_fetch;
 mod web_search;
 mod worktree;

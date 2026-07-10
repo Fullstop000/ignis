@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.4] - 2026-07-09
+
+### Fixed
+- LLM — `parse_sse_line` now emits every tool_call in a single OpenAI-compatible streaming chunk, instead of silently dropping indices 1+. ([#247](https://github.com/Fullstop000/ignis/pull/247))
+- Tools — `web_fetch` and `web_search` no longer buffer arbitrary HTTP response bodies into memory; a hard byte cap now bounds peak memory usage. ([#247](https://github.com/Fullstop000/ignis/pull/247))
+
 ## [0.45.3] - 2026-07-07
 
 ### Fixed

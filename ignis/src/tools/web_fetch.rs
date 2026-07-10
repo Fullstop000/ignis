@@ -4,6 +4,10 @@ use std::time::Duration;
 
 /// Cap on returned text so a large page can't blow up the context.
 const MAX_OUTPUT_CHARS: usize = 20_000;
+/// Hard cap on bytes read before the HTML→text pass. This bounds peak memory
+/// regardless of how large the server response is; output is still truncated to
+/// `MAX_OUTPUT_CHARS` afterward.
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// Fetch a URL and return its readable text. HTML is stripped to plain text.
 /// Pairs with `web_search` (search finds URLs, fetch reads them).
@@ -60,10 +64,8 @@ impl StaticTool for WebFetchTool {
             .and_then(|v| v.to_str().ok())
             .map(|ct| ct.contains("html"))
             .unwrap_or(false);
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read body: {e}"))?;
+        let (body, truncated) =
+            crate::tools::util::read_body_with_cap(resp, MAX_BODY_BYTES).await?;
 
         let text = if is_html || looks_like_html(&body) {
             html_to_text(&body)
@@ -74,7 +76,14 @@ impl StaticTool for WebFetchTool {
         if text.is_empty() {
             return Ok("(empty response)".to_string());
         }
-        Ok(crate::tools::util::truncate_chars(text, MAX_OUTPUT_CHARS))
+        // If the body hit the byte cap, preserve the marker even after the
+        // character-based output truncation that follows.
+        let mut out = crate::tools::util::truncate_chars(text, MAX_OUTPUT_CHARS);
+        if truncated && !out.ends_with(crate::tools::util::TRUNCATION_MARKER) {
+            out.push('\n');
+            out.push_str(crate::tools::util::TRUNCATION_MARKER);
+        }
+        Ok(out)
     }
 }
 
