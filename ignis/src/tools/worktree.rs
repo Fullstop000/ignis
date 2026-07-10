@@ -35,6 +35,11 @@ pub struct ActiveWorktree {
     /// The commit the branch was cut from — used to detect commits made only in
     /// the worktree when deciding whether `remove` would lose work.
     pub base_commit: String,
+    /// The base ref/branch name the worktree was cut from (e.g. `main` or
+    /// `origin/main`). Used to detect when the worktree branch has since been
+    /// merged into the base, so `remove` does not incorrectly demand
+    /// `discard_changes` for already-landed work.
+    pub base_ref: String,
     /// Where the session was before `enter_worktree`, restored on exit.
     pub original_cwd: PathBuf,
 }
@@ -166,7 +171,18 @@ fn parse_enter_result(result: &str) -> Option<ActiveWorktree> {
     let rest = result.strip_prefix("Entered worktree at ")?;
     let (session_cwd, rest) = rest.split_once(" on new branch `")?;
     let (branch, rest) = rest.split_once("` (isolated from ")?;
-    let (original_cwd, _) = rest.split_once(").")?;
+    let (original_cwd, base_ref) = if let Some((cwd, base_part)) = rest.split_once(", base_ref `") {
+        let base_ref = base_part
+            .split_once("`).")
+            .map(|(r, _)| r.to_string())
+            .or_else(|| base_part.strip_suffix("`).").map(ToString::to_string))
+            .unwrap_or_default();
+        (cwd, base_ref)
+    } else {
+        // Back-compat with messages created before the base_ref field was added.
+        let (cwd, _) = rest.split_once(").")?;
+        (cwd, String::new())
+    };
 
     let session_cwd = PathBuf::from(session_cwd);
     let original_cwd = PathBuf::from(original_cwd);
@@ -188,6 +204,7 @@ fn parse_enter_result(result: &str) -> Option<ActiveWorktree> {
         session_cwd,
         branch: branch.to_string(),
         base_commit,
+        base_ref,
         original_cwd,
     })
 }
@@ -263,6 +280,17 @@ async fn create(
     let base_commit = git(cwd, &["rev-parse", &base])
         .await
         .map_err(|e| format!("cannot resolve base ref '{base}': {e}"))?;
+    // Record a stable reference to the base branch so we can later tell whether
+    // the worktree branch has been merged into it. For `head` we use the
+    // current branch name if there is one; otherwise fall back to the symbolic
+    // ref (e.g. `HEAD` for detached states) so the behavior remains safe.
+    let base_ref_name = if matches!(base_ref, BaseRef::Head) {
+        git(cwd, &["symbolic-ref", "--short", "HEAD"])
+            .await
+            .unwrap_or_else(|_| "HEAD".to_string())
+    } else {
+        base.clone()
+    };
 
     git(
         cwd,
@@ -276,6 +304,7 @@ async fn create(
         session_cwd,
         branch: name,
         base_commit,
+        base_ref: base_ref_name,
         original_cwd: cwd.to_path_buf(),
     })
 }
@@ -298,7 +327,26 @@ async fn unsaved_work(active: &ActiveWorktree) -> Result<Option<String>, String>
     .map_err(|e| format!("cannot verify commits in the worktree for safe removal: {e}"))?
     .parse()
     .unwrap_or(usize::MAX);
-    if uncommitted == 0 && ahead == 0 {
+    // If there are commits ahead of the original base, check whether the
+    // worktree branch has already been merged into the current base branch. If
+    // so, the commits are safe to drop because they are reachable from the
+    // base branch (e.g. a merge commit brought them in).
+    let merged = if ahead > 0 && !active.base_ref.is_empty() {
+        git(
+            &active.path,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &active.branch,
+                &active.base_ref,
+            ],
+        )
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    if uncommitted == 0 && (ahead == 0 || merged) {
         return Ok(None);
     }
     Ok(Some(format!(
@@ -391,13 +439,14 @@ impl StaticTool for EnterWorktreeTool {
 
         self.cwd.set(active.session_cwd.clone());
         let msg = format!(
-            "Entered worktree at {} on new branch `{}` (isolated from {}). Use relative paths \
-             from here on — they now resolve inside the worktree (your system prompt's Working \
-             Directory is stale). Call exit_worktree with action \"keep\" (review later) or \
-             \"remove\" (discard) when done.",
+            "Entered worktree at {} on new branch `{}` (isolated from {}, base_ref `{}`). \
+             Use relative paths from here on — they now resolve inside the worktree (your \
+             system prompt's Working Directory is stale). Call exit_worktree with action \
+             \"keep\" (review later) or \"remove\" (discard) when done.",
             active.session_cwd.display(),
             active.branch,
-            active.original_cwd.display()
+            active.original_cwd.display(),
+            active.base_ref,
         );
         *self.state.lock().unwrap() = Some(active);
         Ok(msg)
@@ -637,6 +686,37 @@ mod tests {
             .unwrap();
         assert!(ok.contains("Removed"));
         assert!(!wt.exists());
+    }
+
+    #[tokio::test]
+    async fn exit_remove_allows_already_merged_commits() {
+        let repo = init_repo();
+        let (cwd, state, enter, exit) = tools(repo.path());
+        enter.run(json!({ "name": "merged" })).await.unwrap();
+        let wt = state.lock().unwrap().clone().unwrap().path;
+
+        // Commit work inside the worktree.
+        std::fs::write(wt.join("feature.txt"), "done\n").unwrap();
+        sh(&wt, &["git", "add", "."]);
+        sh(&wt, &["git", "commit", "-qm", "feature work"]);
+
+        // Simulate the PR being merged into main via a merge commit from the
+        // main checkout (not from inside the worktree).
+        sh(repo.path(), &["git", "checkout", "main", "-q"]);
+        sh(
+            repo.path(),
+            &["git", "merge", "--no-ff", "-m", "merge feature", "merged"],
+        );
+        // Switch back so the worktree is still on its branch and the session
+        // remains consistent.
+        sh(repo.path(), &["git", "checkout", "-"]);
+
+        // The worktree branch is now reachable from main, so remove should not
+        // complain about unsaved commits.
+        let msg = exit.run(json!({ "action": "remove" })).await.unwrap();
+        assert!(msg.contains("Removed"), "{msg}");
+        assert!(!wt.exists());
+        assert_eq!(cwd.get(), repo.path());
     }
 
     #[tokio::test]
